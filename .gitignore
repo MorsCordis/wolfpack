@@ -1,0 +1,18 @@
+# Wolfpack — hunt artifacts (local, copied back by /merge)
+.wolfpack/plans/*/
+!.wolfpack/plans/*/pedigree.json
+
+# Wolfpack — worktrees
+.claude/worktrees/
+
+# Wolfpack — campaigns (local planning artifacts)
+.wolfpack/campaigns/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
