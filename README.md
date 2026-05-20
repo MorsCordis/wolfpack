@@ -53,7 +53,18 @@ ln -s /path/to/wolfpack/.claude/skills/wolfpack /path/to/your/project/.claude/sk
 # (repeat for each role skill and command)
 ```
 
-### 2. Configure
+### 2. Install hooks
+
+```bash
+mkdir -p .claude/hooks
+cp wolfpack/hooks/*.sh .claude/hooks/
+chmod +x .claude/hooks/*.sh
+cp wolfpack/hooks/settings.example.json .claude/settings.json
+```
+
+Hooks enforce branch discipline, block `git add .`, and catch agent spin loops. See [HOOKS.md](HOOKS.md) for details and customization.
+
+### 3. Configure
 
 Copy the config template and fill in your project's details:
 
@@ -68,7 +79,7 @@ Edit `wolfpack-config.md` with:
 - Code review checklist (project conventions Pointer should enforce)
 - Compliance requirements (if any)
 
-### 3. Set up agents directory (for Mistral/Gemini)
+### 4. Set up agents directory (for Mistral/Gemini)
 
 ```bash
 cd /path/to/your/project
@@ -76,7 +87,7 @@ ln -s .claude/skills .agents/skills
 ln -s .claude/commands .agents/commands
 ```
 
-### 4. Run your first hunt
+### 5. Run your first hunt
 
 ```bash
 # In Claude Code:
@@ -156,8 +167,15 @@ your-project/
 ├── .agents/
 │   ├── skills -> ../.claude/skills
 │   └── commands -> ../.claude/commands
-└── scripts/
-    └── wolfpack-lessons.sh      # Pedigree aggregator
+├── scripts/
+│   └── wolfpack-lessons.sh      # Pedigree aggregator
+└── .claude/
+    ├── hooks/
+    │   ├── main-branch-guard.sh # Blocks source edits on main
+    │   ├── git-add-guard.sh     # Blocks git add . / -A / --all
+    │   ├── spin-detector.sh     # Catches agent loops
+    │   └── reset-spin-state.sh  # Clears spin state on session start
+    └── settings.json            # Hook wiring + permissions
 ```
 
 ## Key Design Principles

@@ -74,7 +74,27 @@ What project conventions should Pointer enforce? Think about the mistakes you've
 - Every database query must have an index strategy
 ```
 
-## Step 3: Update your .gitignore
+## Step 3: Install hooks (recommended)
+
+Hooks enforce pipeline discipline at the tool level — preventing agents from committing to main, `git add .`-ing secrets, or spinning in loops.
+
+```bash
+# Copy hook scripts
+mkdir -p .claude/hooks
+cp /path/to/wolfpack/hooks/*.sh .claude/hooks/
+chmod +x .claude/hooks/*.sh
+
+# Add hook config to settings.json
+# If you don't have one yet:
+cp /path/to/wolfpack/hooks/settings.example.json .claude/settings.json
+
+# If you already have a settings.json, merge the "hooks" section from
+# hooks/settings.example.json into your existing file.
+```
+
+See [HOOKS.md](HOOKS.md) for details on each hook, customization options, and how to add project-specific hooks (prod deploy blocker, linter on save, test runner on stop).
+
+## Step 4: Update your .gitignore
 
 Add the Wolfpack artifacts that should be local-only:
 
@@ -87,6 +107,11 @@ Add the Wolfpack artifacts that should be local-only:
 .claude/worktrees/
 ```
 
+```gitignore
+# Wolfpack — spin detector state
+.claude/state/
+```
+
 And the files that SHOULD be tracked:
 ```
 # These are tracked (don't ignore them):
@@ -97,7 +122,7 @@ And the files that SHOULD be tracked:
 # .wolfpack/plans/*/pedigree.json
 ```
 
-## Step 4: Add to your CLAUDE.md
+## Step 5: Add to your CLAUDE.md
 
 Add a Wolfpack section to your project's `CLAUDE.md`:
 
@@ -111,7 +136,7 @@ See `.claude/skills/wolfpack/SKILL.md` for full detail.
 Project configuration: `wolfpack-config.md`
 ```
 
-## Step 5: Run your first hunt
+## Step 6: Run your first hunt
 
 ```
 /hunt my-first-feature "Brief description of what you're building"

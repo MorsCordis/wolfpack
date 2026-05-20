@@ -1,0 +1,64 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/git-add-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/spin-detector.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/main-branch-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/spin-detector.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/main-branch-guard.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/spin-detector.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/spin-detector.sh"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/reset-spin-state.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
