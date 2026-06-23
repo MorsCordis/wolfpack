@@ -1,6 +1,8 @@
 # Wolfpack Hooks
 
-Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) enforce pipeline discipline at the tool level. Skills tell agents what to do; hooks prevent them from doing what they shouldn't. Without hooks, a well-intentioned agent can still commit to main, `git add .`, or spin in a loop re-reading the same file.
+Most agent harnesses support **hooks** — shell commands the runtime fires around tool calls — to enforce pipeline discipline at the tool level. Skills tell agents what to do; hooks prevent them from doing what they shouldn't. Without hooks, a well-intentioned agent can still commit to main, `git add .`, or spin in a loop re-reading the same file.
+
+The hooks below are plain shell scripts and are runtime-neutral: they read the tool call off `TOOL_INPUT` (a JSON blob your harness supplies) and exit non-zero to block. The wiring shown uses Claude Code's `settings.json` schema as a concrete example; adapt the config to whatever your harness's hook mechanism expects. The scripts themselves don't change.
 
 ## Included Hooks
 
@@ -8,7 +10,7 @@ Claude Code [hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) enforc
 
 **Type:** PreToolUse (Edit, Write)
 
-Blocks source-file edits when on `main` (or `master`). Agents must create a branch first. Non-source files (CLAUDE.md, TODO.md, .claude/, .wolfpack/, docs/, scripts/) pass through.
+Blocks source-file edits when on `main` (or `master`). Agents must create a branch first. Non-source files (agent instructions, TODO.md, `.agents/`, `.claude/`, `.wolfpack/`, docs/, scripts/) pass through.
 
 **Why it matters for Wolfpack:** The `/smoke` command walks through post-deploy tests. When the agent finds a bug, it may start fixing it before branching — landing the fix directly on main. This hook forces branching first. The smoke skill also creates a branch up front during setup, but the hook catches any agent that skips the skill instructions.
 
@@ -36,20 +38,23 @@ Tracks repeated operations per session. If the same command is run 3+ times, or 
 
 ### Step 1: Copy hook scripts
 
-```bash
-cp hooks/*.sh /path/to/your/project/.claude/hooks/
-chmod +x /path/to/your/project/.claude/hooks/*.sh
-```
-
-### Step 2: Add to `.claude/settings.json`
-
-If you don't have a `settings.json` yet, copy the example:
+Put the scripts wherever your harness can reach them. Wolfpack's canonical layout uses `.agents/` (with `.claude/` as a compat symlink), so either path works:
 
 ```bash
-cp hooks/settings.example.json /path/to/your/project/.claude/settings.json
+mkdir -p /path/to/your/project/.agents/hooks
+cp hooks/*.sh /path/to/your/project/.agents/hooks/
+chmod +x /path/to/your/project/.agents/hooks/*.sh
 ```
 
-Or merge the hooks section into your existing `settings.json`. The key structure:
+### Step 2: Wire the hooks into your harness settings
+
+If you don't have a settings file yet, copy the example:
+
+```bash
+cp hooks/settings.example.json /path/to/your/project/.agents/settings.json
+```
+
+Or merge the hooks section into your existing settings file. The example uses Claude Code's schema and references the scripts at `.claude/hooks/…` (resolved through the compat symlink); adjust the paths and the schema to match your harness. The key structure:
 
 ```json
 {
@@ -97,20 +102,20 @@ Or merge the hooks section into your existing `settings.json`. The key structure
 ### Step 3: Add state directory to .gitignore
 
 ```gitignore
-.claude/state/
+.agents/state/
 ```
 
 ### Step 4: Test the hooks
 
 ```bash
 # Should BLOCK (source file on main):
-TOOL_INPUT='{"tool_input":{"file_path":"src/app.py"}}' bash .claude/hooks/main-branch-guard.sh
+TOOL_INPUT='{"tool_input":{"file_path":"src/app.py"}}' bash .agents/hooks/main-branch-guard.sh
 
 # Should PASS (docs on main):
-TOOL_INPUT='{"tool_input":{"file_path":"TODO.md"}}' bash .claude/hooks/main-branch-guard.sh
+TOOL_INPUT='{"tool_input":{"file_path":"TODO.md"}}' bash .agents/hooks/main-branch-guard.sh
 
 # Should BLOCK (git add .):
-TOOL_INPUT='{"tool_input":{"command":"git add ."}}' bash .claude/hooks/git-add-guard.sh
+TOOL_INPUT='{"tool_input":{"command":"git add ."}}' bash .agents/hooks/git-add-guard.sh
 ```
 
 ## Adding Project-Specific Hooks

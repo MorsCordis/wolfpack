@@ -1,53 +1,56 @@
 # Setting Up Wolfpack for Your Project
 
-This guide walks through configuring Wolfpack for a new codebase. You can do this manually or ask Claude to help — either way, the result is a `wolfpack-config.md` in your project root.
+This guide walks through wiring Wolfpack into a new codebase. You can do this manually or ask your agent to help — either way, the result is a `wolfpack-config.md` in your project root plus a skills symlink that points your harness at this repo.
+
+Wolfpack is harness-agnostic. The roles are `SKILL.md` files (an open standard) and work with any skill-aware agent runtime — Claude Code, Vibe, Aider, Cline, OpenCode, and others. Wherever this guide names Claude Code, it's only as one concrete example of "your agent harness."
 
 ## Prerequisites
 
-- [Claude Code](https://claude.ai/code) installed
+- A skill-aware agent harness (Claude Code, Vibe, Aider, Cline, OpenCode, …)
 - A git repository for your project
-- At least one AI model available (Opus recommended for Alpha and Tracker)
+- At least one model per family in your pool (judgment / work-horse / reviewer) — see Step 3
 
-## Step 1: Copy the Wolfpack files
+## How distribution works
+
+You do **not** copy the skills and commands into each project. Wolfpack lives in one cloned repo; you point your harness's user-level skills directory at this repo's canonical `.agents/skills`. The framework's real home is `.agents/` (skills, commands, workflows); `.claude/` is a compatibility symlink → `.agents/` for Claude Code users. Each project then only needs its own `wolfpack-config.md` and a `.wolfpack/` artifacts directory.
+
+## Step 1: Clone Wolfpack and link the skills
+
+```bash
+git clone <wolfpack-repo-url> ~/wolfpack
+```
+
+Point your harness's user-level skills/commands directories at this repo's `.agents/` tree:
+
+```bash
+# Generic, open SKILL.md location (Vibe, Aider, Cline, OpenCode, ...):
+ln -s ~/wolfpack/.agents/skills ~/.agents/skills
+
+# Claude Code reads ~/.claude/skills — link the same content:
+ln -s ~/wolfpack/.agents/skills ~/.claude/skills
+ln -s ~/wolfpack/.agents/commands ~/.claude/commands
+```
+
+Adjust the destination to wherever your runtime discovers user-level skills and commands. The slash commands (`/hunt`, `/alpha`, …) become available once the harness sees them.
+
+## Step 2: Set up the project artifacts directory
 
 From your project root:
 
 ```bash
-# Copy skills
-cp -r /path/to/wolfpack/.claude/skills/alpha /path/to/wolfpack/.claude/skills/bloodhound \
-      /path/to/wolfpack/.claude/skills/shepherd /path/to/wolfpack/.claude/skills/pointer \
-      /path/to/wolfpack/.claude/skills/tracker /path/to/wolfpack/.claude/skills/watchdog \
-      /path/to/wolfpack/.claude/skills/wolfpack \
-      .claude/skills/
-
-# Copy commands
-cp /path/to/wolfpack/.claude/commands/hunt.md \
-   /path/to/wolfpack/.claude/commands/alpha.md \
-   /path/to/wolfpack/.claude/commands/bloodhound.md \
-   /path/to/wolfpack/.claude/commands/debrief.md \
-   /path/to/wolfpack/.claude/commands/shepherd.md \
-   /path/to/wolfpack/.claude/commands/pointer.md \
-   /path/to/wolfpack/.claude/commands/tracker.md \
-   /path/to/wolfpack/.claude/commands/watchdog.md \
-   /path/to/wolfpack/.claude/commands/merge.md \
-   /path/to/wolfpack/.claude/commands/smoke.md \
-   /path/to/wolfpack/.claude/commands/expedition.md \
-   .claude/commands/
-
-# Copy infrastructure
-cp -r /path/to/wolfpack/.wolfpack/ .wolfpack/
-cp /path/to/wolfpack/scripts/wolfpack-lessons.sh scripts/
-
-# Set up agent symlinks (for Mistral/Gemini)
-mkdir -p .agents
-ln -s ../.claude/skills .agents/skills
-ln -s ../.claude/commands .agents/commands
+# Per-hunt + pedigree artifacts live in your project's .wolfpack/
+mkdir -p .wolfpack/pedigree .wolfpack/plans .wolfpack/campaigns
+cp ~/wolfpack/.wolfpack/pedigree/index.md       .wolfpack/pedigree/ 2>/dev/null || : 
+cp ~/wolfpack/.wolfpack/known-broken-tests.md   .wolfpack/ 2>/dev/null || :
+cp ~/wolfpack/.wolfpack/cross-cutting-debt.md   .wolfpack/ 2>/dev/null || :
 ```
 
-## Step 2: Create your project configuration
+(These seed files are optional starting points — the roles create what they need on first run.)
+
+## Step 3: Create your project configuration
 
 ```bash
-cp /path/to/wolfpack/wolfpack-config.example.md wolfpack-config.md
+cp ~/wolfpack/wolfpack-config.example.md wolfpack-config.md
 ```
 
 Open `wolfpack-config.md` and fill in each section. The most important ones:
@@ -57,6 +60,16 @@ How do you run tests? This is what Tracker will call.
 ```markdown
 - **Test command:** `pytest` or `npm test` or `./scripts/run_tests.sh`
 ```
+
+### Model Pool
+Map the abstract role families onto the concrete models you have. The router (`scripts/wolfpack-routing.mjs`) reasons about families, not brands:
+```markdown
+- judgment    → (your strongest reasoning model)
+- work-horse  → (your cheap high-throughput model)
+- reviewer-a  → (a model from a different family than your implementers)
+- reviewer-b  → (a second cross-family reviewer, optional)
+```
+The hard rule the router enforces: reviewers must be a **different family** from the implementer (cross-family adversarial review).
 
 ### Hard rules
 What must agents NEVER do? These go beyond the defaults (no `git add .`, no prod deploy).
@@ -74,27 +87,27 @@ What project conventions should Pointer enforce? Think about the mistakes you've
 - Every database query must have an index strategy
 ```
 
-## Step 3: Install hooks (recommended)
+## Step 4: Install hooks (recommended)
 
 Hooks enforce pipeline discipline at the tool level — preventing agents from committing to main, `git add .`-ing secrets, or spinning in loops.
 
 ```bash
-# Copy hook scripts
-mkdir -p .claude/hooks
-cp /path/to/wolfpack/hooks/*.sh .claude/hooks/
-chmod +x .claude/hooks/*.sh
+# Copy hook scripts into your harness's hooks directory
+mkdir -p .agents/hooks
+cp ~/wolfpack/hooks/*.sh .agents/hooks/
+chmod +x .agents/hooks/*.sh
 
-# Add hook config to settings.json
+# Add hook config to your harness's settings file.
 # If you don't have one yet:
-cp /path/to/wolfpack/hooks/settings.example.json .claude/settings.json
+cp ~/wolfpack/hooks/settings.example.json .agents/settings.json
 
-# If you already have a settings.json, merge the "hooks" section from
+# If you already have settings, merge the "hooks" section from
 # hooks/settings.example.json into your existing file.
 ```
 
-See [HOOKS.md](HOOKS.md) for details on each hook, customization options, and how to add project-specific hooks (prod deploy blocker, linter on save, test runner on stop).
+The example settings reference the scripts by relative path (`.claude/hooks/…` for the Claude Code compat layout). Adjust those paths to wherever your harness reads its settings and where you placed the scripts. See [HOOKS.md](HOOKS.md) for details on each hook, customization, and how to add project-specific hooks (prod deploy blocker, linter on save, test runner on stop).
 
-## Step 4: Update your .gitignore
+## Step 5: Update your .gitignore
 
 Add the Wolfpack artifacts that should be local-only:
 
@@ -104,12 +117,10 @@ Add the Wolfpack artifacts that should be local-only:
 !.wolfpack/plans/*/pedigree.json
 
 # Wolfpack — worktrees
-.claude/worktrees/
-```
+.agents/worktrees/
 
-```gitignore
 # Wolfpack — spin detector state
-.claude/state/
+.agents/state/
 ```
 
 And the files that SHOULD be tracked:
@@ -122,21 +133,21 @@ And the files that SHOULD be tracked:
 # .wolfpack/plans/*/pedigree.json
 ```
 
-## Step 5: Add to your CLAUDE.md
+## Step 6: Add to your agent instructions
 
-Add a Wolfpack section to your project's `CLAUDE.md`:
+Add a Wolfpack section to your project's agent instructions file (`CLAUDE.md`, `AGENTS.md`, or whatever your harness reads):
 
 ```markdown
 ## Wolfpack Pipeline
 
 Multi-agent workflow: plan → review → implement → code review → test → certify.
 Six roles, five tiers. Slash commands only; `/clear` between phases.
-See `.claude/skills/wolfpack/SKILL.md` for full detail.
+See the `wolfpack` skill for full detail.
 
 Project configuration: `wolfpack-config.md`
 ```
 
-## Step 6: Run your first hunt
+## Step 7: Run your first hunt
 
 ```
 /hunt my-first-feature "Brief description of what you're building"
@@ -149,32 +160,25 @@ The hunt will:
 
 Follow the finishing messages — each phase tells you what to do next.
 
-## Asking Claude to Set It Up
+## Asking your agent to set it up
 
-If you'd rather have Claude configure everything:
+If you'd rather have your agent configure everything:
 
 ```
-I want to set up the Wolfpack pipeline for this project. 
-The framework is at ~/Projects/wolfpack/. 
-Copy the skills and commands, create wolfpack-config.md 
-with my project's conventions, and update .gitignore.
+I want to set up the Wolfpack pipeline for this project.
+The framework is cloned at ~/wolfpack/.
+Link the skills, create wolfpack-config.md with my project's
+conventions (including the Model Pool), and update .gitignore.
 ```
 
-Claude will read your codebase, infer conventions, and fill in the config. Review the config before running your first hunt — it's the foundation everything else builds on.
+The agent will read your codebase, infer conventions, and fill in the config. Review the config before running your first hunt — it's the foundation everything else builds on, especially the Model Pool mapping.
 
 ## Updating Wolfpack
 
-When the upstream framework updates (new role features, tier adjustments, scoring changes):
+When the upstream framework updates (new role features, tier adjustments, scoring changes), just pull — your symlink picks up the new content automatically:
 
 ```bash
-# Pull updates
-cd /path/to/wolfpack && git pull
-
-# Re-copy skills and commands to your project
-cp -r /path/to/wolfpack/.claude/skills/{alpha,bloodhound,shepherd,pointer,tracker,watchdog,wolfpack} \
-      /path/to/your/project/.claude/skills/
-cp /path/to/wolfpack/.claude/commands/{hunt,alpha,bloodhound,debrief,shepherd,pointer,tracker,watchdog,merge,smoke,expedition}.md \
-      /path/to/your/project/.claude/commands/
+cd ~/wolfpack && git pull
 ```
 
-Your `wolfpack-config.md` is never overwritten — it's your project's file, not the framework's.
+Because your harness reads the skills through a symlink to this repo, there's nothing to re-copy. Your `wolfpack-config.md` is your project's file (not the framework's) and is never touched by an update.
