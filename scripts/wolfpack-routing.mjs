@@ -51,6 +51,7 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { ucbSelect } from './wolfpack-bandit.mjs'
 
 // ─── The neutral model pool ──────────────────────────────────────
 // DEFAULT_POOL is a provider-agnostic EXAMPLE. Real projects supply their own
@@ -150,6 +151,32 @@ export function trusted(cell) {
   return !!cell && Number(cell.runs || 0) >= MIN_RUNS
 }
 
+// ─── Adaptive (bandit) selection ─────────────────────────────────
+// When pedigree-v2 reward (per-cell `reward_mean`, aggregated from pedigree `overall`)
+// is present, the router becomes an adaptive UCB bandit over the candidate families: it
+// EXPLORES under-sampled cells (sampling floor) for coverage, then EXPLOITS the best mean
+// reward — deterministically (no Math.random). Falls back to the legacy default/best-by-data
+// path when no reward data exists yet, so pre-pedigree-v2 behavior (and tests) stay intact.
+function rewardCandidates(models, stats, role, domain) {
+  return models.map((model) => {
+    const cell = cellOf(stats, model, role, domain)
+    return {
+      model,
+      runs: Number(cell?.runs || 0),
+      rewardMean: cell && Number.isFinite(cell.reward_mean) ? Number(cell.reward_mean) : null,
+    }
+  })
+}
+
+function banditPick(models, stats, role, domain, explore) {
+  const cands = rewardCandidates(models, stats, role, domain)
+  if (!cands.some((c) => c.rewardMean != null)) return null   // no pedigree-v2 reward yet → legacy path
+  const pick = ucbSelect(cands, { exploreAllowed: explore, minRuns: MIN_RUNS })
+  if (!pick) return null                                       // exploit-only, nothing trusted → safe default
+  const source = pick.source === 'exploit' ? 'exploit' : 'explore'
+  return { model: pick.model, rationale: `bandit ${pick.source} — ${pick.reason}`, source }
+}
+
 // Best reviewer family for a role+domain BY DATA (signal − noise − miss), among
 // trusted cells only; null if no candidate has trusted data. reviewer-b is stripped
 // from autonomous routing, so only reviewer-a is considered here.
@@ -227,6 +254,13 @@ function pickWithPin(role, pins, defModel, stats, domain, explore, warnings, poo
     if (!fam) { warnings.push(`unrecognized ${role} pin "${pins[role]}" — using default ${defModel}`) }
     else return { model: fam, rationale: `operator pin (${pins[role]})`, source: 'pin' }
   }
+  // Adaptive: on explore-eligible tiers, let the bandit pick among the implementer families
+  // once pedigree-v2 reward exists. Heavy/compliance tiers are exploit-only and already
+  // forced to the judgment family upstream, so the implementer bandit is NOT consulted there.
+  if (explore) {
+    const adaptive = banditPick([pool.workHorse, pool.judgment], stats, role, domain, explore)
+    if (adaptive) return adaptive
+  }
   const cell = cellOf(stats, defModel, role, domain)
   if (trusted(cell)) return { model: defModel, rationale: `tier default, confirmed by data (${cell.runs} runs)`, source: 'exploit' }
   return {
@@ -249,6 +283,11 @@ function pickReviewer(role, pins, defModel, stats, domain, explore, warnings, po
   let base = REVIEWER.has(defModel) ? defModel : pool.reviewerA
   if (base !== defModel) warnings.push(`${role} default coerced to ${base} (reviewers must be a reviewer family)`)
 
+  // Adaptive: bandit over BOTH reviewer families once reward exists — you can't learn the
+  // best reviewer without sampling both, so this re-introduces reviewer-b as an explore
+  // candidate on cheap tiers (exploit-only tiers just pick the best KNOWN reviewer).
+  const adaptive = banditPick([pool.reviewerA, pool.reviewerB], stats, role, domain, explore)
+  if (adaptive) return adaptive
   const best = bestReviewerByData(stats, role, domain, pool)
   if (best && best !== base) {
     return { model: best, rationale: `data-driven: ${best} best signal/noise for ${role}/${domain}`, source: 'exploit' }
