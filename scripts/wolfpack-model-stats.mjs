@@ -9,7 +9,12 @@
 // Output schema (.wolfpack/pedigree/model-stats.json):
 //   { meta: { hunts, sourced, generated_at? },
 //     model_stats: { "<model>": { "<role>": { "<domain>": {
-//        runs, spend_s, signal, noise, miss_rate, quality } } } } }
+//        runs, spend_s, signal, noise, miss_rate, quality,
+//        reward_mean, reward_n, blocked_n } } } } }
+//
+//   * reward_mean — mean pedigree-v2 `overall` for this cell (the bandit's reward); null
+//                   until a scored hunt lands. reward_n = # scored; blocked_n = # compliance
+//                   vetoes (tracked separately, NOT folded into the mean).
 //
 //   * runs      — how many hunts this (model × role × domain) cell has seen.
 //   * spend_s   — total wall-clock the model spent in that role ([05] timing.by_model);
@@ -58,7 +63,9 @@ export function normalizeHunt(p) {
 
   // Per-role model family. model_assignments is the authoritative source; fall
   // back to shepherd_model for the implementer on old cards.
-  const ma = p.model_assignments || {}
+  // model_assignments (v1) is authoritative; pedigree-v2 carries the same per-role map as
+  // `routing`. Fall back to shepherd_model for the implementer on old cards.
+  const ma = p.model_assignments || p.routing || {}
   const models = {}
   for (const role of ROLES) {
     const raw = ma[role] || (role === 'shepherd' ? p.shepherd_model : null)
@@ -84,7 +91,13 @@ export function normalizeHunt(p) {
   // [04] smoke escape (lagging miss signal). Boolean if present, else null.
   const miss = typeof p.smoke_escape === 'boolean' ? p.smoke_escape : null
 
-  return { models, domain, quality, byModel, ledger, miss, verdict: p.certifier_verdict || null }
+  // [pedigree-v2] reward = the hunt's outcome-anchored `overall` (0-1), attributed to every
+  // participating (model × role) cell as the bandit's reward. A compliance VETO (overall
+  // null + compliance fail) is tracked as `blocked`, NOT folded into the reward mean.
+  const reward = typeof p.overall === 'number' ? p.overall : null
+  const blocked = p.blocked_reason === 'compliance_veto' || p.dimensions?.compliance?.status === 'fail'
+
+  return { models, domain, quality, byModel, ledger, miss, reward, blocked, verdict: p.certifier_verdict || null }
 }
 
 // Reduce review_fingerprints into per-role {raised, grounded, dropped} tallies.
@@ -127,6 +140,7 @@ export function aggregateModelStats(hunts) {
       runs: 0, _spend: 0, _spendSeen: false,
       _raised: 0, _grounded: 0, _dropped: 0, _ledgerSeen: false,
       _miss: 0, _missRuns: 0, _q: 0, _qSeen: 0,
+      _reward: 0, _rewardN: 0, _blockedN: 0,
     }
     return stats[model][role][domain]
   }
@@ -159,6 +173,10 @@ export function aggregateModelStats(hunts) {
 
       // quality proxy
       if (h.quality != null) { c._q += h.quality; c._qSeen++ }
+
+      // [pedigree-v2] reward — credit the hunt's `overall` to every participating cell.
+      if (h.reward != null) { c._reward += h.reward; c._rewardN++ }
+      if (h.blocked) c._blockedN++
     }
   }
 
@@ -174,6 +192,9 @@ export function aggregateModelStats(hunts) {
           noise: c._ledgerSeen && c._raised > 0 ? round3(c._dropped / c._raised) : null,
           miss_rate: c._missRuns > 0 ? round3(c._miss / c._missRuns) : null,
           quality: c._qSeen ? round3(c._q / c._qSeen) : null,
+          reward_mean: c._rewardN > 0 ? round3(c._reward / c._rewardN) : null,
+          reward_n: c._rewardN,
+          blocked_n: c._blockedN,
         }
         stats[model][role][domain] = out
         if (c.runs < MIN_RUNS || out.signal == null) {

@@ -190,3 +190,57 @@ test('provisional cell with runs≥MIN_RUNS but null signal is NOT exploited by-
   assert.equal(r.assignments.bloodhound.model, 'reviewer-a')
   assert.equal(r.assignments.bloodhound.source, 'explore')   // not flipped to the provisional reviewer-b cell
 })
+
+// ─── pedigree-v2 reward → bandit (closing the loop) ──────────────
+test('normalizeHunt: pedigree-v2 reward (overall) + routing → per-role models and reward', () => {
+  const h = normalizeHunt({
+    schema_version: 2,
+    predicted_dimensions: { frontend_complexity: 0 },
+    routing: { shepherd: 'work-horse', pointer: 'reviewer-a' },
+    overall: 0.84,
+  })
+  assert.equal(h.models.shepherd, 'work-horse')
+  assert.equal(h.models.pointer, 'reviewer-a')
+  assert.equal(h.reward, 0.84)
+  assert.equal(h.blocked, false)
+})
+
+test('normalizeHunt: a compliance veto (overall null + compliance fail) is blocked, reward null', () => {
+  const h = normalizeHunt({
+    schema_version: 2,
+    predicted_dimensions: { domain_sensitivity: 4 },
+    routing: { shepherd: 'judgment' },
+    overall: null,
+    dimensions: { compliance: { status: 'fail' } },
+  })
+  assert.equal(h.reward, null)
+  assert.equal(h.blocked, true)
+})
+
+test('aggregate: pedigree-v2 reward → reward_mean / reward_n / blocked_n (veto excluded from mean)', () => {
+  const mk = (overall) => normalizeHunt({
+    schema_version: 2, predicted_dimensions: { frontend_complexity: 0 },
+    routing: { shepherd: 'work-horse' }, overall,
+  })
+  const veto = normalizeHunt({
+    schema_version: 2, predicted_dimensions: { frontend_complexity: 0 },
+    routing: { shepherd: 'work-horse' }, overall: null, dimensions: { compliance: { status: 'fail' } },
+  })
+  const { model_stats } = aggregateModelStats([mk(0.9), mk(0.7), veto])
+  const c = model_stats['work-horse'].shepherd.backend
+  assert.equal(c.runs, 3)            // total observations
+  assert.equal(c.reward_n, 2)        // scored observations
+  assert.equal(c.reward_mean, 0.8)   // (0.9 + 0.7) / 2 — veto NOT averaged in
+  assert.equal(c.blocked_n, 1)
+})
+
+test('end-to-end: v2 reward stats drive the bandit via the real aggregation path', () => {
+  const mk = (model, overall, n) => Array.from({ length: n }, () => normalizeHunt({
+    schema_version: 2, predicted_dimensions: { frontend_complexity: 0, domain_sensitivity: 0 },
+    routing: { shepherd: model }, overall,
+  }))
+  const { model_stats } = aggregateModelStats([...mk('work-horse', 0.92, 5), ...mk('judgment', 0.6, 5)])
+  const r = recommendModels({ tier: 'Yellow', dimensions: { frontend_complexity: 0, domain_sensitivity: 0 }, stats: model_stats })
+  assert.equal(r.assignments.shepherd.model, 'work-horse')
+  assert.match(r.assignments.shepherd.rationale, /bandit/)
+})

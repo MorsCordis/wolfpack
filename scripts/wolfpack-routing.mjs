@@ -160,11 +160,11 @@ export function trusted(cell) {
 function rewardCandidates(models, stats, role, domain) {
   return models.map((model) => {
     const cell = cellOf(stats, model, role, domain)
-    return {
-      model,
-      runs: Number(cell?.runs || 0),
-      rewardMean: cell && Number.isFinite(cell.reward_mean) ? Number(cell.reward_mean) : null,
-    }
+    const rewardMean = cell && Number.isFinite(cell.reward_mean) ? Number(cell.reward_mean) : null
+    // Floor on SCORED observations (reward_n) when present — a cell needs enough graded
+    // outcomes to trust its reward, not merely enough total appearances.
+    const runs = cell && Number.isFinite(cell.reward_n) ? Number(cell.reward_n) : Number(cell?.runs || 0)
+    return { model, runs, rewardMean }
   })
 }
 
