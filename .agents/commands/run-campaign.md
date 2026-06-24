@@ -63,13 +63,23 @@ Parse `$ARGUMENTS` as: `<campaign-slug> [max-parallel]`. Default max-parallel is
    ✔ Wave 1  shipped (3/3 merged)
    ⊘ Wave 2  certified, NOT merged (2/2) — release first:  /merge-wave $SLUG 2
    ▶ Wave 3  NEXT — runs 2 hunt(s):
-       ▸ <slug-a>   Yellow  "<desc>"   [ready_for_alpha]
-       ▸ <slug-b>   Green   "<desc>"   [reviewed — resumes mid-pipeline]
+       ▸ <slug-a>   Yellow   [ready_for_alpha]
+           intent: <one plain-English sentence — what it accomplishes>
+           source: <ticket dev#22 | deferral from <hunt> (finding) | TODO.md | ad-hoc>
+       ▸ <slug-b>   Green    [reviewed — resumes mid-pipeline]
+           intent: …
+           source: …
      ⏸ also in Wave 3, skipped (need /resolve):
        ⏸ <slug-c>   parked:compliance_review   → /resolve <slug-c>
      ⏳ quota (auto-resumes this pass): <slug or none>
    ◻ Wave 4  queued (5 hunts) — not reached until Wave 3 clears
    ```
+   For each hunt in the **NEXT (resuming) wave**, surface its **`intent`** (the plain-English
+   `Intent`/`Description` from `campaign.md`) and **`source`** (the `Source` field — env-qualify
+   ticket refs: `dev#N` ≠ `prod#N`) BEFORE the confirm, so the user reviews the wave's specs and can
+   reconcile their ticketing system in one glance. If a hunt predates the `Source` field (older
+   `campaign.md`), show `source: (not recorded)` and fall back to its `TODO items cleared`.
+
    Each hunt's `[status]` is read verbatim from its metadata — `merged` (shipped),
    `certified`/`certified_not_merged` (awaiting `/merge-wave`), `parked:*` / `needs_spec`
    (awaiting `/resolve`), or a mid-pipeline rung. If an EARLIER wave shows ⊘ certified-not-merged,
