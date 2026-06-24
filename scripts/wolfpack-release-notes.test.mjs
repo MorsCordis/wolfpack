@@ -114,6 +114,14 @@ test('compliance: matched entries are suppressed from customers AND surfaced in 
   assert.ok(compliance.every((e) => e.suppressed && e.compliance));
 });
 
+test('compliance: a refactor that merely touches compliance code is noise, NOT surfaced', () => {
+  const real = classifyEntry({ text: 'Tightened who can export the DEA Form 222 report', category: 'Fixed' }, { complianceTerms: ['DEA'] });
+  const refactor = classifyEntry({ text: 'Refactored DEA logging into a service-layer (behavior-preserving)', category: 'Changed' }, { complianceTerms: ['DEA'] });
+  assert.equal(real.compliance, true);        // a genuine change → surfaced
+  assert.equal(refactor.compliance, false);   // refactor touching compliance code → noise
+  assert.equal(refactor.suppressed, true);    // still kept out of the customer note
+});
+
 // ─── post-check (safety net) ─────────────────────────────────────────────────
 test('postCheck: catches a leaked suppressed term, passes a clean draft', () => {
   assert.deepEqual(postCheck('We strengthened DEA reporting controls.', ['DEA', 'PCI']), ['DEA']);

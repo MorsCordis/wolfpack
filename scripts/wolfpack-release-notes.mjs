@@ -115,10 +115,12 @@ export const DEFAULT_INTERNAL_MARKERS = [
 // real-world headings like "### Tooling (no APP_VERSION bump — …)" or "### Docs (…)" match.
 export const DEFAULT_SUPPRESS_CATEGORIES = ['Security', 'Tooling', 'Docs', 'Documentation', 'Chore', 'Internal'];
 
-// Regulatory/compliance markers. An entry matching one is BOTH suppressed from the customer
-// note AND collected into the compliance digest — suppression must never mean a silent drop
-// of a licensure-critical change (the compliance owner has to see it). Generic defaults;
-// the project adds its own (e.g. DEA, NM Board, SAQ, controlled substance) via wolfpack-config.
+// Regulatory/compliance markers. A real compliance CHANGE is surfaced in its own bucket —
+// never silently dropped. WHERE it's surfaced is a project policy (see wolfpack-config
+// `compliance_visibility`): to the END USER when they are the regulated party (PawPIMS — the
+// vet holds the DEA registration, is the SAQ merchant, owns the TCPA numbers), or to an
+// internal compliance owner otherwise. Generic defaults; the project adds its own (DEA, NM
+// Board, SAQ, controlled substance, …). Non-issue for projects with no regulated domain (chispa).
 export const DEFAULT_COMPLIANCE_TERMS = ['compliance', 'regulatory', 'HIPAA', 'PCI', 'GDPR', 'SOC 2', 'audit trail', 'retention'];
 
 export function classifyEntry(entry, {
@@ -126,15 +128,18 @@ export function classifyEntry(entry, {
   internalMarkers = DEFAULT_INTERNAL_MARKERS, suppressCategories = DEFAULT_SUPPRESS_CATEGORIES,
 } = {}) {
   const reasons = [];
-  let compliance = false;
+  let complianceHit = false;
   const hay = (entry.text || '').toLowerCase();
   if (entry.category && suppressCategories.some((c) => entry.category.toLowerCase().startsWith(c.toLowerCase()))) {
     reasons.push(`category:${entry.category.split(/[\s(]/)[0]}`);
   }
-  // compliance hit → force-suppress from customers AND flag for the digest
-  for (const term of complianceTerms) if (term && hay.includes(term.toLowerCase())) { reasons.push(`compliance:${term}`); compliance = true; }
+  for (const term of complianceTerms) if (term && hay.includes(term.toLowerCase())) { reasons.push(`compliance:${term}`); complianceHit = true; }
   for (const term of denylist) if (term && hay.includes(term.toLowerCase())) reasons.push(`denylist:${term}`);
   for (const m of internalMarkers) if (m && hay.includes(m.toLowerCase())) reasons.push(`internal:${m.trim()}`);
+  // Distinguish a real compliance CHANGE (surface it) from a behavior-preserving refactor that
+  // merely touches compliance code (an internal/category marker present → just noise).
+  const internalNoise = reasons.some((r) => r.startsWith('internal:') || r.startsWith('category:'));
+  const compliance = complianceHit && !internalNoise;
   return { ...entry, suppressed: reasons.length > 0, compliance, reasons };
 }
 

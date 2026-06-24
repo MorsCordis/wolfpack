@@ -23,9 +23,15 @@ extract+filter (code)  →  translate to voice (model)  →  post-check (code, f
 ## Inputs from the project's `wolfpack-config.md` → `## Release Notes`
 - **Audience** — who reads it (e.g. "veterinary clinic staff").
 - **Denylist** — terms that must never reach the audience (security/domain-sensitive).
-- **Compliance terms** — regulatory markers (e.g. DEA, NM Board, PCI, SAQ). Entries matching
-  these are kept OUT of the customer note but **surfaced in a separate compliance digest** — a
-  regulatory change is never silently dropped; the compliance owner must see it.
+- **Compliance terms** — regulatory markers (e.g. DEA, NM Board, PCI, SAQ). A real compliance
+  *change* matching these is surfaced (never silently dropped); a behavior-preserving refactor
+  that merely touches compliance code stays internal noise.
+- **`compliance_visibility`** — `customer` or `digest`:
+  - `customer` (when the END USER is the regulated party — PawPIMS: the vet holds the DEA
+    registration, is the SAQ merchant, owns the TCPA numbers): compliance changes go INTO the
+    customer note, in their own "Compliance & regulatory updates" section. The user must know.
+  - `digest` (default; chispa and non-regulated projects): compliance changes go to an internal
+    digest only, not the customer note.
 - **Template** — the email/announcement skeleton.
 - **Exemplars** — 2–3 engineering→audience rewrite examples (how a small model learns the voice).
 
@@ -60,17 +66,21 @@ Group related items. Keep it short.
 ### 4. Post-check (code — the safety net)
 Write the draft to a temp file and run:
 ```bash
-node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <same denylist> --compliance <same compliance terms>
+# digest mode — compliance terms must NOT appear in the note:
+node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <denylist> --compliance <compliance terms>
+# customer mode — compliance terms ARE allowed (you're telling the regulated user about them); scan denylist only:
+node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <denylist>
 ```
-Exit 1 = a suppressed or compliance term leaked into your prose → fix and re-check. Do **not**
-present a draft that hasn't passed this check.
+Exit 1 = a forbidden term leaked → fix and re-check. Do **not** present a draft that hasn't passed.
 
-### 5. Present — two outputs
-1. **The customer note** — paste-ready, from `included` only, post-check passed.
-2. **Compliance & regulatory digest (internal — NOT for customers)** — list the `compliance`
-   entries plainly (no client spin) so the compliance owner can review whether any is a real
-   regulatory change needing action. Never merge this into the customer note. If non-empty, say
-   so explicitly: "⚠ N compliance/regulatory entries in this range — review before they're lost."
+### 5. Present (depends on `compliance_visibility`)
+- **`customer` mode (PawPIMS):** ONE note with two sections — "What's new" (`included`), and a
+  **"Compliance & regulatory updates"** section built from `compliance`, rewritten in plain
+  language for the regulated user (e.g. "We tightened who can export DEA Form 222 reports —
+  only staff with reporting + inventory permissions can download them now"). These are changes
+  the vet must know to stay compliant. Run the **customer-mode** post-check.
+- **`digest` mode (default):** the note is `included` only; render `compliance` as a separate
+  internal digest, never merged in. Run the **digest-mode** post-check.
 Footer: "(N customer-facing, M compliance, K internal held back)."
 
 ## What NOT to do
