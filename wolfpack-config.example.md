@@ -78,21 +78,33 @@ Project-specific items Bloodhound should check during plan review.
 - Migration command: (e.g., `python manage.py migrate_schemas` not `migrate`)
 ```
 
-## Model Pool Preferences
+## Model Pool
 
-Customize which models are available and any project-specific routing rules.
+Wolfpack is model-agnostic. The pipeline reasons about model **families** by role, not by brand:
+
+- **judgment** — strongest reasoning family. Fixed for the planner (Alpha); used for heavy/compliance implementation and test authoring (Tracker).
+- **work-horse** — cheap, high-throughput implementer family (default Shepherd on light tiers).
+- **reviewer-a** — primary reviewer family + verify specialist (Watchdog).
+- **reviewer-b** — secondary reviewer family (cross-family alternate), optional.
+
+Map each family onto a concrete model you have. The router (`scripts/wolfpack-routing.mjs`) reads this mapping and the pedigree history to pick a model per role per hunt. The brand names below are fill-in EXAMPLES — replace them with whatever models your harness can reach.
 
 ```markdown
-### Fixed assignments
-- Alpha: claude:opus:high (always)
-- Tracker: claude:opus:high (always — test writing needs the strongest model)
+### Family → model mapping (EXAMPLES — fill in your own)
+- judgment    → claude:opus:high          # e.g. Opus, GPT-5, Gemini Pro
+- work-horse  → claude:sonnet             # e.g. Sonnet, GPT-5-mini, a local 70B
+- reviewer-a  → gemini:flash              # any family ≠ your implementers
+- reviewer-b  → mistral:large             # optional second cross-family reviewer
 
-### Pool (available for pedigree-driven selection)
-- Opus, Sonnet, Gemini, Mistral
+### Hard constraints (enforced by the router — never relax)
+- Alpha is ALWAYS the judgment family (load-bearing planner).
+- Reviewers (Bloodhound, Pointer, Watchdog) are NEVER an implementer family —
+  adversarial review must be CROSS-FAMILY from the implementer.
+- Pointer/Watchdog family ≠ Shepherd family.
 
-### Overrides
-- (e.g., Red tier / compliance hunts: always Opus for Shepherd)
-- (e.g., Bloodhound: prefer Mistral for cross-model from Opus Alpha)
+### Overrides (optional)
+- (e.g., Red tier / compliance hunts: force judgment family for Shepherd)
+- (e.g., UI-heavy hunts: pin reviewer-a as the visual-review specialist)
 ```
 
 ## Deployment Notes
