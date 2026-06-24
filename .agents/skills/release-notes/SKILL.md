@@ -22,7 +22,10 @@ extract+filter (code)  →  translate to voice (model)  →  post-check (code, f
 
 ## Inputs from the project's `wolfpack-config.md` → `## Release Notes`
 - **Audience** — who reads it (e.g. "veterinary clinic staff").
-- **Denylist** — terms that must never reach the audience (compliance/security/domain).
+- **Denylist** — terms that must never reach the audience (security/domain-sensitive).
+- **Compliance terms** — regulatory markers (e.g. DEA, NM Board, PCI, SAQ). Entries matching
+  these are kept OUT of the customer note but **surfaced in a separate compliance digest** — a
+  regulatory change is never silently dropped; the compliance owner must see it.
 - **Template** — the email/announcement skeleton.
 - **Exemplars** — 2–3 engineering→audience rewrite examples (how a small model learns the voice).
 
@@ -39,10 +42,12 @@ denylist (guessing the denylist risks leaking compliance/security detail).
 ```bash
 node scripts/wolfpack-release-notes.mjs \
   --changelog CHANGELOG.md --from <prod-version> \
-  --denylist <comma-list from wolfpack-config> --json
+  --denylist <denylist from wolfpack-config> \
+  --compliance <compliance terms from wolfpack-config> --json
 ```
-This returns `{ included, suppressed }`. Use **only `included`**. The `suppressed` list (with
-reasons) is for transparency — show the user the count so they know what was held back.
+This returns `{ included, suppressed, compliance }`. Use **only `included`** for the customer
+note. Keep `compliance` for the digest (step 5). `suppressed` (with reasons) is for transparency
+— show the user the counts so they know what was held back.
 - If `included` is empty, say so plainly: "No customer-facing changes since vX — this release
   was internal (refactors/fixes)." Do **not** invent items. (This is the correct, common
   outcome for a refactor/compliance release.)
@@ -55,14 +60,18 @@ Group related items. Keep it short.
 ### 4. Post-check (code — the safety net)
 Write the draft to a temp file and run:
 ```bash
-node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <same list>
+node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <same denylist> --compliance <same compliance terms>
 ```
-Exit 1 = a suppressed term leaked into your prose → fix and re-check. Do **not** present a
-draft that hasn't passed this check.
+Exit 1 = a suppressed or compliance term leaked into your prose → fix and re-check. Do **not**
+present a draft that hasn't passed this check.
 
-### 5. Present
-Show the paste-ready note, plus a one-line footer for the user: "(N changes summarized; M
-internal/compliance entries held back)."
+### 5. Present — two outputs
+1. **The customer note** — paste-ready, from `included` only, post-check passed.
+2. **Compliance & regulatory digest (internal — NOT for customers)** — list the `compliance`
+   entries plainly (no client spin) so the compliance owner can review whether any is a real
+   regulatory change needing action. Never merge this into the customer note. If non-empty, say
+   so explicitly: "⚠ N compliance/regulatory entries in this range — review before they're lost."
+Footer: "(N customer-facing, M compliance, K internal held back)."
 
 ## What NOT to do
 - Don't parse the changelog by reading it yourself and deciding what's user-facing — that's the
@@ -71,3 +80,5 @@ internal/compliance entries held back)."
 - Don't include internal/compliance/security detail, file names, endpoints, or version numbers
   the audience doesn't need.
 - Don't invent changes when `included` is empty.
+- Don't silently drop compliance/regulatory entries — they go in the digest (step 5), surfaced
+  for review, never just suppressed.

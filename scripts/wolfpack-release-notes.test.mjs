@@ -104,6 +104,16 @@ test('filterForAudience: splits a real range into included/suppressed', () => {
   assert.deepEqual(suppressed.map((e) => e.hunt).sort(), ['auth-gap', 'billing-extract']);
 });
 
+// ─── compliance digest (surfaced, not dropped) ───────────────────────────────
+test('compliance: matched entries are suppressed from customers AND surfaced in the digest', () => {
+  const parsed = parseChangelog(SAMPLE);
+  const range = selectRange(parsed, { fromVersion: '1.1.0' });
+  const { included, compliance } = filterForAudience(range, { denylist: [], complianceTerms: ['DEA'] });
+  assert.deepEqual(compliance.map((e) => e.hunt), ['auth-gap']);   // surfaced for review
+  assert.ok(!included.some((e) => e.hunt === 'auth-gap'));         // never customer-facing
+  assert.ok(compliance.every((e) => e.suppressed && e.compliance));
+});
+
 // ─── post-check (safety net) ─────────────────────────────────────────────────
 test('postCheck: catches a leaked suppressed term, passes a clean draft', () => {
   assert.deepEqual(postCheck('We strengthened DEA reporting controls.', ['DEA', 'PCI']), ['DEA']);

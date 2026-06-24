@@ -115,17 +115,27 @@ export const DEFAULT_INTERNAL_MARKERS = [
 // real-world headings like "### Tooling (no APP_VERSION bump — …)" or "### Docs (…)" match.
 export const DEFAULT_SUPPRESS_CATEGORIES = ['Security', 'Tooling', 'Docs', 'Documentation', 'Chore', 'Internal'];
 
+// Regulatory/compliance markers. An entry matching one is BOTH suppressed from the customer
+// note AND collected into the compliance digest — suppression must never mean a silent drop
+// of a licensure-critical change (the compliance owner has to see it). Generic defaults;
+// the project adds its own (e.g. DEA, NM Board, SAQ, controlled substance) via wolfpack-config.
+export const DEFAULT_COMPLIANCE_TERMS = ['compliance', 'regulatory', 'HIPAA', 'PCI', 'GDPR', 'SOC 2', 'audit trail', 'retention'];
+
 export function classifyEntry(entry, {
-  denylist = [], internalMarkers = DEFAULT_INTERNAL_MARKERS, suppressCategories = DEFAULT_SUPPRESS_CATEGORIES,
+  denylist = [], complianceTerms = DEFAULT_COMPLIANCE_TERMS,
+  internalMarkers = DEFAULT_INTERNAL_MARKERS, suppressCategories = DEFAULT_SUPPRESS_CATEGORIES,
 } = {}) {
   const reasons = [];
+  let compliance = false;
   const hay = (entry.text || '').toLowerCase();
   if (entry.category && suppressCategories.some((c) => entry.category.toLowerCase().startsWith(c.toLowerCase()))) {
     reasons.push(`category:${entry.category.split(/[\s(]/)[0]}`);
   }
+  // compliance hit → force-suppress from customers AND flag for the digest
+  for (const term of complianceTerms) if (term && hay.includes(term.toLowerCase())) { reasons.push(`compliance:${term}`); compliance = true; }
   for (const term of denylist) if (term && hay.includes(term.toLowerCase())) reasons.push(`denylist:${term}`);
   for (const m of internalMarkers) if (m && hay.includes(m.toLowerCase())) reasons.push(`internal:${m.trim()}`);
-  return { ...entry, suppressed: reasons.length > 0, reasons };
+  return { ...entry, suppressed: reasons.length > 0, compliance, reasons };
 }
 
 export function filterForAudience(entries, config = {}) {
@@ -133,6 +143,7 @@ export function filterForAudience(entries, config = {}) {
   return {
     included: classified.filter((e) => !e.suppressed),
     suppressed: classified.filter((e) => e.suppressed),
+    compliance: classified.filter((e) => e.compliance),   // surfaced subset — NOT dropped
   };
 }
 
@@ -149,19 +160,21 @@ export function postCheck(noteText, denylist = []) {
 // Check:    node wolfpack-release-notes.mjs --check draft.md --denylist PCI,DEA   (exit 1 on leak)
 if (import.meta.url === `file://${process.argv[1]}`) {
   const args = process.argv.slice(2);
-  const opt = { changelog: 'CHANGELOG.md', from: null, to: null, denylist: [], json: false, check: null };
+  const opt = { changelog: 'CHANGELOG.md', from: null, to: null, denylist: [], compliance: [], json: false, check: null };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--changelog') opt.changelog = args[++i];
     else if (a === '--from') opt.from = args[++i].replace(/^v/i, '');
     else if (a === '--to') opt.to = args[++i].replace(/^v/i, '');
     else if (a === '--denylist') opt.denylist = args[++i].split(',').map((s) => s.trim()).filter(Boolean);
+    else if (a === '--compliance') opt.compliance = args[++i].split(',').map((s) => s.trim()).filter(Boolean);
     else if (a === '--json') opt.json = true;
     else if (a === '--check') opt.check = args[++i];
   }
 
   if (opt.check) {
-    const violations = postCheck(fs.readFileSync(opt.check, 'utf8'), opt.denylist);
+    // a compliance term leaking into a customer draft is the harm — check both lists
+    const violations = postCheck(fs.readFileSync(opt.check, 'utf8'), [...opt.denylist, ...opt.compliance]);
     if (violations.length) {
       process.stderr.write(`FAIL: draft contains suppressed terms: ${violations.join(', ')}\n`);
       process.exit(1);
@@ -172,18 +185,26 @@ if (import.meta.url === `file://${process.argv[1]}`) {
 
   const parsed = parseChangelog(fs.readFileSync(opt.changelog, 'utf8'));
   const range = selectRange(parsed, { fromVersion: opt.from, toVersion: opt.to });
-  const { included, suppressed } = filterForAudience(range, { denylist: opt.denylist });
+  const { included, suppressed, compliance } = filterForAudience(range, {
+    denylist: opt.denylist, complianceTerms: opt.compliance.length ? opt.compliance : undefined,
+  });
 
-  if (opt.json) { process.stdout.write(JSON.stringify({ included, suppressed }, null, 2) + '\n'); process.exit(0); }
+  if (opt.json) { process.stdout.write(JSON.stringify({ included, suppressed, compliance }, null, 2) + '\n'); process.exit(0); }
 
-  process.stderr.write(`# release-notes: ${included.length} customer-facing / ${suppressed.length} suppressed (from ${opt.from || 'beginning'} to ${opt.to || 'dev'})\n`);
+  process.stderr.write(`# release-notes: ${included.length} customer-facing / ${compliance.length} compliance / ${suppressed.length} suppressed (from ${opt.from || 'beginning'} to ${opt.to || 'dev'})\n`);
+  process.stdout.write('## Customer-facing\n');
   if (!included.length) {
-    process.stdout.write('(no customer-facing changes in this range — every entry was internal/suppressed)\n');
+    process.stdout.write('(none — every change in this range was internal / compliance / suppressed)\n');
   } else {
     for (const e of included) process.stdout.write(`- [${e.category || '?'}] ${e.text}${e.hunt ? `  (hunt:${e.hunt})` : ''}\n`);
   }
+  if (compliance.length) {
+    // SURFACED, never dropped — for the compliance owner, never for customers
+    process.stdout.write(`\n## ⚠ Compliance / regulatory updates — review (NOT for customers)\n`);
+    for (const e of compliance) process.stdout.write(`- ${e.text}${e.hunt ? `  (hunt:${e.hunt})` : ''}\n`);
+  }
   if (suppressed.length) {
-    process.stderr.write(`\n# suppressed (${suppressed.length}):\n`);
+    process.stderr.write(`\n# suppressed detail (${suppressed.length}):\n`);
     for (const e of suppressed) process.stderr.write(`  - ${e.reasons.join(',')}: ${e.text.slice(0, 70)}…\n`);
   }
 }
