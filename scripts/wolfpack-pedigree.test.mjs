@@ -2,8 +2,49 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  computeOverall, gradeConvergence, gradeCatchRate, applyOutcome, validate,
+  computeOverall, gradeConvergence, gradeCatchRate, applyOutcome, validate, buildRecord,
 } from './wolfpack-pedigree.mjs';
+
+test('gradeConvergence: configurable floor/span calibrates for local models', () => {
+  assert.equal(gradeConvergence({ rounds: 5, tier: 'Yellow' }), 0);            // frontier default annihilates a 5-round hunt
+  assert.ok(gradeConvergence({ rounds: 5, tier: 'Yellow', span: 10 }) > 0.5);  // wide span → 5 rounds is par for local, not broken
+  assert.equal(gradeConvergence({ rounds: 4, tier: 'Yellow', floor: 4 }), 1);  // raised floor → 4 rounds is "expected"
+});
+
+test('buildRecord: convergenceSpan flows through (slow-but-correct local hunt not zeroed)', () => {
+  const r = buildRecord({ huntId: 'h', routing: { a: 'x' }, tier: 'Yellow', rounds: 5, caught: 2, convergenceSpan: 10 });
+  assert.ok(r.dimensions.convergence.score > 0.5);
+  assert.ok(r.overall > 0.7);   // correct + caught + slow ≠ broken
+});
+
+test('buildRecord: clean run → computed dims, geometric overall, provisional, valid', () => {
+  const r = buildRecord({ huntId: 'h', tier: 'Yellow', routing: { shepherd: 'work-horse' }, rounds: 1, caught: 2, slipped: 0 });
+  assert.equal(r.schema_version, 2);
+  assert.equal(r.dimensions.convergence.score, 1.0);   // rounds 1 ≤ Yellow floor 1
+  assert.equal(r.dimensions.catch_rate.score, 1.0);
+  assert.equal(r.dimensions.convergence.source, 'computed');
+  assert.equal(r.provisional, true);
+  assert.equal(validate(r).ok, true);
+});
+
+test('buildRecord: rework + a slip differentiate (the anti-5/5/5 gradient)', () => {
+  const r = buildRecord({ huntId: 'h', tier: 'Yellow', routing: { a: 'x' }, rounds: 3, caught: 1, slipped: 1 });
+  assert.equal(r.dimensions.convergence.score, 0.5);   // 1 - (3-1)/4
+  assert.equal(r.dimensions.catch_rate.score, 0.5);    // 1 of 2 caught
+  assert.ok(r.overall < 1);                            // no longer a flat 5
+});
+
+test('buildRecord: compliance fail vetoes — overall null + blocked, never a stamp', () => {
+  const r = buildRecord({ huntId: 'h', routing: { a: 'x' }, complianceStatus: 'fail' });
+  assert.equal(r.overall, null);
+  assert.equal(r.blocked_reason, 'compliance_veto');
+});
+
+test('buildRecord: revert forces correctness 0 → overall 0', () => {
+  const r = buildRecord({ huntId: 'h', routing: { a: 'x' }, reverted: true, caught: 1 });
+  assert.equal(r.dimensions.correctness.score, 0);
+  assert.equal(r.overall, 0);
+});
 
 test('computeOverall: geometric mean of numeric dims', () => {
   const all1 = { correctness: { score: 1 }, completeness: { score: 1 }, convergence: { score: 1 }, catch_rate: { score: 1 } };
