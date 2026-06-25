@@ -33,6 +33,17 @@ ln -s ~/wolfpack/.agents/commands ~/.claude/commands
 
 Adjust the destination to wherever your runtime discovers user-level skills and commands. The slash commands (`/hunt`, `/alpha`, …) become available once the harness sees them.
 
+### Point at the framework scripts (`WOLFPACK_HOME`)
+
+The roles invoke helper scripts (`wolfpack-routing.mjs`, `wolfpack-pedigree.mjs`, `wolfpack-watch.sh`, …) that live in this repo's `scripts/`. Like the skills, they are **not** copied into each project — set `WOLFPACK_HOME` to the cloned repo so every role resolves them from one place:
+
+```bash
+# add to ~/.bashrc / ~/.zshrc (or your launcher) and re-source:
+export WOLFPACK_HOME=~/wolfpack
+```
+
+Skill/command invocations reference scripts as `"${WOLFPACK_HOME:-.}/scripts/<script>"`. If the var is unset they fall back to a project-local `./scripts/` (legacy behavior), so an unset var degrades gracefully instead of breaking mid-hunt — but export it so the scripts ride along with the one cloned repo, with no per-project copies to keep in sync.
+
 ## Step 2: Set up the project artifacts directory
 
 From your project root:

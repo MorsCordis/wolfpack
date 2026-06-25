@@ -45,7 +45,7 @@ Bloodhound runs as the **cross-model adversarial reviewer** in the multi-model s
   planner seat (Alpha) is fixed, also different from Alpha's family. A same-family reviewer is not
   adversarial cross-model review. The reviewer pool is the project's configured pool minus the
   implementer's family (`wolfpack-config.md` → Model Pool).
-- The router (`scripts/wolfpack-routing.mjs`) picks among the eligible reviewer families by domain +
+- The router (`$WOLFPACK_HOME/scripts/wolfpack-routing.mjs`) picks among the eligible reviewer families by domain +
   per-model signal/noise data: frontend-heavy → the visual-specialist model (`wolfpack-config.md` →
   Model Pool → Overrides); backend → route review volume to the unmetered work-horse model.
 - Alpha adopts the router's pick during planning; the runtime then sticks with whichever model

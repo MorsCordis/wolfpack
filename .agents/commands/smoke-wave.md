@@ -50,7 +50,7 @@ of genuine failures on v1-push-3 wave 2 — per-hunt batching is the fix.)
 3. For each released hunt, read `.wolfpack/plans/<slug>/acceptance.md` (copied back by
    `/merge-wave`). Parse its criteria deterministically:
    ```bash
-   node scripts/wolfpack-release.mjs criteria .wolfpack/plans/<slug>/acceptance.md <slug>
+   node "${WOLFPACK_HOME:-.}/scripts/wolfpack-release.mjs" criteria .wolfpack/plans/<slug>/acceptance.md <slug>
    ```
    Each criterion carries `{slug, id, tag, text, ref}` where `ref` = `<slug>/<n>` — the
    **owning-hunt attribution** that makes a failure map to exactly one merge commit (AC3).

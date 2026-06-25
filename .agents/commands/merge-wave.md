@@ -100,7 +100,7 @@ abort leaves them recoverable.
 1. **Aggregate the bump** across the merged hunts' recorded bumps and compute the wave version:
    ```bash
    LAST_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo "v0.0.0")
-   eval "$(node scripts/wolfpack-release.mjs version "$LAST_TAG" <bump1> <bump2> ...)"
+   eval "$(node "${WOLFPACK_HOME:-.}/scripts/wolfpack-release.mjs" version "$LAST_TAG" <bump1> <bump2> ...)"
    # exports BUMP=<level|none> and VERSION=<next|"">
    ```
    - Highest step wins (minor beats patch); tooling-only hunts contribute nothing

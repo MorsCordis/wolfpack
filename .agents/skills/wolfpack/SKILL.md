@@ -104,7 +104,7 @@ and emits its verdict; it does **not** spawn sub-agents:
   was a tool-box failure, not a capability one). The **one** deliberate omission is `task`: that
   keeps cross-model self-orchestration off, so Vibe still physically cannot spawn sub-agents.
   The read-only worktree mount + sandbox are the real guardrail; reviewer-writes-to-source are
-  read-only-by-ROLE (caught by diff-catch), not by a tool fence. `scripts/wolfpack-toolcheck.mjs`
+  read-only-by-ROLE (caught by diff-catch), not by a tool fence. `$WOLFPACK_HOME/scripts/wolfpack-toolcheck.mjs`
   is the preflight that FAILS LOUD if the set ever silently re-boxes (the `read,grep` comma bug).
 - Agy has no tool-allowlist flag; the prompt forbids sub-agent fan-out and the container mount
   set + diff-catch are the boundary.

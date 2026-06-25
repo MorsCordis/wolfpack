@@ -384,7 +384,7 @@ run-until-converged cycle. The old "always escalate to the top judgment-tier mod
 
 ### The router decides — don't hand-pick from folklore
 
-`node scripts/wolfpack-routing.mjs <planDir>` is the authoritative recommender (run it from the
+`node "${WOLFPACK_HOME:-.}/scripts/wolfpack-routing.mjs" <planDir>` is the authoritative recommender (run it from the
 Plan phase, after writing `predicted_dimensions` + `tier`). It reads the per-model meter
 (`.wolfpack/pedigree/model-stats.json`, signal/noise/miss/spend sliced by domain) and returns
 assignments. **Adopt them** unless you have a specific, documented reason to override (note it in

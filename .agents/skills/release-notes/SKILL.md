@@ -12,7 +12,7 @@ never writes to CHANGELOG or TODO.
 
 **Design:** the parts a (small/local) model is unreliable at — parsing, and the
 safety-critical decision of what to **suppress** — are done in **code**
-(`scripts/wolfpack-release-notes.mjs`). The model's only job is rewriting the pre-filtered
+(`$WOLFPACK_HOME/scripts/wolfpack-release-notes.mjs`). The model's only job is rewriting the pre-filtered
 safe bullets in the project's voice. A final code post-check fails loud if any suppressed
 term leaked. This is what lets a 12B match a frontier model here.
 
@@ -46,7 +46,7 @@ denylist (guessing the denylist risks leaking compliance/security detail).
 
 ### 2. Extract + filter (code — do NOT eyeball the changelog yourself)
 ```bash
-node scripts/wolfpack-release-notes.mjs \
+node "${WOLFPACK_HOME:-.}/scripts/wolfpack-release-notes.mjs" \
   --changelog CHANGELOG.md --from <prod-version> \
   --denylist <denylist from wolfpack-config> \
   --compliance <compliance terms from wolfpack-config> --json
@@ -67,9 +67,9 @@ Group related items. Keep it short.
 Write the draft to a temp file and run:
 ```bash
 # digest mode — compliance terms must NOT appear in the note:
-node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <denylist> --compliance <compliance terms>
+node "${WOLFPACK_HOME:-.}/scripts/wolfpack-release-notes.mjs" --check <draft.md> --denylist <denylist> --compliance <compliance terms>
 # customer mode — compliance terms ARE allowed (you're telling the regulated user about them); scan denylist only:
-node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <denylist>
+node "${WOLFPACK_HOME:-.}/scripts/wolfpack-release-notes.mjs" --check <draft.md> --denylist <denylist>
 ```
 Exit 1 = a forbidden term leaked → fix and re-check. Do **not** present a draft that hasn't passed.
 

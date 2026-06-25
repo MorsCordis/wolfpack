@@ -421,7 +421,7 @@ Each scored dimension carries a `score` (1-5), a `rationale` (one sentence), and
     "tracker:<model>": { "test_quality": 5, "coverage": 5 }
   },
   "certifier_verdict": "pass|rework|flawed_plan",
-  "timing": "WRITTEN BY THE AGGREGATOR — do NOT hand-author. node scripts/wolfpack-timing.mjs fills { total_s, duration, total_method, by_phase, by_model, complete, incomplete_phases? } from timing.jsonl. See the aggregator section below.",
+  "timing": "WRITTEN BY THE AGGREGATOR — do NOT hand-author. node $WOLFPACK_HOME/scripts/wolfpack-timing.mjs fills { total_s, duration, total_method, by_phase, by_model, complete, incomplete_phases? } from timing.jsonl. See the aggregator section below.",
   "parallelism_metrics": {
     "sub_agents_spawned": 7,
     "redundancy_rate": 0.15,
@@ -505,7 +505,7 @@ Pick from this list. If a behavior doesn't match any tag, mention it in `notes` 
 After writing `pedigree.json`, run the aggregator script to regenerate `.wolfpack/pedigree/lessons.md`:
 
 ```bash
-./scripts/wolfpack-lessons.sh
+"${WOLFPACK_HOME:-.}/scripts/wolfpack-lessons.sh"
 ```
 
 The script reads all `.wolfpack/plans/*/pedigree.json` files, counts tag occurrences across the last 10 hunts, and rewrites `lessons.md`. If the script fails or the file isn't present, log it but don't block certification — `lessons.md` is an optimization, not a gate.
@@ -515,7 +515,7 @@ The script reads all `.wolfpack/plans/*/pedigree.json` files, counts tag occurre
 After writing `pedigree.json`, run the timing aggregator so the scorecard carries a duration the limit gate can schedule against. **Run it on the HOST** (the operator on a manual `/watchdog`, or the workflow's host-side orchestrator after the certifier returns) — `node` is NOT installed in the cross-model sandbox container, so do not run it from inside a sandboxed certifier harness. It's a host tool, like `/merge`.
 
 ```bash
-node scripts/wolfpack-timing.mjs "$PLAN_DIR"
+node "${WOLFPACK_HOME:-.}/scripts/wolfpack-timing.mjs" "$PLAN_DIR"
 ```
 
 It reads `$PLAN_DIR/timing.jsonl` (the per-phase start/end markers each phase agent appended) plus `metadata.json`, computes total + per-phase + per-model durations, and writes a `timing` block into `pedigree.json`. **Capture the `DURATION=<…>` line it prints** — that's the value for the index Duration column. If it prints an `INCOMPLETE` warning (a phase missing a start/end, or no `created`/`completed_at` window), note it in `pedigree.json` `notes` — an incomplete record means an agent died mid-phase, which is worth surfacing; don't paper over it. Like the lessons aggregator, this is telemetry, not a gate: if it fails, log it and continue. **First make sure metadata has `completed_at`** (stamp `date -Iseconds` when you set `status: certified`) — without it the total falls back to a phase sum and the record is flagged incomplete.
@@ -527,7 +527,7 @@ reward loop (model-stats → bandit) has a discriminating signal. **Run on the H
 in the sandbox). You supply OBJECTIVE COUNTS — not scores; the script computes the 0-1 dimensions:
 
 ```bash
-node scripts/wolfpack-pedigree.mjs emit --plan-dir "$PLAN_DIR" \
+node "${WOLFPACK_HOME:-.}/scripts/wolfpack-pedigree.mjs" emit --plan-dir "$PLAN_DIR" \
   --caught <# valid Bloodhound+Pointer findings raised in-pipeline> \
   --slipped 0 \                 # 0 at cert; /merge & /smoke fold slips in later via `outcome`
   --completeness <plan items accounted for ÷ total, 0-1> \
@@ -539,7 +539,7 @@ node scripts/wolfpack-pedigree.mjs emit --plan-dir "$PLAN_DIR" \
 This MERGES `routing`, `dimensions`, `overall` into `pedigree.json` (v1 fields preserved) and
 prints the scorecard. Do NOT hand-score the dimensions — report counts, let the script compute.
 `overall` is **provisional**; `/merge` or `/smoke` later runs
-`node scripts/wolfpack-pedigree.mjs outcome --plan-dir "$PLAN_DIR" [--slipped-smoke N] [--reverted]`
+`node "${WOLFPACK_HOME:-.}/scripts/wolfpack-pedigree.mjs" outcome --plan-dir "$PLAN_DIR" [--slipped-smoke N] [--reverted]`
 once the real outcome lands.
 
 **Round budgets ≠ frontier:** local models legitimately need more review rounds. Convergence is

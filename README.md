@@ -68,6 +68,12 @@ ln -s ~/wolfpack/.agents/commands ~/.claude/commands
 
 (Adjust the destination to wherever your runtime discovers user-level skills/commands.)
 
+The roles also call helper **scripts** (`scripts/wolfpack-*.mjs|sh`) from this repo. Point at them with `WOLFPACK_HOME` so they resolve from the one cloned repo — no per-project copies:
+
+```bash
+export WOLFPACK_HOME=~/wolfpack   # add to your shell profile
+```
+
 ### 3. Configure your project
 
 Copy the config template into your project root and fill it in:

@@ -23,7 +23,7 @@ Parse `$ARGUMENTS` as: `<slug> "<description>"`. The description should be in qu
    just creates an endless scroll):
    ```bash
    echo "Live progress — paste into a separate terminal:"
-   echo "watch -c -n5 'WOLFPACK_WATCH_COLOR=1 ./scripts/wolfpack-watch.sh'"
+   echo "watch -c -n5 'WOLFPACK_WATCH_COLOR=1 \${WOLFPACK_HOME:-.}/scripts/wolfpack-watch.sh'"
    exec ./scripts/run-pipeline-sandbox.sh --hunt $SLUG "$DESCRIPTION"
    ```
 
