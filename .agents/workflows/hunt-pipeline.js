@@ -2142,9 +2142,21 @@ Steps:
    Write certification.md to ${planDir}/certification.md.
    Write pedigree.json to ${planDir}/pedigree.json.
    If PASS: append to .wolfpack/pedigree/index.md, run ./scripts/wolfpack-lessons.sh,
-   commit wolfpack artifacts (git add by name, git commit).
+   then commit the wolfpack learning-loop artifacts. STRICT staging rules (a past bug
+   force-committed gitignored worktree plan files into main at .claude/worktrees/<slug>/…
+   paths — these rules prevent that recurrence):
+     - FIRST \`cd ${worktreePath}\` so every path you stage is WORKTREE-RELATIVE. NEVER
+       stage a path that begins with \`.claude/worktrees/\` (that path only exists from the
+       MAIN repo and force-commits the worktree's files into main).
+     - Stage ONLY by EXACT name: \`.wolfpack/pedigree/index.md\`,
+       \`.wolfpack/pedigree/lessons.md\` (if changed), and
+       \`.wolfpack/plans/${slug}/pedigree.json\` (the force-tracked scorecard).
+     - NEVER \`git add .\` / \`git add -A\` / \`git add -f\`. NEVER stage certification.md or
+       metadata.json — they are GITIGNORED plan artifacts that ride the worktree and are
+       copied back by /merge; force-adding them is the leak.
+   Then \`git commit\`.
    Update ${planDir}/metadata.json with verdict.
-   SAFETY: No git push. No deploy commands.
+   SAFETY: No git push. No deploy commands. No \`git add -f\` — ever.
    End your response with a <verdict> block: {verdict, plan_adherence, code_quality, test_result}"
 
 3. Run PRIMARY certifier (${EXAMINER_LABEL[crossExaminer]}). The wrapper caps
@@ -2263,7 +2275,16 @@ cd to ${worktreePath}.
 1b. Spec-flag override (authoritative): in that same metadata.json, read
    \`spec.compliance_review_required\`. If it is true, the Spec phase ALREADY
    classified this hunt compliance-critical (e.g. it touches billing or
-   controlled_substances broadly, beyond the narrow path allowlist below). Return
+   controlled_substances broadly, beyond the narrow path allowlist below).
+   FIRST write ${planDir}/compliance-summary.md — this hunt WILL park for sign-off and
+   the park payload references this file by path, so it MUST exist (a missing summary
+   here is the recurring bug this branch fixes: the spec-flag path used to STOP before
+   the step-4 write). The whole diff is the compliance surface (no narrow path match), so:
+   run \`git diff --stat main..HEAD\` for the file list, then \`git diff main..HEAD\` and
+   quote the risk-bearing hunks (controlled_substances; billing money/tax/PCI; records
+   retention / soft-delete), noting each against the [compliance] criteria in
+   ${planDir}/acceptance.md (if present). Keep it readable in under a minute. Do NOT
+   commit it. THEN return
    { complianceTouched:true, determined:true, alreadySignedOff:false,
    touchedPaths:["spec.compliance_review_required"], summary:"Spec flagged
    compliance_review_required" } — STOP. The path allowlist in step 3 only ADDS
