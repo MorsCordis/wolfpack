@@ -16,6 +16,22 @@ keep their original filing dates.
   visible from one host-side glob regardless of cwd. Applies to the reference `hunt-pipeline.js` AND
   the DevDen Python orchestrator reimplementation.
 
+- [~] **Handoff validation + retry-before-park (stop spurious parks on malformed phase output)**
+  (Medium, 2026-06-26; from Spark bench): a malformed Bloodhound output parked a hunt that should
+  have just retried. (1) **per-phase output validator** ✅ and (2) **pre-handoff retry-before-park
+  with corrective nudge** ✅ — DONE 2026-06-26 (`feat/handoff-validation-retry`): `isFormatFailureStatus`
+  classifies the retryable format-failure class (malformed_verdict / missing_verdict_block /
+  empty_findings_contradiction) distinct from quota/ungrounded; `runReviewFanout` re-runs a
+  format-failed lens with `verdictCorrectiveNudge` (N=2, same concurrency) **before** any
+  `review_error` park. Triggered on `inventory-flexible-tracking` (parked twice on Gemini's XML
+  verdict). (3) **next-phase kick-back** (`kickback:<phase>` — downstream preflight validates its
+  input and re-triggers upstream) **STILL OPEN** → build as a focused follow-up.
+  Deferral LIFTED: it was a sequencing wait for the other session's in-flight hunt, not a benchmark
+  gate. Applies to `hunt-pipeline.js` (1+2 done) AND the DevDen Python orchestrator (pending).
+  NOTE: the pawpims runtime copy is now GENERATED from canonical via
+  `scripts/wolfpack-sync-runtime.sh` (deterministic `.agents`→`.claude` path transform) — this
+  ends the hand-sync drift (~47 line-groups) between canonical and the pawpims runtime copy.
+
 - [ ] **Make router output BINDING, not advisory — close the model-attribution gap**
   (Medium, 2026-06-11; from pawpims): `scripts/wolfpack-routing.mjs` assigns roles per tier/pedigree,
   but adoption is advisory — `hunt-pipeline.js` tells Alpha to "adopt UNLESS you have a documented

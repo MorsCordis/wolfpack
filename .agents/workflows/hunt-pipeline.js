@@ -892,6 +892,35 @@ read-only role: print a LOUD log line "WOLFPACK_REVIEWER_DIFF_VIOLATION: <files>
 // the agent-set status defensively (exact "model_quota" plus throttle-ish synonyms).
 const isQuotaStatus = (s) => /model_quota|quota|rate[_\s-]?limit|both.*(rate|throttl)|throttl/i.test(String(s || ''))
 
+// [handoff-retry] Per-phase output VALIDATOR — the FORMAT-failure class. A reviewer
+// that PRODUCED a substantive review but whose machine-readable <verdict> block failed
+// validation (emitted XML / prose / malformed JSON, or an ISSUES_FOUND with no findings)
+// is in a fundamentally different bucket from a quota outage (model down → can't retry it
+// productively) or an ungrounded review (hallucinated files → a quality signal). A format
+// failure is RETRYABLE: the same model, told EXACTLY what was wrong, can re-emit a valid
+// verdict. So instead of parking review_error on the first format glitch (the observed
+// failure: a good Gemini review whose verdict was XML parked a hunt twice), the fan-out
+// re-runs with a corrective nudge first. Mirrors isQuotaStatus — match the agent-set
+// status strings the review-runner returns in step 6.
+const FORMAT_FAILURE_STATUSES = new Set([
+  'malformed_verdict', 'missing_verdict_block', 'empty_findings_contradiction',
+])
+const isFormatFailureStatus = (s) => FORMAT_FAILURE_STATUSES.has(String(s || ''))
+
+// [handoff-retry] The corrective nudge appended to a review re-run after a FORMAT failure.
+// The reviewer's analysis was usable; only the verdict ENCODING was wrong. Tell it exactly
+// what to fix so it re-emits a valid block rather than the pipeline discarding a real review.
+const verdictCorrectiveNudge = (status) => `
+
+CORRECTIVE RE-RUN — your PREVIOUS attempt was rejected for: ${status || 'malformed_verdict'}.
+Your review CONTENT was acceptable; the machine-readable verdict FAILED VALIDATION. Re-run the
+review, then end with EXACTLY ONE <verdict>...</verdict> block whose body is STRICT JSON —
+double-quoted keys/strings, NO XML tags, NO markdown fences, and NOTHING after the closing tag:
+<verdict>{"verdict":"APPROVED"|"ISSUES_FOUND","findings":[ ... ]}</verdict>
+If your earlier verdict was XML or prose, TRANSLATE it to this JSON shape (REJECT→ISSUES_FOUND,
+APPROVE→APPROVED) — do NOT change the substance of your findings, only fix the format. An
+ISSUES_FOUND verdict MUST carry a non-empty findings array.`
+
 // [02] Compliance-review risk-surface allowlist. The post-PASS compliance gate
 // (AC5) parks any hunt whose diff touches one of these surfaces for human
 // sign-off BEFORE the release queue. This is a NARROW allowlist of genuinely
@@ -1048,7 +1077,10 @@ function mergeFindings(done) {
 // hang, never proceed. Each degradation step is logged with the failed unit's reason.
 const REVIEW_FANOUT_CAP = 3
 async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
-  let pending = lenses.map((l, i) => ({ ...l, idx: i }))
+  // [handoff-retry] nudge = corrective re-runs this unit has consumed (FORMAT failures
+  // only). MAX_NUDGE_RETRIES is the per-unit retry-before-park budget (spec N≈2).
+  const MAX_NUDGE_RETRIES = 2
+  let pending = lenses.map((l, i) => ({ ...l, idx: i, nudge: 0 }))
   let cap = Math.min(pending.length, REVIEW_FANOUT_CAP)
   const done = []
   const degradeLog = []
@@ -1059,23 +1091,42 @@ async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
     for (let i = 0; i < pending.length; i += cap) {
       const chunk = pending.slice(i, i + cap)
       const res = await parallel(chunk.map(unit => () =>
-        agent(buildPrompt(unit), { label: `${label}:${unit.key}`, phase: phaseLabel, schema: REVIEW_SCHEMA })))
+        agent(buildPrompt(unit, unit.nudge ? verdictCorrectiveNudge(unit.lastStatus) : ''),
+              { label: `${label}:${unit.key}${unit.nudge ? `:nudge${unit.nudge}` : ''}`, phase: phaseLabel, schema: REVIEW_SCHEMA })))
       results.push(...res)
     }
     const failed = []
     const failedStatuses = []
+    const retryNudge = []   // [handoff-retry] format failures with retry budget remaining
     results.forEach((r, i) => {
       const unit = pending[i]
       if (r && r.verdict && r.verdict !== 'ERROR') {
         done.push({ unit, r })
+        return
+      }
+      const st = (r && r.status) || 'null/error'
+      // [handoff-retry] PRE-HANDOFF GATE: a FORMAT failure (valid review, bad verdict
+      // encoding) is re-run with a corrective nudge — NOT parked — until its budget is
+      // spent. Quota / grounding / empty-findings failures are NOT format-retryable and
+      // fall through to the existing cap-degradation + park path unchanged.
+      if (isFormatFailureStatus(st) && unit.nudge < MAX_NUDGE_RETRIES) {
+        retryNudge.push({ ...unit, nudge: unit.nudge + 1, lastStatus: st })
+        degradeLog.push(`lens "${unit.key}" format-fail (${st}) → corrective re-run ${unit.nudge + 1}/${MAX_NUDGE_RETRIES}`)
       } else {
         failed.push(unit)
-        const st = (r && r.status) || 'null/error'
         failedStatuses.push(st)
         degradeLog.push(`lens "${unit.key}" failed (${st})`)
       }
     })
-    if (!failed.length) break
+    // [handoff-retry] Corrective re-runs go back at the SAME concurrency (a verdict-format
+    // glitch is not a concurrency problem). Only escalate to cap-degrade/park when a HARD
+    // (non-format or budget-exhausted) failure remains.
+    if (!failed.length && retryNudge.length) {
+      log(`↻ ${retryNudge.length} review lens(es) returned a malformed verdict — corrective re-run before any park.`)
+      pending = retryNudge
+      continue
+    }
+    if (!failed.length && !retryNudge.length) break
     lastFailedStatuses = failedStatuses
     if (cap <= 1) {
       // Floor reached and STILL failing — surface ERROR so the caller parks. [05] AC3:
@@ -1092,7 +1143,7 @@ async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
     }
     cap -= 1
     log(`⚠ ${failed.length} review lens(es) failed — degrading concurrency → ${cap}, retrying the failed unit(s).`)
-    pending = failed
+    pending = failed.concat(retryNudge)   // [handoff-retry] carry any nudge-owed units forward too
   }
   const merged = mergeFindings(done)
   const verdict = done.some(d => d.r.verdict === 'ISSUES_FOUND') ? 'ISSUES_FOUND' : 'APPROVED'
@@ -1371,7 +1422,7 @@ if (at('Review')) {
     // the fan-out + n-1 concurrency degradation (workflow-orchestrated, never CLI self-
     // orchestration). For the 'full' lens the raw file is review-${round}.md (Alpha-revise
     // + the resume probe read it); extra lenses get review-${round}-<lens>.md.
-    const buildBloodhoundPrompt = (unit) => {
+    const buildBloodhoundPrompt = (unit, nudge) => {
       const rawFile = unit.key === 'full' ? `review-${round}.md` : `review-${round}-${unit.key}.md`
       const tmpFile = unit.key === 'full' ? `/tmp/bloodhound-${slug}-r${round}.txt` : `/tmp/bloodhound-${slug}-r${round}-${unit.key}.txt`
       return `
@@ -1392,7 +1443,7 @@ Steps:
 
 2. Write the review prompt to a temp file (avoids shell escaping issues):
    Write to ${tmpFile}:
-   "You are reviewing Wolfpack hunt '${slug}', round ${round}, tier ${tier}. Read the plan at ${planDir}/${planFile}. Also read TODO.md, CLAUDE.md, and .wolfpack/pedigree/index.md for context. Read metadata.json at ${planDir}/metadata.json for tier and scope. Read .agents/skills/bloodhound/SKILL.md and follow it. Produce your adversarial review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): do NOT read whole large files — grep for the relevant symbols/lines first, then read only those ranges with a line offset/limit. Scope every grep to the relevant app directory (e.g. billing/, records/, controlled_substances/), never the repo root, or it times out. Reading entire 1000+ line files (models.py, views.py) bloats context and can crash the request mid-review.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive adversarial review covering every lens (correctness, compliance/DEA, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. The headless cross-model roster fan-out is disabled — the pipeline handles orchestration, not you.' : ''}${VERDICT_CONTRACT}"
+   "You are reviewing Wolfpack hunt '${slug}', round ${round}, tier ${tier}. Read the plan at ${planDir}/${planFile}. Also read TODO.md, CLAUDE.md, and .wolfpack/pedigree/index.md for context. Read metadata.json at ${planDir}/metadata.json for tier and scope. Read .agents/skills/bloodhound/SKILL.md and follow it. Produce your adversarial review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): do NOT read whole large files — grep for the relevant symbols/lines first, then read only those ranges with a line offset/limit. Scope every grep to the relevant app directory (e.g. billing/, records/, controlled_substances/), never the repo root, or it times out. Reading entire 1000+ line files (models.py, views.py) bloats context and can crash the request mid-review.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive adversarial review covering every lens (correctness, compliance/DEA, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. The headless cross-model roster fan-out is disabled — the pipeline handles orchestration, not you.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
 
 3. Try PRIMARY (${EXAMINER_LABEL[crossExaminer]}) with retry:
    Attempt 1: ${reviewCmd(crossExaminer, 'wolfpack-bloodhound', tmpFile)}
@@ -1759,7 +1810,7 @@ if (at('Code Review') && pointerRounds > 0) {
     pRound++
     log(`Pointer round ${pRound} (floor ${pFloor}, breaker ${pcfg.maxRounds} rounds, plan-smell ≥${pcfg.planSmellBound} distinct criticals, crit-persist ${pcfg.critPersist})`)
 
-    const buildPointerPrompt = (unit) => {
+    const buildPointerPrompt = (unit, nudge) => {
       const rawFile = unit.key === 'full' ? `pointer-review-${pRound}.md` : `pointer-review-${pRound}-${unit.key}.md`
       const tmpFile = unit.key === 'full' ? `/tmp/pointer-${slug}-r${pRound}.txt` : `/tmp/pointer-${slug}-r${pRound}-${unit.key}.txt`
       return `
@@ -1778,7 +1829,7 @@ Steps:
 
 2. Write the review prompt to a temp file:
    Write to ${tmpFile}:
-   "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff main..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}"
+   "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff main..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
 
 3. Try PRIMARY (${EXAMINER_LABEL[crossExaminer]}) with retry:
    Attempt 1: ${reviewCmd(crossExaminer, 'wolfpack-pointer', tmpFile)}
