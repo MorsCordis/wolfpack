@@ -37,7 +37,9 @@ CHECK=0
 [ "${2:-}" = "--check" ] && CHECK=1
 
 [ -f "$CANONICAL" ] || { echo "ERROR: canonical not found: $CANONICAL" >&2; exit 2; }
-[ -f "$TARGET" ]    || { echo "ERROR: target not found: $TARGET" >&2; exit 2; }
+# TARGET may legitimately NOT exist yet — a fresh clone, or after the runtime copy was
+# gitignored/removed. We CREATE it in that case (this is exactly the fresh-clone bootstrap
+# the README points people at), so do NOT hard-fail on a missing target here.
 
 # The deterministic namespace swap (worktrees + skills). This is the ENTIRE legitimate
 # difference between canonical and a consumer runtime copy.
@@ -55,6 +57,10 @@ case "$GENERATED" in
 esac
 
 if [ "$CHECK" = "1" ]; then
+  if [ ! -f "$TARGET" ]; then
+    echo "DRIFT — $TARGET does not exist yet; run without --check to generate it."
+    exit 1
+  fi
   if diff -q <(printf '%s' "$GENERATED") "$TARGET" >/dev/null; then
     echo "in sync: $TARGET"
     exit 0
@@ -64,5 +70,6 @@ if [ "$CHECK" = "1" ]; then
   exit 1
 fi
 
+mkdir -p "$(dirname "$TARGET")"
 printf '%s\n' "$GENERATED" > "$TARGET"
 echo "synced: $TARGET  ←  generate($CANONICAL)  [${SRC_NS}→${DST_NS}]"
