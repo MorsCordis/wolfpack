@@ -16,16 +16,21 @@ keep their original filing dates.
   visible from one host-side glob regardless of cwd. Applies to the reference `hunt-pipeline.js` AND
   the DevDen Python orchestrator reimplementation.
 
-- [ ] **Handoff validation + retry-before-park (stop spurious parks on malformed phase output)**
+- [~] **Handoff validation + retry-before-park (stop spurious parks on malformed phase output)**
   (Medium, 2026-06-26; from Spark bench): a malformed Bloodhound output parked a hunt that should
-  have just retried. Add to the orchestration loop: (1) a **per-phase output validator** (schema/
-  format check on `review-N.md` verdict, `plan.md` predicted_dimensions, `metadata.json` fields);
-  (2) a **pre-handoff gate** — if `validate(P.output)` fails, **re-run P with a corrective nudge**
-  (the required format) up to N≈2, and **park only after retries exhaust**; (3) **next-phase
-  kick-back** — downstream preflight validates its input and emits `kickback:<phase>` to re-trigger
-  upstream if malformed. Fits the DevDen §1 deterministic-control-plane gates. **DEFERRED until the
-  model benchmarks complete** (2026-06-26 decision — individual benchmarks first). Applies to
-  `hunt-pipeline.js` AND the DevDen Python orchestrator.
+  have just retried. (1) **per-phase output validator** ✅ and (2) **pre-handoff retry-before-park
+  with corrective nudge** ✅ — DONE 2026-06-26 (`feat/handoff-validation-retry`): `isFormatFailureStatus`
+  classifies the retryable format-failure class (malformed_verdict / missing_verdict_block /
+  empty_findings_contradiction) distinct from quota/ungrounded; `runReviewFanout` re-runs a
+  format-failed lens with `verdictCorrectiveNudge` (N=2, same concurrency) **before** any
+  `review_error` park. Triggered on `inventory-flexible-tracking` (parked twice on Gemini's XML
+  verdict). (3) **next-phase kick-back** (`kickback:<phase>` — downstream preflight validates its
+  input and re-triggers upstream) **STILL OPEN** → build as a focused follow-up.
+  Deferral LIFTED: it was a sequencing wait for the other session's in-flight hunt, not a benchmark
+  gate. Applies to `hunt-pipeline.js` (1+2 done) AND the DevDen Python orchestrator (pending).
+  NOTE: the pawpims runtime copy is now GENERATED from canonical via
+  `scripts/wolfpack-sync-runtime.sh` (deterministic `.agents`→`.claude` path transform) — this
+  ends the hand-sync drift (~47 line-groups) between canonical and the pawpims runtime copy.
 
 - [ ] **Make router output BINDING, not advisory — close the model-attribution gap**
   (Medium, 2026-06-11; from pawpims): `scripts/wolfpack-routing.mjs` assigns roles per tier/pedigree,
