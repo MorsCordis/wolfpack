@@ -16,6 +16,17 @@ keep their original filing dates.
   visible from one host-side glob regardless of cwd. Applies to the reference `hunt-pipeline.js` AND
   the DevDen Python orchestrator reimplementation.
 
+- [ ] **Handoff validation + retry-before-park (stop spurious parks on malformed phase output)**
+  (Medium, 2026-06-26; from Spark bench): a malformed Bloodhound output parked a hunt that should
+  have just retried. Add to the orchestration loop: (1) a **per-phase output validator** (schema/
+  format check on `review-N.md` verdict, `plan.md` predicted_dimensions, `metadata.json` fields);
+  (2) a **pre-handoff gate** — if `validate(P.output)` fails, **re-run P with a corrective nudge**
+  (the required format) up to N≈2, and **park only after retries exhaust**; (3) **next-phase
+  kick-back** — downstream preflight validates its input and emits `kickback:<phase>` to re-trigger
+  upstream if malformed. Fits the DevDen §1 deterministic-control-plane gates. **DEFERRED until the
+  model benchmarks complete** (2026-06-26 decision — individual benchmarks first). Applies to
+  `hunt-pipeline.js` AND the DevDen Python orchestrator.
+
 - [ ] **Make router output BINDING, not advisory — close the model-attribution gap**
   (Medium, 2026-06-11; from pawpims): `scripts/wolfpack-routing.mjs` assigns roles per tier/pedigree,
   but adoption is advisory — `hunt-pipeline.js` tells Alpha to "adopt UNLESS you have a documented
