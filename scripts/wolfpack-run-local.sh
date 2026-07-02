@@ -165,7 +165,10 @@ import sys, re
 content = open(sys.argv[1]).read()
 m = re.search(r'<verdict>(.*?)</verdict>', content, re.DOTALL)
 if m:
-    print(m.group(1).strip())
+    text = m.group(1).strip()
+    text = re.sub(r'^```[a-zA-Z0-9]*\n', '', text)
+    text = re.sub(r'\n```$', '', text)
+    print(text.strip())
 else:
     print('{\"verdict\": \"ERROR\", \"findings\": [{\"severity\": \"CRITICAL\", \"title\": \"Missing verdict block\", \"claim\": \"LLM did not output verdict contract tags\"}]}')
 " "$file"
