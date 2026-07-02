@@ -1670,8 +1670,24 @@ Skipping a finding is NOT allowed — every line must have a disposition.
 ${checklist}
 --- END CHECKLIST ---
 
-Write ${planDir}/plan-revised-${round}.md as the complete revised plan.
-Include a "## Bloodhound Response" section in the revised plan listing each finding with its disposition.
+Produce ${planDir}/plan-revised-${round}.md as the COMPLETE, self-contained revised plan (Shepherd
+implements from it, so it can't be a diff) — but BUILD it by making MINIMAL, TARGETED edits to the
+current plan: change only the sections the findings touch, and preserve every untouched section
+VERBATIM. Do NOT rewrite, re-explain, or pad sections the findings don't concern. The plan MUST NOT
+grow round-over-round; aim to keep it under ~1,200 lines — well past that the headless reviewer
+times out. A revised plan materially larger than the current one means you rewrote instead of edited
+(surgical edits also avoid introducing NEW defects in sections that were already correct — a primary
+reason review loops fail to converge). If the current plan is ALREADY oversized — e.g. it carries
+accreted "## Bloodhound Response" / "## Revisions After Review" sections from prior rounds, or
+redundant restatements — COMPACT it as part of this revision: strip those embedded per-round logs
+(their dispositions now live in the revision-log files) and any duplicated prose, preserving ALL
+substantive plan content.
+
+Write the per-finding dispositions (each: ACCEPTED with what changed, or REJECTED with why) to a
+SEPARATE file ${planDir}/revision-log-${round}.md. Do NOT embed a "## Bloodhound Response" or
+"## Revisions After Review" section inside the plan — that per-round log accreting in the plan is
+what bloats it past the reviewer's size limit and eventually times the review out. (This supersedes
+any "add a Revisions section to the plan" guidance in the skill.)
 Update ${planDir}/metadata.json.
 
 Return the findingsAddressed array with disposition (ACCEPTED or REJECTED) and justification for each.
