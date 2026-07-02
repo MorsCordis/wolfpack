@@ -1639,7 +1639,15 @@ ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + un
       .map(f => `[ ] Finding ${f.id} [${f.severity}]: ${f.title}${f.file ? ` (${f.file})` : ''}`)
       .join('\n')
 
-    const revisionResult = await agent(`
+    // [dropped-agent guard] alpha-revise regenerates the FULL plan (large output), the step most
+    // exposed to a mid-response connection drop — agent() then returns null and a bare
+    // revisionResult.findingsAddressed deref crashed the whole campaign (observed on
+    // inventory-adjustment-core r1/r3, 2026-07-02). Retry the transient drop inline, then fail
+    // LOUD + resumable rather than a cryptic TypeError; never silently proceed with 0 addressed.
+    let revisionResult = null
+    for (let reviseAttempt = 1; reviseAttempt <= 3 && !revisionResult; reviseAttempt++) {
+      if (reviseAttempt > 1) log(`↻ alpha-revise:${slug}:r${round} dropped mid-response — retry ${reviseAttempt}/3`)
+      revisionResult = await agent(`
 You are the Alpha planner running a Phase 2 revision, headlessly.
 
 First, read your full instructions at .agents/skills/alpha/SKILL.md — follow the Phase 2 (Revision) section.
@@ -1672,6 +1680,10 @@ Set allAddressed to true only if every finding has a disposition.
 Do NOT ask the user. Pick reasonable defaults.
 ${heartbeat('Review', `Alpha revision round ${round}`)}${HUMAN_NOTES_DIRECTIVE}${convergenceMetaInstruction(planDir, bhEntry, verdictC.detail.startsWith('converging') ? 'converging' : 'continue', cumCrit)}
 `, { label: `alpha-revise:${slug}:r${round}`, phase: 'Review', schema: REVISION_SCHEMA })
+    }
+    if (!revisionResult) {
+      throw new Error(`alpha-revise:${slug}:r${round} returned null after 3 attempts (agent dropped mid-response / terminal API error) — cannot proceed without the revised plan; resume the run to retry this round.`)
+    }
 
     const totalFindings = findings.length
     const addressed = revisionResult.findingsAddressed?.length || 0
@@ -2003,7 +2015,12 @@ ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' +
       .map(f => `[ ] Finding ${f.id} [${f.severity}]: ${f.title}${f.file ? ` (${f.file})` : ''}`)
       .join('\n')
 
-    const rewriteResult = await agent(`
+    // [dropped-agent guard] see alpha-revise above — a dropped Shepherd rewrite returns null and
+    // the bare rewriteResult.findingsAddressed deref would crash the campaign. Retry then fail loud.
+    let rewriteResult = null
+    for (let rewriteAttempt = 1; rewriteAttempt <= 3 && !rewriteResult; rewriteAttempt++) {
+      if (rewriteAttempt > 1) log(`↻ shepherd-rewrite:${slug}:r${pRound} dropped mid-response — retry ${rewriteAttempt}/3`)
+      rewriteResult = await agent(`
 You are the Shepherd addressing Pointer code review findings, running headlessly.
 
 Read .agents/skills/shepherd/SKILL.md for your instructions.
@@ -2031,6 +2048,10 @@ Set allAddressed to true only if every finding has a disposition.
 SAFETY: No git push, no deploy, no git add .
 ${heartbeat('Code Review', `Shepherd rewrite round ${pRound}`)}${HUMAN_NOTES_DIRECTIVE}${convergenceMetaInstruction(planDir, pEntry, pv.detail.startsWith('converging') ? 'converging' : 'continue', pCumCrit)}
 `, { label: `shepherd-rewrite:${slug}:r${pRound}`, phase: 'Code Review', schema: REVISION_SCHEMA, model: shepherdModel })
+    }
+    if (!rewriteResult) {
+      throw new Error(`shepherd-rewrite:${slug}:r${pRound} returned null after 3 attempts (agent dropped mid-response / terminal API error) — cannot proceed without the rework; resume the run to retry this round.`)
+    }
 
     const totalPtrFindings = pFindings.length
     const ptrAddressed = rewriteResult.findingsAddressed?.length || 0
