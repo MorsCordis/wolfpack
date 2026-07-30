@@ -134,7 +134,9 @@ You are a reviewer, not an implementer. You write `pointer-review-N.md` and upda
 
 ## Proportionality by Tier
 
-- **Blue:** One-shot review. Report findings but do NOT loop. Keep findings to CRITICAL/HIGH severity only. Target: 1-5 findings max.
+- **Blue:** Narrow review — keep findings to CRITICAL/HIGH severity only, target 1-5 findings.
+  Proportionality limits WHAT YOU LOOK FOR, never whether a finding bounces: a CRITICAL or
+  HIGH goes back to Shepherd on Blue exactly as it would on Red.
 - **Yellow:** Full review, 1-2 rounds. Report all severities. Can trigger Shepherd rewrites.
 - **Orange:** Full review, 2 rounds. Spawn sub-agent lenses if needed (security, compliance, performance).
 - **Red:** Full review, 2 rounds. Security and compliance lens mandatory. Sub-agent specialists for high-sensitivity areas.
@@ -231,7 +233,7 @@ Read `metadata.tier` and apply the appropriate threshold:
 
 | Tier | REWRITE_NEEDED when | APPROVED when |
 |------|---------------------|---------------|
-| **Blue** | Any CRITICAL or HIGH | MEDIUM/LOW only (or no findings) — one-shot, no loop |
+| **Blue** | Any CRITICAL or HIGH | MEDIUM/LOW only (or no findings) |
 | **Yellow** | Any CRITICAL or HIGH, OR 2+ MEDIUMs | 0-1 MEDIUMs and no CRITICAL/HIGH |
 | **Orange** | Any CRITICAL, HIGH, or MEDIUM | LOW only (or no findings) |
 | **Red** | Any CRITICAL, HIGH, or MEDIUM | LOW only (or no findings) |
@@ -246,14 +248,21 @@ On APPROVED:
 2. Update `metadata.json`: `status: "code_reviewed"`, `phase: "test"`, `pointer_round: <N>`
 3. Finishing message directs to `/tracker`
 
-**Blue tier exception:** Blue never loops — even if findings meet the REWRITE threshold, set verdict to APPROVED and let Tracker and Watchdog see the findings. The one-shot constraint takes precedence.
+**No tier auto-approves a failure.** Every tier bounces at its threshold — there is no
+"report it and proceed" lane, and no tier is one-shot. Tier sets the *threshold* (what counts
+as bounce-worthy) and the *round budget*; it never decides *whether* a bounce happens. Never
+set APPROVED on findings that meet the REWRITE threshold. If the budget runs out, PARK (below)
+— parking is honest, laundering a failure into an approval is not.
 
-**Round cap:** If `pointer_round >= pointer_rounds` (the cap from metadata), escalate to user regardless of findings:
+**Round budget = non-convergence breaker, NOT a lockout.** The budget exists to stop a
+Shepherd/Pointer pair that cannot reach concurrence from looping forever — it is not a licence
+to approve. If `pointer_round >= pointer_rounds` and findings still meet the threshold, park for
+a human rather than passing known defects downstream:
 ```
 ⚠ Pointer round cap reached (<N>/<cap>). Remaining issues:
   <list of unresolved findings by severity>
 
-User decision needed: proceed to Tracker with known issues, or manual fix.
+Writer and reviewer did not converge. Park for a human decision — do NOT approve.
 ```
 
 ## MANDATORY OUTPUT

@@ -33,7 +33,7 @@ Pipeline ceremony scales with hunt complexity. Tier is set by Alpha during dimen
 | Tier | Bloodhound | Pointer | Tracker | Watchdog | When to use |
 |------|-----------|---------|---------|----------|-------------|
 | **Green** | skip | skip | skip | trust-Shepherd (read shepherd-log only) | Typos, config, tiny fixes (avg ≤ 1.5, max ≤ 2) |
-| **Blue** | 1 round | 1 round (one-shot, no loop) | write + run (one-shot, no loop) | checklist (abbreviated) | Small features, polish (avg ≤ 2.0, max ≤ 3, compliance ≤ 2) |
+| **Blue** | 1 round | 1 round, can loop | write + run, can trigger rewrite | checklist (abbreviated) | Small features, polish (avg ≤ 2.0, max ≤ 3, compliance ≤ 2) |
 | **Yellow** | 1-2 rounds | 1-2 rounds (can loop) | write + run, can trigger rewrite | full cert | Standard features (avg ≤ 2.5, max ≤ 3) |
 | **Orange** | 2 rounds | 2 rounds (can loop) | write + run, can trigger rewrite | full cert | Multi-app features, API changes (avg ≤ 3.5, max ≤ 4, compliance ≤ 3) |
 | **Red** | 3 rounds | 2 rounds + security/compliance lens | full coverage, can trigger rewrite | full cert + manual smoke | Compliance-critical / business-critical / architectural — see `wolfpack-config.md` (else) |
@@ -79,8 +79,12 @@ branch are gone. Finding fingerprints + per-round ledger land in `metadata.revie
 
 Pointer and Tracker can each trigger Shepherd rewrites:
 - **Pointer → Shepherd:** Pointer writes `pointer-review-N.md` with findings → Shepherd reads it and fixes code → Pointer re-reviews. Under the automated pipeline the loop is **convergence-gated** ([03] Part B), not a fixed 2-round cap: it continues while the diff converges and **parks** (`non_convergence` / `open_critical`) when it stalls or a critical sticks. A manual `/hunt` still escalates to the user at the tier's round count.
-- **Tracker → Shepherd:** Tracker writes `tracker-report-N.md` with failing tests and root cause → Shepherd fixes → Tracker re-runs. Max 2 rounds before user escalation.
-- **Blue tier exception:** Pointer and Tracker run one-shot — report findings but do NOT loop back to Shepherd.
+- **Tracker → Shepherd:** Tracker writes `tracker-report-N.md` with failing tests and root cause → Shepherd fixes → Tracker re-runs. Convergence-gated like the Pointer loop: it continues while failures are actually being retired and **parks** (`non_convergence`) when it stalls — the round count bounds a stuck pair, it does not cap a first fix.
+- **No tier is one-shot.** A failing review or test ALWAYS goes back to the writer, at every
+  tier including Blue. Round counts are a **non-convergence breaker** — they stop a writer and
+  reviewer who cannot reach concurrence from looping forever, and the hunt then **parks** for a
+  human. They are never a lockout that lets a known failure through, and never a reason to
+  auto-approve or to certify past a failing acceptance criterion.
 
 Green is the fastest lane: no review phases, trust-Shepherd Watchdog. Blue adds lightweight review and testing. Yellow is the standard pipeline. Orange and Red add full ceremony where risk justifies it.
 

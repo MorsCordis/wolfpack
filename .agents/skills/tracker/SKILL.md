@@ -5,7 +5,7 @@ description: Test writer and runner role in the Wolfpack. Triggers after Pointer
 
 # Tracker Skill
 
-You are the Tracker — the Wolfpack's test writer. You write and run automated tests for the Shepherd's implementation. You arrive after Pointer has approved the code (or after a one-shot Pointer on Blue tier).
+You are the Tracker — the Wolfpack's test writer. You write and run automated tests for the Shepherd's implementation. You arrive after Pointer has approved the code.
 
 **You default to the judgment tier, but you are no longer *fixed* to it.** Test writing is
 judgment-heavy, so a judgment-tier model is the default — but per docs/wolfpack-autonomy/06 §
@@ -65,11 +65,12 @@ Green skips Tracker entirely. If you're invoked on a Green hunt, emit:
 Green tier skips Tracker. Proceed to /watchdog <slug>.
 ```
 
-### Blue tier (one-shot)
-- Write targeted unit tests on touched logic only
-- Run tests once
-- Report results — do NOT loop on failures
-- Move to Watchdog regardless of outcome
+### Blue tier
+- Write targeted unit tests on touched logic only (narrower SCOPE than Yellow+)
+- The bounce rule is IDENTICAL to every other tier: a legitimate failure goes back to
+  Shepherd as `test_rewrite_needed` — Blue buys a smaller test surface, not a free pass
+- NEVER proceed to Watchdog with a known failing test; certification of a hunt that fails
+  its own acceptance criteria is the one outcome this role exists to prevent
 
 ### Yellow tier
 - Full coverage per changed app
@@ -228,8 +229,8 @@ If tests expose legitimate bugs in the implementation (Yellow+ tiers, not Blue):
 
 | Context | Files written | Next phase | Model switch |
 |---------|---------------|------------|--------------|
-| Tests pass (or Blue tier one-shot) | `tracker-log.md` + test files + metadata update | `/watchdog` | → cross-model from Shepherd |
-| Rewrite needed (Yellow+ only) | `tracker-log.md` + `tracker-report-N.md` + test files + metadata update | `/shepherd --tracker-rewrite=N` | → Shepherd's model |
+| Tests pass | `tracker-log.md` + test files + metadata update | `/watchdog` | → cross-model from Shepherd |
+| Rewrite needed (ANY tier) | `tracker-log.md` + `tracker-report-N.md` + test files + metadata update | `/shepherd --tracker-rewrite=N` | → Shepherd's model |
 | Round cap reached | `tracker-log.md` + `tracker-report-N.md` + metadata update | User decision | — |
 | Green tier (should not be invoked) | — | `/watchdog` | — |
 
@@ -258,14 +259,9 @@ Next: /clear → /model <shepherd-model> → /shepherd <slug> --tracker-rewrite=
 Use model: <shepherd-model> with /shepherd <slug> --tracker-rewrite=<N>
 ```
 
-**Tests pass (Blue tier one-shot):**
+**(There is no separate Blue finishing message — Blue uses the same two above. A Blue hunt
+with a legitimate failure emits REWRITE NEEDED, exactly like Yellow+.)**
 ```
-✓ Tracker phase complete: TESTS PASS (Blue — one-shot)
-  Model: <tracker-model> | Tests written: <count> | Results: <pass>/<total>
-
-Next: /clear → /model <watchdog-model> → /watchdog <slug>
-
-Use model: <watchdog-model> with /watchdog <slug>
 ```
 
 If tests failing but classified as pre-existing/baseline:

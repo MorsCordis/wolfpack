@@ -1037,6 +1037,30 @@ ${heartbeat(phaseLabel || 'Review', 'recording FLAWED_PLAN (plan smell)')}
      schema: { type: 'object', properties: { ok: { type: 'boolean' } } } })
 }
 
+// Stamp the BACKWARD_AUTHORITATIVE "Tracker bounced it back" status so the next pass
+// resumes at Implement (STATUS_RESUME.test_rewrite_needed → Implement) instead of letting
+// the forward-biased artifact scan carry a failing hunt into Certify. Same tiny write-only
+// agent shape as recordFlawedPlan (the workflow JS has no fs). See the call site in the
+// Tracker gate for the incident this exists to prevent.
+async function recordTestRewriteNeeded({ phaseLabel }) {
+  return await agent(`
+You ONLY update metadata.json for Wolfpack hunt ${slug} — do NOT plan, review, fix, test, or commit.
+
+cd to ${worktreePath}. Use absolute paths.
+
+1. Edit ${planDir}/metadata.json: set top-level "status" = "test_rewrite_needed",
+   "phase" = "implement". Preserve every other field — in particular do NOT alter
+   tracker_round / tracker_rounds / pointer_round, and do NOT touch any park block.
+   (The worktree metadata is authoritative — do NOT mirror to any main-repo plan dir.)
+   If the status is ALREADY "test_rewrite_needed", leave the file unchanged and return ok.
+
+Do NOT commit. Do NOT push. Do NOT git add.
+Return { ok: true }.
+${heartbeat(phaseLabel || 'Test', 'recording TEST_REWRITE_NEEDED (tests failed)')}
+`, { label: `test-rewrite:${slug}`, phase: phaseLabel || 'Test',
+     schema: { type: 'object', properties: { ok: { type: 'boolean' } } } })
+}
+
 // [03] Part B — merge the findings of N review-fanout units into one set. For the DEFAULT
 // single-lens round this is a strict pass-through: the one unit's findingsList is returned
 // verbatim, ids untouched, so the checklist still matches the shim's raw review-<n>.md. Only
@@ -2118,6 +2142,16 @@ ${heartbeat('Test', 'Tracker writing and running tests')}
   // Gate on Tracker results — do NOT proceed to Watchdog if tests fail
   if (trackerResult.verdict === 'TESTS_FAIL' || trackerResult.verdict === 'REWRITE_NEEDED') {
     log(`Tracker: ${trackerResult.verdict}. Tests did not pass.`)
+    // FORCE the resumable status instead of trusting the Tracker agent's own write.
+    // Observed 2026-07-29 (tickets-jul29 / inventory-filter-stickiness): a Tracker that
+    // found a legitimate failure wrote `tracker_complete` — a status in NEITHER
+    // STATUS_RESUME, DONE_STATUSES, nor the human-gated set. The next pass therefore fell
+    // through to the FORWARD-biased artifact scan, whose furthest artifact is
+    // tracker-report-N.md → it resumes at Certify and can certify a hunt that fails its
+    // own acceptance criteria. `test_rewrite_needed` is BACKWARD_AUTHORITATIVE, so it
+    // overrides the artifact scan and routes back to Shepherd. Idempotent — harmless when
+    // the Tracker already wrote the right status.
+    await recordTestRewriteNeeded({ phaseLabel: 'Test' })
     return { slug, verdict: trackerResult.verdict, tier, findings: trackerResult.findings, worktreePath }
   }
   log(`Tracker: ${trackerResult.verdict}`)
