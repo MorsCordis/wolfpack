@@ -2109,7 +2109,16 @@ if (at('Test')) {
   phase('Test')
   log(`Tracker testing: ${slug}`)
 
-  const trackerResult = await agent(`
+  // [dropped-agent guard] Same lesson as alpha-revise and shepherd-rewrite above, which the Test
+  // phase never got: agent() returns null when the subagent dies on a terminal error (quota
+  // exhaustion, API failure after retries), and the bare `trackerResult.verdict` deref below
+  // crashed the ENTIRE campaign run rather than parking the hunt. Observed 2026-08-01,
+  // tickets-jul29 wave 2: "You've hit your session limit" → TypeError at the verdict gate, whole
+  // workflow aborted with Pointer already approved and the work stranded mid-pipeline.
+  let trackerResult = null
+  for (let trackerAttempt = 1; trackerAttempt <= 3 && !trackerResult; trackerAttempt++) {
+    if (trackerAttempt > 1) log(`↻ tracker:${slug} dropped mid-response — retry ${trackerAttempt}/3`)
+    trackerResult = await agent(`
 You are the Tracker writing and running tests, headlessly.
 
 First, read your full instructions at .agents/skills/tracker/SKILL.md — follow them exactly.
@@ -2138,6 +2147,24 @@ SAFETY: No git push, no deploy, no git add .
 Do NOT ask the user.
 ${heartbeat('Test', 'Tracker writing and running tests')}
 `, { label: `tracker:${slug}`, phase: 'Test', schema: VERDICT_SCHEMA })
+  }
+
+  // Still nothing after 3 attempts → the subagent died terminally (almost always quota).
+  // Park instead of crashing. `model_quota` is the ONE auto-resumable park (see isQuotaPark),
+  // so the next runner pass picks the hunt back up at Test with no /resolve needed — which is
+  // exactly right for a rate-limit window that resets on its own.
+  if (!trackerResult) {
+    log(`⏸ ${slug}: Tracker dropped 3x — parking model_quota at Test (auto-resumes next pass).`)
+    await parkHunt({
+      reason: 'model_quota',
+      resumePhase: 'Test',
+      resolutionTypeExpected: 'clarify',
+      phaseLabel: 'Test',
+      needFromUser: `The Tracker subagent died before returning a verdict — almost always a rate-limit / session-limit window rather than a code problem. This park is TRANSIENT and auto-resumes: re-run the campaign after the window resets and the hunt picks up at Test. No code change is implied; nothing about the diff has been judged.`,
+      context: `Pointer had already approved the diff; only the Test phase is outstanding.`,
+    })
+    return { slug, verdict: 'PARKED_QUOTA', tier, worktreePath }
+  }
 
   // Gate on Tracker results — do NOT proceed to Watchdog if tests fail
   if (trackerResult.verdict === 'TESTS_FAIL' || trackerResult.verdict === 'REWRITE_NEEDED') {
