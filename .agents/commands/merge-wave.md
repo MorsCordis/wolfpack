@@ -66,8 +66,8 @@ paraphrase, reformat, or drop `/clear`. It is the user's copy-paste handoff.
 
 ## Step 2 — Per-hunt merge (NO tag, NO version heading)
 
-For each Ready hunt **in order**, run the same merge mechanics as `/merge` (read
-`.claude/skills/git-workflow/SKILL.md` once up front for the authoritative rules) with two
+For each Ready hunt **in order**, run the same merge mechanics as `/merge` (read the project's
+`wolfpack-config.md` → `## Hard Rules` once up front for the authoritative git rules) with two
 deliberate omissions — **do not lay a tag and do not stamp a version heading per hunt**:
 
 1. `.wolfpack/` auto-commit sweep (same rule as `/merge` step 3a — only `.wolfpack/` paths

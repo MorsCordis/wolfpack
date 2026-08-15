@@ -6,7 +6,7 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, AskUserQuestion
 
 Resolve the parked hunt: `$ARGUMENTS`
 
-**Read `.claude/skills/parked/SKILL.md` now — it is the canonical source.** This command
+**Read `.agents/skills/parked/SKILL.md` now — it is the canonical source.** This command
 is a thin entry point; the skill's `/resolve` section specifies the locate/dual-scan, the
 park-payload display, the `AskUserQuestion` answer collection, the clarify-vs-redirect
 classification, the append-only `human-notes.md` write, the status-flip inverse map, the

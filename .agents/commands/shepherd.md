@@ -6,7 +6,7 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep
 
 Run the Wolfpack Shepherd for feature: $ARGUMENTS
 
-Read and follow `.claude/skills/shepherd/SKILL.md` — it is the authoritative spec for this phase.
+Read and follow `.agents/skills/shepherd/SKILL.md` — it is the authoritative spec for this phase.
 
 Hard rails:
 - Do NOT push. Do NOT merge to main.

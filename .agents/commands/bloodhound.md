@@ -6,6 +6,6 @@ allowed-tools: Bash, Read, Write, Edit, Agent
 
 Run Bloodhound (adversarial plan review) for feature: $ARGUMENTS
 
-Read and follow `.claude/skills/bloodhound/SKILL.md` — it is the authoritative spec for this phase.
+Read and follow `.agents/skills/bloodhound/SKILL.md` — it is the authoritative spec for this phase.
 
 Begin.
