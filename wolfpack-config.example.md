@@ -119,6 +119,39 @@ Information the pipeline needs about your deployment process.
 - Smoke test access: (how to reach the deployed app for manual verification)
 ```
 
+`/merge` reads the following to build its hand-off. Leave a field blank and `/merge`
+simply omits that step from the finishing message.
+
+```markdown
+- Dev deploy command: (e.g., `deploy-dev`, `npm run deploy:staging`, or blank if deploys are automatic)
+- Migration command: (e.g., `gcloud run jobs execute migrate-dev --region us-central1 --wait`, `rails db:migrate`, or blank)
+- Migration file pattern: (path fragment identifying a migration in a diff — e.g., `/migrations/`, `db/migrate/`)
+- Deploy-before-migrate: (yes/no — yes if the migration runner must use the image built by the deploy)
+- Changelog file: (e.g., `CHANGELOG.md`, or blank if the project keeps no changelog)
+- Backlog file: (e.g., `TODO.md`, or blank)
+```
+
+**Deploy-before-migrate** exists because some deployment models pin the migration
+runner to a built artifact. If the migration job runs the *previously* deployed image,
+migrating first silently applies the old schema. Set `yes` and `/merge` will order the
+hand-off deploy-then-migrate and refuse to offer migrations earlier.
+
+## Module Map
+
+`/hunt` uses this to pre-fill a hunt's `target_surface` from its description, so a
+well-described hunt scaffolds without interactive scope questions. List each module
+agents should recognize, with the words a human would actually use for it.
+
+```markdown
+- `billing` ← "invoice", "invoicing", "payment", "charge"
+- `scheduler` ← "appointment", "calendar", "booking"
+- `inventory` ← "stock", "supply"
+```
+
+Also list any non-source areas worth recognizing as a surface (e.g., `scripts/`,
+`.agents/`, docs) and any feature-area names that don't map to a single directory.
+The more complete this map, the fewer questions `/hunt` has to ask.
+
 ## Existing Patterns
 
 Point agents to canonical implementations they should mirror when adding new features.
