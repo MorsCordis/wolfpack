@@ -61,7 +61,11 @@ if [ "$CHECK" = "1" ]; then
     echo "DRIFT — $TARGET does not exist yet; run without --check to generate it."
     exit 1
   fi
-  if diff -q <(printf '%s' "$GENERATED") "$TARGET" >/dev/null; then
+  # Must use the SAME printf form as the write path below ('%s\n'). Comparing with a
+  # bare '%s' drops the trailing newline that write mode adds, so every check differed
+  # by exactly one byte and --check reported DRIFT unconditionally — with an empty diff
+  # body, since the report on the next line already used the '\n' form.
+  if diff -q <(printf '%s\n' "$GENERATED") "$TARGET" >/dev/null; then
     echo "in sync: $TARGET"
     exit 0
   fi
