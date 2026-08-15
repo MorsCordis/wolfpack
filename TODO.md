@@ -52,6 +52,17 @@ keep their original filing dates.
   failure patterns from the project's `wolfpack-config.md` test command and emit the project's
   documented re-auth step.
 
+- [ ] **Tracker/Watchdog: gate on `makemigrations --check --dry-run`, not just the test suite**
+  (Medium, 2026-07-01; from pawpims): Tracker runs `run_tests.sh` with `--keepdb`, which never regenerates
+  the migration graph, so a model change shipped without its matching migration passes certification and
+  then fails at deploy on the Dockerfile's `makemigrations --check --dry-run` build gate. Concretely: the
+  `inventory-noncs-adjustment-waste` hunt (v1-preflight wave 1) created `InventoryAdjustment`/
+  `InventoryAdjustmentAudit` with `AutoField` ids but not the `BigAutoField` alter; it certified green,
+  then broke the v0.38.0 `deploy-dev`. Add a `makemigrations --check --dry-run` step to the Tracker (or
+  Watchdog) gate for any hunt whose diff touches a `models.py`, so incomplete/missing migrations fail
+  in-pipeline. The check needs no DB connection (it works from model + migration state), so it's cheap
+  and hermetic.
+
 ## Hunt artifacts / retrospectives
 
 - [ ] **Hunt notes must reproduce full reviewer findings, not just counts**

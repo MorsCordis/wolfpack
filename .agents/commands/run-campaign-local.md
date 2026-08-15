@@ -84,7 +84,7 @@ then invoke the Workflow tool directly.
 Surface first (own line, copies cleanly):
 ```
 Live progress — paste into a separate terminal:
-watch -c -n5 'WOLFPACK_WATCH_COLOR=1 ./scripts/wolfpack-watch.sh'
+./scripts/wolfpack-watch.sh --loop 5
 ```
 
 Then call the **Workflow tool**:

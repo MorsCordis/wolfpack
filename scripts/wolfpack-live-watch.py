@@ -103,7 +103,7 @@ def get_hunts_status():
         
         # Resolve active model for current phase
         meta = read_meta(slug)
-        tier = meta.get("tier", "-")
+        tier = meta.get("tier") or "-"  # key may be present with null value pre-Alpha
         ma = meta.get("model_assignments", {}) or {}
         role = PHASE_ROLE.get(phase, "")
         if phase == "Review" and "alpha" in detail.lower():
@@ -262,11 +262,12 @@ def render():
         print("  (no active hunts running)")
     for h in hunts:
         tier_color = Colors.BOLD
-        if h["tier"].lower() == "red": tier_color += Colors.RED
-        elif h["tier"].lower() == "orange": tier_color += Colors.YELLOW
-        elif h["tier"].lower() == "yellow": tier_color += Colors.CYAN
-        elif h["tier"].lower() == "blue": tier_color += Colors.BLUE
-        elif h["tier"].lower() == "green": tier_color += Colors.GREEN
+        tier = (h["tier"] or "").lower()  # tier is null until Alpha scores it
+        if tier == "red": tier_color += Colors.RED
+        elif tier == "orange": tier_color += Colors.YELLOW
+        elif tier == "yellow": tier_color += Colors.CYAN
+        elif tier == "blue": tier_color += Colors.BLUE
+        elif tier == "green": tier_color += Colors.GREEN
         
         status_flag = ""
         if h["agent"] == "working":
