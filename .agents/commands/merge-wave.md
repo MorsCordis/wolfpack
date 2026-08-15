@@ -19,7 +19,7 @@ paraphrase, reformat, or drop `/clear`. It is the user's copy-paste handoff.
 
 ## Preflight: CWD + campaign
 1. `cd "$(git rev-parse --show-toplevel)"` — wave merges run from the main repo. If you're in
-   a worktree (`pwd` ends in `/.claude/worktrees/*`), the `--show-toplevel` of the *common*
+   a worktree (`pwd` ends in `/.agents/worktrees/*`), the `--show-toplevel` of the *common*
    dir is the main repo: `cd "$(dirname "$(git rev-parse --git-common-dir)")"`.
 2. Verify `.wolfpack/campaigns/$1/campaign.md` exists. If not: STOP — "No campaign `$1` (run /expedition first)."
 

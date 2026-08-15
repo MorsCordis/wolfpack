@@ -3,6 +3,10 @@
 !.wolfpack/plans/*/pedigree.json
 
 # Wolfpack — worktrees
+# Both namespaces: canonical creates them under .agents/, a Claude Code
+# consuming project under .claude/. Ignoring only one leaves a whole worktree
+# showing as untracked and trips /merge's dirty-state check.
+.agents/worktrees/
 .claude/worktrees/
 
 # Wolfpack — campaigns (local planning artifacts)
