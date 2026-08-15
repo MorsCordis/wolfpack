@@ -31,7 +31,7 @@ self-spec headlessly in-run and may park mid-wave for a human).
    user to `/expedition` first.
 
 ## Step 1 — RESUME PLAN preflight (READ-ONLY)
-Run the **exact** RESUME PLAN preflight from `.claude/commands/run-campaign.md` **Step 2** — read
+Run the **exact** RESUME PLAN preflight from `.agents/commands/run-campaign.md` **Step 2** — read
 that file and follow it verbatim: parse the hunts in wave order, resolve each hunt's live status
 via the worktree-first dual path, classify with `campaign-runner.js`'s own rules
 (`DONE_STATUSES`, `parked:model_quota` auto-resumes, other `parked:`/`needs_spec` are

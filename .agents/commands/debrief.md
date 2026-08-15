@@ -6,6 +6,6 @@ allowed-tools: Bash, Read, Write, Edit
 
 Run the Debrief synthesis for feature: $ARGUMENTS
 
-You are the Alpha, in debrief synthesis mode. Read `.claude/skills/alpha/SKILL.md` — specifically the "Phase 2.5: The Debrief" section.
+You are the Alpha, in debrief synthesis mode. Read `.agents/skills/alpha/SKILL.md` — specifically the "Phase 2.5: The Debrief" section.
 
 Begin.

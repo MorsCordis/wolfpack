@@ -6,7 +6,7 @@ allowed-tools: Bash, Read, Glob, Grep
 
 Show the parked-hunt inbox.
 
-**Read `.claude/skills/parked/SKILL.md` now — it is the canonical source.** This command
+**Read `.agents/skills/parked/SKILL.md` now — it is the canonical source.** This command
 is a thin entry point; the skill's `/parked` section specifies the dual-scan, the orphan
 check, the severity sort, and the output format.
 

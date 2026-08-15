@@ -6,6 +6,6 @@ allowed-tools: Bash, Read, Write, Edit, Agent
 
 Run the Wolfpack Alpha for feature: $ARGUMENTS
 
-Read and follow `.claude/skills/alpha/SKILL.md` — it is the authoritative spec for this phase.
+Read and follow `.agents/skills/alpha/SKILL.md` — it is the authoritative spec for this phase.
 
 Begin.
