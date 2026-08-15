@@ -14,7 +14,7 @@ Parse `$ARGUMENTS` as: `<campaign-slug> [max-parallel]`. Default max-parallel is
 
 2. **Build the RESUME PLAN and confirm — READ-ONLY, before any launch.** The point of this step
    is that you (and the user) see *exactly* which wave and hunts will run — or what's blocking —
-   before kicking off. It must mirror the runner's selection logic (`.claude/workflows/campaign-runner.js`)
+   before kicking off. It must mirror the runner's selection logic (`.agents/workflows/campaign-runner.js`)
    exactly; a divergence here would mislead. Never `exec` blind.
 
    **2a. Parse the campaign.** Read `.wolfpack/campaigns/$SLUG/campaign.md`. From "## Proposed Hunts"
@@ -24,7 +24,7 @@ Parse `$ARGUMENTS` as: `<campaign-slug> [max-parallel]`. Default max-parallel is
    **2b. Resolve each hunt's LIVE status (dual-path, worktree first — main metadata is frozen until
    /merge).** For each hunt:
    ```bash
-   WT=".claude/worktrees/$slug/.wolfpack/plans/$slug/metadata.json"
+   WT=".agents/worktrees/$slug/.wolfpack/plans/$slug/metadata.json"
    MAIN=".wolfpack/plans/$slug/metadata.json"
    F=$([ -f "$WT" ] && echo "$WT" || echo "$MAIN")
    if [ -f "$F" ]; then jq -r '[.status, (.park.reason // ""), (.park.compliance_signed_off // false)] | @tsv' "$F"; else echo $'not_scaffolded\t\tfalse'; fi

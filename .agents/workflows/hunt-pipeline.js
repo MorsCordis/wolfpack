@@ -2241,10 +2241,10 @@ Steps:
    Write pedigree.json to ${planDir}/pedigree.json.
    If PASS: append to .wolfpack/pedigree/index.md, run ./scripts/wolfpack-lessons.sh,
    then commit the wolfpack learning-loop artifacts. STRICT staging rules (a past bug
-   force-committed gitignored worktree plan files into main at .claude/worktrees/<slug>/…
+   force-committed gitignored worktree plan files into main at .agents/worktrees/<slug>/…
    paths — these rules prevent that recurrence):
      - FIRST \`cd ${worktreePath}\` so every path you stage is WORKTREE-RELATIVE. NEVER
-       stage a path that begins with \`.claude/worktrees/\` (that path only exists from the
+       stage a path that begins with \`.agents/worktrees/\` (that path only exists from the
        MAIN repo and force-commits the worktree's files into main).
      - Stage ONLY by EXACT name: \`.wolfpack/pedigree/index.md\`,
        \`.wolfpack/pedigree/lessons.md\` (if changed), and

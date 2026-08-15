@@ -180,7 +180,7 @@ worktree off main** (the originating worktree may be cleaned up — this is the 
 from doc 04):
 
 ```
-git worktree add .claude/worktrees/fix-<slug>-smoke-<N> -b fix/<slug>-smoke-<N> main
+git worktree add .agents/worktrees/fix-<slug>-smoke-<N> -b fix/<slug>-smoke-<N> main
 ```
 
 Then:
@@ -194,7 +194,7 @@ Then:
    `<worktree>/.wolfpack/plans/fix-<slug>-smoke-<N>/metadata.json` — **the plan-dir slug MUST
    match the branch/worktree name** (`fix-<slug>-smoke-<N>`) so Pointer's preflight resolves it.
    Because this runs in a worktree, the metadata MUST set
-   `"is_worktree": true` and `"worktree_path": "<absolute path to .claude/worktrees/fix-<slug>-smoke-<N>>"`
+   `"is_worktree": true` and `"worktree_path": "<absolute path to .agents/worktrees/fix-<slug>-smoke-<N>>"`
    — without them the downstream roles' preflight reads `is_worktree:false` and writes to the
    main repo root instead of the isolated worktree. No unreviewed patch lands post-merge.
 3. **Merge the fix branch** `--no-ff` to main, push. Then **re-lay the wave tag** on the new

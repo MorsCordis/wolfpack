@@ -52,7 +52,7 @@ hunts already past Spec (acceptance.md present / status beyond `needs_spec`). Ru
 user confirms in Step 1, BEFORE the Workflow launch in Step 2.
 
 For each such pending hunt, in wave order:
-1. **Scaffold if needed.** If the hunt has no worktree (`.claude/worktrees/<slug>/`), scaffold
+1. **Scaffold if needed.** If the hunt has no worktree (`.agents/worktrees/<slug>/`), scaffold
    it with `/hunt <slug> "<the campaign Trigger description>"` (carry the campaign tier). A hunt
    already scaffolded — including the currently-parked `needs_spec` ones — keeps its worktree;
    do NOT recreate it.

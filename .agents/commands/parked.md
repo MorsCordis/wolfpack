@@ -12,7 +12,7 @@ check, the severity sort, and the output format.
 
 ## Hard rails
 - READ-ONLY. Do NOT modify, create, or delete anything.
-- Scan BOTH `.wolfpack/plans/*/` and `.claude/worktrees/*/.wolfpack/plans/*/`; de-dupe by slug.
+- Scan BOTH `.wolfpack/plans/*/` and `.agents/worktrees/*/.wolfpack/plans/*/`; de-dupe by slug.
 - Include `needs_spec` hunts (no parked.md — read it from metadata).
 
 Begin.
