@@ -251,12 +251,12 @@ The legacy `scripts/howl.sh` orchestrator was retired 2026-04-21. Slash commands
   "mode": "update|feature",
   "models": {
     "planner": "claude:opus:high",
-    "reviewer": "mistral:medium",
+    "reviewer": "<from wolfpack-config.md Model Pool — MUST be non-Claude, cross-family from the planner>",
     "architect": "claude:sonnet:medium",
     "architect_recommended": null,
-    "code_reviewer": null,
+    "code_reviewer": "<from wolfpack-config.md Model Pool — non-Claude>",
     "test_writer": "claude:opus:high",
-    "certifier": "claude:opus:high"
+    "certifier": "<from wolfpack-config.md Model Pool — MUST be non-Claude; certification is cross-model, never the planner's family>"
   },
   "proposed_version": {
     "bump": null,

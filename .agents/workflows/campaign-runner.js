@@ -63,7 +63,11 @@ const parallelCap = maxParallel || 2
 // Alpha-aware cross-hunt reassignment would need post-Plan coordination — not
 // done yet; the flock cap is the interim safeguard.
 let huntCounter = 0
-const nextCrossExaminer = () => (huntCounter++ % 2 === 0 ? 'mistral' : 'gemini')
+// Alternation only matters when Mistral is opted back in (WOLFPACK_ENABLE_MISTRAL_AUTO=1);
+// hunt-pipeline's AUTO_GEMINI_ONLY otherwise forces gemini regardless of this hint, so
+// default the hint to gemini too — a "mistral" hint against a stripped provider was noise.
+const MISTRAL_AUTO = !!(typeof process !== 'undefined' && process.env && process.env.WOLFPACK_ENABLE_MISTRAL_AUTO)
+const nextCrossExaminer = () => (MISTRAL_AUTO && huntCounter++ % 2 === 0 ? 'mistral' : 'gemini')
 
 // ─── [05] AC1 — self-imposed token-budget breaker ─────────────
 // The Workflow harness `budget` global is a SHARED output-token pool across the main
