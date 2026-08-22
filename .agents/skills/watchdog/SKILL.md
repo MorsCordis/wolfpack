@@ -136,7 +136,7 @@ On Red-tier hunts (or when `review_strategy == "ultra"`), Watchdog MAY spawn 2-3
 - [ ] `shepherd-log.md` has a `## Documentation` section (present, not silently omitted)
 - [ ] Status is one of: CREATED, UPDATED, SKIPPED, DEFERRED (any is valid; missing is not)
 - [ ] If status is CREATED or UPDATED: docs exist at the listed paths and match the shipped behavior
-- [ ] If status is SKIPPED: the reason matches one of the Shepherd's "when to skip" criteria (pure backend, tooling, bug fix restoring existing behavior, API-only)
+- [ ] If status is SKIPPED: the reason matches one of the Shepherd's "when to skip" criteria (pure backend, tooling, bug fix restoring existing behavior, API-only) — AND the claim survives the diff. Run `git diff main..HEAD -- '*.html' '*.js'` (plus user-string-bearing `.py`: model choices, user-facing messages) and look for added/changed user-readable strings — labels, badges, banners, dialogs, statuses, enumerated options, error messages. ANY such string voids SKIPPED; a skip prose that itself admits a new label ("the only user-visible change is a new status label") is an automatic fail. Score Documentation Coverage as a failure and route back to Shepherd. (Precedent: v0.64.0 "Partially Refunded" badge and the v0.69.1 fallback-timezone banner were both skip-rationalized; their help articles went stale until the 2026-08-22 manual audit.)
 - [ ] If status is DEFERRED: the blocker is legitimate and a follow-up is noted
 - [ ] If the feature adds/changes user-visible workflows: doc frontmatter includes required tags: `docs/help/<area>`, `help/<workflow>`, `audience/<role>`
 
