@@ -189,6 +189,16 @@ After all plan items are implemented, assess whether the feature warrants user-f
 - Bug fixes that restore existing documented behavior (no new workflow)
 - API-only changes with no frontend surface
 
+**User-visible-string gate (overrides every skip reason above):** if your diff adds or
+changes ANY string a clinic user can read — a label, badge, banner, dialog, status name,
+enumerated option, or error message — SKIPPED is not available. A "bug fix" or "hardening
+pass" that introduces a new badge or banner IS a documentation change: grep `docs/help/`
+for the surface it appears on and UPDATE the covering article(s), or record
+`DEFERRED: <exact article path(s)>` if genuinely blocked. Precedent for why this gate
+exists: the v0.64.0 "Partially Refunded" badge and the v0.69.1 fallback-timezone banner
+were both skip-rationalized ("no new workflow" / "restores documented behavior") and their
+articles went stale until a manual audit caught it (2026-08-22).
+
 **If docs are warranted:**
 1. Check `docs/help/` for existing articles covering the affected workflow.
 2. If no article exists, draft one following the `technical-writing` skill's Help Article type:
