@@ -2355,7 +2355,7 @@ if (watchdogResult.verdict !== 'PASS') {
 // hunts. Fail-closed: if path detection is uncertain, park anyway. A prior /resolve
 // sign-off (park.compliance_signed_off) short-circuits the gate so resume proceeds.
 if (at('Verify')) {
-  const complianceGate = await agent(`
+  const complianceGate = (await agent(`
 You are the compliance-review gate for a certified Wolfpack hunt. You ONLY inspect
 which paths the diff touched and whether a human already signed off — you do NOT
 review, fix, certify, or commit.
@@ -2410,7 +2410,14 @@ ${COMPLIANCE_PATHS.map(p => `   - ${p}`).join('\n')}
 Return { complianceTouched, determined, alreadySignedOff:false, touchedPaths (the
 matched files), summary (one line) }.
 ${heartbeat('Certify', 'compliance-review gate: scanning touched paths')}
-`, { label: `compliance-gate:${slug}`, phase: 'Certify', schema: COMPLIANCE_GATE_SCHEMA })
+`, { label: `compliance-gate:${slug}`, phase: 'Certify', schema: COMPLIANCE_GATE_SCHEMA }))
+    // agent() returns null when the seat dies on a terminal error (session
+    // limit, skip). The comment below already promises fail-closed on a
+    // malformed result — a NULL result crashed the run instead (observed
+    // 2026-08-22, session-limit death at this seat). Coalesce to the
+    // fail-closed shape so a dead gate PARKS for a human like any other
+    // inconclusive determination.
+    ?? { determined: false, complianceTouched: null, alreadySignedOff: false, touchedPaths: [] }
 
   // Fail closed: review unless the gate EXPLICITLY determined the diff and found no
   // compliance surface. `determined !== true` (covers false AND undefined) forces a
