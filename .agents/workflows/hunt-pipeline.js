@@ -2506,7 +2506,16 @@ SAFETY:
 ${heartbeat('Verify', 'preparing deploy commands and smoke steps')}
 `, { label: `verify:${slug}`, phase: 'Verify', schema: VERDICT_SCHEMA })
 
-log(`Verification phase: ${verifyResult.verdict}`)
+// agent() returns null when the seat dies on a terminal error (session limit,
+// user skip). The hunt is already CERTIFIED at this point — Verify only preps
+// deploy/smoke guidance — so degrade gracefully instead of crashing the run
+// (observed 2026-08-20: session-limit death at the verify seat crashed an
+// otherwise-complete pipeline on this exact dereference).
+if (verifyResult == null) {
+  log(`Verification seat died (limit/skip) — hunt is certified; deploy/smoke guidance not generated.`)
+} else {
+  log(`Verification phase: ${verifyResult.verdict}`)
+}
 log(`Pipeline complete for ${slug}. Awaiting user deploy + smoke + /merge.`)
 
 return {
@@ -2515,5 +2524,5 @@ return {
   tier,
   findings: watchdogResult?.findings,
   worktreePath,
-  status: verifyResult.status,
+  status: verifyResult?.status ?? 'awaiting_user_deploy',
 }
