@@ -325,3 +325,55 @@ test('campaign-runner: gemini-only rotation (GLM off, Mistral off) skips the pre
 test('hunt-pipeline carries the capability marker the runner greps for', () => {
   assert.match(SRC, /WOLFPACK_EXAMINER_PROTOCOL=2/)
 })
+
+// ─── Round 2: durable writer record (crash between GLM commit and metadata write) ───
+const RESUME_AT_CODE_REVIEW = { fresh: false, status: 'implemented', resumePhase: 'Code Review', tier: 'Yellow',
+  worktreePath: WT, planDir: PD, worktreeExists: true, branchExists: true, trackerRounds: 1, pointerRounds: 1, bloodhoundRounds: 1 }
+
+test('crash after GLM commit, before metadata: git trailer keeps glm out of review (union, loud mismatch)', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    'resume-probe': RESUME_AT_CODE_REVIEW,
+    // metadata lost the glm record; git still carries the Wolfpack-Writer: glm trailer
+    'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: ['claude'],
+      lastShepherdFamily: 'claude', gitWriterFamilies: ['glm'], gitHeadWriter: 'glm', glmWritePending: false },
+    pointer: issuesThenApprove,
+    'shepherd-glm': { outcome: 'done', exitCode: 0, committed: true, changedFiles: ['a'],
+      findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true },
+  } })
+  assert.equal(find('shepherd:').length, 0, 'resumed past Implement')
+  for (const c of find('pointer:')) assert.doesNotMatch(c.prompt, /-glm'/, 'GLM must not review its own commit')
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /wolfpack-watchdog-glm/)
+  assert.ok(logs.some(l => /WRITER RECORD MISMATCH/.test(l)))
+  assert.equal(find('shepherd-glm').length, 1, 'git HEAD trailer (glm) routes the rework back to GLM')
+})
+
+test('crash mid-GLM-step (glm_write_pending, no trailer yet): glm excluded even without a pin', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    'resume-probe': RESUME_AT_CODE_REVIEW,
+    'shepherd-seat': { shepherdPin: '', complianceCritical: false, shepherdFamilies: [], lastShepherdFamily: '',
+      gitWriterFamilies: [], gitHeadWriter: '', glmWritePending: true, uncommittedChanges: true },
+  } })
+  assert.doesNotMatch(find('pointer:')[0].prompt, /-glm'/)
+  assert.ok(logs.some(l => /glm_write_pending=true/.test(l)))
+})
+
+test('writer record: seat probe cross-checks git trailers; GLM wrapper pre-marks before the shim and trailers its commit', async () => {
+  const { find } = await runHunt({ answers: { 'shepherd-seat': GLM_SEAT } })
+  const probe = find('shepherd-seat')[0].prompt
+  assert.match(probe, /trailers:key=Wolfpack-Writer,valueonly/)
+  const w = find('shepherd-glm')[0].prompt
+  const pre = w.indexOf('"glm_write_pending" = true'), shim = w.indexOf('4. Run the shim')
+  assert.ok(pre > 0 && pre < shim, 'pending marker is written BEFORE the shim runs')
+  assert.match(w, /--trailer "Wolfpack-Writer: glm"/)
+  assert.match(find('pointer:')[0].prompt, /Pointer/)   // sanity: pipeline continued
+})
+
+test('node helper invocations quote repo/plan paths (space + quote)', async () => {
+  const wt = "/re po/it's/.agents/worktrees/h"
+  const { find } = await runHunt({ answers: { scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
+  const q = (x) => `'${x.replace(/'/g, `'\\''`)}'`
+  assert.ok(find('alpha:')[0].prompt.includes(`node ${q("/re po/it's/scripts/wolfpack-routing.mjs")} ${q(`${wt}/.wolfpack/plans/h`)}`))
+  const wd = find('watchdog:')[0].prompt
+  assert.ok(wd.includes(`node ${q("/re po/it's/scripts/wolfpack-timing.mjs")} ${q(`${wt}/.wolfpack/plans/h`)}`))
+  assert.ok(wd.includes(`node ${q("/re po/it's/scripts/wolfpack-model-stats.mjs")} --stamp`))
+})

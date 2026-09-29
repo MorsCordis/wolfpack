@@ -381,6 +381,11 @@ const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
 const EXAMINER_PROTOCOL = 2
 void EXAMINER_PROTOCOL
 
+// Git trailer stamped on every Shepherd commit ("Wolfpack-Writer: glm|claude") — the
+// DURABLE, git-side code-writer record. The resume probe reads it back and unions it with
+// metadata.shepherd_families, so losing metadata can never let a family review its own code.
+const WRITER_TRAILER = 'Wolfpack-Writer'
+
 // ─── Examiner CHAIN (non-Claude reviewer families, in fallback order) ─────────
 // Every review seat (Bloodhound, Pointer, Watchdog) walks an ORDERED chain of non-Claude
 // examiner families and falls to the next link when one is rate-limited (shim exit 75 /
@@ -1446,7 +1451,7 @@ Execute Phase 1 (Initial Plan):
 - Read CLAUDE.md, AGENTS.md, TODO.md for project context
 - Read .wolfpack/pedigree/index.md and .wolfpack/pedigree/lessons.md for model selection data
 - [06] ROUTING — base ALL model_assignments on the data-driven router, not folklore: run
-  \`node ${repoRoot}/scripts/wolfpack-routing.mjs "${planDir}"\` AFTER you've written
+  \`node ${shq(`${repoRoot}/scripts/wolfpack-routing.mjs`)} ${shq(planDir)}\` AFTER you've written
   predicted_dimensions + tier to ${planDir}/metadata.json. It reads those + the per-model meter
   (.wolfpack/pedigree/model-stats.json, [06] AC3) and returns the work-horse/judgment tier
   defaults overridden by capability×economics + domain (frontend→thorough verify;
@@ -1559,6 +1564,10 @@ const SHEPHERD_SEAT_SCHEMA = {
     complianceCritical: { type: 'boolean' },  // spec.compliance_critical / review_required / domain_sensitivity ≥3
     shepherdFamilies: { type: 'array', items: { type: 'string' } },  // metadata.shepherd_families
     lastShepherdFamily: { type: 'string' },   // metadata.last_shepherd_family, or ""
+    glmWritePending: { type: 'boolean' },     // metadata.glm_write_pending === true
+    gitWriterFamilies: { type: 'array', items: { type: 'string' } },  // Wolfpack-Writer trailers on main..HEAD
+    gitHeadWriter: { type: 'string' },        // the trailer on the newest trailer-bearing commit, or ""
+    uncommittedChanges: { type: 'boolean' },  // app files dirty outside .wolfpack/
   },
   required: ['shepherdPin', 'complianceCritical', 'shepherdFamilies'],
 }
@@ -1574,11 +1583,33 @@ You are a READ-ONLY probe. Do NOT modify anything. Read ${planDir}/metadata.json
   metadata.predicted_dimensions.domain_sensitivity >= 3; else false.
 - shepherdFamilies: metadata.shepherd_families if it is an array of strings, else [].
 - lastShepherdFamily: metadata.last_shepherd_family if a non-empty string, else "".
+- glmWritePending: metadata.glm_write_pending === true (else false).
+- gitWriterFamilies: the DISTINCT lowercase values of every "${WRITER_TRAILER}:" trailer on the
+  branch's commits. Run (if the worktree exists; else []):
+    git -C ${shq(worktreePath)} log --format='%(trailers:key=${WRITER_TRAILER},valueonly)' main..HEAD
+  Also count a commit whose subject ends in "[glm-shepherd]" as "glm" (legacy/untrailered).
+- gitHeadWriter: the trailer value of the NEWEST commit in main..HEAD that has one, else "".
+- uncommittedChanges: true if \`git -C ${shq(worktreePath)} status --porcelain\` lists any path
+  outside .wolfpack/, else false.
 Return ONLY these fields.
 `, { label: `shepherd-seat:${slug}`, phase: 'Implement', schema: SHEPHERD_SEAT_SCHEMA, model: 'sonnet' })
   const pinFam = familyOf(seat && seat.shepherdPin)
-  for (const f of ((seat && seat.shepherdFamilies) || [])) { const ff = familyOf(f); if (ff) codeWriterFamilies.add(ff) }
-  lastWriterFamily = familyOf(seat && seat.lastShepherdFamily) || ''
+  // Writer record = UNION of metadata and git (the more restrictive set): a crash between
+  // a GLM commit and its metadata write can't downgrade the record, and neither can a lost
+  // metadata.json. A pending GLM step with uncommitted edits counts as a GLM write.
+  const metaFams = ((seat && seat.shepherdFamilies) || []).map(familyOf).filter(Boolean)
+  const gitFams = ((seat && seat.gitWriterFamilies) || []).map(familyOf).filter(Boolean)
+  for (const ff of [...metaFams, ...gitFams]) codeWriterFamilies.add(ff)
+  if (seat && seat.glmWritePending) codeWriterFamilies.add('glm')
+  const disagree = gitFams.filter(f => !metaFams.includes(f))
+  if (disagree.length) {
+    log(`⚠ WRITER RECORD MISMATCH: git trailers show ${disagree.join(', ')} wrote on feat/${slug} but metadata.shepherd_families (${metaFams.join(', ') || 'empty'}) does not — using the UNION (more restrictive): ${[...codeWriterFamilies].join(', ')}.`)
+  }
+  if (seat && seat.glmWritePending) {
+    log(`⚠ ${slug}: metadata.glm_write_pending=true — a GLM step was interrupted${seat.uncommittedChanges ? ' with uncommitted edits in the worktree' : ''}; treating glm as a code writer.`)
+  }
+  // Last writer: git's newest trailer wins over metadata (it is written atomically with the commit).
+  lastWriterFamily = familyOf(seat && seat.gitHeadWriter) || familyOf(seat && seat.lastShepherdFamily) || ''
   if (pinFam === 'glm') {
     if (HEAVY_TIER || (seat && seat.complianceCritical)) {
       log(`⚠ Shepherd pin "${seat.shepherdPin}" IGNORED — ${HEAVY_TIER ? `tier ${tier}` : 'compliance-critical hunt'} forces the Claude ${shepherdModel} Shepherd (judgment override never relaxes).`)
@@ -1646,6 +1677,11 @@ ${mode === 'implement'
 =====GLM TASK START=====
 ${task}
 =====GLM TASK END=====
+3b. DURABLE WRITER RECORD FIRST (crash safety — do this BEFORE step 4): update
+   ${planDir}/metadata.json: remember whether "shepherd_families" ALREADY contained "glm"
+   (call it HAD_GLM), then ensure "shepherd_families" contains "glm" and set
+   "glm_write_pending" = true. Preserve every other field. (If the run dies anywhere after
+   this, the resume probe still sees GLM as a possible writer — the safe direction.)
 4. Run the shim. It can run for up to an hour — longer than one shell call may block — so
    start it in the BACKGROUND and poll:
      ( ${cmd} > ${q('.out')} 2> ${q('.err')}; echo $? > ${q('.rc')} ) &
@@ -1661,7 +1697,10 @@ ${task}
    rc 0 but NOTHING changed outside .wolfpack/ → outcome "no_changes".` : ''}
 7. rc 0 with changes: stage EACH changed/new file BY NAME (git add -- <path> …) — NEVER
    git add . / -A / -f; skip anything under .wolfpack/plans/ (gitignored plan artifacts).
-   Commit with a conventional message ending in "[glm-shepherd]" (e.g. "${mode === 'implement' ? `feat(<scope>): <summary> [glm-shepherd]` : `fix(<scope>): address Pointer round ${round} findings [glm-shepherd]`}").
+   Commit with a conventional message ending in "[glm-shepherd]" (e.g. "${mode === 'implement' ? `feat(<scope>): <summary> [glm-shepherd]` : `fix(<scope>): address Pointer round ${round} findings [glm-shepherd]`}")
+   AND the git trailer "${WRITER_TRAILER}: glm" as the LAST line of the message (e.g.
+   git commit -m "<subject>" --trailer "${WRITER_TRAILER}: glm"). The trailer is the
+   durable, git-side writer record the resume probe cross-checks — never omit it.
    The commit must contain ONLY GLM's changes. Set committed=true.
    On rate_limited / failed: do NOT commit, revert, stash or clean — leave any partial GLM
    edits in the working tree for the fallback implementer (committed=false).${mode === 'rewrite' ? `
@@ -1669,11 +1708,13 @@ ${task}
    {"findingsAddressed":[{"id","severity","title","disposition","justification"}],"allAddressed":bool}.
    Pass it through as findingsAddressed / allAddressed. rc 0 but no parseable block →
    outcome "failed", evidence "no dispositions block" (keep the commit).` : ''}
-9. Update ${planDir}/metadata.json (the code-writer record the cross-family review rule
+9. Finalize ${planDir}/metadata.json (the code-writer record the cross-family review rule
    reads on resume; preserve every other field):
-   - if changedFiles is NON-empty (GLM actually wrote something, committed or not): ensure
-     the "shepherd_families" array exists and contains "glm";
-   - if outcome is "done": set "last_shepherd_family" = "glm".
+   - if changedFiles is EMPTY and nothing was committed AND HAD_GLM was false (GLM wrote
+     nothing this step and never before): remove "glm" from "shepherd_families" again;
+     otherwise KEEP "glm" there;
+   - if outcome is "done": set "last_shepherd_family" = "glm";
+   - set "glm_write_pending" = false (only AFTER the lines above).
 10. rm -f ${q('.txt')} ${q('.out')} ${q('.err')} ${q('.rc')}
 Return outcome ("done" when rc 0 and the step completed), exitCode, evidence (≤300 chars of
 the .err/.out tail), changedFiles, committed${mode === 'rewrite' ? ', findingsAddressed, allAddressed' : ''}.
@@ -1700,13 +1741,17 @@ You are the Claude fallback implementer (${shepherdModel}).
   append to ${planDir}/metadata.json "fallback_log" (create if absent):
   {"role":"shepherd","round":${round},"primary":"glm","fallback":"claude:${shepherdModel}","reason":"${glmFallbackReason(r)}","evidence":"<≤200 chars>"}
   and ensure "shepherd_families" contains "claude"${(r.changedFiles || []).length ? ' and "glm" (GLM left edits)' : ''}; set
-  "last_shepherd_family" = "claude". Preserve every other field.
+  "last_shepherd_family" = "claude" and "glm_write_pending" = false. Preserve every other field.
+- End every commit message with the git trailer "${WRITER_TRAILER}: claude"${(r.changedFiles || []).length ? `
+  PLUS a second trailer "${WRITER_TRAILER}: glm" on the commit that includes GLM's partial edits` : ''}.
 `
 
 // Writer record appended to a plain (non-fallback) Claude Shepherd prompt.
 const CLAUDE_WRITER_RECORD = `
-WRITER RECORD: after committing, update ${planDir}/metadata.json — ensure the "shepherd_families"
-array exists and contains "claude", and set "last_shepherd_family" = "claude". Preserve every other field.`
+WRITER RECORD: end every commit message with the git trailer "${WRITER_TRAILER}: claude"
+(git commit --trailer "${WRITER_TRAILER}: claude"). After committing, update ${planDir}/metadata.json —
+ensure the "shepherd_families" array exists and contains "claude", and set "last_shepherd_family" = "claude".
+Preserve every other field.`
 
 // Which family gets the NEXT rework (Pointer round / Tracker or Pointer bounce re-entry):
 // the family that LAST actually wrote, and GLM only while the GLM seat is still eligible.
@@ -2739,7 +2784,7 @@ ${certifySteps}
 8. On PASS only — fold timing into the scorecard (non-blocking, like the lessons
    aggregator). Run this YOURSELF on the host AFTER the certifier returns (node is
    NOT in the sandbox container — do not put this in the certifier prompt):
-   \`node ${repoRoot}/scripts/wolfpack-timing.mjs "${planDir}"\`.
+   \`node ${shq(`${repoRoot}/scripts/wolfpack-timing.mjs`)} ${shq(planDir)}\`.
    It reads ${planDir}/timing.jsonl + metadata.json, writes a "timing" block into
    ${planDir}/pedigree.json, and prints a "DURATION=<…>" line plus an
    "INCOMPLETE" warning if any phase is missing a start/end. Capture the DURATION
@@ -2750,7 +2795,7 @@ ${certifySteps}
 8b. On PASS only — refresh the [06] per-model routing meter (host-side, non-blocking,
    same rules as step 8: run YOURSELF on the host after the certifier returns, node is
    NOT in the sandbox; pass the agent clock since the script has no Date):
-   \`node ${repoRoot}/scripts/wolfpack-model-stats.mjs --stamp "$(date -Iseconds)"\`.
+   \`node ${shq(`${repoRoot}/scripts/wolfpack-model-stats.mjs`)} --stamp "$(date -Iseconds)"\`.
    It re-aggregates every .wolfpack/plans/*/pedigree.json (this hunt's now folded in:
    model_assignments, execution_scores, predicted_dimensions, and timing/review_fingerprints
    if present) into .wolfpack/pedigree/model-stats.json — per-model signal/noise/miss/spend
