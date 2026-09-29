@@ -173,6 +173,33 @@ parked/needs_spec hunts with their verbatim status.
 
 log(`Campaign parsed: ${campaign.waves.length} waves, ${campaign.waves.reduce((n, w) => n + w.hunts.length, 0)} hunts`)
 
+// ─── Preflight: runtime hunt-pipeline supports the hinted examiner families ────
+// The runtime hunt-pipeline.js in a consuming project is a GENERATED, often gitignored
+// copy (scripts/wolfpack-sync-runtime.sh). A stale copy predates the examiner chain: it
+// would silently misread a "glm" hint (as mistral, or drop it). Whenever we would hint a
+// non-gemini family, require the generated pipeline's capability marker
+// (WOLFPACK_EXAMINER_PROTOCOL=<n>) to be ≥ REQUIRED_EXAMINER_PROTOCOL — else fail LOUD
+// before any hunt starts.
+const REQUIRED_EXAMINER_PROTOCOL = 2
+if (EXAMINER_ROTATION.some(f => f !== 'gemini')) {
+  const cap = await agent(`
+READ-ONLY check — modify nothing. From the current repo root, pick the runtime workflow file:
+.claude/workflows/hunt-pipeline.js if it exists, else .agents/workflows/hunt-pipeline.js.
+Run: grep -o 'WOLFPACK_EXAMINER_PROTOCOL=[0-9]*' <that file> | head -1
+Return path (the file you checked, or "" if neither exists) and protocol (the integer after
+the "=", or 0 if the marker is absent / the file is missing).
+`, { label: 'pipeline-capability', phase: 'Parse', model: 'sonnet', schema: {
+    type: 'object',
+    properties: { path: { type: 'string' }, protocol: { type: 'number' } },
+    required: ['protocol'],
+  } })
+  const proto = Number(cap && cap.protocol) || 0
+  if (proto < REQUIRED_EXAMINER_PROTOCOL) {
+    throw new Error(`campaign-runner: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) is STALE — examiner protocol ${proto} < ${REQUIRED_EXAMINER_PROTOCOL}; it cannot honor the ${EXAMINER_ROTATION.join('/')} examiner hints. Re-run ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh (hunt-pipeline.js + campaign-runner.js), then relaunch.`)
+  }
+  log(`Pipeline capability OK: examiner protocol ${proto} (${cap.path}) — hint rotation ${EXAMINER_ROTATION.join(' / ')}`)
+}
+
 // ─── Phase: Execute Waves ──────────────────────────────────────
 phase('Execute')
 

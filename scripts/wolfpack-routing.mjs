@@ -423,12 +423,16 @@ export function assertConstraints(A, warnings, pool = DEFAULT_POOL) {
   return warnings
 }
 
-// Operator pins from metadata: /hunt --shepherd/--bloodhound/--watchdog land in
-// metadata.models.{architect_recommended,reviewer,certifier}; explicit model_pins win.
+// BINDING pins from metadata. The Shepherd pin is binding ONLY when explicit:
+// metadata.model_pins.shepherd, else metadata.model_assignments.shepherd (Alpha/Debrief's
+// adopted assignment). metadata.models.architect_recommended (/hunt --shepherd=…) is
+// ADVISORY — Alpha weighs it and promotes it into model_assignments on an eligible tier;
+// the router never treats it as binding. /hunt --bloodhound/--watchdog land in
+// models.reviewer/certifier and pin those seats; explicit model_pins win over everything.
 export function pinsFromMeta(meta = {}) {
   const m = meta.models || {}
   const pins = {}
-  if (m.architect_recommended) pins.shepherd = m.architect_recommended
+  if (meta.model_assignments?.shepherd) pins.shepherd = meta.model_assignments.shepherd
   if (m.reviewer) pins.bloodhound = m.reviewer
   if (m.certifier) pins.watchdog = m.certifier
   return { ...pins, ...(meta.model_pins || {}) }

@@ -69,11 +69,11 @@ test('default gates: Claude Shepherd; Bloodhound/Pointer chain = gemini → glm;
   assert.notEqual(result.status, 'parked:cross_family_violation')
   const bh = find('bloodhound:')[0].prompt
   assert.match(bh, /Agy\/Gemini → Vibe\/GLM/)
-  assert.match(bh, /podman-vibe\.sh wolfpack-bloodhound-glm /)
-  assert.doesNotMatch(bh, /podman-vibe\.sh wolfpack-bloodhound "/)   // mistral not enabled
+  assert.match(bh, /podman-vibe\.sh' 'wolfpack-bloodhound-glm'/)
+  assert.doesNotMatch(bh, /podman-vibe\.sh' 'wolfpack-bloodhound'/)   // mistral not enabled
   const ptr = find('pointer:')[0].prompt
-  assert.match(ptr, /podman-agy\.sh --review/)
-  assert.match(ptr, /podman-vibe\.sh wolfpack-pointer-glm /)
+  assert.match(ptr, /podman-agy\.sh' --review/)
+  assert.match(ptr, /podman-vibe\.sh' 'wolfpack-pointer-glm'/)
   assert.equal(find('shepherd-glm').length, 0)
   assert.equal(find('shepherd:')[0].opts.model, 'sonnet')
 })
@@ -82,16 +82,16 @@ test('glm Shepherd pin (Yellow): GLM implements via --implement; glm is REMOVED 
   const { find, logs } = await runHunt({ answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })
   const g = find('shepherd-glm')
   assert.equal(g.length, 1)
-  assert.match(g[0].prompt, /podman-vibe\.sh --implement wolfpack-shepherd-glm /)
+  assert.match(g[0].prompt, /podman-vibe\.sh' --implement wolfpack-shepherd-glm '/)
   assert.match(g[0].prompt, /git rebase origin\/main/)
   assert.equal(find('shepherd:').length + find('shepherd-fallback').length, 0, 'no Claude Shepherd when GLM succeeds')
   const ptr = find('pointer:')[0].prompt
-  assert.doesNotMatch(ptr, /-glm /, 'Pointer must not offer a GLM link for GLM-written code')
-  assert.match(ptr, /podman-agy\.sh --review/)
+  assert.doesNotMatch(ptr, /-glm'/, 'Pointer must not offer a GLM link for GLM-written code')
+  assert.match(ptr, /podman-agy\.sh' --review/)
   const wd = find('watchdog:')[0].prompt
   assert.doesNotMatch(wd, /wolfpack-watchdog-glm/)
-  assert.match(wd, /podman-agy\.sh --certify/)
-  assert.ok(logs.some(l => /Code-writer families: claude, glm/.test(l)))
+  assert.match(wd, /podman-agy\.sh' --certify/)
+  assert.ok(logs.some(l => /Code-writer families after Implement: claude, glm \(last writer: glm\)/.test(l)))
 })
 
 test('runtime invariant: a GLM Pointer review of GLM-written code PARKS cross_family_violation', async () => {
@@ -134,7 +134,7 @@ test('GLM Shepherd rate-limited → Claude fallback (sonnet), logged; glm still 
   assert.match(fb[0].prompt, /"primary":"glm","fallback":"claude:sonnet","reason":"rate_limited"/)
   assert.doesNotMatch(fb[0].prompt, /CRITICAL FIRST STEP: Rebase/)
   assert.ok(logs.some(l => /WOLFPACK_FALLBACK: shepherd r1 glm→claude:sonnet reason=rate_limited/.test(l)))
-  assert.doesNotMatch(find('pointer:')[0].prompt, /-glm /)
+  assert.doesNotMatch(find('pointer:')[0].prompt, /-glm'/)
 })
 
 test('glm pin ignored on Red / Orange / compliance — Claude Opus Shepherd, GLM stays a reviewer', async () => {
@@ -157,7 +157,7 @@ test('WOLFPACK_ENABLE_GLM=0: no seat probe, no GLM links anywhere', async () => 
   assert.equal(find('shepherd-seat').length, 0)
   assert.equal(find('shepherd-glm').length, 0)
   for (const c of [...find('bloodhound:'), ...find('pointer:'), ...find('watchdog:')]) {
-    assert.doesNotMatch(c.prompt, /-glm /)
+    assert.doesNotMatch(c.prompt, /-glm'/)
   }
 })
 
@@ -166,13 +166,13 @@ test('Mistral opted in + glm Shepherd: code-review chain = gemini → mistral (n
     answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })
   const ptr = find('pointer:')[0].prompt
   assert.match(ptr, /Agy\/Gemini → Vibe\/Mistral/)
-  assert.match(ptr, /podman-vibe\.sh wolfpack-pointer "/)
-  assert.doesNotMatch(ptr, /-glm /)
+  assert.match(ptr, /podman-vibe\.sh' 'wolfpack-pointer'/)
+  assert.doesNotMatch(ptr, /-glm'/)
 })
 
 test('resume: metadata.shepherd_families=["glm"] keeps glm out of the chain even without a pin', async () => {
   const { find } = await runHunt({ answers: { 'shepherd-seat': { shepherdPin: '', complianceCritical: false, shepherdFamilies: ['glm', 'claude'] } } })
-  assert.doesNotMatch(find('pointer:')[0].prompt, /-glm /)
+  assert.doesNotMatch(find('pointer:')[0].prompt, /-glm'/)
   assert.doesNotMatch(find('watchdog:')[0].prompt, /wolfpack-watchdog-glm/)
 })
 
@@ -191,4 +191,137 @@ test('Pointer rework goes back to the GLM Shepherd (same family that wrote the c
   assert.equal(glm.length, 2, 'implement + rework both on GLM')
   assert.match(glm[1].prompt, /<dispositions>/)
   assert.equal(find('shepherd-rewrite').length, 0, 'no Claude rewrite when GLM reworks successfully')
+})
+
+const GLM_SEAT = { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] }
+const FINDING = { id: 1, severity: 'MEDIUM', title: 't', file: 'app/x.py', line: 1, claim: 'c', evidence: 'e', fingerprint: 'app/x.py:null-deref' }
+const issuesThenApprove = (_p, _o, n) => (n === 1
+  ? { verdict: 'ISSUES_FOUND', findings: 1, findingsList: [FINDING], provider: 'gemini' }
+  : { verdict: 'APPROVED', findingsList: [], provider: 'gemini' })
+
+test('writer tracking: GLM rate-limited BEFORE writing → Claude writes → rework goes to Claude; reviewers may include glm', async () => {
+  const { find } = await runHunt({ answers: {
+    'shepherd-seat': GLM_SEAT,
+    'shepherd-glm': { outcome: 'rate_limited', exitCode: 75, evidence: 'WOLFPACK_RATE_LIMITED:glm', changedFiles: [] },
+    'shepherd-rewrite': { findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true },
+    pointer: issuesThenApprove,
+  } })
+  assert.equal(find('shepherd-glm').length, 1, 'only the initial GLM attempt — rework is NOT routed by the pin')
+  assert.equal(find('shepherd-fallback').length, 1)
+  assert.equal(find('shepherd-rewrite').length, 1, 'rework goes to the Claude family that actually wrote')
+  for (const c of find('pointer:')) assert.match(c.prompt, /'wolfpack-pointer-glm'/, 'glm wrote nothing → glm may review')
+  assert.match(find('watchdog:')[0].prompt, /wolfpack-watchdog-glm/)
+})
+
+test('writer tracking: GLM rate-limited AFTER partial edits → Claude finishes; glm stays excluded (it wrote code)', async () => {
+  const { find } = await runHunt({ answers: {
+    'shepherd-seat': GLM_SEAT,
+    'shepherd-glm': { outcome: 'rate_limited', exitCode: 75, changedFiles: ['app/x.py'] },
+  } })
+  assert.match(find('shepherd-fallback')[0].prompt, /"glm" \(GLM left edits\)/)
+  assert.doesNotMatch(find('pointer:')[0].prompt, /-glm'/)
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /wolfpack-watchdog-glm/)
+})
+
+test('writer tracking: GLM writes → rework on GLM → every Pointer round excludes glm', async () => {
+  const { find } = await runHunt({ answers: {
+    'shepherd-seat': GLM_SEAT,
+    pointer: issuesThenApprove,
+    'shepherd-glm': (p) => (/Pointer round 1 rework/.test(p)
+      ? { outcome: 'done', exitCode: 0, committed: true, changedFiles: ['app/x.py'], findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'fixed' }], allAddressed: true }
+      : BASE['shepherd-glm']),
+  } })
+  assert.equal(find('shepherd-glm').length, 2)
+  const ptrs = find('pointer:')
+  assert.equal(ptrs.length, 2)
+  for (const c of ptrs) assert.doesNotMatch(c.prompt, /-glm'/)
+})
+
+test('GLM Shepherd timeout → Claude fallback logged as timeout (not rate_limited)', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    'shepherd-seat': GLM_SEAT,
+    'shepherd-glm': { outcome: 'timeout', exitCode: 76, evidence: 'WOLFPACK_TIMEOUT:glm', changedFiles: [] },
+  } })
+  assert.match(find('shepherd-fallback')[0].prompt, /"reason":"timeout"/)
+  assert.ok(logs.some(l => /glm→claude:sonnet reason=timeout/.test(l)))
+})
+
+test('seat probe treats models.architect_recommended as ADVISORY (binding = model_assignments.shepherd)', async () => {
+  const { find } = await runHunt({})
+  const probe = find('shepherd-seat')[0].prompt
+  assert.match(probe, /metadata\.model_assignments\.shepherd/)
+  assert.match(probe, /IGNORE metadata\.models\.architect_recommended/)
+})
+
+test('slug charset is validated fail-loud at hunt start', async () => {
+  for (const bad of ['bad slug', 'x;rm -rf /', "a'b", 'Upper', '-lead', '']) {
+    await assert.rejects(runHunt({ args: { slug: bad } }), /invalid slug/, bad)
+  }
+})
+
+test('shell commands single-quote interpolated paths (worktree with a space and a quote)', async () => {
+  const wt = "/re po/it's/.agents/worktrees/h"
+  const { find } = await runHunt({ answers: { scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
+  const bh = find('bloodhound:')[0].prompt
+  assert.ok(bh.includes(`'/re po/it'\\''s/.agents/worktrees/h'`), 'worktree path is POSIX single-quoted')
+  assert.ok(bh.includes(`'/re po/it'\\''s/scripts/podman-agy.sh' --review`), 'shim path is quoted too')
+})
+
+test('resume: a Tracker-bounce re-entry goes to the LAST writer (claude), not the glm pin', async () => {
+  const probe = { fresh: false, status: 'test_rewrite_needed', resumePhase: 'Implement', tier: 'Yellow',
+    worktreePath: WT, planDir: PD, worktreeExists: true, branchExists: true, trackerRounds: 1, pointerRounds: 1, bloodhoundRounds: 1 }
+  const { find } = await runHunt({ answers: {
+    'resume-probe': probe,
+    'shepherd-seat': { ...GLM_SEAT, shepherdFamilies: ['glm', 'claude'], lastShepherdFamily: 'claude' },
+  } })
+  assert.equal(find('shepherd-glm').length, 0, 'last writer was Claude → no GLM step')
+  assert.match(find('shepherd:')[0].prompt, /REWRITE ENTRY — Tracker round 1/)
+  // glm wrote earlier on this branch (shepherd_families) → still excluded from review
+  assert.doesNotMatch(find('pointer:')[0].prompt, /-glm'/)
+})
+
+test('resume: a Tracker-bounce re-entry goes back to GLM when GLM was the last writer', async () => {
+  const probe = { fresh: false, status: 'test_rewrite_needed', resumePhase: 'Implement', tier: 'Yellow',
+    worktreePath: WT, planDir: PD, worktreeExists: true, branchExists: true, trackerRounds: 1, pointerRounds: 1, bloodhoundRounds: 1 }
+  const { find } = await runHunt({ answers: {
+    'resume-probe': probe,
+    'shepherd-seat': { ...GLM_SEAT, shepherdFamilies: ['glm'], lastShepherdFamily: 'glm' },
+  } })
+  assert.equal(find('shepherd-glm').length, 1)
+  assert.match(find('shepherd-glm')[0].prompt, /REWRITE ENTRY — Tracker round 1/)
+})
+
+// ─── campaign-runner: stale runtime pipeline guard ──────────────────────────
+const RUNNER = readFileSync(join(here, '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8')
+  .replace(/^export const meta/m, 'const meta')
+async function runRunner({ env = {}, protocol }) {
+  const calls = []
+  const agent = async (_p, opts = {}) => {
+    calls.push(opts.label)
+    if (opts.label === 'parse-campaign') return { waves: [] }
+    if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol }
+    return {}
+  }
+  const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'process', 'workflow', RUNNER)
+  await fn({ campaign: 'c' }, agent, async (f) => Promise.all(f.map(x => x())), () => {}, () => {},
+    { total: 0, remaining: () => 1e12 }, { env }, async () => ({}))
+  return calls
+}
+
+test('campaign-runner: stale runtime pipeline (no examiner protocol) fails loud before any hunt', async () => {
+  await assert.rejects(runRunner({ protocol: 0 }), /STALE .*wolfpack-sync-runtime\.sh/)
+})
+
+test('campaign-runner: current runtime pipeline passes the capability preflight', async () => {
+  const calls = await runRunner({ protocol: 2 })
+  assert.ok(calls.includes('pipeline-capability'))
+})
+
+test('campaign-runner: gemini-only rotation (GLM off, Mistral off) skips the preflight', async () => {
+  const calls = await runRunner({ env: { WOLFPACK_ENABLE_GLM: '0' }, protocol: 0 })
+  assert.ok(!calls.includes('pipeline-capability'))
+})
+
+test('hunt-pipeline carries the capability marker the runner greps for', () => {
+  assert.match(SRC, /WOLFPACK_EXAMINER_PROTOCOL=2/)
 })

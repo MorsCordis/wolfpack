@@ -257,7 +257,9 @@ test('fuzz (POOL3): no reviewer or chain link ever shares the Shepherd family', 
   }
 })
 
-test('pinsFromMeta: /hunt pins (models.*) feed the router; model_pins win', () => {
-  assert.deepEqual(pinsFromMeta({ models: { architect_recommended: 'reviewer-c' } }), { shepherd: 'reviewer-c' })
-  assert.deepEqual(pinsFromMeta({ models: { architect_recommended: 'reviewer-c' }, model_pins: { shepherd: 'judgment' } }), { shepherd: 'judgment' })
+test('pinsFromMeta: architect_recommended is ADVISORY; model_assignments.shepherd / model_pins bind', () => {
+  assert.deepEqual(pinsFromMeta({ models: { architect_recommended: 'reviewer-c' } }), {})
+  assert.deepEqual(pinsFromMeta({ models: { architect_recommended: 'reviewer-c' }, model_assignments: { shepherd: 'judgment' } }), { shepherd: 'judgment' })
+  assert.deepEqual(pinsFromMeta({ model_assignments: { shepherd: 'reviewer-c' } }), { shepherd: 'reviewer-c' })
+  assert.deepEqual(pinsFromMeta({ model_assignments: { shepherd: 'reviewer-c' }, model_pins: { shepherd: 'judgment' } }), { shepherd: 'judgment' })
 })
