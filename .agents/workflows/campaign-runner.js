@@ -53,8 +53,8 @@ const parallelCap = maxParallel || 2
 
 // Alternate the non-Claude cross-examiner per hunt so two parallel hunts never
 // stack their reviews on the same model (which trips Mistral rate limits).
-// Examiner SPREAD DEFAULT (the "runner rebalances" baseline): even-indexed hunts
-// → Mistral, odd → Gemini, so parallel hunts don't both start on one provider.
+// Examiner SPREAD DEFAULT (the "runner rebalances" baseline): hunts rotate their FIRST
+// examiner over the enabled families, so parallel hunts don't all start on one provider.
 // This is only a HINT now — once a hunt's Alpha runs, its pedigree-driven
 // model_assignments.bloodhound OVERRIDES this per hunt (hunt-pipeline.js
 // setExaminer), and the hunt then sticks with whichever examiner answers. When
@@ -63,11 +63,23 @@ const parallelCap = maxParallel || 2
 // Alpha-aware cross-hunt reassignment would need post-Plan coordination — not
 // done yet; the flock cap is the interim safeguard.
 let huntCounter = 0
-// Alternation only matters when Mistral is opted back in (WOLFPACK_ENABLE_MISTRAL_AUTO=1);
-// hunt-pipeline's AUTO_GEMINI_ONLY otherwise forces gemini regardless of this hint, so
-// default the hint to gemini too — a "mistral" hint against a stripped provider was noise.
-const MISTRAL_AUTO = !!(typeof process !== 'undefined' && process.env && process.env.WOLFPACK_ENABLE_MISTRAL_AUTO)
-const nextCrossExaminer = () => (MISTRAL_AUTO && huntCounter++ % 2 === 0 ? 'mistral' : 'gemini')
+// The hint rotates over the ENABLED examiner families, in hunt-pipeline's chain order:
+// gemini always; glm unless WOLFPACK_ENABLE_GLM is off (default ON — unset/""/"1"/"true");
+// mistral only with WOLFPACK_ENABLE_MISTRAL_AUTO. With the defaults that alternates
+// gemini/glm. It only ROTATES the chain's first link — hunt-pipeline still removes the
+// code writer's family (e.g. glm on a GLM-Shepherd hunt), so a hint can never cause a
+// same-family review; a disabled family is never hinted.
+const _envRunner = (k) => ((typeof process !== 'undefined' && process.env) ? process.env[k] : undefined)
+const MISTRAL_AUTO = !!_envRunner('WOLFPACK_ENABLE_MISTRAL_AUTO')
+const GLM_ENABLED = (() => {
+  const v = _envRunner('WOLFPACK_ENABLE_GLM')
+  if (v === undefined || v === null) return true
+  const t = String(v).trim().toLowerCase()
+  return t === '' || t === '1' || t === 'true'
+})()
+const EXAMINER_ROTATION = ['gemini', 'glm', 'mistral']
+  .filter(f => f === 'gemini' || (f === 'glm' && GLM_ENABLED) || (f === 'mistral' && MISTRAL_AUTO))
+const nextCrossExaminer = () => EXAMINER_ROTATION[huntCounter++ % EXAMINER_ROTATION.length]
 
 // ─── [05] AC1 — self-imposed token-budget breaker ─────────────
 // The Workflow harness `budget` global is a SHARED output-token pool across the main

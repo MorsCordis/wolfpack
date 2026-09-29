@@ -86,6 +86,8 @@ Wolfpack is model-agnostic. The pipeline reasons about model **families** by rol
 - **work-horse** — cheap, high-throughput implementer family (default Shepherd on light tiers).
 - **reviewer-a** — primary reviewer family + verify specialist (Watchdog).
 - **reviewer-b** — secondary reviewer family (cross-family alternate), optional.
+- **reviewer-c** — optional third reviewer family; slots into the examiner chain between reviewer-a and reviewer-b.
+- **coder-alt** — optional non-default implementer for NON-heavy tiers (often the same family as reviewer-c — a model that can both code and review). Heavy/compliance tiers still force judgment.
 
 Map each family onto a concrete model you have. The router (`scripts/wolfpack-routing.mjs`) reads this mapping and the pedigree history to pick a model per role per hunt. The brand names below are fill-in EXAMPLES — replace them with whatever models your harness can reach.
 
@@ -95,12 +97,18 @@ Map each family onto a concrete model you have. The router (`scripts/wolfpack-ro
 - work-horse  → claude:sonnet             # e.g. Sonnet, GPT-5-mini, a local 70B
 - reviewer-a  → gemini:flash              # any family ≠ your implementers
 - reviewer-b  → mistral:large             # optional second cross-family reviewer
+- reviewer-c  → glm:5.3                   # optional third reviewer (chain: a → c → b)
+- coder-alt   → glm:5.3                   # optional non-Claude implementer; fallback = work-horse
 
 ### Hard constraints (enforced by the router — never relax)
 - Alpha is ALWAYS the judgment family (load-bearing planner).
 - Reviewers (Bloodhound, Pointer, Watchdog) are NEVER an implementer family —
   adversarial review must be CROSS-FAMILY from the implementer.
 - Pointer/Watchdog family ≠ Shepherd family.
+- CHAIN RULE: each review seat walks the ordered examiner chain (reviewer-a → reviewer-c →
+  reviewer-b, filtered by what is enabled) with the WRITER's family removed, falling to the
+  next link on a rate limit; chain exhausted → park. A coder-alt Shepherd therefore removes
+  its own family from the Pointer/Watchdog chains. A seat never reviews its own family's work.
 
 ### Overrides (optional)
 - (e.g., Red tier / compliance hunts: force judgment family for Shepherd)

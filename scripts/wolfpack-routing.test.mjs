@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import {
   recommendModels, tierDefaults, deriveDomain, isCompliance, exploreEligible,
   bestReviewerByData, providerFamily, assertConstraints, MIN_RUNS, DEFAULT_POOL,
+  reviewerChain, reviewerOrder, pinsFromMeta,
 } from './wolfpack-routing.mjs'
 
 const dims = (o) => ({ file_spread: 1, logic_complexity: 1, domain_sensitivity: 1,
@@ -170,4 +171,93 @@ test('every produced assignment satisfies constraints (fuzz over tiers/domains)'
       }
     }
   }
+})
+
+// ─── Optional reviewer-c / coder-alt slots (the examiner CHAIN rule) ──────────
+// POOL3 adds a third reviewer family that can also implement (coder-alt) — the shape
+// of e.g. GLM-via-Vibe in a concrete pool. DEFAULT_POOL omits both slots, so every
+// test above proves the two-reviewer behaviour is unchanged.
+const POOL3 = { ...DEFAULT_POOL, reviewerC: 'reviewer-c', coderAlt: 'reviewer-c' }
+
+test('reviewerOrder/reviewerChain: a → c → b, env filter, writer exclusion, prefer', () => {
+  assert.deepEqual(reviewerOrder(DEFAULT_POOL), ['reviewer-a', 'reviewer-b'])
+  assert.deepEqual(reviewerOrder(POOL3), ['reviewer-a', 'reviewer-c', 'reviewer-b'])
+  assert.deepEqual(reviewerChain({ pool: POOL3 }), ['reviewer-a', 'reviewer-c', 'reviewer-b'])
+  assert.deepEqual(reviewerChain({ pool: POOL3, enabled: new Set(['reviewer-a', 'reviewer-c']) }), ['reviewer-a', 'reviewer-c'])
+  assert.deepEqual(reviewerChain({ pool: POOL3, exclude: ['reviewer-c:5.3'] }), ['reviewer-a', 'reviewer-b'])
+  assert.deepEqual(reviewerChain({ pool: POOL3, prefer: 'reviewer-c' }), ['reviewer-c', 'reviewer-a', 'reviewer-b'])
+  assert.deepEqual(reviewerChain({ pool: POOL3, exclude: ['reviewer-c'], prefer: 'reviewer-c' }), ['reviewer-a', 'reviewer-b'])
+  assert.deepEqual(reviewerChain({ pool: POOL3, exclude: ['reviewer-a'], enabled: new Set(['reviewer-a']) }), [])
+})
+
+test('providerFamily: reviewer-c resolves before reviewer-b', () => {
+  const P = { ...DEFAULT_POOL, reviewerB: 'mistral', reviewerC: 'glm', coderAlt: 'glm' }
+  assert.equal(providerFamily('glm:5.3', P), 'glm')
+  assert.equal(providerFamily('mistral:zai-glm-5-3', P), 'glm')
+  assert.equal(providerFamily('mistral:medium', P), 'mistral')
+})
+
+test('recommend: coder-alt Shepherd on Yellow → fallback work-horse; its family leaves the code-review chain', () => {
+  const r = recommendModels({ tier: 'Yellow', dimensions: dims(), pins: { shepherd: 'reviewer-c' }, pool: POOL3 })
+  const a = r.assignments
+  assert.equal(a.shepherd.model, 'reviewer-c')
+  assert.equal(a.shepherd.fallback, 'work-horse')
+  for (const role of ['pointer', 'watchdog']) {
+    assert.notEqual(a[role].model, 'reviewer-c')
+    assert.ok(!a[role].chain.includes('reviewer-c'), role)
+  }
+  assert.ok(a.bloodhound.chain.includes('reviewer-c'))   // plan written by judgment, c may review it
+})
+
+test('recommend: coder-alt pin ignored on heavy/compliance tiers (judgment forced)', () => {
+  for (const [tier, d] of [['Red', dims()], ['Orange', dims()], ['Yellow', dims({ domain_sensitivity: 4 })]]) {
+    const r = recommendModels({ tier, dimensions: d, pins: { shepherd: 'reviewer-c' }, pool: POOL3 })
+    assert.equal(r.assignments.shepherd.model, 'judgment', tier)
+    assert.ok(r.warnings.some(w => /heavy\/compliance/.test(w)), tier)
+  }
+})
+
+test('recommend: coder-alt pin ignored when its family is disabled', () => {
+  const r = recommendModels({ tier: 'Yellow', dimensions: dims(), pins: { shepherd: 'reviewer-c' }, pool: POOL3,
+    enabled: new Set(['reviewer-a', 'reviewer-b']) })
+  assert.equal(r.assignments.shepherd.model, 'work-horse')
+})
+
+test('recommend: same-family reviewer pin against a coder-alt Shepherd is refused', () => {
+  const r = recommendModels({ tier: 'Yellow', dimensions: dims(), pool: POOL3,
+    pins: { shepherd: 'reviewer-c', pointer: 'reviewer-c', watchdog: 'reviewer-c' } })
+  assert.notEqual(r.assignments.pointer.model, 'reviewer-c')
+  assert.notEqual(r.assignments.watchdog.model, 'reviewer-c')
+  assert.ok(r.warnings.some(w => /cross-family rule/.test(w)))
+})
+
+test('assertConstraints: a Shepherd-family chain link throws', () => {
+  const A = {
+    alpha: { model: 'judgment' }, shepherd: { model: 'reviewer-c', fallback: 'work-horse' },
+    bloodhound: { model: 'reviewer-a', chain: ['reviewer-a'] },
+    pointer: { model: 'reviewer-a', chain: ['reviewer-a', 'reviewer-c'] },
+    watchdog: { model: 'reviewer-a', chain: ['reviewer-a'] }, tracker: { model: 'judgment' },
+  }
+  assert.throws(() => assertConstraints(A, [], POOL3), /pointer chain contains the Shepherd's family/)
+})
+
+test('fuzz (POOL3): no reviewer or chain link ever shares the Shepherd family', () => {
+  for (const tier of ['Green', 'Blue', 'Yellow', 'Orange', 'Red']) {
+    for (const ds of [1, 4]) {
+      for (const shep of [null, 'reviewer-c', 'work-horse', 'judgment']) {
+        const r = recommendModels({ tier, dimensions: dims({ domain_sensitivity: ds }), pool: POOL3,
+          pins: shep ? { shepherd: shep } : {} })
+        const a = r.assignments
+        const shepFams = [a.shepherd.model, a.shepherd.fallback].filter(Boolean)
+        for (const role of ['pointer', 'watchdog']) {
+          for (const link of a[role].chain) assert.ok(!shepFams.includes(link), `${tier}/${ds}/${shep} ${role} ${link}`)
+        }
+      }
+    }
+  }
+})
+
+test('pinsFromMeta: /hunt pins (models.*) feed the router; model_pins win', () => {
+  assert.deepEqual(pinsFromMeta({ models: { architect_recommended: 'reviewer-c' } }), { shepherd: 'reviewer-c' })
+  assert.deepEqual(pinsFromMeta({ models: { architect_recommended: 'reviewer-c' }, model_pins: { shepherd: 'judgment' } }), { shepherd: 'judgment' })
 })

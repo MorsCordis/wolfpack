@@ -18,6 +18,18 @@
 //   * reviewer-a  — the primary reviewer family (also the verify specialist).
 //   * reviewer-b  — the secondary reviewer family (cross-family alternate).
 //
+// Two OPTIONAL slots extend the pool (absent from DEFAULT_POOL, so a pool without
+// them routes exactly as before):
+//
+//   * reviewer-c  — a third reviewer family, slotted into the examiner CHAIN between
+//                   reviewer-a and reviewer-b (chain order: a → c → b).
+//   * coder-alt   — an optional non-default IMPLEMENTER family for NON-heavy tiers
+//                   (typically the same family as reviewer-c: a model that can both
+//                   code and review). Heavy/compliance tiers still force `judgment`.
+//                   Because coder-alt may also review, the cross-family rule is the
+//                   CHAIN rule: a review seat walks the ordered examiner chain with the
+//                   writer's family REMOVED, falling to the next link on a rate limit.
+//
 // `judgment` + `work-horse` are the IMPLEMENTER families (they may NOT review —
 // adversarial review must be cross-family from the implementer). `reviewer-a` +
 // `reviewer-b` are the REVIEWER families. A real project maps these neutral roles
@@ -67,13 +79,33 @@ export const DEFAULT_POOL = {
   reviewerB: 'reviewer-b',  // secondary reviewer (cross-family alternate)
 }
 
+// The ordered examiner chain families for a pool: reviewer-a → reviewer-c → reviewer-b
+// (reviewer-c only when the pool defines it).
+export function reviewerOrder(pool = DEFAULT_POOL) {
+  return [pool.reviewerA, pool.reviewerC, pool.reviewerB].filter(Boolean)
+}
+
+// The ordered examiner chain for one review seat: reviewerOrder ∩ enabled, minus every
+// family in `exclude` (the WRITER of the artifact under review — the Shepherd for
+// Pointer/Watchdog, the planner for Bloodhound). `enabled` (Set, optional) models env
+// gates — omitted = every pool reviewer family. `prefer` rotates one eligible family
+// to the front (pin / sticky pick) but never re-admits an excluded one. Returns [] when
+// nothing is eligible: the caller must FAIL LOUD (park), never review same-family.
+export function reviewerChain({ pool = DEFAULT_POOL, exclude = [], enabled = null, prefer = null } = {}) {
+  const ex = new Set([...exclude].map((m) => providerFamily(m, pool) || m))
+  const base = reviewerOrder(pool).filter((f) => (!enabled || enabled.has(f)) && !ex.has(f))
+  const p = providerFamily(prefer, pool)
+  if (p && base.includes(p)) return [p, ...base.filter((f) => f !== p)]
+  return base
+}
+
 // Derived family sets for the running pool. IMPLEMENTER = families that must NOT
 // review; REVIEWER = the eligible reviewer families. Built from a pool object so a
 // caller can swap the concrete vocabulary while keeping all routing logic intact.
 export function familySets(pool = DEFAULT_POOL) {
   return {
     IMPLEMENTER: new Set([pool.judgment, pool.workHorse]),
-    REVIEWER: new Set([pool.reviewerA, pool.reviewerB]),
+    REVIEWER: new Set(reviewerOrder(pool)),
   }
 }
 
@@ -136,7 +168,7 @@ export function tierDefaults(tier, dimensions, pool = DEFAULT_POOL) {
   // on non-heavy tiers under the metered-with-fallback guards.
   const tracker = pool.judgment
 
-  return { shepherd, reviewer, watchdog: pool.reviewerA, watchdogMode, tracker, domain, compliance }
+  return { shepherd, reviewer, watchdog: pool.reviewerA, watchdogMode, tracker, domain, compliance, heavy }
 }
 
 // ─── Stats lookup ───────────────────────────────────────────────
@@ -196,7 +228,7 @@ export function bestReviewerByData(stats, role, domain, pool = DEFAULT_POOL) {
 // ─── The recommender ────────────────────────────────────────────
 // Returns { assignments, domain, compliance, explore, warnings }. assignments is
 // keyed by role: { model, mode?, rationale, source: 'default'|'exploit'|'explore'|'pin' }.
-export function recommendModels({ tier, dimensions = {}, stats = {}, pins = {}, pool = DEFAULT_POOL } = {}) {
+export function recommendModels({ tier, dimensions = {}, stats = {}, pins = {}, pool = DEFAULT_POOL, enabled = null } = {}) {
   const warnings = []
   const { REVIEWER } = familySets(pool)
   const t = tier || 'Red'            // fail-closed: unknown tier → heaviest ceremony
@@ -213,27 +245,28 @@ export function recommendModels({ tier, dimensions = {}, stats = {}, pins = {}, 
     warnings.push(`ignoring alpha pin "${pins.alpha}" — Alpha is fixed ${pool.judgment}`)
   }
 
-  // Shepherd — pin wins; else tier default. Heavy/compliance is exploit-only.
-  A.shepherd = pickWithPin('shepherd', pins, def.shepherd, stats, domain, explore, warnings, pool)
+  // Shepherd — pin wins; else tier default. Heavy/compliance is exploit-only. A
+  // coder-alt pin is honored only on non-heavy tiers (judgment override never relaxes)
+  // and carries a `fallback` implementer for when coder-alt is rate-limited.
+  A.shepherd = pickShepherd(pins, def, stats, domain, explore, warnings, pool, enabled)
 
   // Reviewers — NEVER an implementer family. Exploit best-by-data if trusted, else
   // tier default; on explore-eligible tiers with thin data, explore the work-horse default.
-  A.bloodhound = pickReviewer('bloodhound', pins, def.reviewer, stats, domain, explore, warnings, pool)
+  // Bloodhound reviews the PLAN, so the planner (judgment) family is its excluded writer.
+  A.bloodhound = pickReviewer('bloodhound', pins, def.reviewer, stats, domain, explore, warnings, pool, enabled, [A.alpha.model])
 
   // Pointer — domain default, but MUST be cross-family from Shepherd (and a reviewer family).
-  let pointerDefault = def.reviewer
-  const shepFam = providerFamily(A.shepherd.model, pool)
-  if (shepFam === pointerDefault) pointerDefault = otherReviewer(pointerDefault, pool)
-  A.pointer = pickReviewer('pointer', pins, pointerDefault, stats, domain, explore, warnings, pool)
-  enforceCrossFamily(A.pointer, A.shepherd, 'Pointer', warnings, pool)
+  const shepEx = [A.shepherd.model, A.shepherd.fallback].filter(Boolean)
+  const pointerDefault = reviewerChain({ pool, exclude: shepEx, enabled, prefer: def.reviewer })[0] || def.reviewer
+  A.pointer = pickReviewer('pointer', pins, pointerDefault, stats, domain, explore, warnings, pool, enabled, shepEx)
+  enforceCrossFamily(A.pointer, A.shepherd, 'Pointer', warnings, pool, enabled)
 
   // Watchdog — reviewer-a verify by default; cross-family from Shepherd; carries mode.
-  let wdDefault = def.watchdog
-  if (shepFam === wdDefault) wdDefault = otherReviewer(wdDefault, pool)
-  A.watchdog = pickReviewer('watchdog', pins, wdDefault, stats, domain, explore, warnings, pool)
+  const wdDefault = reviewerChain({ pool, exclude: shepEx, enabled, prefer: def.watchdog })[0] || def.watchdog
+  A.watchdog = pickReviewer('watchdog', pins, wdDefault, stats, domain, explore, warnings, pool, enabled, shepEx)
   A.watchdog.mode = def.watchdogMode
   A.watchdog.rationale += ` — ${def.watchdogMode} verify (${domain})`
-  enforceCrossFamily(A.watchdog, A.shepherd, 'Watchdog', warnings, pool)
+  enforceCrossFamily(A.watchdog, A.shepherd, 'Watchdog', warnings, pool, enabled)
 
   // Tracker — judgment default; routable (metered-with-fallback) on explore-eligible
   // tiers only. NOT a reviewer, so it may be an implementer family.
@@ -270,50 +303,77 @@ function pickWithPin(role, pins, defModel, stats, domain, explore, warnings, poo
   }
 }
 
-// Reviewer pick — always a reviewer family. Exploit best-by-data when a candidate is
+// Shepherd pick. A coder-alt pin (a family that is NOT judgment/work-horse, e.g. a
+// model that also reviews) is honored only on non-heavy tiers with the family enabled,
+// and carries `fallback` = the tier-default implementer the pipeline runs instead when
+// coder-alt is rate-limited. Every other pin behaves exactly as before (pin wins).
+function pickShepherd(pins, def, stats, domain, explore, warnings, pool, enabled) {
+  const pinFam = providerFamily(pins.shepherd, pool)
+  if (pool.coderAlt && pinFam === pool.coderAlt && pinFam !== pool.judgment && pinFam !== pool.workHorse) {
+    if (def.heavy) {
+      warnings.push(`ignoring shepherd pin "${pins.shepherd}" — heavy/compliance tiers force ${def.shepherd} (judgment)`)
+      return pickWithPin('shepherd', {}, def.shepherd, stats, domain, explore, warnings, pool)
+    }
+    if (enabled && !enabled.has(pinFam)) {
+      warnings.push(`ignoring shepherd pin "${pins.shepherd}" — ${pinFam} is disabled`)
+      return pickWithPin('shepherd', {}, def.shepherd, stats, domain, explore, warnings, pool)
+    }
+    return { model: pinFam, fallback: def.shepherd, rationale: `operator pin (${pins.shepherd}) — coder-alt; falls back to ${def.shepherd} on rate limit`, source: 'pin' }
+  }
+  return pickWithPin('shepherd', pins, def.shepherd, stats, domain, explore, warnings, pool)
+}
+
+// Reviewer pick — always a reviewer family, enabled, and never a family in `exclude`
+// (the writer of the reviewed artifact). Exploit best-by-data when a candidate is
 // trusted; else the domain default. Coerces any implementer/garbage to a reviewer family.
-function pickReviewer(role, pins, defModel, stats, domain, explore, warnings, pool) {
+// The returned assignment carries `chain`: its ordered fallback list (model first).
+function pickReviewer(role, pins, defModel, stats, domain, explore, warnings, pool, enabled = null, exclude = []) {
   const { REVIEWER } = familySets(pool)
+  const withChain = (a) => ({ ...a, chain: reviewerChain({ pool, exclude, enabled, prefer: a.model }) })
+  const eligible = reviewerChain({ pool, exclude, enabled })
   if (pins[role]) {
     const fam = providerFamily(pins[role], pool)
-    if (fam && REVIEWER.has(fam)) return { model: fam, rationale: `operator pin (${pins[role]})`, source: 'pin' }
-    if (fam) warnings.push(`ignoring ${role} pin "${pins[role]}" — reviewers must be a reviewer family (non-implementer)`)
+    if (fam && REVIEWER.has(fam) && eligible.includes(fam)) return withChain({ model: fam, rationale: `operator pin (${pins[role]})`, source: 'pin' })
+    if (fam && REVIEWER.has(fam)) warnings.push(`ignoring ${role} pin "${pins[role]}" — same family as the artifact's writer (cross-family rule) or disabled`)
+    else if (fam) warnings.push(`ignoring ${role} pin "${pins[role]}" — reviewers must be a reviewer family (non-implementer)`)
     else warnings.push(`unrecognized ${role} pin "${pins[role]}" — using default`)
   }
-  let base = REVIEWER.has(defModel) ? defModel : pool.reviewerA
+  let base = eligible.includes(defModel) ? defModel : (eligible[0] || pool.reviewerA)
   if (base !== defModel) warnings.push(`${role} default coerced to ${base} (reviewers must be a reviewer family)`)
 
   // Adaptive: bandit over BOTH reviewer families once reward exists — you can't learn the
   // best reviewer without sampling both, so this re-introduces reviewer-b as an explore
   // candidate on cheap tiers (exploit-only tiers just pick the best KNOWN reviewer).
-  const adaptive = banditPick([pool.reviewerA, pool.reviewerB], stats, role, domain, explore)
-  if (adaptive) return adaptive
+  // Only chain-eligible families are candidates (never the writer's family).
+  const adaptive = banditPick([pool.reviewerA, pool.reviewerB].filter((m) => eligible.includes(m)), stats, role, domain, explore)
+  if (adaptive) return withChain(adaptive)
   const best = bestReviewerByData(stats, role, domain, pool)
-  if (best && best !== base) {
-    return { model: best, rationale: `data-driven: ${best} best signal/noise for ${role}/${domain}`, source: 'exploit' }
+  if (best && best !== base && eligible.includes(best)) {
+    return withChain({ model: best, rationale: `data-driven: ${best} best signal/noise for ${role}/${domain}`, source: 'exploit' })
   }
   const cell = cellOf(stats, base, role, domain)
-  if (trusted(cell)) return { model: base, rationale: `${domain} default, confirmed by data (${cell.runs} runs)`, source: 'exploit' }
-  return {
+  if (trusted(cell)) return withChain({ model: base, rationale: `${domain} default, confirmed by data (${cell.runs} runs)`, source: 'exploit' })
+  return withChain({
     model: base,
     rationale: explore ? `${domain} default (work horse) — exploring to accrue data` : `${domain} default (thin data → safe)`,
     source: explore ? 'explore' : 'default',
-  }
+  })
 }
 
-// Given one reviewer family, return the OTHER reviewer family (the cross-family alternate).
-function otherReviewer(m, pool = DEFAULT_POOL) {
-  return m === pool.reviewerB ? pool.reviewerA : pool.reviewerB
-}
-
-// Coerce a reviewer assignment to differ from Shepherd's family (cross-family).
-function enforceCrossFamily(reviewerA, shepherdA, label, warnings, pool) {
-  if (providerFamily(reviewerA.model, pool) === providerFamily(shepherdA.model, pool)) {
-    const fixed = otherReviewer(reviewerA.model, pool)
-    warnings.push(`${label} collided with Shepherd family (${reviewerA.model}) — switched to ${fixed} (cross-family)`)
-    reviewerA.model = fixed
+// Coerce a reviewer assignment to differ from Shepherd's family (cross-family): move to
+// the first link of the chain with the Shepherd's family (and its fallback) removed.
+// An empty chain is an invariant breach — throw (fail loud), never keep the collision.
+function enforceCrossFamily(reviewerA, shepherdA, label, warnings, pool, enabled = null) {
+  const shepEx = [shepherdA.model, shepherdA.fallback].filter(Boolean)
+  const exFams = new Set(shepEx.map((m) => providerFamily(m, pool)))
+  if (exFams.has(providerFamily(reviewerA.model, pool))) {
+    const chain = reviewerChain({ pool, exclude: shepEx, enabled })
+    if (!chain.length) throw new Error(`routing constraint violation: ${label} has no cross-family reviewer left (Shepherd ${shepherdA.model})`)
+    warnings.push(`${label} collided with Shepherd family (${reviewerA.model}) — switched to ${chain[0]} (cross-family)`)
+    reviewerA.model = chain[0]
     reviewerA.rationale += ` [cross-family from Shepherd]`
   }
+  reviewerA.chain = reviewerChain({ pool, exclude: shepEx, enabled, prefer: reviewerA.model })
 }
 
 // Map a model token to its family. PROVIDER-NEUTRAL: matches against the running
@@ -326,7 +386,10 @@ export function providerFamily(m, pool = DEFAULT_POOL) {
   const s = String(m).toLowerCase()
   // Order: longest/most-specific family names first so a substring of one family
   // name can't shadow another. The default neutral names are mutually non-overlapping.
-  const families = [pool.judgment, pool.workHorse, pool.reviewerA, pool.reviewerB]
+  // reviewer-c / coder-alt are matched BEFORE reviewer-b: a concrete pool may run
+  // reviewer-c through reviewer-b's CLI (e.g. GLM via Vibe on the Mistral API), so its
+  // labels can contain reviewer-b's brand too.
+  const families = [pool.judgment, pool.workHorse, pool.reviewerA, pool.reviewerC, pool.coderAlt, pool.reviewerB]
   for (const fam of families) {
     if (fam && s.includes(String(fam).toLowerCase())) return fam
   }
@@ -344,11 +407,31 @@ export function assertConstraints(A, warnings, pool = DEFAULT_POOL) {
   }
   if (providerFamily(A.pointer.model, pool) === providerFamily(A.shepherd.model, pool)) problems.push('Pointer shares Shepherd family (not cross-model)')
   if (providerFamily(A.watchdog.model, pool) === providerFamily(A.shepherd.model, pool)) problems.push('Watchdog shares Shepherd family (not cross-model)')
+  // Chain rule: no fallback link of a code reviewer may be the Shepherd's family (or its
+  // fallback), and no link of any reviewer may be an implementer family.
+  const shepFams = new Set([A.shepherd.model, A.shepherd.fallback].filter(Boolean).map((m) => providerFamily(m, pool)))
+  for (const role of ['bloodhound', 'pointer', 'watchdog']) {
+    for (const link of A[role].chain || []) {
+      if (IMPLEMENTER.has(providerFamily(link, pool))) problems.push(`${role} chain contains an implementer family (${link})`)
+      if (role !== 'bloodhound' && shepFams.has(providerFamily(link, pool))) problems.push(`${role} chain contains the Shepherd's family (${link})`)
+    }
+  }
   if (problems.length) {
     // Fail-loud: these are invariant breaches, not soft warnings.
     throw new Error(`routing constraint violation: ${problems.join('; ')}`)
   }
   return warnings
+}
+
+// Operator pins from metadata: /hunt --shepherd/--bloodhound/--watchdog land in
+// metadata.models.{architect_recommended,reviewer,certifier}; explicit model_pins win.
+export function pinsFromMeta(meta = {}) {
+  const m = meta.models || {}
+  const pins = {}
+  if (m.architect_recommended) pins.shepherd = m.architect_recommended
+  if (m.reviewer) pins.bloodhound = m.reviewer
+  if (m.certifier) pins.watchdog = m.certifier
+  return { ...pins, ...(meta.model_pins || {}) }
 }
 
 // ─── CLI ────────────────────────────────────────────────────────
@@ -365,7 +448,7 @@ function main(argv) {
     tier: meta.tier,
     dimensions: meta.predicted_dimensions || {},
     stats: stats.model_stats || stats,
-    pins: meta.model_pins || {},
+    pins: pinsFromMeta(meta),
   })
   console.log(JSON.stringify(rec, null, 2))
 }
