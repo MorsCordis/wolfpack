@@ -28,26 +28,29 @@ fi
 # type=assistant; message.content is an array of blocks, some of which
 # are {type:"text", text:"..."}. Walk the transcript from the end to
 # find the most recent assistant turn and concatenate its text blocks.
-LAST_TEXT=$(tac "$TRANSCRIPT" | while IFS= read -r line; do
-    echo "$line" | jq -e 'select(.type == "assistant")' >/dev/null 2>&1 && {
-        echo "$line" | jq -r '.message.content | if type == "array" then map(select(.type == "text") | .text) | join("\n") else . end' 2>/dev/null
-        break
-    }
-done)
+# One streaming jq pass over the transcript tail. The previous `tac | while … break`
+# loop died with SIGPIPE (exit 141) under `set -o pipefail` once transcripts grew past a
+# pipe buffer, surfacing as a "Stop hook error" every turn; it also spawned two jq
+# processes per line. `fromjson?` skips a partially-written final line instead of failing.
+LAST_TEXT=$(tail -n 4000 "$TRANSCRIPT" | jq -nrR '
+    [inputs | fromjson? | select(type == "object" and .type == "assistant")] | last
+    | if . == null then "" else
+        (.message.content | if type == "array" then map(select(.type == "text") | .text) | join("\n") else (. // "") end)
+      end' 2>/dev/null || true)
 
 [[ -z "$LAST_TEXT" ]] && exit 0
 
 # Only inspect the tail — real completion blocks live at the end of the
 # message. This also avoids false positives when the agent quoted a
 # finishing-message template mid-response (as in code review).
-TAIL=$(echo "$LAST_TEXT" | tail -n 25)
+TAIL=$(tail -n 25 <<<"$LAST_TEXT")
 
 # Phase-completion signatures. If any match in the tail, a Next: line must
 # also appear there.
 SIGNATURES='^(✓ Plan written|✓ Revised plan|✓ Review round|✓ Shepherd phase|✓ PASS|✗ REWORK|✗ FLAWED_PLAN|✓ Debrief ready|✓ Merged and pushed|✓ Hunt scaffolded|✓ Campaign scouted|✓ Smoke cycle complete|✓ Smoke tests: all pass)'
 
-if echo "$TAIL" | grep -qE "$SIGNATURES"; then
-    if ! echo "$TAIL" | grep -qE '^Next:'; then
+if grep -qE "$SIGNATURES" <<<"$TAIL"; then
+    if ! grep -qE '^Next:' <<<"$TAIL"; then
         cat >&2 <<'MSG'
 ⚠ Wolfpack handoff check: phase-completion marker detected but the `Next:`
 line is missing from the tail of your response.
