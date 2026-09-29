@@ -5,6 +5,16 @@ this file holds work on the **generic** pipeline (orchestration layer, router, r
 hunt artifacts). Items migrated from `pawpims/TODO.md` during the consumer cutover (2026-06-23)
 keep their original filing dates.
 
+## Follow-ups from 2026-09-28 (platform-console-shell / GLM wiring)
+
+- [ ] **Rebuild the base sandbox image with a current Vibe** — it ships Vibe 2.13 (no `--auto-approve`), so GLM seats exit 2 inside `/run-campaign` container runs; only `/run-campaign-local` works today. Then retire the separate `wolfpack-sandbox-glm` image.
+- [ ] **Certify seat can write + commit product code** — PawPIMS Watchdog (Gemini, `podman-agy.sh --certify`) committed a code fix (`cdaba412`) despite a read-only worktree mount (the git dir / plan dir mounts are writable). Restrict certify to writing `certification.md` + `pedigree.json` only, and have the pipeline reject/park any non-artifact commit authored during certification. Workaround used: re-certify via `--review` (read-only) and write certification.md from its output.
+- [ ] **Sonnet re-entry** (when Cecil enables the new Sonnet — model ID from him): Model Pool + routing so Sonnet is the default Shepherd ≤ Orange and default Tracker; never a reviewer of Claude-written work; staged rollout compared on Pointer/Tracker bounce rates (see PawPIMS memory `project_sonnet_reentry_plan`).
+- [ ] **Vendor-family rule for local models** — Gemma is Google, so Gemini must not review Gemma-written code; encode `gemma → google` (same family as gemini) in `providerFamily`/routing so the examiner chain excludes Gemini for Gemma writers.
+- [ ] **Promote the UI render/content checker into a reusable hunt harness** — `verify_ui.py` (PawPIMS `platform-console-shell` plan dir `h2h/`) caught what 9 review rounds missed (namespace bug, empty page, missing include). Generalise: render every template with realistic context built from the hunt's dataclass contract, assert content (not just "renders"), no content outside blocks, namespaced `{% url %}`, CSP/design-token rules. Lessons baked in: supply `csrf_token` in context; plain static storage.
+- [ ] **Local-model harness lessons → shim + docs**: always `vibe -p … < /dev/null` (open stdin blocks forever — podman-vibe.sh already does; the "hangs on approval" comment there is partly this); `edit` (not `search_replace`) is Vibe's modify tool and `write_file` refuses existing files; `--max-turns` counts the whole resumed session; feed checker output back by resuming the same session.
+- [ ] **Nemotron Lightning re-trial** after its serving config is checked (reasoning parser / streaming after tool calls → Vibe `Completed public history entry is frozen`), with `< /dev/null` + `--auto-approve`.
+
 ## Orchestration layer
 
 - [ ] **Heartbeat: write to an absolute mount path so the host can observe post-Scaffold phases**
