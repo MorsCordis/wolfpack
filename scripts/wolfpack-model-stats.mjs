@@ -56,7 +56,7 @@ const ROLES = ['alpha', 'bloodhound', 'shepherd', 'pointer', 'tracker', 'watchdo
 // Tolerates BOTH the pre-[03]/[05] format (model_assignments/shepherd_model +
 // execution_scores, no ledger/timing) and the newer one (review_fingerprints,
 // timing). Unknown/absent fields → null, never guessed.
-export function normalizeHunt(p) {
+export function normalizeHunt(p, pool) {
   if (!p || typeof p !== 'object') return null
   const dims = p.predicted_dimensions || {}
   const domain = deriveDomain(dims)
@@ -69,7 +69,7 @@ export function normalizeHunt(p) {
   const models = {}
   for (const role of ROLES) {
     const raw = ma[role] || (role === 'shepherd' ? p.shepherd_model : null)
-    models[role] = providerFamily(raw)   // null if unset/unrecognized
+    models[role] = providerFamily(raw, pool)   // null if unset/unrecognized (pool: routing's; default DEFAULT_POOL)
   }
 
   // Quality proxy (coarse, pre-ledger): mean of the two quality-ish scores.

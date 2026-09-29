@@ -17,6 +17,11 @@
 #   scripts/wolfpack-sync-runtime.sh [TARGET_FILE] [--check]
 #     TARGET_FILE  consumer runtime copy to (re)generate
 #                  default: $HOME/Projects/pawpims/.claude/workflows/hunt-pipeline.js
+#                  The canonical SOURCE is chosen by the target's basename:
+#                  .agents/workflows/<basename> — so hunt-pipeline.js AND
+#                  campaign-runner.js (and any future workflow) sync the same way.
+#                  Point it at a worktree to regenerate a branch's copy, e.g.
+#                  …/pawpims/.claude/worktrees/<slug>/.claude/workflows/campaign-runner.js
 #     --check      dry-run: print the diff that WOULD be applied; write nothing.
 #                  Exit 0 = already in sync, 1 = drift, 2 = error.
 #
@@ -29,12 +34,15 @@ SRC_NS='.agents'
 DST_NS='.claude'
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CANONICAL="$REPO_ROOT/.agents/workflows/hunt-pipeline.js"
 
 TARGET="${1:-$HOME/Projects/pawpims/.claude/workflows/hunt-pipeline.js}"
 CHECK=0
 [ "${1:-}" = "--check" ] && { CHECK=1; TARGET="$HOME/Projects/pawpims/.claude/workflows/hunt-pipeline.js"; }
 [ "${2:-}" = "--check" ] && CHECK=1
+
+# Canonical source = the same-named workflow in this repo (hunt-pipeline.js,
+# campaign-runner.js, …). A target whose basename has no canonical twin is an error.
+CANONICAL="$REPO_ROOT/.agents/workflows/$(basename "$TARGET")"
 
 [ -f "$CANONICAL" ] || { echo "ERROR: canonical not found: $CANONICAL" >&2; exit 2; }
 # TARGET may legitimately NOT exist yet — a fresh clone, or after the runtime copy was

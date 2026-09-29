@@ -92,7 +92,7 @@ Then call the **Workflow tool**:
 
 It runs as a **background task in this session**: `campaign-runner` → `workflow('hunt-pipeline')`
 per hunt → `agent()` Claude subagents (this-session billing) → `podman-agy.sh` / `podman-vibe.sh`
-for the Gemini/Mistral reviewer pods (host podman, unaffected by Claude billing). It stops at each
+for the Gemini/GLM/Mistral reviewer pods (host podman, unaffected by Claude billing). It stops at each
 wave barrier exactly like the container path. Relay the barrier verdict when the task completes.
 
 ## Differences from the container path (`/run-campaign`)
@@ -101,7 +101,7 @@ wave barrier exactly like the container path. Relay the barrier verdict when the
   spend.
 - **Sandbox:** the Claude agents run with THIS session's permissions on the host repo — no
   container FS isolation for *them* (worktrees still isolate parallel hunts; the prod/`git add`
-  hooks still block; the Gemini/Mistral pods keep their own isolation). For full isolation, run
+  hooks still block; the Gemini/GLM/Mistral pods keep their own isolation). For full isolation, run
   this session inside a workspace pod (then the reviewer shims need host-podman-socket passthrough
   or rootless podman-in-podman).
 - **No pipeline code changes** — `campaign-runner.js` / `hunt-pipeline.js` are already

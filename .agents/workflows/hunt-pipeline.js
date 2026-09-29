@@ -6,12 +6,12 @@ export const meta = {
     { title: 'Scaffold', detail: 'Create hunt directory, metadata, worktree' },
     { title: 'Spec', detail: 'Capture intent as acceptance.md; confidence gate (build vs park)' },
     { title: 'Plan', detail: 'Alpha writes implementation plan' },
-    { title: 'Review', detail: 'Bloodhound reviews via Gemini, Alpha revises' },
+    { title: 'Review', detail: 'Bloodhound reviews via the non-Claude examiner chain (Gemini → GLM), Alpha revises' },
     { title: 'Debrief', detail: 'Alpha synthesizes plan-final' },
     { title: 'Implement', detail: 'Shepherd implements code in worktree' },
-    { title: 'Code Review', detail: 'Pointer reviews diff via Gemini' },
+    { title: 'Code Review', detail: 'Pointer reviews diff via the cross-family examiner chain' },
     { title: 'Test', detail: 'Tracker writes and runs tests' },
-    { title: 'Certify', detail: 'Watchdog certifies via Gemini' },
+    { title: 'Certify', detail: 'Watchdog certifies via the cross-family examiner chain' },
     { title: 'Verify', detail: 'Deploy feat branch to dev, smoke test before merge' },
   ],
 }
@@ -28,6 +28,9 @@ const VERDICT_SCHEMA = {
     trackerRounds: { type: 'number' },
     bloodhoundModel: { type: 'string' },
     worktreePath: { type: 'string' },
+    // Watchdog: the examiner family that actually certified (gemini | glm | mistral) —
+    // checked against the code writer's family by the cross-family runtime invariant.
+    provider: { type: 'string' },
   },
   required: ['verdict'],
 }
@@ -44,6 +47,9 @@ const REVIEW_SCHEMA = {
     verdict: { type: 'string' },
     findings: { type: 'number' },
     status: { type: 'string' },
+    // The examiner family that produced the ACCEPTED review: "gemini" | "glm" | "mistral"
+    // (never Claude). The orchestrator asserts it is NOT the reviewed artifact's writer
+    // family (cross-family runtime invariant) and parks loud if it is, or if unresolvable.
     provider: { type: 'string' },
     grounded: { type: 'number' },   // file-bearing findings that grounded out (file exists)
     dropped: {                       // findings dropped as ungrounded (file not found)
@@ -357,45 +363,127 @@ const _args = (typeof args === 'string') ? JSON.parse(args) : (args || {})
 const { slug, description, campaign, tier: campaignTier, mode: campaignMode,
         ticketRefs, todoItemsCleared, migrationRisk, rationale } = _args
 
-// Which non-Claude model is THIS hunt's primary cross-examiner. The campaign
-// runner alternates it per hunt (mistral / gemini) so two parallel hunts never
-// stack their reviews on the same model — that round-robin is the DEFAULT/spread
-// baseline. Once Alpha runs, its pedigree-driven model_assignments.bloodhound
-// OVERRIDES this (see below): Alpha picks, the runner's alternation only
-// rebalances when Alpha left it unset. Both Vibe/Mistral and Agy/Gemini can
-// perform every review/certification phase; the only invariant is that the
-// examiner is never Claude (adversarial cross-model review is mandatory).
-// AUTONOMOUS = Gemini-only for cross-model review/cert. Mistral/Vibe is stripped from
-// the auto-pipeline — its API tier (25K tokens/min) can't carry real agentic reviews, so
-// it only ever fell over to Gemini anyway. The MANUAL slash-command path and podman-vibe.sh
-// are untouched (opt-in Mistral still works there). Set WOLFPACK_ENABLE_MISTRAL_AUTO=1 to
-// restore Mistral in autonomous runs.
-const AUTO_GEMINI_ONLY = !(typeof process !== 'undefined' && process.env && process.env.WOLFPACK_ENABLE_MISTRAL_AUTO)
-let crossExaminer = AUTO_GEMINI_ONLY ? 'gemini' : ((_args.crossExaminer === 'gemini') ? 'gemini' : 'mistral')
-let otherExaminer = AUTO_GEMINI_ONLY ? 'gemini' : (crossExaminer === 'mistral' ? 'gemini' : 'mistral')
-const EXAMINER_LABEL = { mistral: 'Vibe/Mistral', gemini: 'Agy/Gemini' }
+// The slug is interpolated into worktree paths, branch names, /tmp files and shell
+// commands. Fail LOUD at hunt start on anything outside the safe charset rather than
+// quoting our way around a hostile/garbled value later.
+if (!/^[a-z0-9][a-z0-9-]*$/.test(String(slug || ''))) {
+  throw new Error(`hunt-pipeline: invalid slug ${JSON.stringify(slug)} — must match ^[a-z0-9][a-z0-9-]*$ (it is used in shell commands and paths)`)
+}
 
-// Map a model-assignment string ("gemini:flash-3.5", "mistral:medium",
-// "Agy/Gemini", "Vibe/Mistral") to its provider family, or null if unrecognized
-// / Claude (Claude can never be an examiner). Used to honor Alpha's reviewer
-// assignment and to pin the examiner that actually answered (stickiness).
-const providerOf = (m) => {
+// POSIX single-quote a value for a shell command string: 'it'\''s' form. Every path /
+// prompt-file / agent name interpolated into a command the shim agents run goes through
+// this (defense in depth on top of the slug charset check).
+const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
+
+// Capability marker read by campaign-runner (via its preflight) to detect a STALE
+// generated runtime copy: protocol 2 = examiner chain + glm family.
+// WOLFPACK_EXAMINER_PROTOCOL=2
+const EXAMINER_PROTOCOL = 2
+void EXAMINER_PROTOCOL
+
+// Git trailer stamped on every Shepherd commit ("Wolfpack-Writer: glm|claude") — the
+// DURABLE, git-side code-writer record. The resume probe reads it back and unions it with
+// metadata.shepherd_families, so losing metadata can never let a family review its own code.
+const WRITER_TRAILER = 'Wolfpack-Writer'
+
+// ─── Examiner CHAIN (non-Claude reviewer families, in fallback order) ─────────
+// Every review seat (Bloodhound, Pointer, Watchdog) walks an ORDERED chain of non-Claude
+// examiner families and falls to the next link when one is rate-limited (shim exit 75 /
+// WOLFPACK_RATE_LIMITED) or fails; chain exhausted by rate limits → park model_quota.
+//   gemini  — Agy/Gemini. Always enabled; the judgment-grade verifier.
+//   glm     — Vibe/GLM (GLM 5.3 via the Mistral API, run through Vibe). Enabled by
+//             default; WOLFPACK_ENABLE_GLM unset/""/"1"/"true" = on, anything else off.
+//   mistral — Vibe/Mistral. Opt-in only (WOLFPACK_ENABLE_MISTRAL_AUTO set): its API tier
+//             can't carry real agentic reviews headlessly, so it stays stripped by default.
+// CROSS-FAMILY RULE (never relaxes): the chain for a seat is the enabled order MINUS the
+// family that WROTE the artifact under review — Bloodhound excludes the planner's family
+// (Alpha = Claude), Pointer/Watchdog exclude every family that wrote code this hunt
+// (codeWriterFamilies: claude, and glm when the GLM Shepherd ran). A seat never reviews
+// its own family's work; an empty chain parks loud, it never falls back same-family.
+// The campaign runner's per-hunt hint (_args.crossExaminer) and Alpha's pedigree pick
+// only ROTATE an eligible family to the front (preferredExaminer); they can't re-admit
+// an excluded or disabled one.
+const _env = (k) => ((typeof process !== 'undefined' && process.env) ? process.env[k] : undefined)
+const MISTRAL_AUTO = !!_env('WOLFPACK_ENABLE_MISTRAL_AUTO')
+const GLM_ENABLED = (() => {
+  const v = _env('WOLFPACK_ENABLE_GLM')
+  if (v === undefined || v === null) return true
+  const t = String(v).trim().toLowerCase()
+  return t === '' || t === '1' || t === 'true'
+})()
+const EXAMINER_ORDER = ['gemini', 'glm', 'mistral']
+  .filter(f => f === 'gemini' || (f === 'glm' && GLM_ENABLED) || (f === 'mistral' && MISTRAL_AUTO))
+const EXAMINER_LABEL = { mistral: 'Vibe/Mistral', gemini: 'Agy/Gemini', glm: 'Vibe/GLM' }
+
+// Map a model-assignment string to its family, or null if unrecognized. glm is matched
+// FIRST: GLM runs through Vibe on the Mistral API, so "Vibe/GLM", "glm:5.3", "glm-5.3",
+// "zai-glm-5-3", "mistral:zai-glm-5-3" must never fall into the vibe/mistral branch.
+// Claude strings resolve to 'claude' (a WRITER family; never an examiner).
+const familyOf = (m) => {
   if (!m) return null
   const s = String(m).toLowerCase()
+  if (s.includes('glm')) return 'glm'
   if (s.includes('gemini') || s.includes('agy')) return 'gemini'
   if (s.includes('mistral') || s.includes('vibe')) return 'mistral'
+  if (s.includes('claude') || s.includes('opus') || s.includes('sonnet') || s.includes('haiku')) return 'claude'
   return null
 }
-// Pin the primary examiner (and derive the fallback). Idempotent; ignores
-// unrecognized/Claude inputs so a bad value never blanks the examiner.
+// Examiner family (non-Claude) or null. Used to honor Alpha's reviewer assignment and
+// to pin the examiner that actually answered (stickiness).
+const providerOf = (m) => { const f = familyOf(m); return f && f !== 'claude' ? f : null }
+
+// The planner (Alpha) is always Claude — Bloodhound's excluded writer family.
+const PLAN_WRITER_FAMILIES = new Set(['claude'])
+// Families that have WRITTEN code on this hunt's branch (Pointer/Watchdog exclusions).
+// Claude by default; the Shepherd seat resolution below adds glm when a GLM Shepherd is
+// (or was, per metadata.shepherd_families) the implementer — and keeps claude whenever a
+// Claude Shepherd (or a Claude fallback) touched the code.
+const codeWriterFamilies = new Set(['claude'])
+
+let preferredExaminer = (() => {
+  const p = providerOf(_args.crossExaminer)
+  return p && EXAMINER_ORDER.includes(p) ? p : 'gemini'
+})()
+
+// The ordered chain for a seat whose artifact was written by `writers` (a Set/array of
+// families). Preferred examiner rotated to the front when eligible.
+const examinerChain = (writers) => {
+  const ex = new Set([...writers].map(w => familyOf(w) || w))
+  const base = EXAMINER_ORDER.filter(f => !ex.has(f))
+  return base.includes(preferredExaminer) ? [preferredExaminer, ...base.filter(f => f !== preferredExaminer)] : base
+}
+const chainLabel = (chain) => chain.map(f => EXAMINER_LABEL[f]).join(' → ') || '(none)'
+
+// Pin the preferred (first-tried) examiner. Idempotent; ignores unrecognized/Claude/
+// disabled inputs so a bad value never blanks the chain. The chain filter still removes
+// it for any seat reviewing its own family's work.
 const setExaminer = (provider, why) => {
-  // Gemini-only autonomous mode: ignore any Mistral assignment, stay on Gemini.
-  if (AUTO_GEMINI_ONLY) { crossExaminer = 'gemini'; otherExaminer = 'gemini'; return }
   const p = providerOf(provider)
-  if (!p || p === crossExaminer) return
-  crossExaminer = p
-  otherExaminer = p === 'mistral' ? 'gemini' : 'mistral'
-  log(`Cross-examiner → ${EXAMINER_LABEL[crossExaminer]} (${why})`)
+  if (!p || p === preferredExaminer) return
+  if (!EXAMINER_ORDER.includes(p)) {
+    log(`Examiner ${p} ignored (${why}) — disabled by env gate (enabled: ${EXAMINER_ORDER.join(', ')})`)
+    return
+  }
+  preferredExaminer = p
+  log(`Preferred examiner → ${EXAMINER_LABEL[p]} (${why})`)
+}
+
+// RUNTIME CROSS-FAMILY INVARIANT. Called on every non-ERROR review/certify result: every
+// family that produced an accepted unit must resolve, be non-Claude, be in the seat's
+// chain, and NOT be a writer family of the reviewed artifact. Returns null when sound,
+// else a reason string — the caller PARKS (fail loud) instead of trusting a same-family
+// (or unattributable) review.
+const crossFamilyViolation = (result, writers, chain) => {
+  const provs = (result && Array.isArray(result.providers) && result.providers.length)
+    ? result.providers : [result && (result.provider || result.status)]
+  for (const p of provs) {
+    const f = familyOf(p)
+    if (!f) return `reviewer family unresolvable (provider="${p || ''}") — cannot prove cross-family review`
+    if (f === 'claude') return `review produced by Claude (${p}) — reviewers must be non-Claude`
+    if ([...writers].includes(f)) return `review produced by ${f}, the SAME family that wrote the artifact (writers: ${[...writers].join(', ')})`
+    if (!chain.includes(f)) return `review produced by ${f}, outside this seat's examiner chain [${chain.join(', ')}]`
+  }
+  return null
 }
 
 const campaignContext = [
@@ -559,7 +647,7 @@ Steps:
    - bloodhoundRounds: metadata.bloodhound_rounds (or 0)
    - pointerRounds: metadata.pointer_rounds (or 0)
    - trackerRounds: metadata.tracker_rounds (or 0)
-   - bloodhoundModel: metadata.model_assignments.bloodhound provider family ("gemini" or "mistral"), or null if unset
+   - bloodhoundModel: metadata.model_assignments.bloodhound provider family ("gemini", "glm" or "mistral"), or null if unset
    - worktreePath: absolute REPO/.agents/worktrees/${slug}
    - planDir: absolute worktree plan dir
    - worktreeExists: true if the worktree directory exists (ls it)
@@ -756,7 +844,7 @@ ${heartbeat('Scaffold', 'creating worktree and metadata')}
   log(`Adopted existing worktree (resume): ${worktreePath}`)
 }
 log(`Worktree: ${worktreePath}`)
-log(`Cross-examiner for this hunt: ${EXAMINER_LABEL[crossExaminer]} (fallback: ${EXAMINER_LABEL[otherExaminer]})`)
+log(`Examiner chain for this hunt (reviews of Claude-written work): ${chainLabel(examinerChain(PLAN_WRITER_FAMILIES))} — enabled: ${EXAMINER_ORDER.join(', ')} (WOLFPACK_ENABLE_GLM ${GLM_ENABLED ? 'on' : 'off'}, WOLFPACK_ENABLE_MISTRAL_AUTO ${MISTRAL_AUTO ? 'on' : 'off'})`)
 
 // ALWAYS invoke the cross-model shims from the MAIN repo root, never the
 // worktree's `./scripts/`. Worktrees fork from main and can carry a STALE/drifted
@@ -781,16 +869,38 @@ log(`Shim root (always current): ${repoRoot}/scripts/`)
 // sweet spot (too few starves; too many accumulates context toward the --max-tokens guard).
 const MISTRAL_REVIEW_TURNS = (typeof process !== 'undefined' && process.env && process.env.WOLFPACK_MISTRAL_REVIEW_TURNS) || '15'
 
-// Read-only review command for a given model. `vibeAgent` is the Vibe agent
-// name used when the model is Mistral (ignored for Gemini/Agy --review).
+// GLM review/cert turn budget. Vibe's --max-turns counts the WHOLE session (incl. resumed
+// turns), so a tight cap starves the review into empty output; the shim's wall-clock
+// timeout (WOLFPACK_VIBE_REVIEW_TIMEOUT) is the real bound. Keep ≥80.
+const GLM_REVIEW_TURNS = _env('WOLFPACK_GLM_REVIEW_TURNS') || '80'
+// GLM implement budget (≥150; WOLFPACK_VIBE_IMPLEMENT_TIMEOUT is the real bound).
+const GLM_IMPLEMENT_TURNS = _env('WOLFPACK_GLM_IMPLEMENT_TURNS') || '150'
+
+// Read-only review command for a given examiner family. `vibeAgent` is the Vibe agent
+// base name used for the Vibe families: Mistral runs it as-is; GLM runs the "-glm"
+// variant (wolfpack-<role>-glm: active_model glm-5.3, read-only tools), which the shim
+// resolves to the glm family (own rate-limit key + semaphore, --auto-approve, strict
+// read-only allow-list). Ignored for Gemini/Agy --review.
 const reviewCmd = (who, vibeAgent, promptFile) =>
   who === 'mistral'
-    ? `${repoRoot}/scripts/podman-vibe.sh ${vibeAgent} "${worktreePath}" ${promptFile} ${MISTRAL_REVIEW_TURNS}`
+    ? `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} ${shq(vibeAgent)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(MISTRAL_REVIEW_TURNS)}`
+    : who === 'glm'
+    ? `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} ${shq(`${vibeAgent}-glm`)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(GLM_REVIEW_TURNS)}`
     // Agy/Gemini (agy 1.0.6) has NO --max-price/--max-tokens/--max-turns equivalent, only
     // --print-timeout (env WOLFPACK_AGY_REVIEW_TIMEOUT in the shim). So the Gemini side
     // keeps the generous wall-clock bound + prompt read-discipline (doc 05 § B1: "where
     // one CLI lacks it, keep the generous turn cap + read-discipline for that side").
-    : `${repoRoot}/scripts/podman-agy.sh --review "${worktreePath}" ${promptFile}`
+    : `${shq(`${repoRoot}/scripts/podman-agy.sh`)} --review ${shq(worktreePath)} ${shq(promptFile)}`
+
+// Prompt fragment: the ordered examiner-chain steps for a review shim agent.
+const chainSteps = (chain, vibeAgent, tmpFile) => chain.map((who, i) => i === 0
+  ? `   [1] PRIMARY ${EXAMINER_LABEL[who]} (provider "${who}") — on a NON-rate-limit failure wait 5s and retry ONCE:\n       ${reviewCmd(who, vibeAgent, tmpFile)}`
+  : `   [${i + 1}] FALLBACK ${EXAMINER_LABEL[who]} (provider "${who}") — one attempt:\n       ${reviewCmd(who, vibeAgent, tmpFile)}`).join('\n')
+
+// Prompt fragment: the hard cross-family boundary for a review shim agent.
+const chainBoundary = (chain, writers) => `CROSS-FAMILY BOUNDARY (hard rule): use ONLY the chain above, in order — ${chain.map(f => `"${f}"`).join(', ')}.
+NEVER review with Claude and NEVER with the family that wrote the artifact (${[...writers].join(', ')}) — not
+even as a last resort. When every link has failed, return ERROR as specified below; do not improvise another model.`
 // (ADC no longer gates anything — Tracker tests run against a local PostgreSQL.)
 void adcValid
 
@@ -833,13 +943,17 @@ Rules:
 const RATE_LIMIT_SIGNAL_NOTE = `
 RATE-LIMIT SIGNAL (read carefully): a cross-model shim that exits with code 75 OR prints
 a line starting with "WOLFPACK_RATE_LIMITED:" is RATE-LIMITED / cooling down — NOT broken.
-Do NOT retry that model; go STRAIGHT to the other (fallback) model. The shim already did
-its own backoff + circuit-breaking internally, so a 75 means "stop asking this endpoint."
-If the PRIMARY is rate-limited but the FALLBACK answers, proceed normally with the
-fallback's verdict. If BOTH the primary AND the fallback are rate-limited (both exit 75 /
-print WOLFPACK_RATE_LIMITED, or both fail with throttle/network/disconnect errors), do NOT
+Do NOT retry that model; go STRAIGHT to the NEXT link of the examiner chain. The shim
+already did its own backoff + circuit-breaking internally, so a 75 means "stop asking this
+endpoint." If an earlier link is rate-limited but a later link answers, proceed normally
+with that link's verdict. If EVERY link in the chain is rate-limited (each exits 75 /
+prints WOLFPACK_RATE_LIMITED, or fails with throttle/network/disconnect errors), do NOT
 return missing_verdict_block — return verdict "ERROR" with status EXACTLY "model_quota".
-That tells the pipeline this is a quota outage to reschedule, not a plumbing failure.`
+That tells the pipeline this is a quota outage to reschedule, not a plumbing failure.
+TIMEOUT SIGNAL: a shim that exits with code 76 OR prints a line starting with
+"WOLFPACK_TIMEOUT:" hit its wall-clock limit. Treat it like a failed link — move to the
+NEXT link (no retry) — but log the fallback reason as "timeout", NOT "rate_limited", and
+do NOT count it toward model_quota (model_quota only when EVERY link was rate-limited).`
 
 // [06] AC2 — record WHY a primary fell back, and CLASSIFY the reason so a
 // tool-box failure is graded differently from a capability failure (the spec's
@@ -848,12 +962,12 @@ That tells the pipeline this is a quota outage to reschedule, not a plumbing fai
 // primary→fallback MUST leave a logged, classified row + a LOUD log line (a buried
 // log isn't disclosure, CLAUDE.md). Appended to every review/certify shim prompt.
 const FALLBACK_LOG_NOTE = `
-FALLBACK LOGGING (mandatory when you fall back from the primary model to the other):
-When the PRIMARY model fails and you use the FALLBACK, you MUST (a) print a LOUD log line
-"WOLFPACK_FALLBACK: <role> r<round> <primary>→<fallback> reason=<reason>" to stdout, and
+FALLBACK LOGGING (mandatory EVERY time you move from one chain link to the next):
+When a link fails and you move to the next one, you MUST (a) print a LOUD log line
+"WOLFPACK_FALLBACK: <role> r<round> <failed>→<next> reason=<reason>" to stdout, and
 (b) append a row to metadata.json's "fallback_log" array (create it if absent):
-  { "role": "<bloodhound|pointer|watchdog>", "round": <n>, "primary": "<gemini|mistral>",
-    "fallback": "<gemini|mistral>", "reason": "<reason>", "evidence": "<short stderr/exit excerpt>" }
+  { "role": "<bloodhound|pointer|watchdog|shepherd>", "round": <n>, "primary": "<gemini|glm|mistral|claude>",
+    "fallback": "<gemini|glm|mistral|claude>", "reason": "<reason>", "evidence": "<short stderr/exit excerpt>" }
 CLASSIFY reason as EXACTLY one of — this drives whether the failure counts against the
 model's capability grade:
   • "rate_limited"  — primary exited 75 / printed WOLFPACK_RATE_LIMITED / threw a
@@ -868,8 +982,11 @@ model's capability grade:
         model failure — this one DOES count against the model's grade.
   • "error"         — plumbing broke (shim crashed, file-not-found, container error). Neither
         a model nor a quota signal; surface for a human.
-Pick the HIGHEST-priority reason that applies in the order rate_limited → tool_starved →
-error → capability (don't grade a model down for a failure a tool box or quota caused).`
+  • "timeout"       — primary exited 76 / printed WOLFPACK_TIMEOUT (wall clock ran out).
+        Recorded separately: neither a quota outage nor (by itself) a capability grade.
+Pick the HIGHEST-priority reason that applies in the order rate_limited → timeout →
+tool_starved → error → capability (don't grade a model down for a failure a tool box or
+quota caused).`
 
 // [06] AC1 tail — diff-catch: reviewers are read-only BY ROLE, enforced by
 // DETECTION not a tool fence ([06] § "un-box, enforce by role + diff-catch"). The
@@ -1179,6 +1296,9 @@ async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
     grounded: done.reduce((s, d) => s + (d.r.grounded || 0), 0),
     dropped: done.flatMap(d => d.r.dropped || []),
     provider: (done.find(d => d.r.provider) || {}).r?.provider || (done[0] && done[0].r.status) || null,
+    // Every accepted lens's provider (falling back to its status) — the cross-family
+    // runtime invariant checks ALL of them, not just the first.
+    providers: done.map(d => d.r.provider || d.r.status || null),
     status: (done.find(d => d.r.provider) || {}).r?.provider || null,
     degradeLog, unitsOk: done.length, unitsTotal: lenses.length,
   }
@@ -1331,13 +1451,16 @@ Execute Phase 1 (Initial Plan):
 - Read CLAUDE.md, AGENTS.md, TODO.md for project context
 - Read .wolfpack/pedigree/index.md and .wolfpack/pedigree/lessons.md for model selection data
 - [06] ROUTING — base ALL model_assignments on the data-driven router, not folklore: run
-  \`node ${repoRoot}/scripts/wolfpack-routing.mjs "${planDir}"\` AFTER you've written
+  \`node ${shq(`${repoRoot}/scripts/wolfpack-routing.mjs`)} ${shq(planDir)}\` AFTER you've written
   predicted_dimensions + tier to ${planDir}/metadata.json. It reads those + the per-model meter
   (.wolfpack/pedigree/model-stats.json, [06] AC3) and returns the work-horse/judgment tier
-  defaults overridden by capability×economics + domain (frontend→Gemini review/thorough
-  verify; backend→Mistral review + thin Gemini verify), honoring the HARD constraints (Alpha
-  always Opus; reviewers NEVER Claude; Pointer/Watchdog cross-family from Shepherd; never
-  explore on Red/compliance). Adopt its assignments into metadata.json model_assignments
+  defaults overridden by capability×economics + domain (frontend→thorough verify;
+  backend→thin verify), honoring the HARD constraints (Alpha always Opus; reviewers NEVER
+  Claude; every reviewer seat walks the examiner CHAIN gemini → glm (→ mistral if opted in)
+  with the WRITER's family removed — Pointer/Watchdog never share the Shepherd's family;
+  a glm:5.3 Shepherd pin is honored only on Green/Blue/Yellow non-compliance hunts and
+  carries a Claude fallback; never explore on Red/compliance). Adopt its assignments into
+  metadata.json model_assignments
   unless you have a specific documented reason to override (note it in the Debrief). The
   meter is thin until a calibration batch accrues, so today it returns the tier defaults —
   that is correct, not a bug. Follow .agents/skills/alpha/SKILL.md § Model Pool Selection.
@@ -1347,7 +1470,8 @@ Execute Phase 1 (Initial Plan):
 - Score predicted_dimensions (7 dimensions, 0-4 each)
 - Compute tier and mode — IF the campaign specifies a tier, use it. Do NOT downgrade.
 - Set bloodhound_rounds, pointer_rounds, tracker_rounds based on tier. These are a FLOOR (minimum rounds), NOT a cap: under the automated pipeline ([03] Part B convergence detection) the review loop continues past the floor while it makes progress and parks when it stalls — round COUNT no longer caps it. The per-tier floors are the single source of truth in TIER_CONFIG (Red bloodhound base=3); you may RAISE a floor for an unusually risky plan, never lower it below the tier base.
-- Select the Bloodhound cross-examiner model (non-Claude — "gemini" or "mistral") using the pedigree/lessons performance + quota data; write it to ${planDir}/metadata.json model_assignments.bloodhound. This pick is binding for the whole Review phase (the runtime sticks with it). NOTE: autonomous runs are Gemini-only (AUTO_GEMINI_ONLY — Mistral's headless -p path rate-limits and is stripped unless WOLFPACK_ENABLE_MISTRAL_AUTO=1), so pick "gemini" unless that env opt-in is set AND the pedigree data favors Mistral for this surface.
+- Select the Bloodhound cross-examiner model (non-Claude — one of the ENABLED examiner families for this run: ${EXAMINER_ORDER.map(f => `"${f}"`).join(', ')}) using the pedigree/lessons performance + quota data; write it to ${planDir}/metadata.json model_assignments.bloodhound. The runtime tries it FIRST, then walks the rest of the chain (${chainLabel(EXAMINER_ORDER)}) on a rate limit. Default to "gemini" unless the pedigree data favors another enabled family for this surface. (Mistral is only enabled with WOLFPACK_ENABLE_MISTRAL_AUTO=1; GLM is on unless WOLFPACK_ENABLE_GLM=0.)
+- Shepherd seat: if ${planDir}/metadata.json models.architect_recommended (the /hunt --shepherd pin) or the router's model_assignments.shepherd is a glm pin (e.g. "glm:5.3"), keep it as model_assignments.shepherd ONLY on a Green/Blue/Yellow non-compliance hunt — Red/Orange/compliance force Opus. Never assign a reviewer seat the Shepherd's family.
 - Set review_strategy based on tier
 - Update ${planDir}/metadata.json with all computed fields
 - If campaign provided ticket refs, include them in the plan's scope section
@@ -1358,7 +1482,7 @@ Do NOT ask the user any questions — you are running autonomously.
 ${heartbeat('Plan', 'Alpha writing plan.md')}${HUMAN_NOTES_DIRECTIVE}
 
 Return the tier, bloodhound_rounds, pointer_rounds, tracker_rounds, the chosen
-Bloodhound reviewer model family as bloodhoundModel ("gemini" or "mistral" — never Claude),
+Bloodhound reviewer model family as bloodhoundModel (${EXAMINER_ORDER.map(f => `"${f}"`).join(' or ')} — never Claude),
 and worktree path.
 `, { label: `alpha:${slug}`, phase: 'Plan', schema: VERDICT_SCHEMA })
 
@@ -1413,8 +1537,231 @@ if ((alphaPlan.trackerRounds || 0) === 0) {
 // never actually used. `tier` is the signal available on BOTH the fresh and resume paths;
 // compliance hunts escalate to Red (→ Opus), and any non-Red compliance hunt is still gated by
 // the pre-merge compliance checkpoint + cross-model Pointer/Watchdog (reviewers stay Gemini).
-const shepherdModel = (tier === 'Red' || tier === 'Orange') ? 'opus' : 'sonnet'
+const HEAVY_TIER = tier === 'Red' || tier === 'Orange'
+// The CLAUDE Shepherd model: the implementer on every hunt without a glm pin, and the
+// fallback implementer when the GLM Shepherd is rate-limited / fails.
+const shepherdModel = HEAVY_TIER ? 'opus' : 'sonnet'
 log(`Shepherd model: ${shepherdModel} (tier ${tier}) — work-horse Sonnet on non-heavy, Opus on Red/Orange`)
+
+// ─── Shepherd SEAT (coder-alt): Claude by default, GLM when pinned ─────────────
+// A hunt whose BINDING Shepherd assignment is glm (metadata.model_assignments.shepherd —
+// Alpha/Debrief adopt /hunt --shepherd=glm:5.3, which only lands in the ADVISORY
+// models.architect_recommended) implements through Vibe/GLM
+// (podman-vibe.sh --implement wolfpack-shepherd-glm) — but ONLY on a non-heavy,
+// non-compliance hunt with GLM enabled: Red/Orange/compliance ALWAYS force the Claude
+// judgment Shepherd (Opus). A GLM rate limit / failure falls back to the Claude Shepherd
+// for that step (logged in metadata.fallback_log). Whoever writes code joins
+// codeWriterFamilies, which the Pointer/Watchdog chains exclude (cross-family rule) —
+// tracked by who ACTUALLY wrote (a GLM step that was rate-limited before changing any
+// file did not write). lastWriterFamily is the family of the LAST successful writer;
+// rework (Pointer rounds, Tracker/Pointer bounce re-entry) goes back to it. The probe
+// restores both from metadata (shepherd_families / last_shepherd_family) on resume, so
+// a resumed Code Review / Certify never lets GLM review code GLM wrote earlier.
+const SHEPHERD_SEAT_SCHEMA = {
+  type: 'object',
+  properties: {
+    shepherdPin: { type: 'string' },          // raw pin string, or "" when none
+    complianceCritical: { type: 'boolean' },  // spec.compliance_critical / review_required / domain_sensitivity ≥3
+    shepherdFamilies: { type: 'array', items: { type: 'string' } },  // metadata.shepherd_families
+    lastShepherdFamily: { type: 'string' },   // metadata.last_shepherd_family, or ""
+    glmWritePending: { type: 'boolean' },     // metadata.glm_write_pending === true
+    gitWriterFamilies: { type: 'array', items: { type: 'string' } },  // Wolfpack-Writer trailers on main..HEAD
+    gitHeadWriter: { type: 'string' },        // the trailer on the newest trailer-bearing commit, or ""
+    uncommittedChanges: { type: 'boolean' },  // app files dirty outside .wolfpack/
+  },
+  required: ['shepherdPin', 'complianceCritical', 'shepherdFamilies'],
+}
+let shepherdFamily = 'claude'
+let lastWriterFamily = ''   // '' = nobody has written yet (fresh Implement)
+if (GLM_ENABLED && (at('Implement') || at('Code Review') || at('Certify'))) {
+  const seat = await agent(`
+You are a READ-ONLY probe. Do NOT modify anything. Read ${planDir}/metadata.json and return:
+- shepherdPin: metadata.model_assignments.shepherd if it is a non-empty string, else ""
+  (empty string). IGNORE metadata.models.architect_recommended — it is advisory only.
+- complianceCritical: true if ANY of metadata.spec.compliance_critical === true,
+  metadata.spec.compliance_review_required === true, or
+  metadata.predicted_dimensions.domain_sensitivity >= 3; else false.
+- shepherdFamilies: metadata.shepherd_families if it is an array of strings, else [].
+- lastShepherdFamily: metadata.last_shepherd_family if a non-empty string, else "".
+- glmWritePending: metadata.glm_write_pending === true (else false).
+- gitWriterFamilies: the DISTINCT lowercase values of every "${WRITER_TRAILER}:" trailer on the
+  branch's commits. Run (if the worktree exists; else []):
+    git -C ${shq(worktreePath)} log --format='%(trailers:key=${WRITER_TRAILER},valueonly)' main..HEAD
+  Also count a commit whose subject ends in "[glm-shepherd]" as "glm" (legacy/untrailered).
+- gitHeadWriter: the trailer value of the NEWEST commit in main..HEAD that has one, else "".
+- uncommittedChanges: true if \`git -C ${shq(worktreePath)} status --porcelain\` lists any path
+  outside .wolfpack/, else false.
+Return ONLY these fields.
+`, { label: `shepherd-seat:${slug}`, phase: 'Implement', schema: SHEPHERD_SEAT_SCHEMA, model: 'sonnet' })
+  const pinFam = familyOf(seat && seat.shepherdPin)
+  // Writer record = UNION of metadata and git (the more restrictive set): a crash between
+  // a GLM commit and its metadata write can't downgrade the record, and neither can a lost
+  // metadata.json. A pending GLM step with uncommitted edits counts as a GLM write.
+  const metaFams = ((seat && seat.shepherdFamilies) || []).map(familyOf).filter(Boolean)
+  const gitFams = ((seat && seat.gitWriterFamilies) || []).map(familyOf).filter(Boolean)
+  for (const ff of [...metaFams, ...gitFams]) codeWriterFamilies.add(ff)
+  if (seat && seat.glmWritePending) codeWriterFamilies.add('glm')
+  const disagree = gitFams.filter(f => !metaFams.includes(f))
+  if (disagree.length) {
+    log(`⚠ WRITER RECORD MISMATCH: git trailers show ${disagree.join(', ')} wrote on feat/${slug} but metadata.shepherd_families (${metaFams.join(', ') || 'empty'}) does not — using the UNION (more restrictive): ${[...codeWriterFamilies].join(', ')}.`)
+  }
+  if (seat && seat.glmWritePending) {
+    log(`⚠ ${slug}: metadata.glm_write_pending=true — a GLM step was interrupted${seat.uncommittedChanges ? ' with uncommitted edits in the worktree' : ''}; treating glm as a code writer.`)
+  }
+  // Last writer: git's newest trailer wins over metadata (it is written atomically with the commit).
+  lastWriterFamily = familyOf(seat && seat.gitHeadWriter) || familyOf(seat && seat.lastShepherdFamily) || ''
+  if (pinFam === 'glm') {
+    if (HEAVY_TIER || (seat && seat.complianceCritical)) {
+      log(`⚠ Shepherd pin "${seat.shepherdPin}" IGNORED — ${HEAVY_TIER ? `tier ${tier}` : 'compliance-critical hunt'} forces the Claude ${shepherdModel} Shepherd (judgment override never relaxes).`)
+    } else {
+      shepherdFamily = 'glm'
+      // Resumed PAST Implement with no writer record (e.g. a crash before metadata was
+      // written): we cannot prove GLM didn't write, so exclude it conservatively.
+      if (!at('Implement') && !seat.shepherdFamilies?.length) codeWriterFamilies.add('glm')
+      log(`Shepherd seat: Vibe/GLM (pin "${seat.shepherdPin}") — Claude ${shepherdModel} is the rate-limit fallback.`)
+    }
+  } else if (pinFam && pinFam !== 'claude') {
+    log(`⚠ Shepherd pin "${seat.shepherdPin}" (${pinFam}) has no implementer path in this pipeline — using the Claude ${shepherdModel} Shepherd.`)
+  }
+} else if (!GLM_ENABLED) {
+  log(`Shepherd seat: Claude ${shepherdModel} (GLM disabled via WOLFPACK_ENABLE_GLM — any glm Shepherd pin is ignored).`)
+}
+log(`Code-writer families: ${[...codeWriterFamilies].join(', ')} → code-review chain: ${chainLabel(examinerChain(codeWriterFamilies))}`)
+
+const GLM_SHEPHERD_SCHEMA = {
+  type: 'object',
+  properties: {
+    outcome: { type: 'string' },      // done | rate_limited | timeout | failed | no_changes | rebase_conflict
+    exitCode: { type: 'number' },
+    evidence: { type: 'string' },
+    changedFiles: { type: 'array', items: { type: 'string' } },
+    committed: { type: 'boolean' },
+    findingsAddressed: REVISION_SCHEMA.properties.findingsAddressed,
+    allAddressed: { type: 'boolean' },
+  },
+  required: ['outcome'],
+}
+
+// Run one GLM Shepherd step through a thin Claude WRAPPER agent that only does plumbing
+// (rebase, write the task file, run the shim, commit GLM's files by name). mode is
+// 'implement' (fresh build / reviewer-bounce entry) or 'rewrite' (a Pointer round).
+// Returns the wrapper's result, or a synthetic { outcome: 'failed' } if it dropped.
+async function runGlmShepherd({ mode, round, task, phaseLabel }) {
+  const tag = mode === 'implement' ? 'impl' : `r${round}`
+  const base = `/tmp/shepherd-glm-${slug}-${tag}`
+  const q = (sfx) => shq(`${base}${sfx}`)
+  const cmd = `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} --implement wolfpack-shepherd-glm ${shq(worktreePath)} ${q('.txt')} ${shq(GLM_IMPLEMENT_TURNS)}`
+  let r = null
+  for (let attempt = 1; attempt <= 2 && !r; attempt++) {
+    if (attempt > 1) log(`↻ shepherd-glm:${slug}:${tag} wrapper dropped mid-response — retry ${attempt}/2`)
+    r = await agent(`
+You are the GLM-Shepherd WRAPPER for Wolfpack hunt '${slug}', running headlessly. GLM 5.3
+(via the Vibe CLI) is the IMPLEMENTER for this ${mode === 'implement' ? 'implementation' : `Pointer round ${round} rework`}.
+YOU DO NOT WRITE, EDIT, FORMAT OR REVERT ANY SOURCE FILE YOURSELF — not even a one-line fix.
+Your job is plumbing only. (If you wrote code, Claude-written code would be reviewed as
+GLM's and the cross-family review invariant would silently break.)
+
+Hunt: ${slug}
+Worktree: ${worktreePath}
+Plan dir: ${planDir}
+
+Steps:
+1. cd ${worktreePath}
+${mode === 'implement'
+  ? `2. REBASE FIRST (worktree drift): git fetch origin && git rebase origin/main
+   If it fails: git rebase --abort and return outcome "rebase_conflict" immediately.`
+  : `2. No rebase for a rework round. Check the tree: git status --porcelain (ignore .wolfpack/).
+   If app files are already modified/uncommitted, return outcome "failed", evidence "dirty tree before GLM rework".`}
+3. Write the GLM task to ${base}.txt with EXACTLY the text between the markers (use your
+   file-write tool, verbatim, no paraphrase, markers excluded):
+=====GLM TASK START=====
+${task}
+=====GLM TASK END=====
+3b. DURABLE WRITER RECORD FIRST (crash safety — do this BEFORE step 4): update
+   ${planDir}/metadata.json: remember whether "shepherd_families" ALREADY contained "glm"
+   (call it HAD_GLM), then ensure "shepherd_families" contains "glm" and set
+   "glm_write_pending" = true. Preserve every other field. (If the run dies anywhere after
+   this, the resume probe still sees GLM as a possible writer — the safe direction.)
+4. Run the shim. It can run for up to an hour — longer than one shell call may block — so
+   start it in the BACKGROUND and poll:
+     ( ${cmd} > ${q('.out')} 2> ${q('.err')}; echo $? > ${q('.rc')} ) &
+   then repeat \`timeout 540 bash -c 'until [ -f "$1" ]; do sleep 20; done' _ ${q('.rc')}\` until
+   ${base}.rc exists (give up after ~80 minutes total → outcome "failed", evidence "shim did not finish").
+   Run the shim EXACTLY as given — no extra flags, never a second copy in parallel.
+5. Classify: rc 75, OR ${base}.err has a line starting "WOLFPACK_RATE_LIMITED:" → outcome
+   "rate_limited". rc 76, OR a line starting "WOLFPACK_TIMEOUT:" → outcome "timeout" (the
+   shim's wall clock ran out — NOT a quota signal). Any other non-zero rc → outcome
+   "failed". rc 0 → continue.
+6. List what GLM changed: git status --porcelain (+ git diff --stat). Put every changed/new
+   path in changedFiles.${mode === 'implement' ? `
+   rc 0 but NOTHING changed outside .wolfpack/ → outcome "no_changes".` : ''}
+7. rc 0 with changes: stage EACH changed/new file BY NAME (git add -- <path> …) — NEVER
+   git add . / -A / -f; skip anything under .wolfpack/plans/ (gitignored plan artifacts).
+   Commit with a conventional message ending in "[glm-shepherd]" (e.g. "${mode === 'implement' ? `feat(<scope>): <summary> [glm-shepherd]` : `fix(<scope>): address Pointer round ${round} findings [glm-shepherd]`}")
+   AND the git trailer "${WRITER_TRAILER}: glm" as the LAST line of the message (e.g.
+   git commit -m "<subject>" --trailer "${WRITER_TRAILER}: glm"). The trailer is the
+   durable, git-side writer record the resume probe cross-checks — never omit it.
+   The commit must contain ONLY GLM's changes. Set committed=true.
+   On rate_limited / failed: do NOT commit, revert, stash or clean — leave any partial GLM
+   edits in the working tree for the fallback implementer (committed=false).${mode === 'rewrite' ? `
+8. From ${base}.out take the LAST <dispositions>{...}</dispositions> block: strict JSON
+   {"findingsAddressed":[{"id","severity","title","disposition","justification"}],"allAddressed":bool}.
+   Pass it through as findingsAddressed / allAddressed. rc 0 but no parseable block →
+   outcome "failed", evidence "no dispositions block" (keep the commit).` : ''}
+9. Finalize ${planDir}/metadata.json (the code-writer record the cross-family review rule
+   reads on resume; preserve every other field):
+   - if changedFiles is EMPTY and nothing was committed AND HAD_GLM was false (GLM wrote
+     nothing this step and never before): remove "glm" from "shepherd_families" again;
+     otherwise KEEP "glm" there;
+   - if outcome is "done": set "last_shepherd_family" = "glm";
+   - set "glm_write_pending" = false (only AFTER the lines above).
+10. rm -f ${q('.txt')} ${q('.out')} ${q('.err')} ${q('.rc')}
+Return outcome ("done" when rc 0 and the step completed), exitCode, evidence (≤300 chars of
+the .err/.out tail), changedFiles, committed${mode === 'rewrite' ? ', findingsAddressed, allAddressed' : ''}.
+SAFETY: No git push, no deploy, no git add . / -A / -f, never run the test suite.
+${heartbeat(phaseLabel, `GLM Shepherd ${mode === 'implement' ? 'coding' : `rework r${round}`}`)}
+`, { label: `shepherd-glm:${slug}:${tag}`, phase: phaseLabel, schema: GLM_SHEPHERD_SCHEMA, model: 'sonnet' })
+  }
+  return r || { outcome: 'failed', evidence: 'GLM wrapper agent dropped twice (no result)', changedFiles: [] }
+}
+
+// Classify a GLM Shepherd miss for fallback_log (same buckets as FALLBACK_LOG_NOTE).
+const glmFallbackReason = (r) => (r.outcome === 'rate_limited' ? 'rate_limited'
+  : r.outcome === 'timeout' ? 'timeout' : r.outcome === 'no_changes' ? 'capability' : 'error')
+
+// The instruction block handed to the CLAUDE Shepherd when it takes over from GLM.
+const glmFallbackNote = (r, round) => `
+FALLBACK ENTRY — the GLM Shepherd (this hunt's pinned implementer) did not complete:
+outcome=${r.outcome}${r.exitCode != null ? ` (rc ${r.exitCode})` : ''}; evidence: ${String(r.evidence || '').slice(0, 300)}.
+You are the Claude fallback implementer (${shepherdModel}).
+- The worktree was already rebased by the GLM wrapper — do NOT rebase again.
+- The working tree may hold UNCOMMITTED partial GLM edits (${(r.changedFiles || []).join(', ') || 'none reported'}).
+  Inspect them (git status / git diff), keep what is correct, fix or finish the rest, commit.
+- Record the fallback: print "WOLFPACK_FALLBACK: shepherd r${round} glm→claude reason=${glmFallbackReason(r)}" and
+  append to ${planDir}/metadata.json "fallback_log" (create if absent):
+  {"role":"shepherd","round":${round},"primary":"glm","fallback":"claude:${shepherdModel}","reason":"${glmFallbackReason(r)}","evidence":"<≤200 chars>"}
+  and ensure "shepherd_families" contains "claude"${(r.changedFiles || []).length ? ' and "glm" (GLM left edits)' : ''}; set
+  "last_shepherd_family" = "claude" and "glm_write_pending" = false. Preserve every other field.
+- End every commit message with the git trailer "${WRITER_TRAILER}: claude"${(r.changedFiles || []).length ? `
+  PLUS a second trailer "${WRITER_TRAILER}: glm" on the commit that includes GLM's partial edits` : ''}.
+`
+
+// Writer record appended to a plain (non-fallback) Claude Shepherd prompt.
+const CLAUDE_WRITER_RECORD = `
+WRITER RECORD: end every commit message with the git trailer "${WRITER_TRAILER}: claude"
+(git commit --trailer "${WRITER_TRAILER}: claude"). After committing, update ${planDir}/metadata.json —
+ensure the "shepherd_families" array exists and contains "claude", and set "last_shepherd_family" = "claude".
+Preserve every other field.`
+
+// Which family gets the NEXT rework (Pointer round / Tracker or Pointer bounce re-entry):
+// the family that LAST actually wrote, and GLM only while the GLM seat is still eligible.
+const reworkFamily = () => (shepherdFamily === 'glm' && (lastWriterFamily || 'glm') === 'glm') ? 'glm' : 'claude'
+// Record a completed GLM step's effect on the writer sets.
+const noteGlmStep = (g) => {
+  if ((g.changedFiles || []).length || g.committed) codeWriterFamilies.add('glm')
+  if (g.outcome === 'done') lastWriterFamily = 'glm'
+}
+const noteClaudeWrote = () => { codeWriterFamilies.add('claude'); lastWriterFamily = 'claude' }
 
 // ─── Phase 2: Bloodhound Review Loop (skipped on resume) ───────
 if (at('Review')) {
@@ -1441,6 +1788,21 @@ if (at('Review')) {
 
     const planFile = round === 1 ? 'plan.md' : `plan-revised-${round - 1}.md`
 
+    // The examiner chain for THIS round (the preferred examiner may have moved on a
+    // sticky answer). The plan's writer is Alpha (Claude), so Claude is the excluded
+    // family. An empty chain can't happen with gemini always enabled, but fail loud
+    // rather than review same-family if the gates ever change.
+    const bhChain = examinerChain(PLAN_WRITER_FAMILIES)
+    if (!bhChain.length) {
+      log(`⛔ ${slug}: no cross-family examiner is enabled for the plan review (writers: ${[...PLAN_WRITER_FAMILIES].join(', ')}). Parking.`)
+      await parkHunt({
+        reason: 'no_cross_family_reviewer', resumePhase: 'Review', resolutionTypeExpected: 'redirect', phaseLabel: 'Review',
+        needFromUser: `No enabled non-Claude examiner family is left for the plan review after removing the writer's family. Enable one (WOLFPACK_ENABLE_GLM / WOLFPACK_ENABLE_MISTRAL_AUTO) or fix the examiner gates, then resume.`,
+        context: `Enabled examiners: ${EXAMINER_ORDER.join(', ') || '(none)'}; plan writer families: ${[...PLAN_WRITER_FAMILIES].join(', ')}`,
+      })
+      return { slug, verdict: 'PARKED', status: 'parked:no_cross_family_reviewer', reason: 'no_cross_family_reviewer', tier, worktreePath }
+    }
+
     // One shim per review lens. The DEFAULT is a single comprehensive lens (current,
     // validated behavior). buildPrompt(unit) closes over the round; runReviewFanout owns
     // the fan-out + n-1 concurrency degradation (workflow-orchestrated, never CLI self-
@@ -1450,10 +1812,9 @@ if (at('Review')) {
       const rawFile = unit.key === 'full' ? `review-${round}.md` : `review-${round}-${unit.key}.md`
       const tmpFile = unit.key === 'full' ? `/tmp/bloodhound-${slug}-r${round}.txt` : `/tmp/bloodhound-${slug}-r${round}-${unit.key}.txt`
       return `
-You are a shim agent orchestrating a Bloodhound review${unit.focus ? ` (FOCUS LENS: ${unit.key})` : ''}. This hunt's assigned
-cross-examiner is ${EXAMINER_LABEL[crossExaminer]}; you try it first, then
-${EXAMINER_LABEL[otherExaminer]} as fallback. (Both are non-Claude — never
-review with Claude.)
+You are a shim agent orchestrating a Bloodhound review${unit.focus ? ` (FOCUS LENS: ${unit.key})` : ''}. This hunt's examiner
+chain for the plan review is ${chainLabel(bhChain)} — try each link in order, moving to the
+next only when the current one fails. (All links are non-Claude — never review with Claude.)
 
 Hunt: ${slug}
 Worktree: ${worktreePath}
@@ -1469,18 +1830,19 @@ Steps:
    Write to ${tmpFile}:
    "You are reviewing Wolfpack hunt '${slug}', round ${round}, tier ${tier}. Read the plan at ${planDir}/${planFile}. Also read TODO.md, CLAUDE.md, and .wolfpack/pedigree/index.md for context. Read metadata.json at ${planDir}/metadata.json for tier and scope. Read .agents/skills/bloodhound/SKILL.md and follow it. Produce your adversarial review following your system prompt instructions. PLAN-REVIEW SCOPE (mandatory): you are reviewing the PLAN DOCUMENT's design — NOT whether it has been implemented. The code is NOT written yet (Shepherd implements in a LATER phase). Findings of the form 'not implemented / missing from the codebase / absent from the file / helper missing / code remains unchanged / pre-implementation state' are INVALID and MUST NOT be reported — that state is EXPECTED at plan-review time and reporting it is a misfire that falsely trips non-convergence. Use the code ONLY to verify the plan's factual claims about the CURRENT codebase are accurate; judge the plan's correctness, completeness, and compliance, never its implementation status.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): do NOT read whole large files — grep for the relevant symbols/lines first, then read only those ranges with a line offset/limit. Scope every grep to the relevant app directory (e.g. billing/, records/, controlled_substances/), never the repo root, or it times out. Reading entire 1000+ line files (models.py, views.py) bloats context and can crash the request mid-review.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive adversarial review covering every lens (correctness, compliance/DEA, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. The headless cross-model roster fan-out is disabled — the pipeline handles orchestration, not you.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
 
-3. Try PRIMARY (${EXAMINER_LABEL[crossExaminer]}) with retry:
-   Attempt 1: ${reviewCmd(crossExaminer, 'wolfpack-bloodhound', tmpFile)}
-   The wrapper enforces a read-only adversarial review and caps concurrent
-   calls on this model at 2 (flock) to avoid rate limits. Run it EXACTLY as
+3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
+${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile)}
+   Each wrapper enforces a read-only adversarial review and caps concurrent
+   calls on its model (flock) to avoid rate limits. Run each EXACTLY as
    given — do not add flags or spawn it multiple times in parallel.
    An attempt FAILS if ANY of: non-zero exit, empty output, no parseable
    <verdict> block (step 6), or — for an ISSUES_FOUND verdict — every
    file-bearing finding fails the grounding check (step 7, the blind/hallucinating
-   reviewer signal). On failure, wait 5 seconds and retry attempt 1 ONCE.
+   reviewer signal). A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) skips
+   straight to the next link — no retry.
+   ${chainBoundary(bhChain, PLAN_WRITER_FAMILIES)}
 
-4. If BOTH primary attempts fail, try FALLBACK (${EXAMINER_LABEL[otherExaminer]}):
-   ${reviewCmd(otherExaminer, 'wolfpack-bloodhound', tmpFile)}
+4. When a link FAILS, move to the NEXT link of the chain (log the fallback — see below).
    Strip ANSI escape codes from the output.
 
 5. Write the raw output (from whichever CLI ran) to ${planDir}/${rawFile}.
@@ -1501,11 +1863,11 @@ Steps:
    claim, evidence (pass them through; do not re-scrape markdown headings).
 7. GROUNDING CHECK — run for every finding that names a "file" (catches the
    blind/hallucinating reviewer: a finding citing a non-existent file is noise):
-   a. Normalize the path: strip a leading "/workspace/" if present, then strip any
-      remaining leading "/", yielding a repo-root-relative path. (A containerized
-      reviewer emits /workspace/... under its mount; the shim runs on the host
-      where that prefix does not exist, so without stripping every finding would be
-      wrongly dropped.)
+   a. Normalize the path: strip a leading "${worktreePath}/" or "/workspace/" if
+      present, then strip any remaining leading "/", yielding a repo-root-relative
+      path. (A containerized reviewer emits /workspace/... under its mount — or, for a
+      GLM seat, the worktree's HOST path; the shim runs on the host, so without
+      stripping every finding would be wrongly dropped.)
    b. test -f "${worktreePath}/<normalized-path>". Exists → GROUNDED (keep, and
       rewrite finding.file to the normalized path). Missing → DROP the finding:
       add { id, file, reason: "file_not_found" } to a \`dropped\` array and EXCLUDE
@@ -1513,8 +1875,8 @@ Steps:
    c. A finding with NO "file" is kept as-is (plan-level/general — nothing to ground).
    d. If verdict == ISSUES_FOUND AND at least one finding named a file AND EVERY
       file-bearing finding was dropped (0 grounded) → the whole review is suspect.
-      This attempt FAILED: go to the FALLBACK model. If the fallback is ALSO 0/N
-      grounded, return "ERROR", status "ungrounded_review".
+      This attempt FAILED: go to the NEXT link of the chain. If every remaining link is
+      ALSO 0/N grounded, return "ERROR", status "ungrounded_review".
    e. Prepend a grounding line to the ${planDir}/${rawFile} header:
       "grounded: <G>/<N> findings, <D> dropped" (N = file-bearing findings seen,
       G = grounded, D = dropped). List the dropped findings beneath it.
@@ -1535,11 +1897,11 @@ Steps:
 9. Clean up temp files: rm -f ${tmpFile}
 10. Return: verdict, findings (count of GROUNDED findingsList items), findingsList
     (grounded only, each with id/severity/title/file/line/claim/evidence/FINGERPRINT),
-    grounded (count), dropped (the array from step 7), and the provider that produced the
-    ACCEPTED review as \`provider\` ("gemini" or "mistral"). Also set \`status\`
-    to that provider.
+    grounded (count), dropped (the array from step 7), and the provider FAMILY that produced
+    the ACCEPTED review as \`provider\` (exactly one of ${bhChain.map(f => `"${f}"`).join(', ')}). Also set
+    \`status\` to that provider.
 
-If NO model produced an acceptable review — both CLIs failed to run, OR every run
+If NO link produced an acceptable review — every CLI in the chain failed to run, OR every run
 lacked a parseable <verdict> block / was malformed / was an empty-findings
 contradiction / grounded 0/N — return verdict "ERROR" with the MOST SPECIFIC status
 above (missing_verdict_block | malformed_verdict | empty_findings_contradiction |
@@ -1559,6 +1921,20 @@ ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + un
       phaseLabel: 'Review',
     })
 
+    // Cross-family runtime invariant — BEFORE trusting (or sticking to) the answer.
+    if (reviewResult.verdict !== 'ERROR') {
+      const bhViolation = crossFamilyViolation(reviewResult, PLAN_WRITER_FAMILIES, bhChain)
+      if (bhViolation) {
+        log(`⛔ ${slug}: Bloodhound round ${round} CROSS-FAMILY VIOLATION — ${bhViolation}. Parking (not trusting this review).`)
+        await parkHunt({
+          reason: 'cross_family_violation', resumePhase: 'Review', resolutionTypeExpected: 'clarify', phaseLabel: 'Review',
+          needFromUser: `The plan review for round ${round} could not be proven cross-family: ${bhViolation}. The review was NOT accepted. Resume to re-run the review (clarify), or fix the reviewer plumbing (redirect).`,
+          context: `Examiner chain: ${bhChain.join(' → ')}; providers reported: ${JSON.stringify(reviewResult.providers || [reviewResult.provider])}`,
+        })
+        return { slug, verdict: 'PARKED', status: 'parked:cross_family_violation', reason: 'cross_family_violation', tier, worktreePath }
+      }
+    }
+
     // Stickiness: pin whichever examiner actually answered so later rounds try it
     // first (don't re-roll the primary→fallback order every round — that's how a
     // fabricating fallback slipped in on round 2 of unfinalize-inventory-restore).
@@ -1571,7 +1947,7 @@ ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + un
     }
     if (reviewResult.verdict === 'ERROR') {
       // [03] Part B — review fan-out floored at concurrency 1 and STILL failing → PARK.
-      // [05] AC3 — distinguish a QUOTA outage (both cross-models rate-limited; status
+      // [05] AC3 — distinguish a QUOTA outage (every chain examiner rate-limited; status
       // "model_quota") from broken PLUMBING (review_error). Quota is transient: the host
       // driver reschedules past the window reset (A3); plumbing needs a human to fix.
       // Neither hangs and neither proceeds past an open review.
@@ -1584,8 +1960,8 @@ ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + un
         resolutionTypeExpected: 'clarify',
         phaseLabel: 'Review',
         needFromUser: quota
-          ? `Both cross-model reviewers (Vibe/Mistral AND Agy/Gemini) are rate-limited / quota-exhausted, so the plan review could not run. This is transient: re-run the campaign after the window resets (the host gate auto-resumes overnight runs) — clarify to resume, or redirect if you suspect the reviewer plumbing.`
-          : `Both cross-model reviewers failed to produce a usable verdict for the plan review even at sequential concurrency (cap 1) — likely a model outage or quota exhaustion. Decide: retry later (clarify → resume the review), or investigate the reviewer plumbing (redirect).`,
+          ? `Every examiner in the chain (${chainLabel(bhChain)}) is rate-limited / quota-exhausted, so the plan review could not run. This is transient: re-run the campaign after the window resets (the host gate auto-resumes overnight runs) — clarify to resume, or redirect if you suspect the reviewer plumbing.`
+          : `Every examiner in the chain (${chainLabel(bhChain)}) failed to produce a usable verdict for the plan review even at sequential concurrency (cap 1) — likely a model outage or quota exhaustion. Decide: retry later (clarify → resume the review), or investigate the reviewer plumbing (redirect).`,
         context: `Review fan-out degradation log:\n${(reviewResult.degradeLog || []).map(l => `- ${l}`).join('\n') || '- (no detail captured)'}\nFinal status: ${reviewResult.status}`,
         options: quota
           ? `- A (clarify): transient quota — resume the review after the window resets.\n- B (redirect): not actually quota — fix the reviewer plumbing, then resume.`
@@ -1807,7 +2183,9 @@ plan items. After fixing, re-run your self-check (git diff main..HEAD) and commi
 `
 }
 
-await agent(`
+// The Claude Shepherd (primary on non-glm hunts; fallback for a GLM miss). fallbackNote
+// is the GLM-takeover block (skips the rebase the GLM wrapper already did).
+const runClaudeShepherd = (fallbackNote = '') => agent(`
 You are the Shepherd implementing a Wolfpack hunt, running headlessly.
 
 First, read your full instructions at .agents/skills/shepherd/SKILL.md — follow them exactly.
@@ -1815,16 +2193,18 @@ First, read your full instructions at .agents/skills/shepherd/SKILL.md — follo
 Hunt: ${slug}
 Worktree: ${worktreePath}
 Plan dir: ${planDir}
-${rewriteDirective}
+${rewriteDirective}${fallbackNote}
 cd to ${worktreePath} before doing any work.
-
+${fallbackNote ? `
+(Rebase already done by the GLM wrapper — skip it.)
+` : `
 CRITICAL FIRST STEP: Rebase onto main to avoid worktree drift.
   cd ${worktreePath} && git fetch origin && git rebase origin/main
   If the rebase FAILS (conflict, diverged history, etc.):
   - Run: git rebase --abort
   - Return verdict "REBASE_CONFLICT" immediately — do NOT proceed with implementation
   - The user must resolve the conflict manually
-
+`}
 Only if rebase succeeds, execute ALL Shepherd instructions:
 - Read ${planDir}/plan-final.md and ${planDir}/debrief.md
 - Implement all plan items
@@ -1841,8 +2221,51 @@ SAFETY RULES:
 - Do NOT run git add . or git add -A
 
 Do NOT ask the user. If you need to deviate from the plan, document it in shepherd-log.md.
+${fallbackNote ? '' : CLAUDE_WRITER_RECORD}
 ${heartbeat('Implement', 'Shepherd coding')}${HUMAN_NOTES_DIRECTIVE}
-`, { label: `shepherd:${slug}`, phase: 'Implement', model: shepherdModel })
+`, { label: `shepherd${fallbackNote ? '-fallback' : ''}:${slug}`, phase: 'Implement', model: shepherdModel })
+
+// A fresh build goes to the seat family; a bounce re-entry (rewriteDirective) goes back to
+// the family that LAST actually wrote the code (a Claude takeover stays with Claude).
+const implFamily = rewriteDirective ? reworkFamily() : shepherdFamily
+log(`Implement step → ${implFamily === 'glm' ? 'Vibe/GLM' : `Claude ${shepherdModel}`}${rewriteDirective ? ` (rework; last writer: ${lastWriterFamily || 'unknown'})` : ''}`)
+if (implFamily === 'glm') {
+  // GLM has no shell: the task names every file it must read/write by absolute path,
+  // and the wrapper commits. The rewrite directive (Tracker/Pointer bounce entry) rides
+  // along verbatim — "commit on feat/…" in it is the wrapper's job, not GLM's.
+  const glmTask = `You are the Wolfpack Shepherd (implementer) for hunt '${slug}', tier ${tier}.
+You have NO shell: you cannot run git, tests or any command. Your tools: read_file, grep,
+write_file (creates NEW files only — it refuses a file that exists), edit (modify an
+EXISTING file), dev_cortex_repo_map and dev_cortex_file_outline (code maps of this
+checkout). The worktree root is ${worktreePath} (already rebased); use absolute paths under it.
+${rewriteDirective ? `${rewriteDirective}(A wrapper commits your changes after you finish — you cannot commit.)\n` : ''}
+1. Read ${worktreePath}/.agents/skills/shepherd/SKILL.md and follow it, skipping anything
+   that needs a shell (rebase, git, tests — the wrapper handles git; Tracker runs tests).
+2. Read ${worktreePath}/CLAUDE.md for the project rules, then ${planDir}/plan-final.md and
+   ${planDir}/debrief.md. Implement ALL plan items in the worktree.
+3. Write ${planDir}/shepherd-log.md (write_file if it does not exist yet, else edit)
+   documenting what you did, file by file, and any deviation from the plan with its reason.
+4. Do NOT modify files outside ${worktreePath}. Under .wolfpack/ touch ONLY shepherd-log.md.
+   Do not write or edit test files unless the plan explicitly lists them as implementation.
+EFFICIENCY: start from dev_cortex_repo_map / dev_cortex_file_outline and grep; read only the
+line ranges you need — never whole 1000+ line files. Make ONE tool call at a time.
+End your response with a short list of every file you created or changed.`
+  const g = await runGlmShepherd({ mode: 'implement', round: 1, task: glmTask, phaseLabel: 'Implement' })
+  noteGlmStep(g)
+  if (g.outcome === 'done') {
+    log(`GLM Shepherd implemented ${slug} (${(g.changedFiles || []).length} file(s), committed=${!!g.committed}).`)
+  } else if (g.outcome === 'rebase_conflict') {
+    log(`⚠ ${slug}: REBASE_CONFLICT before the GLM Shepherd ran — the user must resolve the conflict manually (same as the Claude path).`)
+  } else {
+    log(`⚠ WOLFPACK_FALLBACK: shepherd r1 glm→claude:${shepherdModel} reason=${glmFallbackReason(g)} (${g.outcome}: ${String(g.evidence || '').slice(0, 160)})`)
+    await runClaudeShepherd(glmFallbackNote(g, 1))
+    noteClaudeWrote()
+  }
+} else {
+  await runClaudeShepherd()
+  noteClaudeWrote()
+}
+log(`Code-writer families after Implement: ${[...codeWriterFamilies].join(', ')} (last writer: ${lastWriterFamily || 'none'})`)
 }
 
 // ─── Phase 5: Pointer Code Review Loop (skipped on resume) ─────
@@ -1862,13 +2285,28 @@ if (at('Code Review') && pointerRounds > 0) {
     pRound++
     log(`Pointer round ${pRound} (floor ${pFloor}, breaker ${pcfg.maxRounds} rounds, plan-smell ≥${pcfg.planSmellBound} distinct criticals, crit-persist ${pcfg.critPersist})`)
 
+    // Code-review chain: enabled examiners minus EVERY family that wrote code on this
+    // branch (a GLM Shepherd removes glm; a Claude fallback keeps claude excluded too).
+    const ptrChain = examinerChain(codeWriterFamilies)
+    if (!ptrChain.length) {
+      log(`⛔ ${slug}: no cross-family examiner left for the code review (writers: ${[...codeWriterFamilies].join(', ')}). Parking.`)
+      await parkHunt({
+        reason: 'no_cross_family_reviewer', resumePhase: 'Code Review', resolutionTypeExpected: 'redirect', phaseLabel: 'Code Review',
+        needFromUser: `Every enabled examiner shares a family with the code's writer(s) (${[...codeWriterFamilies].join(', ')}), so no cross-family code review is possible. Enable another examiner family (WOLFPACK_ENABLE_GLM / WOLFPACK_ENABLE_MISTRAL_AUTO) or re-implement with a different Shepherd, then resume.`,
+        context: `Enabled examiners: ${EXAMINER_ORDER.join(', ') || '(none)'}; code writer families: ${[...codeWriterFamilies].join(', ')}`,
+      })
+      return { slug, verdict: 'PARKED', status: 'parked:no_cross_family_reviewer', reason: 'no_cross_family_reviewer', tier, worktreePath }
+    }
+    log(`Pointer chain r${pRound}: ${chainLabel(ptrChain)} (code writers: ${[...codeWriterFamilies].join(', ')})`)
+
     const buildPointerPrompt = (unit, nudge) => {
       const rawFile = unit.key === 'full' ? `pointer-review-${pRound}.md` : `pointer-review-${pRound}-${unit.key}.md`
       const tmpFile = unit.key === 'full' ? `/tmp/pointer-${slug}-r${pRound}.txt` : `/tmp/pointer-${slug}-r${pRound}-${unit.key}.txt`
       return `
-You are a shim agent orchestrating a Pointer code review${unit.focus ? ` (FOCUS LENS: ${unit.key})` : ''}. This hunt's assigned
-cross-examiner is ${EXAMINER_LABEL[crossExaminer]}; try it first, then
-${EXAMINER_LABEL[otherExaminer]} as fallback. (Both non-Claude.)
+You are a shim agent orchestrating a Pointer code review${unit.focus ? ` (FOCUS LENS: ${unit.key})` : ''}. The examiner chain
+for this code review is ${chainLabel(ptrChain)} — try each link in order, moving to the next
+only when the current one fails. (All non-Claude, and none shares a family with the code's
+writer(s): ${[...codeWriterFamilies].join(', ')}.)
 
 Hunt: ${slug}
 Worktree: ${worktreePath}
@@ -1883,17 +2321,17 @@ Steps:
    Write to ${tmpFile}:
    "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff main..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
 
-3. Try PRIMARY (${EXAMINER_LABEL[crossExaminer]}) with retry:
-   Attempt 1: ${reviewCmd(crossExaminer, 'wolfpack-pointer', tmpFile)}
-   The wrapper enforces a read-only review and caps concurrent calls on this
-   model at 2 (flock). Run it EXACTLY as given — no extra flags, no parallel spawns.
+3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
+${chainSteps(ptrChain, 'wolfpack-pointer', tmpFile)}
+   Each wrapper enforces a read-only review and caps concurrent calls on its
+   model (flock). Run each EXACTLY as given — no extra flags, no parallel spawns.
    An attempt FAILS if ANY of: non-zero exit, empty output, no parseable
    <verdict> block (step 6), or — for an ISSUES_FOUND verdict — every file-bearing
-   finding fails the grounding check (step 7). On failure, wait 5 seconds and retry
-   attempt 1 ONCE.
+   finding fails the grounding check (step 7). A rate-limit signal (exit 75 /
+   WOLFPACK_RATE_LIMITED) skips straight to the next link — no retry.
+   ${chainBoundary(ptrChain, codeWriterFamilies)}
 
-4. If BOTH primary attempts fail, try FALLBACK (${EXAMINER_LABEL[otherExaminer]}):
-   ${reviewCmd(otherExaminer, 'wolfpack-pointer', tmpFile)}
+4. When a link FAILS, move to the NEXT link of the chain (log the fallback — see below).
 
 5. Write the raw output (from whichever CLI ran) to ${planDir}/${rawFile}.
 6. EXTRACT THE VERDICT — strict extract-and-validate, NO prose-rescue. The reviewer
@@ -1909,16 +2347,16 @@ Steps:
    IS findingsList (id, severity, title, file, line, claim, evidence) — pass through;
    do not re-scrape markdown headings.
 7. GROUNDING CHECK — for every finding that names a "file":
-   a. Normalize: strip a leading "/workspace/" then any remaining leading "/" →
-      repo-root-relative (the containerized reviewer emits /workspace/... under its
-      mount; the host shim has no such path, so unstripped paths would all be dropped).
+   a. Normalize: strip a leading "${worktreePath}/" or "/workspace/", then any remaining
+      leading "/" → repo-root-relative (a containerized reviewer emits /workspace/... —
+      or the worktree's host path for a GLM seat; unstripped paths would all be dropped).
    b. test -f "${worktreePath}/<normalized-path>". Exists → GROUNDED (keep, rewrite
       finding.file to the normalized path). Missing → DROP: add
       { id, file, reason: "file_not_found" } to a \`dropped\` array, EXCLUDE from findingsList.
    c. A finding with no "file" is kept as-is (plan-level/general).
    d. If verdict == ISSUES_FOUND AND ≥1 finding named a file AND every file-bearing
       finding was dropped (0 grounded) → review is suspect: this attempt FAILED, go to
-      the FALLBACK model. If the fallback is also 0/N grounded, "ERROR", status
+      the NEXT link. If every remaining link is also 0/N grounded, "ERROR", status
       "ungrounded_review".
    e. Prepend a grounding line to the ${planDir}/${rawFile} header:
       "grounded: <G>/<N> findings, <D> dropped"; list the dropped findings beneath it.
@@ -1936,9 +2374,10 @@ Steps:
 9. Clean up temp files: rm -f ${tmpFile}
 10. Return: verdict, findings (count of GROUNDED items), findingsList (grounded only,
     each with id/severity/title/file/line/claim/evidence/FINGERPRINT), grounded (count),
-    dropped (array), provider used.
+    dropped (array), and the provider FAMILY that produced the accepted review as
+    \`provider\` (exactly one of ${ptrChain.map(f => `"${f}"`).join(', ')}).
 
-If NO model produced an acceptable review — both CLIs failed, OR every run lacked a
+If NO link produced an acceptable review — every CLI in the chain failed, OR every run lacked a
 parseable <verdict> block / was malformed / was an empty-findings contradiction /
 grounded 0/N — return verdict "ERROR" with the MOST SPECIFIC status
 (missing_verdict_block | malformed_verdict | empty_findings_contradiction |
@@ -1957,6 +2396,20 @@ ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' +
       phaseLabel: 'Code Review',
     })
 
+    // Cross-family runtime invariant — the reviewer must not share the code writer's family.
+    if (pointerResult.verdict !== 'ERROR') {
+      const ptrViolation = crossFamilyViolation(pointerResult, codeWriterFamilies, ptrChain)
+      if (ptrViolation) {
+        log(`⛔ ${slug}: Pointer round ${pRound} CROSS-FAMILY VIOLATION — ${ptrViolation}. Parking (not trusting this review).`)
+        await parkHunt({
+          reason: 'cross_family_violation', resumePhase: 'Code Review', resolutionTypeExpected: 'clarify', phaseLabel: 'Code Review',
+          needFromUser: `The code review for round ${pRound} could not be proven cross-family: ${ptrViolation}. The review was NOT accepted. Resume to re-run the code review (clarify), or fix the reviewer plumbing (redirect).`,
+          context: `Examiner chain: ${ptrChain.join(' → ')}; code writer families: ${[...codeWriterFamilies].join(', ')}; providers reported: ${JSON.stringify(pointerResult.providers || [pointerResult.provider])}`,
+        })
+        return { slug, verdict: 'PARKED', status: 'parked:cross_family_violation', reason: 'cross_family_violation', tier, worktreePath }
+      }
+    }
+
     setExaminer(pointerResult.provider, `sticky: answered pointer round ${pRound}`)
 
     if (pointerResult.verdict === 'APPROVED') {
@@ -1966,7 +2419,7 @@ ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' +
     }
     if (pointerResult.verdict === 'ERROR') {
       // [03] Part B — code-review fan-out floored at cap 1 and STILL failing → PARK.
-      // [05] AC3 — quota outage (both cross-models throttled) parks model_quota (host
+      // [05] AC3 — quota outage (every chain examiner throttled) parks model_quota (host
       // driver reschedules past reset); broken plumbing parks review_error.
       const quota = isQuotaStatus(pointerResult.status)
       const reason = quota ? 'model_quota' : 'review_error'
@@ -1977,8 +2430,8 @@ ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' +
         resolutionTypeExpected: 'clarify',
         phaseLabel: 'Code Review',
         needFromUser: quota
-          ? `Both cross-model reviewers (Vibe/Mistral AND Agy/Gemini) are rate-limited / quota-exhausted, so the code review could not run. Transient: re-run after the window resets (clarify), or redirect if you suspect the reviewer plumbing.`
-          : `Both cross-model reviewers failed to produce a usable verdict for the code review even at sequential concurrency (cap 1) — likely a model outage or quota exhaustion. Decide: retry later (clarify → resume the code review), or investigate the reviewer plumbing (redirect).`,
+          ? `Every examiner in the code-review chain (${chainLabel(ptrChain)}) is rate-limited / quota-exhausted, so the code review could not run. Transient: re-run after the window resets (clarify), or redirect if you suspect the reviewer plumbing.`
+          : `Every examiner in the code-review chain (${chainLabel(ptrChain)}) failed to produce a usable verdict even at sequential concurrency (cap 1) — likely a model outage or quota exhaustion. Decide: retry later (clarify → resume the code review), or investigate the reviewer plumbing (redirect).`,
         context: `Code-review fan-out degradation log:\n${(pointerResult.degradeLog || []).map(l => `- ${l}`).join('\n') || '- (no detail captured)'}\nFinal status: ${pointerResult.status}`,
         options: quota
           ? `- A (clarify): transient quota — resume the code review after the window resets.\n- B (redirect): not actually quota — fix the reviewer plumbing, then resume.`
@@ -2055,9 +2508,39 @@ ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' +
       .map(f => `[ ] Finding ${f.id} [${f.severity}]: ${f.title}${f.file ? ` (${f.file})` : ''}`)
       .join('\n')
 
+    // Pointer rewrites go back to the SAME Shepherd family that wrote the code. A GLM
+    // rework that is rate-limited / fails falls back to the Claude Shepherd for this round
+    // (logged), which also makes claude a code writer (already excluded from review).
+    let rewriteResult = null
+    let rewriteFallbackNote = ''
+    if (reworkFamily() === 'glm') {
+      const glmRework = `You are the Wolfpack Shepherd (implementer) for hunt '${slug}', addressing Pointer code-review round ${pRound}.
+You have NO shell (no git, no tests, no commands). Tools: read_file, grep, write_file (NEW files
+only — it refuses an existing file), edit (modify EXISTING files), dev_cortex_repo_map,
+dev_cortex_file_outline. Worktree root: ${worktreePath} (absolute paths under it).
+Read ${worktreePath}/.agents/skills/shepherd/SKILL.md (skip shell steps) and the full review at
+${planDir}/pointer-review-${pRound}.md.
+MANDATORY: address EVERY finding below — ACCEPTED (change the code, say what changed) or
+REJECTED (say specifically why the finding is wrong). Skipping a finding is NOT allowed.
+--- FINDINGS CHECKLIST (from Pointer round ${pRound}) ---
+${pointerChecklist}
+--- END CHECKLIST ---
+Update ${planDir}/shepherd-log.md (edit) with the disposition of each finding. Touch nothing
+outside ${worktreePath}; under .wolfpack/ touch ONLY shepherd-log.md. One tool call at a time.
+End your response with EXACTLY ONE block, strict JSON, nothing after it:
+<dispositions>{"findingsAddressed":[{"id":1,"severity":"HIGH","title":"...","disposition":"ACCEPTED","justification":"..."}],"allAddressed":true}</dispositions>`
+      const g = await runGlmShepherd({ mode: 'rewrite', round: pRound, task: glmRework, phaseLabel: 'Code Review' })
+      noteGlmStep(g)
+      if (g.outcome === 'done' && Array.isArray(g.findingsAddressed)) {
+        rewriteResult = { findingsAddressed: g.findingsAddressed, allAddressed: !!g.allAddressed, __glm: true }
+        log(`GLM Shepherd reworked Pointer round ${pRound} (${g.findingsAddressed.length} disposition(s)).`)
+      } else {
+        log(`⚠ WOLFPACK_FALLBACK: shepherd r${pRound} glm→claude:${shepherdModel} reason=${glmFallbackReason(g)} (${g.outcome}: ${String(g.evidence || '').slice(0, 160)})`)
+        rewriteFallbackNote = glmFallbackNote(g, pRound)
+      }
+    }
     // [dropped-agent guard] see alpha-revise above — a dropped Shepherd rewrite returns null and
     // the bare rewriteResult.findingsAddressed deref would crash the campaign. Retry then fail loud.
-    let rewriteResult = null
     for (let rewriteAttempt = 1; rewriteAttempt <= 3 && !rewriteResult; rewriteAttempt++) {
       if (rewriteAttempt > 1) log(`↻ shepherd-rewrite:${slug}:r${pRound} dropped mid-response — retry ${rewriteAttempt}/3`)
       rewriteResult = await agent(`
@@ -2068,7 +2551,7 @@ Read .agents/skills/shepherd/SKILL.md for your instructions.
 Hunt: ${slug}
 Worktree: ${worktreePath}
 Plan dir: ${planDir}
-
+${rewriteFallbackNote}
 cd to ${worktreePath}.
 
 Read ${planDir}/pointer-review-${pRound}.md for full context on each finding.
@@ -2086,9 +2569,12 @@ Return the findingsAddressed array with disposition (ACCEPTED or REJECTED) and j
 Set allAddressed to true only if every finding has a disposition.
 
 SAFETY: No git push, no deploy, no git add .
+${rewriteFallbackNote ? '' : CLAUDE_WRITER_RECORD}
 ${heartbeat('Code Review', `Shepherd rewrite round ${pRound}`)}${HUMAN_NOTES_DIRECTIVE}${convergenceMetaInstruction(planDir, pEntry, pv.detail.startsWith('converging') ? 'converging' : 'continue', pCumCrit)}
 `, { label: `shepherd-rewrite:${slug}:r${pRound}`, phase: 'Code Review', schema: REVISION_SCHEMA, model: shepherdModel })
     }
+    // A Claude rewrite ran (no GLM result) → Claude is now the last writer.
+    if (rewriteResult && !rewriteResult.__glm) noteClaudeWrote()
     if (!rewriteResult) {
       throw new Error(`shepherd-rewrite:${slug}:r${pRound} returned null after 3 attempts (agent dropped mid-response / terminal API error) — cannot proceed without the rework; resume the run to retry this round.`)
     }
@@ -2195,9 +2681,11 @@ log(`Watchdog certifying: ${slug}`)
 
 // Certification writes files (certification.md, pedigree.json). Two mechanics:
 //  - Agy (--certify): full tool access in -p mode, writes directly.
-//  - Vibe: read-only (--enabled-tools), so the shim writes the files from its output.
-// Primary follows this hunt's assigned cross-examiner; the other is the fallback.
-const agyCertifyStep = `${repoRoot}/scripts/podman-agy.sh --certify "${worktreePath}" "${planDir}" /tmp/watchdog-${slug}.txt`
+//  - Vibe (GLM or Mistral): read-only (--enabled-tools), so the shim writes the files
+//    from its output.
+// The certifier walks the same cross-family chain as the Pointer: enabled examiners
+// minus every family that wrote code on this branch.
+const agyCertifyStep = `${shq(`${repoRoot}/scripts/podman-agy.sh`)} --certify ${shq(worktreePath)} ${shq(planDir)} ${shq(`/tmp/watchdog-${slug}.txt`)}`
 // [07 §6] Cert turn budget (same correction as the review step above: disconnect was
 // request-SIZE/gateway, fixed by the LEAN config — not a turn/TPM cap). A cert reads MORE
 // (diff + tests + plan), so it needs at least as much room as a review; 8 was too few once
@@ -2205,21 +2693,36 @@ const agyCertifyStep = `${repoRoot}/scripts/podman-agy.sh --certify "${worktreeP
 // ceiling it should scope its reads, or it routes to Gemini (the heavier judgment role, no
 // gateway ceiling here). Env-tunable.
 const MISTRAL_CERTIFY_TURNS = (typeof process !== 'undefined' && process.env && process.env.WOLFPACK_MISTRAL_CERTIFY_TURNS) || '15'
-const vibeCertifyStep = `${repoRoot}/scripts/podman-vibe.sh wolfpack-pointer "${worktreePath}" /tmp/watchdog-${slug}.txt ${MISTRAL_CERTIFY_TURNS}`
-const watchdogPrimaryIsAgy = crossExaminer === 'gemini'
-const watchdogPrimaryStep = watchdogPrimaryIsAgy ? agyCertifyStep : vibeCertifyStep
-// Gemini-only autonomous mode: never fall back to Vibe/Mistral for certification.
-const watchdogFallbackStep = AUTO_GEMINI_ONLY ? agyCertifyStep : (watchdogPrimaryIsAgy ? vibeCertifyStep : agyCertifyStep)
+const vibeCertifyStep = `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} wolfpack-pointer ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(MISTRAL_CERTIFY_TURNS)}`
+// GLM certifier: its own read-only Watchdog agent (wolfpack-watchdog-glm, glm-5.3), ≥80 turns.
+const glmCertifyStep = `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} wolfpack-watchdog-glm ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(GLM_REVIEW_TURNS)}`
+const certifyStep = (who) => (who === 'gemini' ? agyCertifyStep : who === 'glm' ? glmCertifyStep : vibeCertifyStep)
+const wdChain = examinerChain(codeWriterFamilies)
+if (!wdChain.length) {
+  log(`⛔ ${slug}: no cross-family certifier left (writers: ${[...codeWriterFamilies].join(', ')}). Parking.`)
+  await parkHunt({
+    reason: 'no_cross_family_reviewer', resumePhase: 'Certify', resolutionTypeExpected: 'redirect', phaseLabel: 'Certify',
+    needFromUser: `Every enabled examiner shares a family with the code's writer(s) (${[...codeWriterFamilies].join(', ')}), so no cross-family certification is possible. Enable another examiner family, then resume.`,
+    context: `Enabled examiners: ${EXAMINER_ORDER.join(', ') || '(none)'}; code writer families: ${[...codeWriterFamilies].join(', ')}`,
+  })
+  return { slug, verdict: 'PARKED', status: 'parked:no_cross_family_reviewer', reason: 'no_cross_family_reviewer', tier, worktreePath }
+}
+log(`Watchdog chain: ${chainLabel(wdChain)} (code writers: ${[...codeWriterFamilies].join(', ')})`)
+const certifySteps = wdChain.map((who, i) => `   [${i + 1}] ${i === 0 ? 'PRIMARY' : 'FALLBACK'} ${EXAMINER_LABEL[who]} (provider "${who}"):
+       ${certifyStep(who)}
+       ${who === 'gemini'
+          ? 'Agy writes certification.md / pedigree.json directly; git restricted to diff/add/commit.'
+          : `${EXAMINER_LABEL[who]} is read-only — capture its stdout and YOU write certification.md / pedigree.json from it.`}`).join('\n')
 
 watchdogResult = await agent(`
-You are a shim agent orchestrating Watchdog certification. This hunt's assigned
-certifier is ${EXAMINER_LABEL[crossExaminer]} (fallback: ${EXAMINER_LABEL[otherExaminer]}).
-Both are non-Claude — certification must be cross-model. Watchdog must produce
-certification.md and pedigree.json:
+You are a shim agent orchestrating Watchdog certification. The certifier chain for this
+hunt is ${chainLabel(wdChain)} — try each link in order. All links are non-Claude and none
+shares a family with the code's writer(s) (${[...codeWriterFamilies].join(', ')}) —
+certification must be cross-family. Watchdog must produce certification.md and pedigree.json:
  - If the running model is Agy/Gemini (--certify), it has full tool access and
    writes those files directly.
- - If the running model is Vibe/Mistral, it is read-only (--enabled-tools), so
-   YOU (the shim) must write the files from its stdout output.
+ - If the running model is a Vibe family (Vibe/GLM or Vibe/Mistral), it is read-only
+   (--enabled-tools), so YOU (the shim) must write the files from its stdout output.
 
 Hunt: ${slug}
 Worktree: ${worktreePath}
@@ -2257,25 +2760,19 @@ Steps:
    SAFETY: No git push. No deploy commands. No \`git add -f\` — ever.
    End your response with a <verdict> block: {verdict, plan_adherence, code_quality, test_result}"
 
-3. Run PRIMARY certifier (${EXAMINER_LABEL[crossExaminer]}). The wrapper caps
-   concurrent calls on this model at 2 (flock). Run it EXACTLY as given:
-   ${watchdogPrimaryStep}
-   Capture stdout for verdict parsing.
-   ${watchdogPrimaryIsAgy
-      ? 'Agy writes certification.md / pedigree.json directly; git restricted to diff/add/commit.'
-      : 'Vibe is read-only — capture its stdout and YOU write certification.md / pedigree.json from it.'}
+3. Walk the CERTIFIER CHAIN in order. Each wrapper caps concurrent calls on its model
+   (flock). Run each EXACTLY as given, capture stdout for verdict parsing:
+${certifySteps}
+   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) skips straight to the next link.
+   ${chainBoundary(wdChain, codeWriterFamilies)}
 
-4. Extract the verdict from the primary, in PRIORITY ORDER:
+4. Extract the verdict from the link that ran, in PRIORITY ORDER:
    - If ${planDir}/certification.md exists (the model wrote it), read the verdict from the file
    - Else if stdout has a <verdict> block, parse it
    - Else if stdout has a "## Status: <VERDICT>" line or a clear PASS / REWORK / FLAWED_PLAN statement, use that
-   - If none of these are present, the primary failed — go to step 5
+   - If none of these are present, that link failed — go to step 5
 
-5. If the primary failed, try FALLBACK (${EXAMINER_LABEL[otherExaminer]}):
-   ${watchdogFallbackStep}
-   ${watchdogPrimaryIsAgy
-      ? 'Vibe fallback is read-only — capture stdout and write the certification files yourself.'
-      : 'Agy fallback writes the files directly; capture stdout for the verdict.'}
+5. If a link failed, move to the NEXT link of the chain (step 3 list) and repeat step 4.
 
 6. Clean up: rm -f /tmp/watchdog-${slug}.txt
 
@@ -2287,7 +2784,7 @@ Steps:
 8. On PASS only — fold timing into the scorecard (non-blocking, like the lessons
    aggregator). Run this YOURSELF on the host AFTER the certifier returns (node is
    NOT in the sandbox container — do not put this in the certifier prompt):
-   \`node ${repoRoot}/scripts/wolfpack-timing.mjs "${planDir}"\`.
+   \`node ${shq(`${repoRoot}/scripts/wolfpack-timing.mjs`)} ${shq(planDir)}\`.
    It reads ${planDir}/timing.jsonl + metadata.json, writes a "timing" block into
    ${planDir}/pedigree.json, and prints a "DURATION=<…>" line plus an
    "INCOMPLETE" warning if any phase is missing a start/end. Capture the DURATION
@@ -2298,7 +2795,7 @@ Steps:
 8b. On PASS only — refresh the [06] per-model routing meter (host-side, non-blocking,
    same rules as step 8: run YOURSELF on the host after the certifier returns, node is
    NOT in the sandbox; pass the agent clock since the script has no Date):
-   \`node ${repoRoot}/scripts/wolfpack-model-stats.mjs --stamp "$(date -Iseconds)"\`.
+   \`node ${shq(`${repoRoot}/scripts/wolfpack-model-stats.mjs`)} --stamp "$(date -Iseconds)"\`.
    It re-aggregates every .wolfpack/plans/*/pedigree.json (this hunt's now folded in:
    model_assignments, execution_scores, predicted_dimensions, and timing/review_fingerprints
    if present) into .wolfpack/pedigree/model-stats.json — per-model signal/noise/miss/spend
@@ -2307,7 +2804,9 @@ Steps:
    gitignored (regenerated, fail-safes to tier defaults on a fresh clone). If it fails, log
    and continue — the meter is telemetry, not a gate.
 
-Return the verdict and which provider ran (status field).
+Return the verdict, and the provider FAMILY that produced the accepted certification in
+BOTH \`provider\` and \`status\` (exactly one of ${wdChain.map(f => `"${f}"`).join(', ')}). If EVERY link was
+rate-limited, return verdict "ERROR" with status "model_quota".
 
 SAFETY: No git push, no deploy.
 ${RATE_LIMIT_SIGNAL_NOTE}
@@ -2317,17 +2816,33 @@ ${heartbeat('Certify', 'Watchdog certification')}
 
 log(`Watchdog verdict: ${watchdogResult.verdict}`)
 
+// Cross-family runtime invariant on the certifier (a real verdict only; quota ERROR is
+// handled below). Unprovable → park; never let a same-family certification through.
+if (watchdogResult && watchdogResult.verdict && watchdogResult.verdict !== 'ERROR') {
+  const wdViolation = crossFamilyViolation(
+    { provider: watchdogResult.provider || watchdogResult.status }, codeWriterFamilies, wdChain)
+  if (wdViolation) {
+    log(`⛔ ${slug}: Watchdog CROSS-FAMILY VIOLATION — ${wdViolation}. Parking (certification NOT accepted).`)
+    await parkHunt({
+      reason: 'cross_family_violation', resumePhase: 'Certify', resolutionTypeExpected: 'clarify', phaseLabel: 'Certify',
+      needFromUser: `Certification could not be proven cross-family: ${wdViolation}. The ${watchdogResult.verdict} verdict was NOT accepted. Resume to re-run certification (clarify), or fix the certifier plumbing (redirect).`,
+      context: `Certifier chain: ${wdChain.join(' → ')}; code writer families: ${[...codeWriterFamilies].join(', ')}; provider reported: ${watchdogResult.provider || watchdogResult.status || '(none)'}`,
+    })
+    return { slug, verdict: 'PARKED', status: 'parked:cross_family_violation', reason: 'cross_family_violation', tier, worktreePath }
+  }
+}
+
 // [05] AC3 — both certifiers rate-limited → PARK model_quota, NOT a non-PASS that
 // masks a quota outage as a quality failure (REWORK/FLAWED_PLAN would wrongly send the
 // hunt back to Shepherd/Alpha). Transient: the host driver reschedules past the window.
 if (watchdogResult.verdict === 'ERROR' && isQuotaStatus(watchdogResult.status)) {
-  log(`⏸ ${slug}: both certifiers rate-limited (${watchdogResult.status}). Parking model_quota.`)
+  log(`⏸ ${slug}: every certifier in the chain rate-limited (${watchdogResult.status}). Parking model_quota.`)
   await parkHunt({
     reason: 'model_quota',
     resumePhase: 'Certify',
     resolutionTypeExpected: 'clarify',
     phaseLabel: 'Certify',
-    needFromUser: `Both cross-model certifiers (Agy/Gemini AND Vibe/Mistral) are rate-limited / quota-exhausted, so certification could not run. Transient: re-run after the window resets (clarify), or redirect if you suspect the certifier plumbing.`,
+    needFromUser: `Every certifier in the chain (${chainLabel(wdChain)}) is rate-limited / quota-exhausted, so certification could not run. Transient: re-run after the window resets (clarify), or redirect if you suspect the certifier plumbing.`,
     context: `Watchdog certify status: ${watchdogResult.status}. The code is implemented + tested; only certification is blocked on model quota.`,
     options: `- A (clarify): transient quota — resume certification after the window resets.\n- B (redirect): not actually quota — fix the certifier plumbing, then resume.`,
   })

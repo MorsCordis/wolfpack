@@ -244,3 +244,14 @@ test('end-to-end: v2 reward stats drive the bandit via the real aggregation path
   assert.equal(r.assignments.shepherd.model, 'work-horse')
   assert.match(r.assignments.shepherd.rationale, /bandit/)
 })
+
+test('normalizeHunt: an optional reviewer-c family resolves (and before reviewer-b) when the pool defines it', () => {
+  const pool = { judgment: 'opus', workHorse: 'sonnet', reviewerA: 'gemini', reviewerB: 'mistral', reviewerC: 'glm', coderAlt: 'glm' }
+  const h = normalizeHunt({
+    predicted_dimensions: {},
+    model_assignments: { shepherd: 'glm:5.3', pointer: 'mistral:zai-glm-5-3', watchdog: 'mistral:medium' },
+  }, pool)
+  assert.equal(h.models.shepherd, 'glm')
+  assert.equal(h.models.pointer, 'glm')
+  assert.equal(h.models.watchdog, 'mistral')
+})
