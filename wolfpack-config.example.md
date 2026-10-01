@@ -12,6 +12,7 @@ Copy this file to your project root as `wolfpack-config.md` and fill in your pro
 - **Test command:** `./scripts/run_tests.sh` or `npm test` or `go test ./...`
 - **Deploy command (dev):** `deploy-dev` or `npm run deploy:staging` or `kubectl apply -f ...`
 - **Deploy command (prod):** USER ONLY — describe the process here so agents know not to run it
+- **Vault root:** `~/Vault` — absolute path to the Obsidian vault that holds `project-notes/<project>/` (session notes, `/memory` project/lesson/reference notes, `/recall` search). Must NOT be inside the code repo or its parent workspace.
 
 ## Hard Rules (agents will be fired for violating these)
 

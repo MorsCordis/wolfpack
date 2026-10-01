@@ -22,7 +22,8 @@ Derive query terms from the task: hunt slug, files/apps touched, domain. Recall 
 pulling the whole vault buries signal and blows the context budget.
 
 ### 2. Retrieve over the graph
-Search the recall substrate — auto-memory dir, the vault `project-notes/<project>/`, and the
+Search the recall substrate — auto-memory dir, the vault's `<vault root>/project-notes/<project>/` (**Vault root** from
+`wolfpack-config.md`, e.g. `~/Vault`), and the
 pedigree index — for notes matching the query terms (slug, `description`, body). Then pull their
 `[[link]]` neighbors (one hop) for context. Rank by relevance + recency. **Do not** search raw
 hunt-plan trees (`.wolfpack/plans/`) — that's high-volatility noise; recall the *distilled*
