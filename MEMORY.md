@@ -92,7 +92,7 @@ local models follow it as a deterministic template (don't trust the format, enfo
    connected, not an island. A `[[slug]]` with no target yet is fine (marks future work).
 5. **Route** —
    - `user`/`feedback` (how to work with this human, cross-project) → auto-memory.
-   - `project`/`lesson`/`reference` tied to a codebase → the vault (`project-notes/<project>/`).
+   - `project`/`lesson`/`reference` tied to a codebase → the vault (`<vault root>/project-notes/<project>/`; **Vault root** in `wolfpack-config.md`).
    - update the index after writing (auto-memory `MEMORY.md`; vault daily-note backlink).
 
 ## The three doors

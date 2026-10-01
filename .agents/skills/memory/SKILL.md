@@ -28,7 +28,7 @@ recall-ready note as reliably as a frontier model does ad hoc).
 
 ### 2. Reconcile (never duplicate)
 Search existing memory for the same subject — by slug, description, and `[[link]]` neighbors
-(use `/recall` or grep the memory dir + `project-notes/`). Then:
+(use `/recall` or grep the memory dir + `<vault root>/project-notes/`). Then:
 - **exists & still true** → just bump `last_verified` to today. Stop. Do not create a copy.
 - **exists & changed** → rewrite the body. If it's a reversal, set the old note's
   `superseded_by:` and add `supersedes:` here.
@@ -42,7 +42,9 @@ not-yet-written note is fine).
 ### 4. Route + index
 - `user` / `feedback` → auto-memory dir; add a one-line pointer to its `MEMORY.md` index.
 - `project` / `lesson` / `reference` tied to a codebase → the vault under
-  `project-notes/<project>/` (per `wolfpack-config.md`'s vault location).
+  `<vault root>/project-notes/<project>/`, where `<vault root>` is the **Vault root** in
+  `wolfpack-config.md` → Project Identity (an absolute path such as `~/Vault`; never resolve
+  `project-notes/` relative to the cwd — that lands inside the code repo).
 
 ## Frontmatter template
 ```yaml
