@@ -359,9 +359,23 @@ CONVERGENCE LEDGER (record only — do NOT act on these findings): update ${plan
 - set top-level "convergence" = { "classification": "${classification}", "cumulative_distinct_criticals": ${cumulativeCriticals}, "rounds": ${entry.round} }
 Preserve every other field. (The worktree plan dir is the single source of truth — do NOT mirror to any main-repo plan dir; /merge handles that.)`
 
-const _args = (typeof args === 'string') ? JSON.parse(args) : (args || {})
-const { slug, description, campaign, tier: campaignTier, mode: campaignMode,
+// Accept an args OBJECT (campaign-runner, /run-hunt-local), its JSON string (the container
+// launcher's -p prompt), or a BARE SLUG string — the Workflow tool's auto-generated
+// "Run the hunt-pipeline workflow" invocation passes the slug alone, and JSON.parse on it used
+// to crash the run before any phase started. A bare slug can only RESUME an already-scaffolded
+// hunt; scaffolding a new one without a description fails loud below.
+const _parseArgs = (a) => {
+  if (typeof a !== 'string') return a || {}
+  const t = a.trim()
+  return t.startsWith('{') ? JSON.parse(t) : { slug: t }
+}
+const _args = _parseArgs(args)
+const { slug, campaign, tier: campaignTier, mode: campaignMode,
         ticketRefs, todoItemsCleared, migrationRisk, rationale } = _args
+const descriptionPassed = typeof _args.description === 'string' && _args.description.trim() !== ''
+const description = descriptionPassed
+  ? _args.description
+  : '(not passed in args — read the hunt\'s metadata.json "description" field and use it VERBATIM)'
 
 // The slug is interpolated into worktree paths, branch names, /tmp files and shell
 // commands. Fail LOUD at hunt start on anything outside the safe charset rather than
@@ -769,6 +783,9 @@ const at = (p) => PHASE_ORDER.indexOf(p) >= PHASE_ORDER.indexOf(resumeFrom)
 let worktreePath, planDir, adcValid = true
 let tier, bloodhoundRounds, pointerRounds, trackerRounds
 if (at('Scaffold')) {
+if (!descriptionPassed) {
+  throw new Error(`hunt-pipeline: ${slug} has no scaffolded hunt to resume and no description was passed — scaffold needs one. Pass args { slug, description } (or run /hunt first, then /run-hunt-local ${slug}).`)
+}
 log(`Scaffolding hunt: ${slug}`)
 
 const scaffold = await agent(`
@@ -2994,8 +3011,11 @@ Steps:
    VERSION=$(git describe --tags --always 2>/dev/null || echo "dev-${slug}")
    timeout 600s gcloud run deploy pawpims-dev --source . --region us-central1 --update-env-vars "APP_VERSION=$VERSION,APP_ENVIRONMENT=dev"
    IMAGE=$(gcloud run services describe pawpims-dev --region us-central1 --format="value(spec.template.spec.containers[0].image)")
+   [ -n "$IMAGE" ] || { echo "ERROR: could not read the deployed image SHA — stop, do NOT pin jobs" >&2; false; }
    gcloud run jobs update migrate-dev --image "$IMAGE" --region us-central1
+   gcloud run jobs update worker-dev --image "$IMAGE" --region us-central1
    gcloud run jobs execute migrate-dev --region us-central1 --wait
+   scripts/ops/check_image_invariant.sh dev   # service + migrate + worker must share one SHA
 
    NOTE: These deploy commands are INTENTIONALLY user-only. The PreToolUse hook
    blocks 'gcloud run deploy pawpims-*' to enforce the image-invariant rule.

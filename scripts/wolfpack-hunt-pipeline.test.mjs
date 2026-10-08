@@ -40,7 +40,7 @@ const BASE = {
   park: {},
 }
 
-async function runHunt({ env = {}, answers = {}, args = {} } = {}) {
+async function runHunt({ env = {}, answers = {}, args = {}, rawArgs } = {}) {
   const calls = []
   const logs = []
   const table = { ...BASE, ...answers }
@@ -59,7 +59,7 @@ async function runHunt({ env = {}, answers = {}, args = {} } = {}) {
   const parallel = async (fns) => Promise.all(fns.map(f => f()))
   const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'process', SRC)
   const result = await fn(
-    { slug: 'h', description: 'd', ...args }, agent, parallel,
+    rawArgs !== undefined ? rawArgs : { slug: 'h', description: 'd', ...args }, agent, parallel,
     (m) => logs.push(String(m)), () => {}, { total: 1e12, remaining: () => 1e12 }, { env })
   return { result, calls, logs, find: (p) => calls.filter(c => c.label.startsWith(p)) }
 }
@@ -257,6 +257,21 @@ test('slug charset is validated fail-loud at hunt start', async () => {
   for (const bad of ['bad slug', 'x;rm -rf /', "a'b", 'Upper', '-lead', '']) {
     await assert.rejects(runHunt({ args: { slug: bad } }), /invalid slug/, bad)
   }
+})
+
+test('args: a bare slug string resumes an existing hunt (the auto-generated invocation)', async () => {
+  const probe = { fresh: false, status: 'ready_for_alpha', resumePhase: 'Spec', worktreePath: WT, planDir: PD,
+    worktreeExists: true, branchExists: true }
+  const { result, find } = await runHunt({ rawArgs: 'h', answers: { 'resume-probe': probe } })
+  assert.equal(find('scaffold').length, 0, 'existing hunt is adopted, not re-scaffolded')
+  assert.notEqual(result.status, undefined)
+})
+
+test('args: a JSON string still parses; a bare slug on a FRESH hunt fails loud (no description)', async () => {
+  const { find } = await runHunt({ rawArgs: '{"slug": "h", "description": "d"}' })
+  assert.equal(find('scaffold').length, 1)
+  await assert.rejects(runHunt({ rawArgs: 'h' }), /no description was passed/)
+  await assert.rejects(runHunt({ rawArgs: 'bad slug' }), /invalid slug/)
 })
 
 test('shell commands single-quote interpolated paths (worktree with a space and a quote)', async () => {
