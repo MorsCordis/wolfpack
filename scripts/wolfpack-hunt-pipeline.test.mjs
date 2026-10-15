@@ -402,3 +402,178 @@ test('node helper invocations quote repo/plan paths (space + quote)', async () =
   assert.ok(wd.includes(`node ${q("/re po/it's/scripts/wolfpack-timing.mjs")} ${q(`${wt}/.wolfpack/plans/h`)}`))
   assert.ok(wd.includes(`node ${q("/re po/it's/scripts/wolfpack-model-stats.mjs")} --stamp`))
 })
+
+// ─── Tracker coverage (retire-gemini-glm-large4) ─────────────────────────────
+// The realized-writer record (AC22/AC23), the claude-ANSWERED review paths (AC17/AC18)
+// and the merge→sync protocol window (AC25). Specified in plan-final.md §
+// `scripts/wolfpack-hunt-pipeline.test.mjs`.
+
+const RESUME_AT_CERTIFY = { fresh: false, status: 'tests_pass', resumePhase: 'Certify', tier: 'Yellow',
+  worktreePath: WT, planDir: PD, worktreeExists: true, branchExists: true,
+  trackerRounds: 1, pointerRounds: 1, bloodhoundRounds: 1 }
+
+test('AC22: a Claude Tracker joins the writer record — Pointer keeps the claude link, Watchdog loses it', async () => {
+  const { find, logs } = await runHunt({ answers: { 'shepherd-seat': GLM_SEAT } })
+  // Implement: only GLM has written — the claude last-resort link is still live
+  assert.ok(logs.some(l => /Code-writer families after Implement: glm \(last writer: glm\)/.test(l)),
+    `after-Implement log missing: ${logs.filter(l => /Code-writer/.test(l))}`)
+  assert.match(find('pointer:')[0].prompt, /Claude \(last resort\)/)
+  // Test: the Tracker's tests are code on the branch, so claude joins the record
+  assert.ok(logs.some(l => /Code-writer families after Test: glm, claude/.test(l)),
+    `after-Test log missing: ${logs.filter(l => /Code-writer/.test(l))}`)
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /Claude \(last resort\)/,
+    'a Claude Watchdog must never certify Claude-written tests')
+  // the trailer the probe reads back must be stamped on the Tracker's own commits
+  const trk = find('tracker:')[0].prompt
+  assert.match(trk, /WRITER RECORD/)
+  assert.match(trk, /Wolfpack-Writer: claude/)
+  assert.doesNotMatch(trk, /Wolfpack-Writer: undefined/)
+  assert.match(trk, /append "claude" to the test_writer_families array/)
+})
+
+test('AC23: Claude Shepherd + Claude Tracker ⇒ no claude link on ANY code-review seat', async () => {
+  const { find, logs } = await runHunt({})
+  assert.ok(logs.some(l => /Code-writer families after Implement: claude \(last writer: claude\)/.test(l)))
+  assert.ok(logs.some(l => /Code-writer families after Test: claude$/.test(l)))
+  assert.doesNotMatch(find('pointer:')[0].prompt, /Claude \(last resort\)/)
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /Claude \(last resort\)/)
+})
+
+test('AC18: a FIRED Claude Shepherd fallback costs the hunt its last-resort link', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    'shepherd-seat': GLM_SEAT,
+    'shepherd-glm': { outcome: 'rate_limited', exitCode: 75, evidence: 'WOLFPACK_RATE_LIMITED:glm', changedFiles: ['app/x.py'] },
+  } })
+  assert.ok(logs.some(l => /Code-writer families after Implement: glm, claude \(last writer: claude\)/.test(l)),
+    `${logs.filter(l => /Code-writer/.test(l))}`)
+  assert.doesNotMatch(find('pointer:')[0].prompt, /Claude \(last resort\)/)
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /Claude \(last resort\)/)
+})
+
+test('AC18: resumed PAST Implement with an empty writer record → loud warning, no claude link', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    'resume-probe': RESUME_AT_CODE_REVIEW,
+    'shepherd-seat': { shepherdPin: '', complianceCritical: false, shepherdFamilies: [],
+      lastShepherdFamily: '', gitWriterFamilies: [], gitHeadWriter: '', glmWritePending: false },
+    pointer: issuesThenApprove,
+  } })
+  assert.ok(logs.some(l => /no code-writer record at code-review dispatch/.test(l)),
+    'an unprovable writer record must be announced, never silently assumed')
+  for (const c of find('pointer:')) assert.doesNotMatch(c.prompt, /Claude \(last resort\)/)
+})
+
+test('AC18: resumed AT Implement with an empty writer record → the phase itself seeds claude', async () => {
+  // Distinct from the row above: here the Implement phase RUNS, so the record is seeded by
+  // noteClaudeWrote() rather than by the dispatch-site guard. Either way the claude link must
+  // be gone by the time Pointer dispatches — that is the guarantee, not which guard fired.
+  const probe = { fresh: false, status: 'debriefed', resumePhase: 'Implement', tier: 'Yellow',
+    worktreePath: WT, planDir: PD, worktreeExists: true, branchExists: true,
+    trackerRounds: 1, pointerRounds: 1, bloodhoundRounds: 1 }
+  const { find, logs } = await runHunt({ answers: {
+    'resume-probe': probe,
+    'shepherd-seat': { shepherdPin: '', complianceCritical: false, shepherdFamilies: [],
+      lastShepherdFamily: '', gitWriterFamilies: [], gitHeadWriter: '', glmWritePending: false },
+  } })
+  assert.ok(logs.some(l => /Code-writer families: \(none yet\)/.test(l)), 'the probe found no record')
+  assert.ok(logs.some(l => /Code-writer families after Implement: claude/.test(l)), 'the phase seeded it')
+  assert.doesNotMatch(find('pointer:')[0].prompt, /Claude \(last resort\)/)
+})
+
+test('AC22 (metadata channel): resume at Certify reads test_writer_families back', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    'resume-probe': RESUME_AT_CERTIFY,
+    'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: ['glm'],
+      testWriterFamilies: ['claude'], lastShepherdFamily: 'glm',
+      gitWriterFamilies: [], gitHeadWriter: '', glmWritePending: false },
+  } })
+  assert.equal(find('tracker:').length, 0, 'resumed past Test')
+  assert.ok(logs.some(l => /Watchdog chain: .*\(code writers: glm, claude\)/.test(l)),
+    `union not {glm,claude}: ${logs.filter(l => /Watchdog chain/.test(l))}`)
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /Claude \(last resort\)/)
+  assert.ok(!logs.some(l => /no test-writer record at Certify dispatch/.test(l)),
+    'the metadata channel satisfied the record — no over-seed warning')
+})
+
+test('AC22 (trailer channel, POSITIVE): a Tracker Wolfpack-Writer trailer is read back at Certify', async () => {
+  // The Shepherd was GLM and its metadata channel says so, so a `claude` trailer on
+  // main..HEAD could only have been produced by a Tracker commit.
+  const { find, logs } = await runHunt({ answers: {
+    'resume-probe': RESUME_AT_CERTIFY,
+    'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: ['glm'],
+      lastShepherdFamily: 'glm', gitWriterFamilies: ['glm', 'claude'], gitHeadWriter: 'claude',
+      glmWritePending: false },
+  } })
+  assert.ok(logs.some(l => /Watchdog chain: .*\(code writers: glm, claude\)/.test(l)),
+    `union not {glm,claude}: ${logs.filter(l => /Watchdog chain/.test(l))}`)
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /Claude \(last resort\)/,
+    'a dead trailer key would show up here as a live claude link')
+})
+
+test('Risk 6: resume at Certify with BOTH Tracker channels lost → loud over-seed, no claude link', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    'resume-probe': RESUME_AT_CERTIFY,
+    'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: ['glm'],
+      lastShepherdFamily: 'glm', gitWriterFamilies: ['glm'], gitHeadWriter: 'glm', glmWritePending: false },
+  } })
+  assert.ok(logs.some(l => /no test-writer record at Certify dispatch — assuming claude wrote the tests/.test(l)))
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /Claude \(last resort\)/)
+})
+
+test('AC17: a claude-ANSWERED review is ACCEPTED, logged loud, and durably recorded', async () => {
+  const { result, find, logs } = await runHunt({ answers: {
+    'shepherd-seat': GLM_SEAT,
+    pointer: { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'claude' },
+  } })
+  assert.notEqual(result.status, 'parked:cross_family_violation', 'claude is a LEGAL final link here')
+  // the prompt mandates the operator-visible marker…
+  assert.match(find('pointer:')[0].prompt, /WOLFPACK_CLAUDE_FALLBACK: pointer/)
+  assert.match(find('pointer:')[0].prompt, /no shim — YOU are Claude/)
+  // …and the PIPELINE writes the durable row itself rather than trusting the examiner
+  assert.ok(logs.some(l => /was answered by the CLAUDE LAST-RESORT examiner \(provider "claude"\)/.test(l)))
+  const rec = find('claude-fallback-record:')
+  assert.equal(rec.length, 1, 'exactly one claude_fallback_reviews row')
+  assert.match(rec[0].prompt, /"claude_fallback_reviews"/)
+  assert.match(rec[0].prompt, /"role": "pointer"/)
+  assert.match(rec[0].prompt, /"round": 1/)
+  assert.match(rec[0].prompt, /"reason": "every cross-family link in \[mistral, claude\] was unavailable"/)
+})
+
+test('AC18: a claude-ANSWERED review when CLAUDE wrote code PARKS cross_family_violation', async () => {
+  const { result, find, logs } = await runHunt({ answers: {
+    'shepherd-seat': { ...GLM_SEAT, shepherdFamilies: ['glm', 'claude'] },
+    pointer: { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'claude' },
+  } })
+  assert.equal(result.status, 'parked:cross_family_violation',
+    'deleting the "never Claude" special case must not weaken the writer-family check')
+  assert.equal(find('claude-fallback-record:').length, 0, 'a rejected review is never recorded as accepted')
+  assert.equal(find('tracker:').length, 0, 'never proceeds past a same-family review')
+  assert.ok(logs.some(l => /CROSS-FAMILY VIOLATION/.test(l)))
+})
+
+// AC25 — the merge→sync window: a protocol-2 runtime pipeline must WARN, never throw.
+async function runRunnerLogged({ env = {}, protocol }) {
+  const calls = []
+  const logs = []
+  const agent = async (_p, opts = {}) => {
+    calls.push(opts.label)
+    if (opts.label === 'parse-campaign') return { waves: [] }
+    if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol }
+    return {}
+  }
+  const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'process', 'workflow', RUNNER)
+  await fn({ campaign: 'c' }, agent, async (f) => Promise.all(f.map(x => x())), (m) => logs.push(String(m)),
+    () => {}, { total: 0, remaining: () => 1e12 }, { env }, async () => ({}))
+  return { calls, logs }
+}
+
+test('AC25: a protocol-2 runtime pipeline (merge→sync window) WARNS and continues', async () => {
+  const { calls, logs } = await runRunnerLogged({ protocol: 2 })
+  assert.ok(calls.includes('pipeline-capability'))
+  assert.ok(logs.some(l => /STALE PIPELINE/.test(l)), `no STALE PIPELINE warning: ${logs}`)
+  assert.ok(logs.some(l => /wolfpack-sync-runtime\.sh/.test(l)), 'the warning names the fix command')
+})
+
+test('AC25: protocol 1 and 0 are still BELOW the floor and fail loud', async () => {
+  await assert.rejects(runRunnerLogged({ protocol: 1 }), /STALE .*examiner protocol/)
+  await assert.rejects(runRunnerLogged({ protocol: 0 }), /STALE .*examiner protocol/)
+})
