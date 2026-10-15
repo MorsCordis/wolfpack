@@ -446,7 +446,8 @@ const EXAMINER_LABEL = { glm: 'Vibe/GLM', mistral: 'Vibe/Mistral Large 4', claud
 // Map a model-assignment string to its family, or null if unrecognized. glm is matched
 // FIRST: GLM runs through Vibe on the Mistral API, so "Vibe/GLM", "glm:5.3", "glm-5.3",
 // "zai-glm-5-3", "mistral:zai-glm-5-3" must never fall into the vibe/mistral branch.
-// Claude strings resolve to 'claude' (a WRITER family; never an examiner).
+// Claude strings resolve to 'claude' (a WRITER family, and a last-resort examiner only as
+// the final chain link).
 const familyOf = (m) => {
   if (!m) return null
   const s = String(m).toLowerCase()
@@ -541,8 +542,8 @@ const setExaminer = (provider, why) => {
 }
 
 // RUNTIME CROSS-FAMILY INVARIANT. Called on every non-ERROR review/certify result: every
-// family that produced an accepted unit must resolve, be non-Claude, be in the seat's
-// chain, and NOT be a writer family of the reviewed artifact. Returns null when sound,
+// family that produced an accepted unit must resolve, be in the seat's chain, and NOT be
+// a writer family of the reviewed artifact. Returns null when sound,
 // else a reason string — the caller PARKS (fail loud) instead of trusting a same-family
 // (or unattributable) review.
 // AC18: the blanket `f === 'claude'` rejection is GONE — the three checks below ARE the whole
@@ -1684,6 +1685,7 @@ const SHEPHERD_SEAT_SCHEMA = {
     trackerAssignment: { type: 'string' },          // raw pin string, or "" when none
     complianceCritical: { type: 'boolean' },  // spec.compliance_critical / review_required / domain_sensitivity ≥3
     shepherdFamilies: { type: 'array', items: { type: 'string' } },  // metadata.shepherd_families
+    testWriterFamilies: { type: 'array', items: { type: 'string' } },  // metadata.test_writer_families
     lastShepherdFamily: { type: 'string' },   // metadata.last_shepherd_family, or ""
     glmWritePending: { type: 'boolean' },     // metadata.glm_write_pending === true
     gitWriterFamilies: { type: 'array', items: { type: 'string' } },  // Wolfpack-Writer trailers on main..HEAD
@@ -2451,8 +2453,8 @@ if (at('Code Review') && pointerRounds > 0) {
       return `
 You are a shim agent orchestrating a Pointer code review${unit.focus ? ` (FOCUS LENS: ${unit.key})` : ''}. The examiner chain
 for this code review is ${chainLabel(ptrChain)} — try each link in order, moving to the next
-only when the current one fails. (All non-Claude, and none shares a family with the code's
-writer(s): ${[...codeWriterFamilies].join(', ')}.)
+only when the current one fails. (Claude only as the final last-resort link; none shares a
+family with the code's writer(s): ${[...codeWriterFamilies].join(', ')}.)
 
 Hunt: ${slug}
 Worktree: ${worktreePath}
