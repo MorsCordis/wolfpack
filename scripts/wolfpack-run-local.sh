@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # REFERENCE — ported from PawPIMS; slated for DevDen reimplementation. NOT fully genericized. See DEVDEN-ARCHITECTURE.md section 14.
+# Retired plumbing: the agy/Gemini seats and .gemini/skills paths below predate the
+# GLM -> Mistral -> Claude examiner chain (hunt: retire-gemini-glm-large4) — do NOT revive
+# this script without reimplementing them.
 # scripts/wolfpack-run-local.sh — model-agnostic local Wolfpack orchestrator.
 # Drives the 6-phase pipeline without a Claude subscription.
 # Uses `agy` for remote Claude/Gemini models and `vibe` for local models.
