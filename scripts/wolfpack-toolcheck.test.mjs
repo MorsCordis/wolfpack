@@ -11,14 +11,13 @@ import { readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
-import { analyzeVibeShim, analyzeAgyShim, CAPABLE_TOOLS } from './wolfpack-toolcheck.mjs'
+import { analyzeVibeShim, CAPABLE_TOOLS } from './wolfpack-toolcheck.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
-// TODO(de-fracture): these shim filenames are harness-specific (see wolfpack-toolcheck.mjs).
+// TODO(de-fracture): this shim filename is harness-specific (see wolfpack-toolcheck.mjs).
 // The "REAL committed shim" tests below auto-skip when the shim is absent so the
 // synthetic-fixture coverage still runs in a repo that doesn't ship these shims.
 const vibePath = join(here, 'podman-vibe.sh')
-const agyPath = join(here, 'podman-agy.sh')
 
 // A minimal capable shim fragment (mirrors the real loop).
 const capableShim = `
@@ -98,18 +97,6 @@ test('missing VIBE_TOOLS_DEFAULT fails loud', () => {
   const res = analyzeVibeShim('echo nothing here')
   assert.equal(res.ok, false)
   assert.ok(res.problems.some(p => /VIBE_TOOLS_DEFAULT not found/.test(p)))
-})
-
-test('the REAL committed podman-agy.sh has no allowlist flag', { skip: !existsSync(agyPath) && 'harness shim not present in this repo' }, () => {
-  const res = analyzeAgyShim(readFileSync(agyPath, 'utf8'))
-  assert.deepEqual(res.problems, [], res.problems.join('\n'))
-  assert.equal(res.ok, true)
-})
-
-test('agy with a stray --enabled-tools fails loud', () => {
-  const res = analyzeAgyShim('agy -p - --enabled-tools read')
-  assert.equal(res.ok, false)
-  assert.ok(res.problems.some(p => /agy.*no allowlist/i.test(p)))
 })
 
 test('CLI exits 0 on the real shims', { skip: !existsSync(vibePath) && 'harness shim not present in this repo' }, () => {

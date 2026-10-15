@@ -9,7 +9,7 @@
 // whole review. So a preflight MUST assert the capable set before a run and FAIL
 // LOUD (exit non-zero), not warn, if a model comes back re-boxed.
 //
-// TODO(de-fracture): the shim filenames (podman-vibe.sh / podman-agy.sh) and the
+// TODO(de-fracture): the shim filename (podman-vibe.sh) and the
 // VIBE_TOOLS_DEFAULT variable name are specific to one cross-model agent harness.
 // Parameterize the shim path(s) + the tools-default variable name via wolfpack-config.md
 // so this guard targets whichever harness shim a project actually ships.
@@ -24,8 +24,6 @@
 //   4. The flag array is built by REPEATING --enabled-tools per tool (argparse
 //      action="append"), not collapsed to one flag.
 //   5. `task` is NOT in the default set — cross-model self-orchestration stays off.
-// And in scripts/podman-agy.sh: agy has no allowlist flag, so assert no
-// --enabled-tools snuck in (its boundary is the mount set + diff-catch, not a box).
 //
 // WHY NODE / NO CLOCK: pure string analysis, host-side; no Date/random (AC5 N/A
 // here but kept clean). Exit 0 = capable; exit 1 = re-boxed (loud) ; exit 2 = the
@@ -101,30 +99,11 @@ export function analyzeVibeShim(text) {
   return { ok: problems.length === 0, tools, problems }
 }
 
-// Analyze podman-agy.sh: assert no --enabled-tools (agy has no allowlist; its
-// boundary is the mount set + diff-catch). Presence of one means someone tried to
-// box agy with a flag it doesn't understand.
-export function analyzeAgyShim(text) {
-  // Strip comment lines first — the shim legitimately MENTIONS --enabled-tools in
-  // prose ("agy has no --enabled-tools equivalent"); only a real command usage is a
-  // violation. Drop everything from an unquoted `#` to end-of-line per line.
-  const code = String(text || '')
-    .split('\n')
-    .map((line) => line.replace(/(^|\s)#.*$/, '$1'))
-    .join('\n')
-  const problems = []
-  if (/--enabled-tools\b/.test(code)) {
-    problems.push('podman-agy.sh contains --enabled-tools — agy has no allowlist flag; remove it (agy is bounded by mounts + diff-catch, not a tool box)')
-  }
-  return { ok: problems.length === 0, problems }
-}
-
 // ─── CLI ────────────────────────────────────────────────────────
 
 function main(argv) {
   const here = dirname(fileURLToPath(import.meta.url))
   const vibePath = argv[2] || join(here, 'podman-vibe.sh')
-  const agyPath = join(dirname(vibePath), 'podman-agy.sh')
 
   let failed = false
 
@@ -139,18 +118,6 @@ function main(argv) {
     failed = true
     console.error('✗ podman-vibe.sh REVIEWER IS RE-BOXED (fail-loud):')
     for (const p of vibe.problems) console.error(`    • ${p}`)
-  }
-
-  // agy is optional to co-locate; only check if present.
-  if (existsSync(agyPath)) {
-    const agy = analyzeAgyShim(readFileSync(agyPath, 'utf8'))
-    if (agy.ok) {
-      console.log('✓ podman-agy.sh: no allowlist flag (mount + diff-catch boundary)')
-    } else {
-      failed = true
-      console.error('✗ podman-agy.sh:')
-      for (const p of agy.problems) console.error(`    • ${p}`)
-    }
   }
 
   process.exit(failed ? 1 : 0)

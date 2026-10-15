@@ -51,7 +51,7 @@ const parsedArgs = typeof args === 'string' ? JSON.parse(args) : (args || {})
 const { campaignSlug, maxParallel } = parsedArgs
 const parallelCap = maxParallel || 2
 
-// Alternate the non-Claude cross-examiner per hunt so two parallel hunts never
+// Alternate the cross-examiner per hunt so two parallel hunts never
 // stack their reviews on the same model (which trips Mistral rate limits).
 // Examiner SPREAD DEFAULT (the "runner rebalances" baseline): hunts rotate their FIRST
 // examiner over the enabled families, so parallel hunts don't all start on one provider.
@@ -63,23 +63,31 @@ const parallelCap = maxParallel || 2
 // Alpha-aware cross-hunt reassignment would need post-Plan coordination — not
 // done yet; the flock cap is the interim safeguard.
 let huntCounter = 0
-// The hint rotates over the ENABLED examiner families, in hunt-pipeline's chain order:
-// gemini always; glm unless WOLFPACK_ENABLE_GLM is off (default ON — unset/""/"1"/"true");
-// mistral only with WOLFPACK_ENABLE_MISTRAL_AUTO. With the defaults that alternates
-// gemini/glm. It only ROTATES the chain's first link — hunt-pipeline still removes the
-// code writer's family (e.g. glm on a GLM-Shepherd hunt), so a hint can never cause a
-// same-family review; a disabled family is never hinted.
+// The hint rotates over the ENABLED SHIM examiner families, in hunt-pipeline's chain order:
+// glm unless WOLFPACK_ENABLE_GLM is off (default ON — unset/""/"1"/"true"); mistral unless
+// WOLFPACK_ENABLE_MISTRAL_AUTO is off (same gate shape, also default ON). With the defaults
+// that alternates glm/mistral. `claude` is deliberately NOT in the rotation: a hint rotates
+// the chain's FIRST link, and claude must never be first (it is the last-resort link only).
+// A hint only ROTATES the first link — hunt-pipeline still removes the code writer's family
+// (e.g. glm on a GLM-Shepherd hunt), so a hint can never cause a same-family review; a
+// disabled family is never hinted. gemini/agy is RETIRED (2026-10-15).
 const _envRunner = (k) => ((typeof process !== 'undefined' && process.env) ? process.env[k] : undefined)
-const MISTRAL_AUTO = !!_envRunner('WOLFPACK_ENABLE_MISTRAL_AUTO')
-const GLM_ENABLED = (() => {
-  const v = _envRunner('WOLFPACK_ENABLE_GLM')
+// Shared default-ON gate, identical to hunt-pipeline's _enabledGate (a deliberate "=0" now
+// means OFF; the old `!!_envRunner(...)` test made "0" truthy).
+const _enabledGateRunner = (k) => {
+  const v = _envRunner(k)
   if (v === undefined || v === null) return true
   const t = String(v).trim().toLowerCase()
   return t === '' || t === '1' || t === 'true'
-})()
-const EXAMINER_ROTATION = ['gemini', 'glm', 'mistral']
-  .filter(f => f === 'gemini' || (f === 'glm' && GLM_ENABLED) || (f === 'mistral' && MISTRAL_AUTO))
-const nextCrossExaminer = () => EXAMINER_ROTATION[huntCounter++ % EXAMINER_ROTATION.length]
+}
+const MISTRAL_AUTO = _enabledGateRunner('WOLFPACK_ENABLE_MISTRAL_AUTO')   // default ON
+const GLM_ENABLED  = _enabledGateRunner('WOLFPACK_ENABLE_GLM')            // default ON
+const EXAMINER_ROTATION = ['glm', 'mistral']
+  .filter(f => (f === 'glm' && GLM_ENABLED) || (f === 'mistral' && MISTRAL_AUTO))
+// Both kill switches off → no SHIM family to hint. Return null rather than indexing modulo 0
+// (NaN): the hint is advisory, and hunt-pipeline's own gates are the authority. The empty-chain
+// case fails loud there, where it belongs — not silently here.
+const nextCrossExaminer = () => (EXAMINER_ROTATION.length ? EXAMINER_ROTATION[huntCounter++ % EXAMINER_ROTATION.length] : null)
 
 // ─── [05] AC1 — self-imposed token-budget breaker ─────────────
 // The Workflow harness `budget` global is a SHARED output-token pool across the main
@@ -176,12 +184,22 @@ log(`Campaign parsed: ${campaign.waves.length} waves, ${campaign.waves.reduce((n
 // ─── Preflight: runtime hunt-pipeline supports the hinted examiner families ────
 // The runtime hunt-pipeline.js in a consuming project is a GENERATED, often gitignored
 // copy (scripts/wolfpack-sync-runtime.sh). A stale copy predates the examiner chain: it
-// would silently misread a "glm" hint (as mistral, or drop it). Whenever we would hint a
-// non-gemini family, require the generated pipeline's capability marker
-// (WOLFPACK_EXAMINER_PROTOCOL=<n>) to be ≥ REQUIRED_EXAMINER_PROTOCOL — else fail LOUD
-// before any hunt starts.
-const REQUIRED_EXAMINER_PROTOCOL = 2
-if (EXAMINER_ROTATION.some(f => f !== 'gemini')) {
+// would silently misread a "glm" hint (as mistral, or drop it). The preflight now runs
+// UNCONDITIONALLY — there is no "gemini-only, nothing to check" case any more, so the old
+// `some(f => f !== 'gemini')` wrapper was trivially true and therefore meaningless.
+//
+// FLOOR vs LATEST (AC25). REQUIRED is the FLOOR: below it the runtime cannot honor an
+// examiner-chain hint at all, so we throw. LATEST is what the current canonical
+// hunt-pipeline emits; at-or-above the floor but below LATEST we WARN and CONTINUE, because
+// this file is tracked and merges with the hunt while the consumer's hunt-pipeline.js stays
+// gitignored and un-regenerated until the operator runs wolfpack-sync-runtime.sh. Throwing
+// there would abort every campaign launch AND every cron auto-resume at the Parse phase for
+// the whole merge→sync window — converting a known, temporary, documented drift into an
+// outage. The degrade is bounded and LOUD: an old protocol-2 pipeline honors a glm hint and
+// falls back to its own gemini-first chain otherwise.
+const REQUIRED_EXAMINER_PROTOCOL = 2   // FLOOR: understands the examiner chain / crossExaminer hint at all
+const LATEST_EXAMINER_PROTOCOL   = 3   // what the current canonical hunt-pipeline emits
+{
   const cap = await agent(`
 READ-ONLY check — modify nothing. From the current repo root, pick the runtime workflow file:
 .claude/workflows/hunt-pipeline.js if it exists, else .agents/workflows/hunt-pipeline.js.
@@ -197,7 +215,13 @@ the "=", or 0 if the marker is absent / the file is missing).
   if (proto < REQUIRED_EXAMINER_PROTOCOL) {
     throw new Error(`campaign-runner: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) is STALE — examiner protocol ${proto} < ${REQUIRED_EXAMINER_PROTOCOL}; it cannot honor the ${EXAMINER_ROTATION.join('/')} examiner hints. Re-run ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh (hunt-pipeline.js + campaign-runner.js), then relaunch.`)
   }
-  log(`Pipeline capability OK: examiner protocol ${proto} (${cap.path}) — hint rotation ${EXAMINER_ROTATION.join(' / ')}`)
+  if (proto < LATEST_EXAMINER_PROTOCOL) {
+    // Disclosed degrade (CLAUDE.md § Fail Loud): logged at WARNING level AND visible in the
+    // campaign output, every pass, naming the exact fix.
+    log(`⚠ STALE PIPELINE: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) reports examiner protocol ${proto}, this campaign-runner is ${LATEST_EXAMINER_PROTOCOL}. Reviews will run on the OLD (gemini-first) chain until you re-run: ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh <repo>/.claude/workflows/hunt-pipeline.js`)
+  } else {
+    log(`Pipeline capability OK: examiner protocol ${proto} (${cap.path}) — hint rotation ${EXAMINER_ROTATION.join(' / ')}`)
+  }
 }
 
 // ─── Phase: Execute Waves ──────────────────────────────────────

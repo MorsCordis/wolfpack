@@ -12,17 +12,17 @@ Wolfpack is a multi-agent pipeline for planning, reviewing, implementing, and ce
 | Role | Name | Default Model | When it runs |
 |------|------|---------------|--------------|
 | Planner | **Alpha** | Claude Opus (fixed) | Phase 1: writes the plan + predicted task dimensions |
-| Adversarial plan reviewer | **Bloodhound** | Cross-model from Alpha — examiner chain Gemini → GLM (→ Mistral if opted in) | Phase 2: reviews the plan, explores the codebase, writes review-N.md |
+| Adversarial plan reviewer | **Bloodhound** | Cross-model from Alpha — examiner chain GLM → Mistral → Claude (last resort) | Phase 2: reviews the plan, explores the codebase, writes review-N.md |
 | Implementer | **Shepherd** | Claude by tier (Sonnet; Opus on Red/Orange/compliance); optional GLM (`glm:5.3`) coder-alt on Green/Blue/Yellow non-compliance, falling back to Claude on a rate limit | Phase 3: implements the plan (code only — no tests) |
-| Adversarial code reviewer | **Pointer** | Cross-family from Shepherd; **non-Claude** — chain Gemini → GLM (→ Mistral) minus the Shepherd's family | Phase 4: reviews the code, triggers Shepherd rewrites |
-| Test writer | **Tracker** | Metered-with-fallback, routable across pool (Opus, Sonnet, Gemini, GLM, Mistral) — NOT a reviewer, so may be Claude | Phase 5: writes + runs tests, triggers Shepherd rewrites |
-| Certifier | **Watchdog** | Cross-family from Shepherd; **non-Claude** — chain Gemini → GLM (→ Mistral) minus the Shepherd's family | Phase 6: verifies code + tests, scores pedigree |
+| Adversarial code reviewer | **Pointer** | Cross-family from Shepherd — chain GLM → Mistral → Claude (last resort) minus EVERY family that wrote code or tests on the branch | Phase 4: reviews the code, triggers Shepherd rewrites |
+| Test writer | **Tracker** | Metered-with-fallback, routable across pool (Opus, Sonnet, GLM, Mistral) — NOT a reviewer, so may be Claude — and because tests are code on the branch, the Tracker's family is recorded as a WRITER (P9/AC22), so it is removed from the Watchdog's chain | Phase 5: writes + runs tests, triggers Shepherd rewrites |
+| Certifier | **Watchdog** | Cross-family from Shepherd — chain GLM → Mistral → Claude (last resort) minus EVERY family that wrote code or tests on the branch | Phase 6: verifies code + tests, scores pedigree |
 
-**Adversarial Cross-Model Rule:** Review/verification roles MUST use a different model family from the role they review. Bloodhound ≠ Alpha. Pointer ≠ Shepherd. Watchdog ≠ Shepherd. This ensures independent perspective at every critical checkpoint. **All three review roles (Bloodhound, Pointer, Watchdog) are always non-Claude** (Gemini, GLM, or Mistral when opted in) — never Opus or Sonnet ([06]; Sonnet is retired from the reviewer pool). A Claude reviewing Claude is not adversarial cross-model review. Each review seat walks an ordered **examiner chain** (Gemini → GLM → Mistral-if-`WOLFPACK_ENABLE_MISTRAL_AUTO`; GLM off with `WOLFPACK_ENABLE_GLM=0`) with the **writer's family removed** — so a GLM-written diff is reviewed/certified by Gemini (or Mistral), never GLM. A rate limit moves to the next link; chain exhausted → park `model_quota`; the pipeline parks `cross_family_violation` if a review can't be proven cross-family. (Tracker is exempt — it writes tests, it doesn't review, so it may be Claude.)
+**The golden rule: no family examines its own work.** Bloodhound ≠ Alpha. Pointer ≠ Shepherd. Watchdog ≠ Shepherd (and ≠ Tracker — tests are code). Each review seat walks an ordered **examiner chain** — `GLM → Mistral → Claude (last resort)`, with `WOLFPACK_ENABLE_GLM=0` / `WOLFPACK_ENABLE_MISTRAL_AUTO=0` as kill switches and **every family that wrote code or tests on the branch removed**. Claude is the LAST link and never the first: it is admitted only when no cross-family shim link (GLM or Mistral) is both enabled and cross-family, and it is filtered out entirely whenever Claude wrote any of the code or tests under review (so the common Claude-Shepherd hunt never reaches it). A Claude reviewing Claude's own work is not adversarial review, and that — not "Claude is ineligible" — is the invariant. A rate limit moves to the next link; chain exhausted → park `model_quota`; a review that cannot be proven cross-family parks `cross_family_violation`. Alpha is ALWAYS the judgment family (unchanged).
 
-**Multi-Model Pool:** Five model families are available: Opus, Sonnet, Gemini, GLM (GLM 5.3 via Vibe), Mistral (opt-in). The concrete mapping lives in `wolfpack-config.md` → Model Pool (reviewer-a/b/c, coder-alt). Alpha selects models for each role during the Debrief based on pedigree scores from past hunts. Only Alpha is fixed (= Opus). The rest are pedigree-driven with cross-model constraints — including Tracker, which is **metered-with-fallback** (routable across the whole pool, gated on pedigree metrics plus a capability fallback; see `docs/wolfpack-autonomy/06-model-tiers-and-routing.md`), no longer pinned to Opus.
+**Multi-Model Pool:** Four model families are available: Opus, Sonnet, GLM (GLM 5.3 via Vibe), Mistral (Large 4). The concrete mapping lives in `wolfpack-config.md` → Model Pool (reviewer-a/b/c, coder-alt). Alpha selects models for each role during the Debrief based on pedigree scores from past hunts. Only Alpha is fixed (= Opus). The rest are pedigree-driven with cross-model constraints — including Tracker, which is **metered-with-fallback** (routable across the whole pool, gated on pedigree metrics plus a capability fallback; see `docs/wolfpack-autonomy/06-model-tiers-and-routing.md`), no longer pinned to Opus.
 
-**Gemini sync:** Gemini maintains its own skill ports in `.gemini/skills/`. Before invoking a hunt skill, Gemini checks git HEAD against `.gemini/SYNC_BASELINE` and ports any changes from `.agents/skills/`. Mistral reads `.agents/skills/` directly.
+Mistral and GLM read `.agents/skills/` directly.
 
 The Debrief (written by Alpha after Phase 2) is a summary of accepted/rejected review points plus the 6-role model assignment. Users read plan-final.md + debrief.md before authorizing Phase 3.
 
@@ -98,8 +98,8 @@ the wave), and degrades concurrency `n → n-1` on flock contention rather than 
 This is **one level of fan-out**, held by the orchestrator — see
 `docs/wolfpack-autonomy/03-convergence-and-verdict.md` § Capped parallel review fan-out.
 
-**Cross-model CLI self-orchestration is disabled.** A headless reviewer — Vibe/Mistral via
-`podman-vibe.sh`, Agy/Gemini via `podman-agy.sh` — runs **one comprehensive single-pass review**
+**Cross-model CLI self-orchestration is disabled.** A headless reviewer — Vibe/Mistral and
+Vibe/GLM via `podman-vibe.sh` — runs **one comprehensive single-pass review**
 and emits its verdict; it does **not** spawn sub-agents:
 
 - `podman-vibe.sh` runs with a **capable, sandbox-scoped toolset** (`read grep edit write_file
@@ -110,8 +110,6 @@ and emits its verdict; it does **not** spawn sub-agents:
   The read-only worktree mount + sandbox are the real guardrail; reviewer-writes-to-source are
   read-only-by-ROLE (caught by diff-catch), not by a tool fence. `scripts/wolfpack-toolcheck.mjs`
   is the preflight that FAILS LOUD if the set ever silently re-boxes (the `read,grep` comma bug).
-- Agy has no tool-allowlist flag; the prompt forbids sub-agent fan-out and the container mount
-  set + diff-catch are the boundary.
 - The old `review_strategy: parallel_specialized | ultra` **self-orchestration is dead** —
   cross-models proved too fragile as orchestrators (roster fan-out timed out / hit turn limits /
   never emitted a verdict on v1-push-3 Reds). Each reviewer skill enforces this with its
@@ -251,12 +249,12 @@ The legacy `scripts/howl.sh` orchestrator was retired 2026-04-21. Slash commands
   "mode": "update|feature",
   "models": {
     "planner": "claude:opus:high",
-    "reviewer": "<from wolfpack-config.md Model Pool — MUST be non-Claude, cross-family from the planner>",
+    "reviewer": "<from wolfpack-config.md Model Pool — the first chain link, cross-family from the planner (the golden rule)>",
     "architect": "claude:sonnet:medium",
     "architect_recommended": null,
-    "code_reviewer": "<from wolfpack-config.md Model Pool — non-Claude>",
+    "code_reviewer": "<from wolfpack-config.md Model Pool — the first chain link, cross-family from every code/test writer>",
     "test_writer": "claude:opus:high",
-    "certifier": "<from wolfpack-config.md Model Pool — MUST be non-Claude; certification is cross-model, never the planner's family>"
+    "certifier": "<from wolfpack-config.md Model Pool — certification is cross-family from EVERY family that wrote code or tests, never the planner's family>"
   },
   "proposed_version": {
     "bump": null,
