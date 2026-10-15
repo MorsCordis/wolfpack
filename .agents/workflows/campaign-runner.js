@@ -1,5 +1,5 @@
 export const meta = {
-// REFERENCE — ported from PawPIMS; this orchestration layer is slated for DevDen reimplementation (deterministic Python). NOT de-PawPIMS-genericized. See wolfpack-lab/DEVDEN-ARCHITECTURE.md section 14.
+// REFERENCE — ported from PawPIMS; NOT de-PawPIMS-genericized. This IS the durable orchestrator: the DevDen Python reimplementation is stale (last commit 2026-07-06; its repomap/memory/RAG were superseded by dev-cortex, its local-model runtime has no consumer). Invest here, not in a successor. See memory project_devden_architecture.
   name: 'campaign-runner',
   description: 'Run all hunts in a Wolfpack campaign wave by wave',
   phases: [
