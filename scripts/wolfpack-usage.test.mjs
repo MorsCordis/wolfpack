@@ -379,3 +379,36 @@ test('r2 F1 CLI: meter + stamp exit 1 on a malformed estimate knob, and the stam
     assert.equal(readFileSync(join(f.planDir, 'metadata.json'), 'utf8'), metaBefore, 'metadata untouched')
   } finally { rmSync(f.d, { recursive: true, force: true }) }
 })
+
+// Pointer r3 (judged benign, pinned here): parallel lens-unit fan-out runs several stamps at
+// once against ONE heartbeat + ONE metadata.json. The per-pid tmp + rename must keep both files
+// parseable with no torn write and no tmp leftovers, and every non-usage field must survive.
+test('stamp: 8 concurrent CLI stamps leave heartbeat + metadata parseable, fields preserved, no tmp leftovers', async () => {
+  const { spawn } = await import('node:child_process')
+  const f = planFixture()
+  try {
+    const now = Date.now()
+    writeJson(f.snapPath, snapshot({ now, fh: 27, fhReset: now + HOUR, sd: 55, sdReset: now + 2 * DAY }))
+    writeJson(f.hb, { hunt: 'x', phase: 'Code Review', agent: 'working' })
+    const clean = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('WOLFPACK_')))
+    const runs = Array.from({ length: 8 }, () => new Promise((res) => {
+      const p = spawn(SHIM, ['stamp', '--heartbeat', f.hb, '--plan-dir', f.planDir],
+        { env: { ...clean, TZ: 'UTC', ...f.env } })
+      let err = ''
+      p.stderr.on('data', (c) => { err += c })
+      p.on('close', (code) => res({ code, err }))
+    }))
+    const results = await Promise.all(runs)
+    for (const r of results) assert.equal(r.code, 0, r.err)
+    const hb = readJson(f.hb)
+    assert.deepEqual([hb.hunt, hb.phase, hb.agent], ['x', 'Code Review', 'working'])
+    assert.equal(hb.usage.five_hour_pct, 27)
+    const m = readJson(join(f.planDir, 'metadata.json'))
+    assert.deepEqual([m.feature, m.status, m.tier, m.nested], ['x', 'planning', 'Orange', { keep: 1 }])
+    assert.equal(m.usage_delta.start.five_hour_pct, 27)
+    assert.equal(m.usage_delta.end.five_hour_pct, 27)
+    assert.equal(m.usage_delta.five_hour_delta, 0)
+    assert.deepEqual(readdirSync(f.planDir), ['metadata.json'])
+    assert.equal(readdirSync(f.d).filter(n => n.endsWith('.tmp')).length, 0)
+  } finally { rmSync(f.d, { recursive: true, force: true }) }
+})
