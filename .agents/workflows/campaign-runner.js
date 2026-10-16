@@ -157,12 +157,39 @@ const USAGE_GATE_SCHEMA = {
   },
   required: ['decision', 'source', 'degraded', 'exitCode'],
 }
+// Pointer r1 F2 — LEGACY gate (a consumer's scripts/wolfpack-window-gate.mjs that predates
+// usage-limit-gate: no WOLFPACK_GATE_PROTOCOL marker). It emits only {decision, exit,
+// gateEnabled, reason, used, remaining, reset_at} — no source/degraded — so the full schema
+// would reject EVERY result and abort every hunt claim. Same merge→sync reasoning as the
+// AC25 STALE PIPELINE warning below: the preflight detects it ONCE, warns loudly, and the
+// gate runs in a LABELLED degraded mode (source "legacy_gate", degraded:true, offload never
+// set) — its real transcript-estimate proceed/defer still gates. Set by the preflight.
+let legacyGate = false
+const LEGACY_GATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    decision: { type: 'string', enum: ['proceed', 'defer', 'error'] },
+    reason: { type: 'string' },
+    reset_at: { type: ['string', 'null'] },
+    exitCode: { type: 'integer' },
+  },
+  required: ['decision', 'exitCode'],
+}
 // Validates BEFORE any caller reads `decision`; never invents proceed/defer. A null result
 // (schema failure), decision 'error', an exit code outside {0,10}, or an inconsistent
 // decision/exit pair ⇒ THROW (loud; nothing has been scaffolded for this hunt yet).
 const usageGate = async (hunt) => {
   const tier = normTier(hunt.tier)
-  const g = await agent(`
+  const g = legacyGate ? await agent(`
+READ-ONLY — modify nothing. From the repo root run exactly:
+  node scripts/wolfpack-window-gate.mjs --json
+Exit code 10 is a NORMAL "defer", not an error. Return the parsed JSON fields VERBATIM
+(decision, reason, reset_at) plus exitCode = the script's real exit code.
+If the script is missing, exits with anything other than 0 or 10, or prints no parseable
+JSON on stdout, return exactly {decision:'error', exitCode:<the real exit code, or -1 if it
+did not run>, reason:<first stderr line>}. Never invent a proceed/defer.
+`, { label: `usage-gate-legacy:${hunt.slug}`, phase: 'Execute', model: 'sonnet', schema: LEGACY_GATE_SCHEMA })
+  : await agent(`
 READ-ONLY — modify nothing. From the repo root run exactly:
   node scripts/wolfpack-window-gate.mjs --json --tier ${tier}
 Exit code 10 is a NORMAL "defer", not an error. Return the parsed JSON fields VERBATIM
@@ -182,7 +209,12 @@ Never invent a proceed/defer.
   if ((g.decision === 'proceed' && g.exitCode !== 0) || (g.decision === 'defer' && g.exitCode !== 10)) {
     fail(`inconsistent gate result: decision ${g.decision} with exit ${g.exitCode}`)
   }
-  const out = {
+  const out = legacyGate ? {
+    decision: g.decision, reason: g.reason || '', reset_at: g.reset_at ?? null,
+    source: 'legacy_gate', degraded: true,
+    degraded_reason: 'STALE gate script (pre-usage-limit-gate, no WOLFPACK_GATE_PROTOCOL) — transcript estimate only; re-run wolfpack-sync-runtime.sh',
+    offload: false, offload_reason: null, five_hour_pct: null, seven_day_pct: null, weekly_pace: null,
+  } : {
     decision: g.decision, reason: g.reason || '', reset_at: g.reset_at ?? null,
     source: g.source, degraded: !!g.degraded, degraded_reason: g.degraded_reason ?? null,
     offload: g.offload === true, offload_reason: g.offload_reason ?? null,
@@ -294,13 +326,20 @@ READ-ONLY check — modify nothing. From the current repo root, pick the runtime
 .claude/workflows/hunt-pipeline.js if it exists, else .agents/workflows/hunt-pipeline.js.
 Run: grep -o 'WOLFPACK_EXAMINER_PROTOCOL=[0-9]*' <that file> | head -1
 Also run: grep -o 'WOLFPACK_USAGE_PROTOCOL=[0-9]*' <that file> | head -1
+Then, for the usage gate script, run: test -f scripts/wolfpack-window-gate.mjs && echo present
+and: grep -o 'WOLFPACK_GATE_PROTOCOL=[0-9]*' scripts/wolfpack-window-gate.mjs | head -1
 Return path (the file you checked, or "" if neither exists), protocol (the integer after
-the first marker's "=", or 0 if the marker is absent / the file is missing) and
-usageProtocol (the integer after the second marker's "=", or 0 if absent).
+the first marker's "=", or 0 if the marker is absent / the file is missing),
+usageProtocol (the integer after the second marker's "=", or 0 if absent), gatePresent
+(true only if scripts/wolfpack-window-gate.mjs exists) and gateProtocol (the integer after
+the WOLFPACK_GATE_PROTOCOL marker's "=", or 0 if absent / the file is missing).
 `, { label: 'pipeline-capability', phase: 'Parse', model: 'sonnet', schema: {
     type: 'object',
-    properties: { path: { type: 'string' }, protocol: { type: 'number' }, usageProtocol: { type: 'number' } },
-    required: ['protocol'],
+    properties: {
+      path: { type: 'string' }, protocol: { type: 'number' }, usageProtocol: { type: 'number' },
+      gatePresent: { type: 'boolean' }, gateProtocol: { type: 'number' },
+    },
+    required: ['protocol', 'gatePresent', 'gateProtocol'],
   } })
   const proto = Number(cap && cap.protocol) || 0
   if (proto < REQUIRED_EXAMINER_PROTOCOL) {
@@ -318,6 +357,18 @@ usageProtocol (the integer after the second marker's "=", or 0 if absent).
   // and usage_delta/heartbeat stamping are missing until the runtime copy is regenerated.
   if ((Number(cap && cap.usageProtocol) || 0) < 1) {
     log(`⚠ STALE PIPELINE: runtime hunt-pipeline predates the usage gate — usage offload and usage_delta will NOT be recorded until you re-run wolfpack-sync-runtime.sh`)
+  }
+  // Pointer r1 F2 — gate-script capability. MISSING ⇒ throw here, once, naming the fix (no
+  // gate at all is not a degrade we can label). PRESENT but pre-protocol ⇒ WARN and run the
+  // labelled legacy mode (see legacyGate) instead of letting the schema reject every claim.
+  if (!(cap && cap.gatePresent)) {
+    throw new Error(`campaign-runner: scripts/wolfpack-window-gate.mjs is MISSING — the usage gate cannot run, so no hunt may start. Re-run ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh, then relaunch.`)
+  }
+  if ((Number(cap.gateProtocol) || 0) < 1) {
+    legacyGate = true
+    log(`⚠ STALE USAGE GATE: scripts/wolfpack-window-gate.mjs predates usage-limit-gate (no WOLFPACK_GATE_PROTOCOL marker). Gating on its TRANSCRIPT ESTIMATE only (source legacy_gate, degraded) — live 5h/weekly figures and usage offload are INACTIVE until you re-run wolfpack-sync-runtime.sh`)
+  } else {
+    log(`Usage gate capability OK: gate protocol ${cap.gateProtocol}`)
   }
 }
 

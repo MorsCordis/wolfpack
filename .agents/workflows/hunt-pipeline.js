@@ -1074,6 +1074,17 @@ const CLAUDE_FINAL_REVIEW_STEP = (round) => `
      {"round": ${round}, "verdict": "<APPROVED|ISSUES_FOUND>", "findings": <grounded count>}
    Do NOT write a claude_fallback_reviews row for this round — it is not a fallback.`
 
+// usage-limit-gate (Pointer r1 F1): the REVIEW step for the Claude final round. It must NOT
+// reuse CLAUDE_SELF_REVIEW_STEP — that text is fallback-only (prints WOLFPACK_CLAUDE_FALLBACK
+// and appends a claude_fallback_reviews row), which would contradict CLAUDE_FINAL_REVIEW_STEP
+// in the same prompt and land the durable record in the wrong array.
+const CLAUDE_FINAL_SELF_REVIEW_STEP = (promptFile) => `   [1] CLAUDE FINAL REVIEW (provider "claude") — (no shim — YOU are Claude.) Read ${promptFile}
+       and perform the review yourself, following the role skill it names. Emit the same
+       <verdict> block the shims must emit, with "provider": "claude". This is the MANDATED
+       final review (usage offload, Red/compliance), NOT a last-resort fallback: do NOT print
+       WOLFPACK_CLAUDE_FALLBACK and do NOT write a claude_fallback_reviews row — record it only
+       in claude_final_reviews (step 8).`
+
 // (ADC no longer gates anything — Tracker tests run against a local PostgreSQL.)
 void adcValid
 
@@ -2510,9 +2521,17 @@ if (at('Code Review') && pointerRounds > 0) {
   let claudeFinalPassed = false
   let claudeFinalRound = false     // true while the CURRENT round is the Claude final review
   let claudeFinalSkipLogged = false
+  // Pointer r1 F3: the mandated Claude-final rounds are EXTRA rounds the cross-family
+  // approval earned — they must not eat into the convergence breaker. classifyConvergence
+  // therefore sees the CROSS-FAMILY round count (pRound minus Claude-final rounds run). Still
+  // bounded: every Claude-final round needs a preceding cross-family APPROVED round, and each
+  // of those advances the effective count, so the breaker still trips on a writer/Claude
+  // ping-pong after maxRounds cross-family rounds.
+  let claudeFinalRoundsRun = 0
 
   while (!pointerApproved) {
     pRound++
+    if (claudeFinalRound) claudeFinalRoundsRun++
     log(`Pointer round ${pRound}${claudeFinalRound ? ' — CLAUDE FINAL REVIEW (usage offload, Red/compliance)' : ''} (floor ${pFloor}, breaker ${pcfg.maxRounds} rounds, plan-smell ≥${pcfg.planSmellBound} distinct criticals, crit-persist ${pcfg.critPersist})`)
 
     // Code-review chain: enabled examiners minus EVERY family that wrote code on this
@@ -2542,7 +2561,9 @@ it with the SAME rigour and the SAME verdict contract.
       return `${finalBanner}
 You are a shim agent orchestrating a Pointer code review${unit.focus ? ` (FOCUS LENS: ${unit.key})` : ''}. The examiner chain
 for this code review is ${chainLabel(ptrChain)} — try each link in order, moving to the next
-only when the current one fails. (Claude only as the final last-resort link; none shares a
+only when the current one fails. (${claudeFinalRound
+  ? 'This round the ONLY link is the mandated Claude FINAL review — not a fallback'
+  : 'Claude only as the final last-resort link'}; none shares a
 family with the code's writer(s): ${[...codeWriterFamilies].join(', ')}.)
 
 Hunt: ${slug}
@@ -2559,7 +2580,7 @@ Steps:
    "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff main..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
 
 3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
-${chainSteps(ptrChain, 'wolfpack-pointer', tmpFile, 'pointer')}
+${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChain, 'wolfpack-pointer', tmpFile, 'pointer')}
    Each wrapper enforces a read-only review and caps concurrent calls on its
    model (flock). Run each EXACTLY as given — no extra flags, no parallel spawns.
    An attempt FAILS if ANY of: non-zero exit, empty output, no parseable
@@ -2684,6 +2705,7 @@ ${META_PRESERVE_NOTE}. Do NOT alter any other file. Do NOT commit. Return record
     }
     // A Claude final round that did NOT approve (ISSUES_FOUND / ERROR) falls through to the
     // normal handling below; the NEXT approval walks the cross-family chain again first.
+    const wasClaudeFinalRound = claudeFinalRound
     claudeFinalRound = false
     if (pointerResult.verdict === 'ERROR') {
       // [03] Part B — code-review fan-out floored at cap 1 and STILL failing → PARK.
@@ -2714,7 +2736,17 @@ ${META_PRESERVE_NOTE}. Do NOT alter any other file. Do NOT commit. Return record
     const pCriticals = pFindings.filter(f => isCriticalSev(f.severity))
     log(`Pointer REWRITE_NEEDED: ${pFindings.length} grounded finding(s)`)
 
-    const pv = classifyConvergence({ round: pRound, findings: pFindings, history: pHistory, cfg: pcfg, floor: pFloor })
+    // Pointer r1 F3: breaker sees cross-family rounds only (see claudeFinalRoundsRun). A
+    // Claude-final ISSUES round shares the round number of the cross-family APPROVED round it
+    // follows, and gets ONE round of grace past the breaker so that approval always earns a
+    // rework (an approval AT maxRounds would otherwise park without one). Bounded: the next
+    // cross-family round is already ≥ maxRounds+1 and parks on ISSUES; a further Claude-final
+    // ISSUES parks at ≥ maxRounds+1.
+    const effRound = pRound - claudeFinalRoundsRun
+    const pv = classifyConvergence({
+      round: effRound, findings: pFindings, history: pHistory, floor: pFloor,
+      cfg: wasClaudeFinalRound ? { ...pcfg, maxRounds: pcfg.maxRounds + 1 } : pcfg,
+    })
     commitRound(pHistory, pFindings, pv.cumulativeCrit)
     const pEntry = ledgerEntry('pointer', pRound, pFindings, (pointerResult.dropped || []).length)
     const pCumCrit = pv.cumulativeCrit.size

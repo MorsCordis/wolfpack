@@ -79,6 +79,12 @@
 //                                  (~/.agents/projects) is harness-specific — set this env
 //                                  var to your harness's transcript location (see wolfpack-config.md).
 // Exit codes: 0 = proceed, 10 = defer, 1 = internal error.
+//
+// Gate protocol 1 = the usage-limit-gate output contract above (source / degraded / offload /
+// flat usage mirrors, --tier). campaign-runner.js greps this marker in its preflight: a gate
+// script WITHOUT it is the pre-usage-limit-gate transcript-only gate, which the runner drives
+// in a loud, labelled legacy-degraded mode instead of aborting every hunt claim.
+// WOLFPACK_GATE_PROTOCOL=1
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
