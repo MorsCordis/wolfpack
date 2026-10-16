@@ -93,8 +93,11 @@ const nextCrossExaminer = () => (EXAMINER_ROTATION.length ? EXAMINER_ROTATION[hu
 // The Workflow harness `budget` global is a SHARED output-token pool across the main
 // loop and every workflow; `budget.total` is the ceiling an operator set for an
 // overnight run ("how much of my window I'll spend"), `budget.remaining()` what's left.
-// This is the runaway guard (NOT the account rate-limit — that's the host-side window
-// gate, scripts/wolfpack-window-gate.mjs). Before scaffolding each NEW hunt we check we
+// This is the runaway guard (NOT the account rate-limit). The account rate-limit is the
+// USAGE GATE (usage-limit-gate, AC5), which is now IN-RUNNER: before claiming each NEW hunt
+// the runner asks scripts/wolfpack-window-gate.mjs (via a sonnet agent Bash step — this
+// file cannot read the clock or fs) for the live 5h/weekly decision; see usageGate below.
+// Before scaffolding each NEW hunt we check we
 // can afford to FINISH it: if remaining < one hunt's estimated cost, stop scaffolding
 // and park the queue (return WAVE_PAUSED_BUDGET) rather than start a hunt that strands
 // half-built at the ceiling.
@@ -128,6 +131,92 @@ const budgetShortfall = (tier) => {
   const have = budget.remaining()
   return have < need ? { need, have, tier } : null
 }
+// ─── usage-limit-gate (AC5/AC6) — the in-runner usage gate ─────
+// Called once per NEW hunt, BEFORE workflow('hunt-pipeline') (never between phases — a
+// half-built hunt is worse than an idle one). The gate decides on Claude Code's real 5h /
+// 7d usage (status-line snapshot), falling back to the transcript estimate (`degraded`).
+//   defer   → stop scaffolding; in-flight hunts finish; return WAVE_PAUSED_QUOTA + resetAt.
+//   proceed + offload → the next hunt runs with usageOffload (GLM Shepherd on every tier).
+// The schema mirrors the gate's FLAT output contract; only decision/source/degraded/exitCode
+// are required so a degraded output (no usage figures) always validates.
+const USAGE_GATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    decision: { type: 'string', enum: ['proceed', 'defer', 'error'] },
+    reason: { type: 'string' },
+    reset_at: { type: ['string', 'null'] },
+    source: { type: 'string' },
+    degraded: { type: 'boolean' },
+    degraded_reason: { type: ['string', 'null'] },
+    offload: { type: 'boolean' },
+    offload_reason: { type: ['string', 'null'] },
+    five_hour_pct: { type: ['number', 'null'] },
+    seven_day_pct: { type: ['number', 'null'] },
+    weekly_pace: { type: ['number', 'null'] },
+    exitCode: { type: 'integer' },
+  },
+  required: ['decision', 'source', 'degraded', 'exitCode'],
+}
+// Validates BEFORE any caller reads `decision`; never invents proceed/defer. A null result
+// (schema failure), decision 'error', an exit code outside {0,10}, or an inconsistent
+// decision/exit pair ⇒ THROW (loud; nothing has been scaffolded for this hunt yet).
+const usageGate = async (hunt) => {
+  const tier = normTier(hunt.tier)
+  const g = await agent(`
+READ-ONLY — modify nothing. From the repo root run exactly:
+  node scripts/wolfpack-window-gate.mjs --json --tier ${tier}
+Exit code 10 is a NORMAL "defer", not an error. Return the parsed JSON fields VERBATIM
+(decision, reason, reset_at, source, degraded, degraded_reason, offload, offload_reason,
+five_hour_pct, seven_day_pct, weekly_pace) plus exitCode = the script's real exit code.
+If the script is missing, exits with anything other than 0 or 10, or prints no parseable
+JSON on stdout, return exactly {decision:'error', source:'', degraded:true,
+exitCode:<the real exit code, or -1 if it did not run>, reason:<first stderr line>}.
+Never invent a proceed/defer.
+`, { label: `usage-gate:${hunt.slug}`, phase: 'Execute', model: 'sonnet', schema: USAGE_GATE_SCHEMA })
+  const fail = (why) => {
+    throw new Error(`campaign-runner: usage gate unavailable (${why}) — not starting ${hunt.slug}`)
+  }
+  if (!g) fail('no schema-valid gate result')
+  if (g.exitCode !== 0 && g.exitCode !== 10) fail(`gate exit ${g.exitCode}${g.reason ? `: ${g.reason}` : ''}`)
+  if (g.decision === 'error') fail(g.reason || 'gate reported error')
+  if ((g.decision === 'proceed' && g.exitCode !== 0) || (g.decision === 'defer' && g.exitCode !== 10)) {
+    fail(`inconsistent gate result: decision ${g.decision} with exit ${g.exitCode}`)
+  }
+  const out = {
+    decision: g.decision, reason: g.reason || '', reset_at: g.reset_at ?? null,
+    source: g.source, degraded: !!g.degraded, degraded_reason: g.degraded_reason ?? null,
+    offload: g.offload === true, offload_reason: g.offload_reason ?? null,
+    five_hour_pct: g.five_hour_pct ?? null, seven_day_pct: g.seven_day_pct ?? null,
+    weekly_pace: g.weekly_pace ?? null,
+  }
+  if (out.degraded) {
+    log(`⚠ USAGE GATE DEGRADED (${hunt.slug}): ${out.degraded_reason || 'snapshot unusable'} — source ${out.source || '?'}; live 5h/weekly gating and offload are INACTIVE for this decision.`)
+  }
+  const figs = out.five_hour_pct == null ? '' : ` [5h ${out.five_hour_pct}%${out.seven_day_pct == null ? '' : ` · 7d ${out.seven_day_pct}% · pace ${out.weekly_pace}`}]`
+  log(`usage gate ${hunt.slug} (${tier}): ${out.decision}${out.offload ? ' + OFFLOAD' : ''} — ${out.reason}${figs}`)
+  return out
+}
+// The WAVE_PAUSED_QUOTA return for a usage-gate defer — modelled on the WAVE_PAUSED_BUDGET
+// return; the verdict token is the existing barrier token the overnight driver loops on.
+const usagePausedReturn = (pause, waveResults, deferred, waveNumber) => {
+  log(``)
+  log(`⛔ Usage gate: ${pause.reason} — not starting ${pause.slug}; resume after ${pause.reset_at || 'the window resets'}`)
+  log(`Deferred ${deferred.length} hunt(s): ${deferred.map(h => h.slug).join(', ')}`)
+  return {
+    campaign: campaignSlug,
+    completed: false,
+    verdict: 'WAVE_PAUSED_QUOTA',
+    certifiedHunts: waveResults.filter(r => r.verdict === 'CERTIFIED_AWAITING_DEPLOY').map(r => r.slug),
+    parkedHunts: [],
+    deferredHunts: deferred.map(h => ({ slug: h.slug, tier: h.tier })),
+    quotaDeferredHunts: [],
+    failedHunts: [],
+    completedWave: waveNumber,
+    resetAt: pause.reset_at || null,     // informational (log / operator / campaign-cron-resume)
+    usage: { source: pause.source, reason: pause.reason },
+  }
+}
+
 // [Fix 1] The old batch-sum breaker (budgetShortfallForBatch) retired with the batch
 // scheduler. The rolling pool below reserves each in-flight hunt's full estimated cost
 // (inFlightReserved) and gates a new claim on (this hunt + in-flight reserved) — same
@@ -204,11 +293,13 @@ const LATEST_EXAMINER_PROTOCOL   = 3   // what the current canonical hunt-pipeli
 READ-ONLY check — modify nothing. From the current repo root, pick the runtime workflow file:
 .claude/workflows/hunt-pipeline.js if it exists, else .agents/workflows/hunt-pipeline.js.
 Run: grep -o 'WOLFPACK_EXAMINER_PROTOCOL=[0-9]*' <that file> | head -1
-Return path (the file you checked, or "" if neither exists) and protocol (the integer after
-the "=", or 0 if the marker is absent / the file is missing).
+Also run: grep -o 'WOLFPACK_USAGE_PROTOCOL=[0-9]*' <that file> | head -1
+Return path (the file you checked, or "" if neither exists), protocol (the integer after
+the first marker's "=", or 0 if the marker is absent / the file is missing) and
+usageProtocol (the integer after the second marker's "=", or 0 if absent).
 `, { label: 'pipeline-capability', phase: 'Parse', model: 'sonnet', schema: {
     type: 'object',
-    properties: { path: { type: 'string' }, protocol: { type: 'number' } },
+    properties: { path: { type: 'string' }, protocol: { type: 'number' }, usageProtocol: { type: 'number' } },
     required: ['protocol'],
   } })
   const proto = Number(cap && cap.protocol) || 0
@@ -221,6 +312,12 @@ the "=", or 0 if the marker is absent / the file is missing).
     log(`⚠ STALE PIPELINE: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) reports examiner protocol ${proto}, this campaign-runner is ${LATEST_EXAMINER_PROTOCOL}. Reviews will run on the OLD (gemini-first) chain until you re-run: ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh <repo>/.claude/workflows/hunt-pipeline.js`)
   } else {
     log(`Pipeline capability OK: examiner protocol ${proto} (${cap.path}) — hint rotation ${EXAMINER_ROTATION.join(' / ')}`)
+  }
+  // usage-limit-gate: a WARNING, not a throw — same merge→sync reasoning as AC25 above. The
+  // gate itself still works (it runs here, in the runner); only the hunt-side offload record
+  // and usage_delta/heartbeat stamping are missing until the runtime copy is regenerated.
+  if ((Number(cap && cap.usageProtocol) || 0) < 1) {
+    log(`⚠ STALE PIPELINE: runtime hunt-pipeline predates the usage gate — usage offload and usage_delta will NOT be recorded until you re-run wolfpack-sync-runtime.sh`)
   }
 }
 
@@ -348,6 +445,8 @@ Return { merged: ["slug", ...] } listing ONLY the slugs you confirmed merged.
   let cursor = 0                 // next independent hunt to claim
   let inFlightReserved = 0       // Σ estimated cost of hunts currently running
   let budgetPause = null         // set to a shortfall once the breaker trips
+  let usagePause = null          // set once the usage gate defers (usage-limit-gate AC5)
+  let usageGateError = null      // a gate FAILURE: stop claiming, let in-flight finish, then throw
   if (independent.length > 0) {
     log(`Wave ${wave.number}: ${independent.length} independent hunts (rolling pool, cap: ${parallelCap})`)
 
@@ -359,9 +458,19 @@ Return { merged: ["slug", ...] } listing ONLY the slugs you confirmed merged.
     // budget.remaining() already reflects in-flight ACTUAL spend, so adding the full
     // reserve slightly OVER-reserves — the safe direction per the fail-loud A4 rule.
     // budget.total falsy ⇒ breaker disabled (only a deliberately budgeted run gates).
-    const claimNext = () => {
-      if (budgetPause || cursor >= independent.length) return null
+    //
+    // usage-limit-gate: the claim now awaits the usage gate, so it is ASYNC — and
+    // SERIALISED through claimChain, so two workers still never interleave a claim (the
+    // cursor/reservation stay race-free exactly as before).
+    const claimOnce = async () => {
+      if (budgetPause || usagePause || usageGateError || cursor >= independent.length) return null
       const hunt = independent[cursor]
+      let g
+      try { g = await usageGate(hunt) } catch (e) { usageGateError = e; return null }
+      if (g.decision === 'defer') {
+        usagePause = { slug: hunt.slug, tier: normTier(hunt.tier), reason: g.reason, reset_at: g.reset_at, source: g.source }
+        return null
+      }
       if (typeof budget !== 'undefined' && budget && budget.total) {
         const need = estimatedHuntCost(hunt.tier) + inFlightReserved
         const have = budget.remaining()
@@ -372,14 +481,17 @@ Return { merged: ["slug", ...] } listing ONLY the slugs you confirmed merged.
       }
       cursor++
       inFlightReserved += estimatedHuntCost(hunt.tier)
+      hunt.__usageOffload = g.offload ? { reason: g.offload_reason || g.reason } : null
       return hunt
     }
+    let claimChain = Promise.resolve(null)
+    const claimNext = () => (claimChain = claimChain.then(claimOnce))
 
     // Each worker drains the shared queue; a finished/parked hunt immediately frees
     // the worker to claim the next one. Release the budget reserve in `finally` so a
     // thrown hunt-pipeline can't leak a reservation and wedge the breaker.
     const worker = async () => {
-      for (let hunt = claimNext(); hunt; hunt = claimNext()) {
+      for (let hunt = await claimNext(); hunt; hunt = await claimNext()) {
         log(`Wave ${wave.number}: ▶ ${hunt.slug} [${normTier(hunt.tier)}] starting`)
         let result = null
         try {
@@ -394,6 +506,7 @@ Return { merged: ["slug", ...] } listing ONLY the slugs you confirmed merged.
             migrationRisk: hunt.migrationRisk,
             rationale: hunt.rationale,
             crossExaminer: nextCrossExaminer(),
+            usageOffload: hunt.__usageOffload || null,
           })
         } finally {
           inFlightReserved -= estimatedHuntCost(hunt.tier)
@@ -431,6 +544,14 @@ Return { merged: ["slug", ...] } listing ONLY the slugs you confirmed merged.
       completedWave: wave.number,
       budget: { remaining: budgetPause.have, neededForNext: budgetPause.need },
     }
+  }
+
+  // usage-limit-gate (AC5): the usage gate deferred mid-pool. Same shape as the budget
+  // pause: in-flight hunts already FINISHED (Promise.all above); the un-started tail and
+  // every dependent are deferred; nothing is half-started.
+  if (usageGateError) throw usageGateError   // loud, AFTER in-flight hunts finished
+  if (usagePause) {
+    return usagePausedReturn(usagePause, waveResults, independent.slice(cursor).concat(dependent), wave.number)
   }
 
   // Run dependent hunts — but ONLY if their dependencies are MERGED to main.
@@ -500,11 +621,22 @@ Return { allMerged: true/false, notMerged: ["slug1", ...], certified: ["slug1", 
       continue
     }
 
+    // usage-limit-gate (AC5): gate the dependent hunt too, right before it would start.
+    const depGate = await usageGate(hunt)
+    if (depGate.decision === 'defer') {
+      return usagePausedReturn(
+        { slug: hunt.slug, tier: normTier(hunt.tier), reason: depGate.reason, reset_at: depGate.reset_at, source: depGate.source },
+        waveResults, dependent.slice(di), wave.number)
+    }
+
     const result = await workflow('hunt-pipeline', {
       slug: hunt.slug,
       description: hunt.description,
       campaign: campaignSlug,
+      tier: hunt.tier,
+      mode: hunt.mode,
       crossExaminer: nextCrossExaminer(),
+      usageOffload: depGate.offload ? { reason: depGate.offload_reason || depGate.reason } : null,
     })
 
     if (result) {
