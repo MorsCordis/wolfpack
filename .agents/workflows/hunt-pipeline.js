@@ -352,9 +352,13 @@ const ledgerEntry = (role, round, findings, droppedCount) => {
 // (Alpha/Shepherd revision, parkHunt, or the flawed-plan stamp) so a SINGLE agent
 // records the round — the review-shim agents must NOT write metadata concurrently
 // (fan-out would race metadata.json). Idempotent: sets review_fingerprints[round-1].
+// Shared read-modify-write clause for every prompt that tells an agent to update
+// metadata.json — the heartbeat stamp writes usage fields there between phases, and a
+// whole-file rewrite would clobber them (e.g. the Plan phase's usage_delta.start).
+const META_PRESERVE_NOTE = '(read-modify-write: preserve every field you did not compute, including `usage_delta`, `usage_offload` and `mistral_rate_limits`)'
 const convergenceMetaInstruction = (planDirArg, entry, classification, cumulativeCriticals) => `
 
-CONVERGENCE LEDGER (record only — do NOT act on these findings): update ${planDirArg}/metadata.json:
+CONVERGENCE LEDGER (record only — do NOT act on these findings): update ${planDirArg}/metadata.json ${META_PRESERVE_NOTE}:
 - ensure top-level "review_fingerprints" is an OBJECT keyed by role; ensure review_fingerprints["${entry.role}"] is an array; SET index [${entry.round - 1}] (round ${entry.round}) to:
   ${JSON.stringify(entry)}
   (one entry per review round, per role — preserve every other index AND the other role's array. If review_fingerprints is currently an array from an older run, replace it with { "${entry.role}": [<that array's entries>] } keyed by role first.)
@@ -373,7 +377,7 @@ const _parseArgs = (a) => {
 }
 const _args = _parseArgs(args)
 const { slug, campaign, tier: campaignTier, mode: campaignMode,
-        ticketRefs, todoItemsCleared, migrationRisk, rationale } = _args
+        ticketRefs, todoItemsCleared, migrationRisk, rationale, usageOffload } = _args
 const descriptionPassed = typeof _args.description === 'string' && _args.description.trim() !== ''
 const description = descriptionPassed
   ? _args.description
@@ -397,6 +401,10 @@ const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
 // A consumer copy below LATEST degrades loudly (STALE PIPELINE warning), below the FLOOR
 // it fails loud — see campaign-runner.js.
 // WOLFPACK_EXAMINER_PROTOCOL=3
+// usage-limit-gate: usage protocol 1 = honors args.usageOffload (records metadata.usage_offload,
+// GLM Shepherd on every tier + Claude final review on Red/compliance) and stamps usage into
+// every host-side heartbeat + metadata.usage_delta. campaign-runner warns when it is absent.
+// WOLFPACK_USAGE_PROTOCOL=1
 const EXAMINER_PROTOCOL = 3
 void EXAMINER_PROTOCOL
 
@@ -597,6 +605,11 @@ const campaignContext = [
 // already covers. detail is deliberately NOT interpolated into the marker (it's
 // already in the heartbeat JSON) so a detail containing a single quote can never
 // break the single-quoted printf format string. Paths are quoted defensively.
+// usage-limit-gate (A-4): the usage meter CLI. Relative until repoRoot is known (Scaffold
+// runs from the main repo root, where the relative path resolves); reassigned to the
+// ABSOLUTE main-repo path right after repoRoot is computed, so a stale worktree lacking the
+// script still stamps. (repoRoot is a later const — never reference it in heartbeat(): TDZ.)
+let usageCli = 'scripts/wolfpack-usage.mjs'
 const heartbeat = (phaseName, detail) => {
   const timed = phaseName !== 'Scaffold'
   const startMarker = timed ? `
@@ -608,10 +621,23 @@ printf '{"phase":"${phaseName}","event":"end","ts":"%s"}\\n' "$(date -Iseconds)"
   // needs .wolfpack/heartbeats; timed phases (all after the worktree exists) also mkdir
   // the worktree-absolute plan dir for the timing log.
   const planDirMk = timed ? ` "${worktreePath}/.wolfpack/plans/${slug}"` : ''
+  // usage-limit-gate (AC7/AC8/AC9): stamp the live usage into the heartbeat (and, for timed
+  // phases, metadata.usage_delta + mistral_rate_limits). GUARDED: containerized Vibe seats
+  // have no main repo mounted and a read-only plan dir, so the guard skips them silently;
+  // the end reading is therefore the last HOST-SIDE phase boundary.
+  const stampGuard = timed
+    ? `[ -f "${usageCli}" ] && [ -w "${worktreePath}/.wolfpack/plans/${slug}" ]`
+    : `[ -f "${usageCli}" ]`
+  const stampCmd = `if ${stampGuard}; then node "${usageCli}" stamp --heartbeat .wolfpack/heartbeats/${slug}.json${timed ? ` --plan-dir "${worktreePath}/.wolfpack/plans/${slug}"` : ''}; fi`
   return `
 HEARTBEAT + TIMING: Before doing anything else, run \`mkdir -p .wolfpack/heartbeats${planDirMk}\`, write this JSON to .wolfpack/heartbeats/${slug}.json:
 {"hunt":"${slug}","phase":"${phaseName}","detail":"${detail}","agent":"starting"}${startMarker}
-Update the heartbeat "agent" field to "working" after you begin. When you finish this phase, set the heartbeat "agent" field to "done"${endMarker}
+then stamp the usage meter into it:
+${stampCmd}
+Update the heartbeat "agent" field to "working" after you begin (preserve every other heartbeat field when you update \`agent\`). When you finish this phase, set the heartbeat "agent" field to "done"${endMarker}
+and run the usage stamp again:
+${stampCmd}
+USAGE STAMP: if the guard skips it, that is expected in a sandboxed seat — do not mention it. If the command itself fails, carry on and say so in your result: the usage meter is telemetry.
 
 TOOLING POLICY (every phase): Do NOT use the chrome-devtools MCP or any browser automation
 (new_page / navigate_page / take_snapshot / etc.). This is a headless BUILD pipeline — there
@@ -894,7 +920,7 @@ Steps:
 5. Copy .wolfpack/plans/${slug}/ into the worktree:
    mkdir -p .agents/worktrees/${slug}/.wolfpack/plans/${slug}/
    cp .wolfpack/plans/${slug}/metadata.json .agents/worktrees/${slug}/.wolfpack/plans/${slug}/
-6. Update metadata.json worktree_path to the absolute path of the worktree
+6. Update metadata.json worktree_path to the absolute path of the worktree ${META_PRESERVE_NOTE}
 7. Create convenience symlinks in the worktree if paw_env and .env exist in main repo
 
 8. GCP preflight (non-blocking): run gcloud auth application-default print-access-token
@@ -944,6 +970,24 @@ const repoRoot = worktreePath.includes('/.agents/worktrees/')
   ? worktreePath.split('/.agents/worktrees/')[0]
   : worktreePath
 log(`Shim root (always current): ${repoRoot}/scripts/`)
+usageCli = `${repoRoot}/scripts/wolfpack-usage.mjs`
+
+// usage-limit-gate (AC6): the campaign runner's usage gate asked for a usage offload
+// (weekly pace too far ahead). Record it ONCE in metadata.usage_offload (first decision
+// sticks) — the router and the Shepherd seat probe read it from there.
+if (usageOffload && typeof usageOffload === 'object') {
+  const rec = await agent(`
+You ONLY record a usage offload for Wolfpack hunt ${slug} — modify nothing else. Run exactly:
+  node ${shq(`${repoRoot}/scripts/wolfpack-usage.mjs`)} record-offload --plan-dir ${shq(planDir)} --reason ${shq(String(usageOffload.reason || 'weekly pace'))}
+Return ok=true and the printed JSON's reason if it exits 0; otherwise ok=false and the first stderr line as error.
+`, { label: `usage-offload:${slug}`, phase: 'Scaffold', model: 'sonnet', schema: {
+    type: 'object',
+    properties: { ok: { type: 'boolean' }, reason: { type: 'string' }, error: { type: 'string' } },
+    required: ['ok'],
+  } })
+  if (rec && rec.ok) log(`⚖ usage offload: ${rec.reason || usageOffload.reason} — GLM Shepherd on every tier for ${slug}`)
+  else log(`⚠ usage offload NOT recorded for ${slug} (${(rec && rec.error) || 'no result'}) — the hunt routes as if no offload was requested`)
+}
 
 // [07 §6] Mistral review turn budget. CORRECTED 2026-06-08: the disconnect was NOT turn
 // accumulation against a 25K-TPM cap (that theory is disproven — Medium is 200K context).
@@ -1021,6 +1065,26 @@ Do NOT alter any other file. Do NOT commit. Return recorded: true when the row i
      model: 'sonnet' })
 }
 
+// usage-limit-gate (AC6): metadata step for the Claude FINAL review round (usage offload on a
+// Red / compliance-critical hunt). It is a mandated pass, NOT a fallback — so it records into
+// claude_final_reviews and never into claude_fallback_reviews.
+const CLAUDE_FINAL_REVIEW_STEP = (round) => `
+   CLAUDE FINAL REVIEW: also append one row to the "claude_final_reviews" array in
+   ${planDir}/metadata.json (create it if absent; preserve every other field):
+     {"round": ${round}, "verdict": "<APPROVED|ISSUES_FOUND>", "findings": <grounded count>}
+   Do NOT write a claude_fallback_reviews row for this round — it is not a fallback.`
+
+// usage-limit-gate (Pointer r1 F1): the REVIEW step for the Claude final round. It must NOT
+// reuse CLAUDE_SELF_REVIEW_STEP — that text is fallback-only (prints WOLFPACK_CLAUDE_FALLBACK
+// and appends a claude_fallback_reviews row), which would contradict CLAUDE_FINAL_REVIEW_STEP
+// in the same prompt and land the durable record in the wrong array.
+const CLAUDE_FINAL_SELF_REVIEW_STEP = (promptFile) => `   [1] CLAUDE FINAL REVIEW (provider "claude") — (no shim — YOU are Claude.) Read ${promptFile}
+       and perform the review yourself, following the role skill it names. Emit the same
+       <verdict> block the shims must emit, with "provider": "claude". This is the MANDATED
+       final review (usage offload, Red/compliance), NOT a last-resort fallback: do NOT print
+       WOLFPACK_CLAUDE_FALLBACK and do NOT write a claude_fallback_reviews row — record it only
+       in claude_final_reviews (step 8).`
+
 // (ADC no longer gates anything — Tracker tests run against a local PostgreSQL.)
 void adcValid
 
@@ -1073,7 +1137,12 @@ That tells the pipeline this is a quota outage to reschedule, not a plumbing fai
 TIMEOUT SIGNAL: a shim that exits with code 76 OR prints a line starting with
 "WOLFPACK_TIMEOUT:" hit its wall-clock limit. Treat it like a failed link — move to the
 NEXT link (no retry) — but log the fallback reason as "timeout", NOT "rate_limited", and
-do NOT count it toward model_quota (model_quota only when EVERY link was rate-limited).`
+do NOT count it toward model_quota (model_quota only when EVERY link was rate-limited).
+INFRA SIGNAL: exit code 77 OR a line starting with \`WOLFPACK_INFRA_ERROR:\` means the shim's
+own sandbox broke (e.g. disk full). This is NOT a rate limit and NOT the model's fault. Move
+to the next link, log the fallback reason as \`error\`, and do NOT count it toward
+model_quota. If every link failed and any of them was infra, return status \`infra_error\`,
+never \`model_quota\`.`
 
 // [06] AC2 — record WHY a primary fell back, and CLASSIFY the reason so a
 // tool-box failure is graded differently from a capability failure (the spec's
@@ -1100,7 +1169,7 @@ model's capability grade:
   • "capability"    — primary produced a malformed/missing verdict, an empty-findings
         contradiction, or empty output with tools WORKING and no rate-limit signal. A REAL
         model failure — this one DOES count against the model's grade.
-  • "error"         — plumbing broke (shim crashed, file-not-found, container error). Neither
+  • "error"         — plumbing broke (shim crashed, file-not-found, container error — incl. exit 77 / WOLFPACK_INFRA_ERROR). Neither
         a model nor a quota signal; surface for a human.
   • "timeout"       — primary exited 76 / printed WOLFPACK_TIMEOUT (wall clock ran out).
         Recorded separately: neither a quota outage nor (by itself) a capability grade.
@@ -1235,7 +1304,7 @@ ${needFromUser}
 ## Context (enough to decide without opening the worktree)
 ${context}
 ${options ? `\n## Options (feeds AskUserQuestion)\n${options}\n` : ''}
-3. Update ${planDir}/metadata.json:
+3. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}:
    - set top-level "status" = "parked:${reason}"
    - add (or overwrite) a "park" block (initialize ALL fields so /resolve and the
      compliance gate never read undefined):
@@ -1259,7 +1328,7 @@ ${heartbeat('Park', reason)}
 // workflow JS has no fs); it does NOT plan, review, fix, or commit.
 async function recordFlawedPlan({ phaseLabel, extraMeta }) {
   return await agent(`
-You ONLY update metadata.json for Wolfpack hunt ${slug} — do NOT plan, review, fix, or commit.
+You ONLY update metadata.json for Wolfpack hunt ${slug} — do NOT plan, review, fix, or commit. ${META_PRESERVE_NOTE}
 
 cd to ${worktreePath}. Use absolute paths.
 
@@ -1281,7 +1350,7 @@ ${heartbeat(phaseLabel || 'Review', 'recording FLAWED_PLAN (plan smell)')}
 // Tracker gate for the incident this exists to prevent.
 async function recordTestRewriteNeeded({ phaseLabel }) {
   return await agent(`
-You ONLY update metadata.json for Wolfpack hunt ${slug} — do NOT plan, review, fix, test, or commit.
+You ONLY update metadata.json for Wolfpack hunt ${slug} — do NOT plan, review, fix, test, or commit. ${META_PRESERVE_NOTE}
 
 cd to ${worktreePath}. Use absolute paths.
 
@@ -1489,7 +1558,7 @@ Steps:
 9. Write acceptance.md to ${planDir}/acceptance.md using the skill's template
    (Source incl. the VERBATIM report, Intent, tagged criteria, Out of scope, rated
    Known assumptions, Repro). Keep the report verbatim.
-10. Update ${planDir}/metadata.json: write the spec block
+10. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: write the spec block
     { confidence, mode_for_build, ambiguity_open, compliance_critical,
     compliance_review_required }. If mode_for_build == "parked", ALSO set the
     top-level status to "needs_spec".
@@ -1592,9 +1661,9 @@ Execute Phase 1 (Initial Plan):
 - Compute tier and mode — IF the campaign specifies a tier, use it. Do NOT downgrade.
 - Set bloodhound_rounds, pointer_rounds, tracker_rounds based on tier. These are a FLOOR (minimum rounds), NOT a cap: under the automated pipeline ([03] Part B convergence detection) the review loop continues past the floor while it makes progress and parks when it stalls — round COUNT no longer caps it. The per-tier floors are the single source of truth in TIER_CONFIG (Red bloodhound base=3); you may RAISE a floor for an unusually risky plan, never lower it below the tier base.
 - Select the Bloodhound cross-examiner model (cross-family from the Claude planner — one of the ENABLED examiner families for this run, EXCLUDING "claude" which is the last-resort link only and is filtered from every Bloodhound chain anyway: ${EXAMINER_ORDER.filter(f => f !== 'claude').map(f => `"${f}"`).join(', ')}) using the pedigree/lessons performance + quota data; write it to ${planDir}/metadata.json model_assignments.bloodhound. The runtime tries it FIRST, then walks the rest of the chain (${chainLabel(EXAMINER_ORDER)}) on a rate limit. Default to "glm" unless the pedigree data favors another enabled family for this surface. (GLM is on unless WOLFPACK_ENABLE_GLM=0; Mistral Large 4 is on unless WOLFPACK_ENABLE_MISTRAL_AUTO=0.)
-- Shepherd seat: if ${planDir}/metadata.json models.architect_recommended (the /hunt --shepherd pin) or the router's model_assignments.shepherd is a glm pin (e.g. "glm:5.3"), keep it as model_assignments.shepherd ONLY on a Green/Blue/Yellow non-compliance hunt — Red/Orange/compliance force Opus. Never assign a reviewer seat the Shepherd's family.
+- Shepherd seat: if ${planDir}/metadata.json models.architect_recommended (the /hunt --shepherd pin) or the router's model_assignments.shepherd is a glm pin (e.g. "glm:5.3"), keep it as model_assignments.shepherd ONLY on a Green/Blue/Yellow non-compliance hunt — Red/Orange/compliance force Opus. EXCEPTION: if metadata.usage_offload is set, the router assigns glm:5.3 on every tier (usage offload). Adopt it. Never assign a reviewer seat the Shepherd's family.
 - Set review_strategy based on tier
-- Update ${planDir}/metadata.json with all computed fields
+- Update ${planDir}/metadata.json with all computed fields ${META_PRESERVE_NOTE}
 - If campaign provided ticket refs, include them in the plan's scope section
 - If campaign provided TODO items to clear, list them in the plan's changelog section
 
@@ -1691,10 +1760,17 @@ const SHEPHERD_SEAT_SCHEMA = {
     gitWriterFamilies: { type: 'array', items: { type: 'string' } },  // Wolfpack-Writer trailers on main..HEAD
     gitHeadWriter: { type: 'string' },        // the trailer on the newest trailer-bearing commit, or ""
     uncommittedChanges: { type: 'boolean' },  // app files dirty outside .wolfpack/
+    usageOffload: { type: 'boolean' },        // metadata.usage_offload is set (an object) — usage-limit-gate
   },
-  required: ['shepherdPin', 'complianceCritical', 'shepherdFamilies'],
+  // usageOffload is REQUIRED: an omitted field would silently read as false and skip the
+  // offload + the mandated Claude final review with no warning (Pointer r2 F2).
+  required: ['shepherdPin', 'complianceCritical', 'shepherdFamilies', 'usageOffload'],
 }
 let shepherdFamily = 'claude'
+// usage-limit-gate (AC6/A-5): set from the seat probe. Offload moves the Shepherd to GLM on
+// EVERY tier; on Red or compliance-critical hunts a Claude final review follows Pointer.
+let usageOffloadActive = false
+let seatComplianceCritical = false
 let lastWriterFamily = ''   // '' = nobody has written yet (fresh Implement)
 if (GLM_ENABLED && (at('Implement') || at('Code Review') || at('Certify'))) {
   const seat = await agent(`
@@ -1717,6 +1793,7 @@ You are a READ-ONLY probe. Do NOT modify anything. Read ${planDir}/metadata.json
 - gitHeadWriter: the trailer value of the NEWEST commit in main..HEAD that has one, else "".
 - uncommittedChanges: true if \`git -C ${shq(worktreePath)} status --porcelain\` lists any path
   outside .wolfpack/, else false.
+- usageOffload: true if metadata.usage_offload is set (a non-null object), else false.
 Return ONLY these fields.
 `, { label: `shepherd-seat:${slug}`, phase: 'Implement', schema: SHEPHERD_SEAT_SCHEMA, model: 'sonnet' })
   const pinFam = familyOf(seat && seat.shepherdPin)
@@ -1745,15 +1822,22 @@ Return ONLY these fields.
   }
   // Last writer: git's newest trailer wins over metadata (it is written atomically with the commit).
   lastWriterFamily = familyOf(seat && seat.gitHeadWriter) || familyOf(seat && seat.lastShepherdFamily) || ''
-  if (pinFam === 'glm') {
-    if (HEAVY_TIER || (seat && seat.complianceCritical)) {
+  // usage-limit-gate: usage offload suspends the judgment override (and ONLY it) — the
+  // GLM Shepherd applies on every tier. Without offload this branch is unchanged.
+  const offload = !!(seat && seat.usageOffload)
+  usageOffloadActive = offload
+  seatComplianceCritical = !!(seat && seat.complianceCritical)
+  if (pinFam === 'glm' || offload) {
+    if (!offload && (HEAVY_TIER || (seat && seat.complianceCritical))) {
       log(`⚠ Shepherd pin "${seat.shepherdPin}" IGNORED — ${HEAVY_TIER ? `tier ${tier}` : 'compliance-critical hunt'} forces the Claude ${shepherdModel} Shepherd (judgment override never relaxes).`)
     } else {
       shepherdFamily = 'glm'
       // Resumed PAST Implement with no writer record (e.g. a crash before metadata was
       // written): we cannot prove GLM didn't write, so exclude it conservatively.
       if (!at('Implement') && !seat.shepherdFamilies?.length) codeWriterFamilies.add('glm')
-      log(`Shepherd seat: Vibe/GLM (pin "${seat.shepherdPin}") — Claude ${shepherdModel} is the rate-limit fallback.`)
+      log(offload
+        ? `⚖ Shepherd seat: Vibe/GLM — USAGE OFFLOAD (weekly pace) on tier ${tier}; Claude ${shepherdModel} is the fallback.${(tier === 'Red' || seatComplianceCritical) ? ' A Claude final review follows the cross-family Pointer review.' : ''}`
+        : `Shepherd seat: Vibe/GLM (pin "${seat.shepherdPin}") — Claude ${shepherdModel} is the rate-limit fallback.`)
     }
   } else if (pinFam && pinFam !== 'claude') {
     log(`⚠ Shepherd pin "${seat.shepherdPin}" (${pinFam}) has no implementer path in this pipeline — using the Claude ${shepherdModel} Shepherd.`)
@@ -1884,7 +1968,7 @@ You are the Claude fallback implementer (${shepherdModel}).
 // Writer record appended to a plain (non-fallback) Claude Shepherd prompt.
 const CLAUDE_WRITER_RECORD = `
 WRITER RECORD: end every commit message with the git trailer "${WRITER_TRAILER}: claude"
-(git commit --trailer "${WRITER_TRAILER}: claude"). After committing, update ${planDir}/metadata.json —
+(git commit --trailer "${WRITER_TRAILER}: claude"). After committing, update ${planDir}/metadata.json ${META_PRESERVE_NOTE} —
 ensure the "shepherd_families" array exists and contains "claude", and set "last_shepherd_family" = "claude".
 Preserve every other field.`
 
@@ -2036,7 +2120,7 @@ ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound')}
    the DEFECT, not by wording or line number (the pipeline uses these to detect
    convergence vs oscillation; a defect re-described differently each round must still
    match). Put \`fingerprint\` on every finding in findingsList.
-8. Update ${planDir}/metadata.json: review_round=${round}, status="reviewed",
+8. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: review_round=${round}, status="reviewed",
    phase="review-${round}", and record grounded/dropped counts. Do NOT write
    review_fingerprints or convergence here — the orchestrator records those once per
    round (concurrent shim writes would race).
@@ -2235,7 +2319,7 @@ SEPARATE file ${planDir}/revision-log-${round}.md. Do NOT embed a "## Bloodhound
 "## Revisions After Review" section inside the plan — that per-round log accreting in the plan is
 what bloats it past the reviewer's size limit and eventually times the review out. (This supersedes
 any "add a Revisions section to the plan" guidance in the skill.)
-Update ${planDir}/metadata.json.
+Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}.
 
 Return the findingsAddressed array with disposition (ACCEPTED or REJECTED) and justification for each.
 Set allAddressed to true only if every finding has a disposition.
@@ -2280,7 +2364,7 @@ Execute:
 - Write ${planDir}/debrief.md summarizing accepted/rejected findings
 - Write ${planDir}/plan-final.md (copy of the last accepted plan version)
 - Compute and write all 6 model_assignments to ${planDir}/metadata.json
-- Update ${planDir}/metadata.json: phase="implement", status="ready"
+- Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: phase="implement", status="ready"
 
 FINAL-ROUND SKIP-CHECK (mandatory — this is the safety gate for proceeding without
 an explicit Bloodhound approval): open the LAST Bloodhound review round
@@ -2427,15 +2511,36 @@ if (at('Code Review') && pointerRounds > 0) {
   const pFloor = pointerRounds
   const pHistory = { fpRounds: [], counts: [], cumulativeCritFps: new Set(), critStreak: new Map() }
   let lastPointerFindings = []
+  // usage-limit-gate (AC6, A-5): under a usage offload the GLM Shepherd wrote the code on a
+  // tier that normally forces Opus. On Red OR compliance-critical hunts, an APPROVED
+  // cross-family round is followed by ONE more round on chain ['claude'] — a CLAUDE FINAL
+  // REVIEW (not a fallback) — through the same prompt, verdict contract, grounding and
+  // convergence bookkeeping. ISSUES_FOUND there takes the normal rework path, and the next
+  // approval goes cross-family again and then Claude-final again. Claude never reviews code
+  // Claude wrote: if the Claude fallback Shepherd fired, the final review is skipped (logged).
+  const claudeFinalNeeded = () =>
+    (tier === 'Red' || seatComplianceCritical) && usageOffloadActive && !codeWriterFamilies.has('claude')
+  let claudeFinalPassed = false
+  let claudeFinalRound = false     // true while the CURRENT round is the Claude final review
+  let claudeFinalSkipLogged = false
+  // Pointer r1 F3: the mandated Claude-final rounds are EXTRA rounds the cross-family
+  // approval earned — they must not eat into the convergence breaker. classifyConvergence
+  // therefore sees the CROSS-FAMILY round count (pRound minus Claude-final rounds run). Still
+  // bounded: every Claude-final round needs a preceding cross-family APPROVED round, and each
+  // of those advances the effective count, so the breaker still trips on a writer/Claude
+  // ping-pong after maxRounds cross-family rounds.
+  let claudeFinalRoundsRun = 0
 
   while (!pointerApproved) {
     pRound++
-    log(`Pointer round ${pRound} (floor ${pFloor}, breaker ${pcfg.maxRounds} rounds, plan-smell ≥${pcfg.planSmellBound} distinct criticals, crit-persist ${pcfg.critPersist})`)
+    if (claudeFinalRound) claudeFinalRoundsRun++
+    log(`Pointer round ${pRound}${claudeFinalRound ? ' — CLAUDE FINAL REVIEW (usage offload, Red/compliance)' : ''} (floor ${pFloor}, breaker ${pcfg.maxRounds} rounds, plan-smell ≥${pcfg.planSmellBound} distinct criticals, crit-persist ${pcfg.critPersist})`)
 
     // Code-review chain: enabled examiners minus EVERY family that wrote code on this
     // branch (a GLM Shepherd removes glm; a Claude fallback keeps claude excluded too).
+    // The Claude final review round forces ['claude'] (claude is not a writer — checked).
     ensureCodeWriterRecord()
-    const ptrChain = examinerChain(codeWriterFamilies)
+    const ptrChain = claudeFinalRound ? ['claude'] : examinerChain(codeWriterFamilies)
     if (!ptrChain.length) {
       log(`⛔ ${slug}: no cross-family examiner left for the code review (writers: ${[...codeWriterFamilies].join(', ')}). Parking.`)
       await parkHunt({
@@ -2450,10 +2555,17 @@ if (at('Code Review') && pointerRounds > 0) {
     const buildPointerPrompt = (unit, nudge) => {
       const rawFile = unit.key === 'full' ? `pointer-review-${pRound}.md` : `pointer-review-${pRound}-${unit.key}.md`
       const tmpFile = unit.key === 'full' ? `/tmp/pointer-${slug}-r${pRound}.txt` : `/tmp/pointer-${slug}-r${pRound}-${unit.key}.txt`
-      return `
+      const finalBanner = claudeFinalRound ? `
+CLAUDE FINAL REVIEW (usage offload, Red/compliance) — not a fallback. The cross-family chain
+already APPROVED this diff; this is the mandated judgment-tier pass on GLM-written code. Review
+it with the SAME rigour and the SAME verdict contract.
+` : ''
+      return `${finalBanner}
 You are a shim agent orchestrating a Pointer code review${unit.focus ? ` (FOCUS LENS: ${unit.key})` : ''}. The examiner chain
 for this code review is ${chainLabel(ptrChain)} — try each link in order, moving to the next
-only when the current one fails. (Claude only as the final last-resort link; none shares a
+only when the current one fails. (${claudeFinalRound
+  ? 'This round the ONLY link is the mandated Claude FINAL review — not a fallback'
+  : 'Claude only as the final last-resort link'}; none shares a
 family with the code's writer(s): ${[...codeWriterFamilies].join(', ')}.)
 
 Hunt: ${slug}
@@ -2470,7 +2582,7 @@ Steps:
    "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff main..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
 
 3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
-${chainSteps(ptrChain, 'wolfpack-pointer', tmpFile, 'pointer')}
+${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChain, 'wolfpack-pointer', tmpFile, 'pointer')}
    Each wrapper enforces a read-only review and caps concurrent calls on its
    model (flock). Run each EXACTLY as given — no extra flags, no parallel spawns.
    An attempt FAILS if ANY of: non-zero exit, empty output, no parseable
@@ -2516,9 +2628,9 @@ ${chainSteps(ptrChain, 'wolfpack-pointer', tmpFile, 'pointer')}
    underlying defect in the SAME file across DIFFERENT rounds MUST yield the SAME
    fingerprint — bucket by the DEFECT, not by wording or line number. Put \`fingerprint\`
    on every finding in findingsList.
-8. Update ${planDir}/metadata.json: pointer_round=${pRound}, status per verdict, record
+8. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: pointer_round=${pRound}, status per verdict, record
    grounded/dropped counts. Do NOT write review_fingerprints or convergence here — the
-   orchestrator records those once per round (concurrent shim writes would race).
+   orchestrator records those once per round (concurrent shim writes would race).${claudeFinalRound ? CLAUDE_FINAL_REVIEW_STEP(pRound) : ''}
 9. Clean up temp files: rm -f ${tmpFile}
 10. Return: verdict, findings (count of GROUNDED items), findingsList (grounded only,
     each with id/severity/title/file/line/claim/evidence/FINGERPRINT), grounded (count),
@@ -2556,16 +2668,47 @@ ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' +
         })
         return { slug, verdict: 'PARKED', status: 'parked:cross_family_violation', reason: 'cross_family_violation', tier, worktreePath }
       }
-      await noteClaudeFallbackReview('pointer', pRound, pointerResult, ptrChain, 'Code Review')
+      // The Claude FINAL review is mandated, not a last-resort fallback — it records into
+      // metadata.claude_final_reviews (CLAUDE_FINAL_REVIEW_STEP), not claude_fallback_reviews.
+      if (!claudeFinalRound) await noteClaudeFallbackReview('pointer', pRound, pointerResult, ptrChain, 'Code Review')
     }
 
-    setExaminer(pointerResult.provider, `sticky: answered pointer round ${pRound}`)
+    if (!claudeFinalRound) setExaminer(pointerResult.provider, `sticky: answered pointer round ${pRound}`)
 
     if (pointerResult.verdict === 'APPROVED') {
+      if (claudeFinalRound) {
+        claudeFinalPassed = true
+        claudeFinalRound = false
+        pointerApproved = true
+        log(`Pointer APPROVED at round ${pRound} — CLAUDE FINAL REVIEW passed (usage offload).`)
+        break
+      }
+      if (!claudeFinalPassed && claudeFinalNeeded()) {
+        claudeFinalRound = true
+        log(`Pointer cross-family APPROVED at round ${pRound} — running the CLAUDE FINAL REVIEW (usage offload on ${tier === 'Red' ? 'Red' : 'compliance-critical'} hunt) before Test.`)
+        continue
+      }
+      if (!claudeFinalPassed && !claudeFinalSkipLogged && usageOffloadActive &&
+          (tier === 'Red' || seatComplianceCritical) && codeWriterFamilies.has('claude')) {
+        claudeFinalSkipLogged = true
+        log(`⚠ Claude final review SKIPPED — claude wrote code on this branch; cross-family review stands`)
+        await agent(`
+You are a minimal RECORD writer. Do exactly one thing, then return.
+Set "claude_final_review_skipped" in ${planDir}/metadata.json to
+  {"round": ${pRound}, "reason": "claude wrote code on this branch (Claude fallback Shepherd) — Claude cannot review its own code; cross-family review stands"}
+${META_PRESERVE_NOTE}. Do NOT alter any other file. Do NOT commit. Return recorded: true.
+`, { label: `claude-final-skip-record:${slug}:r${pRound}`, phase: 'Code Review',
+     schema: { type: 'object', properties: { recorded: { type: 'boolean' } }, required: ['recorded'] },
+     model: 'sonnet' })
+      }
       pointerApproved = true
       log(`Pointer APPROVED at round ${pRound}`)
       break
     }
+    // A Claude final round that did NOT approve (ISSUES_FOUND / ERROR) falls through to the
+    // normal handling below; the NEXT approval walks the cross-family chain again first.
+    const wasClaudeFinalRound = claudeFinalRound
+    claudeFinalRound = false
     if (pointerResult.verdict === 'ERROR') {
       // [03] Part B — code-review fan-out floored at cap 1 and STILL failing → PARK.
       // [05] AC3 — quota outage (every chain examiner throttled) parks model_quota (host
@@ -2595,7 +2738,17 @@ ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' +
     const pCriticals = pFindings.filter(f => isCriticalSev(f.severity))
     log(`Pointer REWRITE_NEEDED: ${pFindings.length} grounded finding(s)`)
 
-    const pv = classifyConvergence({ round: pRound, findings: pFindings, history: pHistory, cfg: pcfg, floor: pFloor })
+    // Pointer r1 F3: breaker sees cross-family rounds only (see claudeFinalRoundsRun). A
+    // Claude-final ISSUES round shares the round number of the cross-family APPROVED round it
+    // follows, and gets ONE round of grace past the breaker so that approval always earns a
+    // rework (an approval AT maxRounds would otherwise park without one). Bounded: the next
+    // cross-family round is already ≥ maxRounds+1 and parks on ISSUES; a further Claude-final
+    // ISSUES parks at ≥ maxRounds+1.
+    const effRound = pRound - claudeFinalRoundsRun
+    const pv = classifyConvergence({
+      round: effRound, findings: pFindings, history: pHistory, floor: pFloor,
+      cfg: wasClaudeFinalRound ? { ...pcfg, maxRounds: pcfg.maxRounds + 1 } : pcfg,
+    })
     commitRound(pHistory, pFindings, pv.cumulativeCrit)
     const pEntry = ledgerEntry('pointer', pRound, pFindings, (pointerResult.dropped || []).length)
     const pCumCrit = pv.cumulativeCrit.size
@@ -2772,7 +2925,7 @@ Execute ALL Tracker instructions:
   auto-bootstraps the cluster on first use. NO Cloud SQL, gcloud, or ADC needed.)
 - Classify failures (baseline/transient/pre-existing/legitimate)
 - Write ${planDir}/tracker-log.md and ${planDir}/tracker-report-1.md if needed
-- Update ${planDir}/metadata.json
+- Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}
 - Commit test files on feat/${slug}. WRITER RECORD: end every commit message with the git
   trailer "${WRITER_TRAILER}: ${trackerFamily}"
   (git commit --trailer "${WRITER_TRAILER}: ${trackerFamily}") — the tests are code on this
@@ -2935,7 +3088,7 @@ Steps:
        metadata.json — they are GITIGNORED plan artifacts that ride the worktree and are
        copied back by /merge; force-adding them is the leak.
    Then \`git commit\`.
-   Update ${planDir}/metadata.json with verdict.
+   Update ${planDir}/metadata.json with verdict ${META_PRESERVE_NOTE}.
    SAFETY: No git push. No deploy commands. No \`git add -f\` — ever.
    End your response with a <verdict> block: {verdict, plan_adherence, code_quality, test_result}"
 
@@ -2955,7 +3108,7 @@ ${certifySteps}
 
 6. Clean up: rm -f /tmp/watchdog-${slug}.txt
 
-7. Update ${planDir}/metadata.json based on verdict:
+7. Update ${planDir}/metadata.json based on verdict ${META_PRESERVE_NOTE}:
    PASS: phase="done", status="certified", completed_at=$(date -Iseconds) (the REAL clock — the t_end marker; "created" is t0)
    REWORK: phase="implement", status="rework_needed"
    FLAWED_PLAN: phase="plan", status="flawed_plan"

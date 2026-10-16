@@ -113,6 +113,11 @@ Map each family onto a concrete model you have. The router (`scripts/wolfpack-ro
 
 ### Overrides (optional)
 - (e.g., Red tier / compliance hunts: force judgment family for Shepherd)
+- (e.g., EXCEPTION — usage offload: when the window gate reports weekly pace > 15 points ahead
+  (`metadata.usage_offload` set), the Shepherd is the coder-alt family on every tier,
+  Red/Orange/compliance included; on Red or compliance-critical hunts a judgment-family final
+  review pass follows the cross-family Pointer review. Reviewers still walk the chain with the
+  coder-alt family removed.)
 - (e.g., UI-heavy hunts: pin reviewer-a as the visual-review specialist)
 ```
 

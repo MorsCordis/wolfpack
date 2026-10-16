@@ -26,6 +26,11 @@
 //   * coder-alt   — an optional non-default IMPLEMENTER family for NON-heavy tiers
 //                   (typically the same family as reviewer-c: a model that can both
 //                   code and review). Heavy/compliance tiers still force `judgment`.
+//                   EXCEPTION — usage offload (usage-limit-gate): when the window gate
+//                   reports the weekly pace > 15 points ahead (metadata.usage_offload),
+//                   the Shepherd is coder-alt on EVERY tier; on Red or compliance-critical
+//                   hunts `claudeFinalReview: true` asks the pipeline for a judgment-family
+//                   final review pass after the cross-family Pointer review.
 //                   Because coder-alt may also review, the cross-family rule is the
 //                   CHAIN rule: a review seat walks the ordered examiner chain with the
 //                   writer's family REMOVED, falling to the next link on a rate limit.
@@ -228,7 +233,7 @@ export function bestReviewerByData(stats, role, domain, pool = DEFAULT_POOL) {
 // ─── The recommender ────────────────────────────────────────────
 // Returns { assignments, domain, compliance, explore, warnings }. assignments is
 // keyed by role: { model, mode?, rationale, source: 'default'|'exploit'|'explore'|'pin' }.
-export function recommendModels({ tier, dimensions = {}, stats = {}, pins = {}, pool = DEFAULT_POOL, enabled = null } = {}) {
+export function recommendModels({ tier, dimensions = {}, stats = {}, pins = {}, pool = DEFAULT_POOL, enabled = null, offload = false, complianceCritical = null } = {}) {
   const warnings = []
   const { REVIEWER } = familySets(pool)
   const t = tier || 'Red'            // fail-closed: unknown tier → heaviest ceremony
@@ -248,7 +253,7 @@ export function recommendModels({ tier, dimensions = {}, stats = {}, pins = {}, 
   // Shepherd — pin wins; else tier default. Heavy/compliance is exploit-only. A
   // coder-alt pin is honored only on non-heavy tiers (judgment override never relaxes)
   // and carries a `fallback` implementer for when coder-alt is rate-limited.
-  A.shepherd = pickShepherd(pins, def, stats, domain, explore, warnings, pool, enabled)
+  A.shepherd = pickShepherd(pins, def, stats, domain, explore, warnings, pool, enabled, offload)
 
   // Reviewers — NEVER an implementer family. Exploit best-by-data if trusted, else
   // tier default; on explore-eligible tiers with thin data, explore the work-horse default.
@@ -275,7 +280,14 @@ export function recommendModels({ tier, dimensions = {}, stats = {}, pins = {}, 
   // Final hard-constraint assertions (fail-loud).
   assertConstraints(A, warnings, pool)
 
-  return { assignments: A, domain, compliance: def.compliance, explore, warnings }
+  // Usage offload on Red OR compliance-critical ⇒ a judgment-family final review follows
+  // the cross-family Pointer review (A-5). "Compliance-critical" is the hunt-pipeline seat
+  // probe's definition (spec.compliance_critical || spec.compliance_review_required ||
+  // domain_sensitivity ≥ 3); callers without the spec block fall back to the dimension axis.
+  const cc = complianceCritical == null ? def.compliance : !!complianceCritical
+  const claudeFinalReview = A.shepherd.source === 'offload' && (t === 'Red' || cc)
+
+  return { assignments: A, domain, compliance: def.compliance, explore, warnings, claudeFinalReview }
 }
 
 // Pin-or-default for non-reviewer roles (Shepherd, Tracker). Heavy tiers never
@@ -307,7 +319,16 @@ function pickWithPin(role, pins, defModel, stats, domain, explore, warnings, poo
 // model that also reviews) is honored only on non-heavy tiers with the family enabled,
 // and carries `fallback` = the tier-default implementer the pipeline runs instead when
 // coder-alt is rate-limited. Every other pin behaves exactly as before (pin wins).
-function pickShepherd(pins, def, stats, domain, explore, warnings, pool, enabled) {
+function pickShepherd(pins, def, stats, domain, explore, warnings, pool, enabled, offload = false) {
+  // Usage offload (weekly pace) — coder-alt on EVERY tier, BEFORE the heavy check. The only
+  // place the judgment override is suspended; without offload nothing below changes.
+  if (offload) {
+    if (pool.coderAlt && (!enabled || enabled.has(pool.coderAlt))) {
+      return { model: pool.coderAlt, fallback: def.shepherd, source: 'offload',
+        rationale: `usage offload (weekly pace) — ${pool.coderAlt} Shepherd on every tier; falls back to ${def.shepherd}` }
+    }
+    warnings.push(`usage offload requested but no enabled coder-alt family in the pool — Shepherd routing unchanged`)
+  }
   const pinFam = providerFamily(pins.shepherd, pool)
   if (pool.coderAlt && pinFam === pool.coderAlt && pinFam !== pool.judgment && pinFam !== pool.workHorse) {
     if (def.heavy) {
@@ -438,6 +459,13 @@ export function pinsFromMeta(meta = {}) {
   return { ...pins, ...(meta.model_pins || {}) }
 }
 
+// The hunt-pipeline seat probe's compliance-critical definition (A-5), from metadata.
+export function complianceCriticalFromMeta(meta = {}) {
+  const spec = meta.spec || {}
+  return !!(spec.compliance_critical || spec.compliance_review_required ||
+    Number(meta.predicted_dimensions?.domain_sensitivity || 0) >= 3)
+}
+
 // ─── CLI ────────────────────────────────────────────────────────
 function main(argv) {
   const planDir = argv[2]
@@ -453,6 +481,8 @@ function main(argv) {
     dimensions: meta.predicted_dimensions || {},
     stats: stats.model_stats || stats,
     pins: pinsFromMeta(meta),
+    offload: !!meta.usage_offload,
+    complianceCritical: complianceCriticalFromMeta(meta),
   })
   console.log(JSON.stringify(rec, null, 2))
 }

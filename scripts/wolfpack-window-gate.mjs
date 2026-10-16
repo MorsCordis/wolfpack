@@ -1,5 +1,32 @@
 #!/usr/bin/env node
-// scripts/wolfpack-window-gate.mjs — [05] limits layer, Part A (A2/A3).
+// scripts/wolfpack-window-gate.mjs — [05] limits layer, Part A (A2/A3) + usage-limit-gate.
+//
+// PRIMARY SOURCE — the LIVE usage snapshot (usage-limit-gate, AC2/AC4). Claude Code pipes
+// the real account figures to the status line on every render (`rate_limits.five_hour` /
+// `rate_limits.seven_day`: `used_percentage` + `resets_at` epoch seconds). The status-line
+// wrapper (scripts/wolfpack-statusline.mjs) snapshots ONLY those to
+// ~/.cache/wolfpack/claude-usage.json (WOLFPACK_USAGE_SNAPSHOT). When that snapshot is
+// fresh (< WOLFPACK_USAGE_STALE_MINUTES, default 10) the gate decides on it:
+//   * weekly 7d ≥ WOLFPACK_WEEKLY_DEFER_PCT (90)        → defer ALL new hunts
+//   * 5h ≥ WOLFPACK_5H_START_MAX_PCT (80; Red/unknown tier: WOLFPACK_5H_START_MAX_PCT_RED 70)
+//                                                       → defer (do not START the hunt)
+//   * otherwise proceed; weekly pace (7d used − elapsed share of the week) above
+//     WOLFPACK_WEEKLY_PACE_POINTS (15) ⇒ `offload:true` (the runner moves the Shepherd to GLM).
+// DEGRADED FALLBACK — the transcript ESTIMATE below (the original [05] gate) runs only when
+// the snapshot is missing / unparseable / stale / lacks a valid five_hour window. Its
+// output is labelled `source:"transcript_estimate", degraded:true` and a stderr warning is
+// written in EVERY mode (--json included) — a degraded reading is never silent (AC3).
+// A-7: a window is valid only with a finite used_percentage AND a finite resets_at > 0.
+// A-6: a fresh snapshot whose window resets_at is already past ⇒ that window is treated as
+//      0% and labelled `reset_since_capture:true` (each window independently).
+//
+// Output contract (--json, both paths): always-present top-level keys
+//   decision, exit, reason, reset_at, source, degraded, gateEnabled, offload,
+//   five_hour_pct, seven_day_pct, weekly_pace   (flat mirrors; null when unavailable)
+// `offload_reason` only when offload. Nested objects never reuse the names decision /
+// reason / reset_at (wolfpack-overnight.sh scrapes those with sed).
+//
+// ─── Degraded fallback: the transcript estimate (original [05] gate) ───
 //
 // HOST-SIDE agent rate-limit gate. The precise account rate-limit (the rolling
 // 5-hour window / weekly Max caps) is NOT reachable inside a Workflow agent — but the
@@ -32,10 +59,19 @@
 //     are in the "uncertain reading" case the fail-closed rule targets → DEFER.
 //
 // Usage:
-//   node scripts/wolfpack-window-gate.mjs [--transcripts <dir>] [--json]
-// Env:
+//   node scripts/wolfpack-window-gate.mjs [--json] [--tier <T>] [--snapshot <path>] [--transcripts <dir>]
+//   --tier is case-insensitive; missing/unknown ⇒ Red (the conservative 70% ceiling).
+// Env (live snapshot — identical names in every fork; a non-numeric / out-of-range value
+// is a HARD error, exit 1 — never a silent default):
+//   WOLFPACK_USAGE_SNAPSHOT        snapshot path (default ~/.cache/wolfpack/claude-usage.json)
+//   WOLFPACK_USAGE_STALE_MINUTES   snapshot older than this ⇒ degraded fallback (default 10)
+//   WOLFPACK_5H_START_MAX_PCT      5h start ceiling, non-Red tiers (default 80)
+//   WOLFPACK_5H_START_MAX_PCT_RED  5h start ceiling, Red / unknown tier (default 70)
+//   WOLFPACK_WEEKLY_PACE_POINTS    weekly pace above this ⇒ offload (default 15)
+//   WOLFPACK_WEEKLY_DEFER_PCT      7d at/above this ⇒ defer all new hunts (default 90)
+// Env (degraded fallback only):
 //   WOLFPACK_AGENT_WINDOW_LIMIT    total tokens in the 5h window for your plan (ENABLES
-//                                  the gate; unset ⇒ gate disabled / proceed-with-warning)
+//                                  the estimate; unset ⇒ estimate disabled / proceed-with-warning)
 //   WOLFPACK_WINDOW_HEADROOM_PCT   % of the limit to keep in reserve (default 15)
 //   WOLFPACK_WINDOW_HOURS          window length in hours (default 5)
 //   WOLFPACK_TRANSCRIPT_DIR        transcript root. Default is the agent harness's local
@@ -43,6 +79,12 @@
 //                                  (~/.agents/projects) is harness-specific — set this env
 //                                  var to your harness's transcript location (see wolfpack-config.md).
 // Exit codes: 0 = proceed, 10 = defer, 1 = internal error.
+//
+// Gate protocol 1 = the usage-limit-gate output contract above (source / degraded / offload /
+// flat usage mirrors, --tier). campaign-runner.js greps this marker in its preflight: a gate
+// script WITHOUT it is the pre-usage-limit-gate transcript-only gate, which the runner drives
+// in a loud, labelled legacy-degraded mode instead of aborting every hunt claim.
+// WOLFPACK_GATE_PROTOCOL=1
 
 import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -182,40 +224,275 @@ export function collectEvents(rootDir, windowStartMs) {
   return { events, readOk: true }
 }
 
-function main() {
-  const argv = process.argv.slice(2)
-  const jsonOnly = argv.includes('--json')
-  const tIdx = argv.indexOf('--transcripts')
-  const rootDir = tIdx >= 0 && argv[tIdx + 1]
-    ? argv[tIdx + 1]
-    // TODO(de-fracture): the default transcript dir (~/.agents/projects) is harness-specific —
-    // override with WOLFPACK_TRANSCRIPT_DIR or parameterize via wolfpack-config.md.
-    : (process.env.WOLFPACK_TRANSCRIPT_DIR || join(homedir(), '.agents', 'projects'))
+// ─── Live usage snapshot (primary source; usage-limit-gate) ───────────────
+const HOUR_MS = 60 * 60 * 1000
+export const WEEK_MS = 7 * 24 * HOUR_MS
+export const DEFAULT_SNAPSHOT_PATH = join(homedir(), '.cache', 'wolfpack', 'claude-usage.json')
+export const WEEKLY_UNAVAILABLE_NOTE =
+  'weekly figures unavailable — weekly cap and pacing NOT enforced this check'
 
-  const limit = Number(process.env.WOLFPACK_AGENT_WINDOW_LIMIT)
-  const headroomPct = process.env.WOLFPACK_WINDOW_HEADROOM_PCT != null
-    ? Number(process.env.WOLFPACK_WINDOW_HEADROOM_PCT) : 15
-  const windowHours = process.env.WOLFPACK_WINDOW_HOURS != null
-    ? Number(process.env.WOLFPACK_WINDOW_HOURS) : 5
+const KNOWN_TIERS = ['Green', 'Blue', 'Yellow', 'Orange', 'Red']
+// Case-insensitive; missing / unknown ⇒ Red (the most conservative ceiling) — A-11,
+// matching campaign-runner.js normTier's "empty ⇒ Red".
+export function normTier(t) {
+  const s = String(t ?? '').trim().toLowerCase()
+  return KNOWN_TIERS.find(k => k.toLowerCase() === s) || 'Red'
+}
+
+export function snapshotPathFromEnv(env = process.env) {
+  return env.WOLFPACK_USAGE_SNAPSHOT || DEFAULT_SNAPSHOT_PATH
+}
+
+// A-7: valid ⇔ finite numeric used_percentage AND finite numeric resets_at > 0.
+export function isValidWindow(w) {
+  return !!w && typeof w === 'object' &&
+    typeof w.used_percentage === 'number' && Number.isFinite(w.used_percentage) &&
+    typeof w.resets_at === 'number' && Number.isFinite(w.resets_at) && w.resets_at > 0
+}
+
+// Env thresholds. Unset or empty ⇒ default. Anything else that is not a finite number in
+// range is a HARD error (throws) — fail loud, never a silent fallback to the default.
+// Read one numeric env var: unset/blank ⇒ default; anything else must parse and be in range
+// or it hard-errors (a typo must never silently disable a gate rule).
+function readNumEnv(env, name, def, { pct = true } = {}) {
+  const raw = env[name]
+  if (raw == null || String(raw).trim() === '') return def
+  const n = Number(raw)
+  const ok = Number.isFinite(n) && (pct ? (n >= 0 && n <= 100) : n > 0)
+  if (!ok) {
+    throw new Error(`${name}=${JSON.stringify(raw)} is invalid — expected ${pct ? 'a number in [0,100]' : 'a number > 0'}`)
+  }
+  return n
+}
+
+export function thresholdsFromEnv(env = process.env) {
+  const read = (name, def, opts) => readNumEnv(env, name, def, opts)
+  return {
+    staleMinutes: read('WOLFPACK_USAGE_STALE_MINUTES', 10, { pct: false }),
+    fiveHourMaxPct: read('WOLFPACK_5H_START_MAX_PCT', 80),
+    fiveHourMaxPctRed: read('WOLFPACK_5H_START_MAX_PCT_RED', 70),
+    weeklyPacePoints: read('WOLFPACK_WEEKLY_PACE_POINTS', 15),
+    weeklyDeferPct: read('WOLFPACK_WEEKLY_DEFER_PCT', 90),
+  }
+}
+export const DEFAULT_THRESHOLDS = thresholdsFromEnv({})
+
+// Read + parse the snapshot. Never throws. {ok:true, snapshot} | {ok:false, error}.
+// Window validity / staleness are judged by computeUsageDecision, not here.
+export function readSnapshot(path, fsImpl = { readFileSync, existsSync }) {
+  try {
+    if (!fsImpl.existsSync(path)) return { ok: false, error: `snapshot missing (${path})` }
+    let snapshot
+    try { snapshot = JSON.parse(fsImpl.readFileSync(path, 'utf8')) } catch (e) {
+      return { ok: false, error: `snapshot unparseable (${path}: ${e.message})` }
+    }
+    if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+      return { ok: false, error: `snapshot is not a JSON object (${path})` }
+    }
+    return { ok: true, snapshot }
+  } catch (e) {
+    return { ok: false, error: `snapshot unreadable (${path}: ${e.message})` }
+  }
+}
+
+const round1 = (v) => Math.round(v * 10) / 10
+const clamp01 = (v) => Math.min(1, Math.max(0, v))
+const isoFromEpochSec = (s) => new Date(s * 1000).toISOString()
+const signed = (v) => (v > 0 ? `+${v}` : `${v}`)
+
+// Why the snapshot cannot drive a live decision (null ⇒ usable).
+export function snapshotUnusableReason(snapshot, nowMs, thresholds, snapshotError) {
+  if (!snapshot) return snapshotError || 'snapshot missing'
+  const capMs = Date.parse(snapshot.captured_at)
+  if (typeof snapshot.captured_at !== 'string' || !Number.isFinite(capMs)) {
+    return 'snapshot captured_at missing/invalid'
+  }
+  if (capMs > nowMs + 60 * 1000) return 'snapshot captured_at is in the future'
+  const ageMin = (nowMs - capMs) / 60000
+  if (ageMin > thresholds.staleMinutes) {
+    return `snapshot ${Math.round(ageMin)} min old (stale > ${thresholds.staleMinutes} min)`
+  }
+  if (!isValidWindow(snapshot.rate_limits?.five_hour)) return 'snapshot five_hour window missing/invalid'
+  return null
+}
+
+// The ONE place the flat mirrors are derived from the nested objects (output contract).
+export function flatten(d) {
+  const out = { ...d }
+  out.five_hour_pct = d.five_hour ? d.five_hour.used_pct : null
+  out.seven_day_pct = d.seven_day ? d.seven_day.used_pct : null
+  out.weekly_pace = d.seven_day ? d.seven_day.pace : null
+  out.offload = d.offload === true
+  if (!out.offload) delete out.offload_reason
+  for (const k of ['decision', 'exit', 'reason', 'reset_at', 'source', 'degraded', 'gateEnabled']) {
+    if (!(k in out)) out[k] = null
+  }
+  return out
+}
+
+// THE PURE LIVE DECISION CORE (unit-tested). No fs / env / Date.now — all arguments.
+//   snapshot      : parsed snapshot object or null
+//   snapshotError : why it could not be read (for degraded_reason)
+//   estimate      : () => computeDecision(...) result — the degraded fallback (lazy, so the
+//                   transcript tree is only walked when actually degraded). Omitted ⇒ the
+//                   disabled-estimate decision (proceed, gateEnabled:false).
+export function computeUsageDecision({ snapshot, snapshotError, nowMs, tier, thresholds = DEFAULT_THRESHOLDS, estimate }) {
+  const t = normTier(tier)
+  const unusable = snapshotUnusableReason(snapshot, nowMs, thresholds, snapshotError)
+  if (unusable) {
+    const est = typeof estimate === 'function' ? estimate()
+      : computeDecision({ events: [], nowMs, limit: null, headroomPct: 15, windowMs: 5 * HOUR_MS, readOk: false })
+    return flatten({
+      ...est, tier: t, source: 'transcript_estimate', degraded: true, degraded_reason: unusable,
+      captured_at: snapshot && typeof snapshot.captured_at === 'string' ? snapshot.captured_at : null,
+      five_hour: null, seven_day: null, offload: false,
+    })
+  }
+
+  const fhRaw = snapshot.rate_limits.five_hour
+  const fhReset = fhRaw.resets_at * 1000 <= nowMs
+  const five_hour = {
+    used_pct: fhReset ? 0 : fhRaw.used_percentage,
+    resets_at: fhRaw.resets_at,
+    reset_since_capture: fhReset,
+  }
+  if (fhReset) five_hour.captured_used_pct = fhRaw.used_percentage
+
+  const sdRaw = snapshot.rate_limits.seven_day
+  let seven_day = null
+  if (isValidWindow(sdRaw)) {
+    const sdReset = sdRaw.resets_at * 1000 <= nowMs
+    const used = sdReset ? 0 : sdRaw.used_percentage
+    const elapsed = sdReset ? 0 : clamp01((nowMs - (sdRaw.resets_at * 1000 - WEEK_MS)) / WEEK_MS)
+    seven_day = {
+      used_pct: used, resets_at: sdRaw.resets_at,
+      elapsed_share: Math.round(elapsed * 1000) / 1000,
+      pace: sdReset ? 0 : round1(used - elapsed * 100),
+      reset_since_capture: sdReset,
+    }
+    if (sdReset) seven_day.captured_used_pct = sdRaw.used_percentage
+  }
+
+  const base = {
+    source: 'live', degraded: false, gateEnabled: true,
+    captured_at: snapshot.captured_at, tier: t, five_hour, seven_day, offload: false,
+  }
+  if (!seven_day) base.weekly_note = WEEKLY_UNAVAILABLE_NOTE
+
+  // Rule 2: weekly cap.
+  if (seven_day && seven_day.used_pct >= thresholds.weeklyDeferPct) {
+    return flatten({
+      ...base, decision: 'defer', exit: DEFER,
+      reason: `weekly cap: 7d ${seven_day.used_pct}% ≥ ${thresholds.weeklyDeferPct}% — defer all new hunts`,
+      reset_at: isoFromEpochSec(seven_day.resets_at),
+    })
+  }
+  // Rule 3: 5h start ceiling (tier-dependent).
+  const ceiling = t === 'Red' ? thresholds.fiveHourMaxPctRed : thresholds.fiveHourMaxPct
+  if (five_hour.used_pct >= ceiling) {
+    return flatten({
+      ...base, decision: 'defer', exit: DEFER,
+      reason: `5h window: ${five_hour.used_pct}% ≥ ${ceiling}% start ceiling (${t}) — defer until the 5h window resets`,
+      reset_at: isoFromEpochSec(five_hour.resets_at),
+    })
+  }
+  // Rule 4: proceed (+ weekly pacing offload).
+  const weekTxt = seven_day ? `; week ${seven_day.used_pct}% (pace ${signed(seven_day.pace)})` : '; week n/a'
+  const out = {
+    ...base, decision: 'proceed', exit: PROCEED,
+    reason: `5h ${five_hour.used_pct}% < ${ceiling}% start ceiling (${t})${weekTxt}`,
+    reset_at: five_hour.reset_since_capture ? null : isoFromEpochSec(five_hour.resets_at),
+  }
+  if (seven_day && seven_day.pace > thresholds.weeklyPacePoints) {
+    out.offload = true
+    out.offload_reason = `weekly pace ${signed(seven_day.pace)} points ahead of the week's elapsed share (> ${thresholds.weeklyPacePoints}) — offload the Shepherd to GLM`
+  }
+  return flatten(out)
+}
+
+// The degraded-fallback ESTIMATE, configured from env exactly as the original gate was.
+// Exported so wolfpack-usage.mjs reuses it verbatim (the env NAMES are fork-specific and
+// live only here). rootDir defaults to WOLFPACK_TRANSCRIPT_DIR / the harness default.
+export function defaultTranscriptDir(env = process.env) {
+  // TODO(de-fracture): the default transcript dir (~/.agents/projects) is harness-specific —
+  // override with WOLFPACK_TRANSCRIPT_DIR or parameterize via wolfpack-config.md.
+  return env.WOLFPACK_TRANSCRIPT_DIR || join(homedir(), '.agents', 'projects')
+}
+// The estimate's tuning knobs, validated with the SAME hard-error rule as thresholdsFromEnv:
+// a malformed WOLFPACK_WINDOW_HEADROOM_PCT / WOLFPACK_WINDOW_HOURS used to yield NaN / 0 and
+// silently make the backstop always proceed (A-8). Unset/blank ⇒ default; invalid ⇒ throw.
+// (WOLFPACK_AGENT_WINDOW_LIMIT is NOT validated here: unset/0 is the documented
+// "estimate disabled" opt-out, reported loudly by computeDecision.)
+export function estimateConfigFromEnv(env = process.env) {
+  return {
+    headroomPct: readNumEnv(env, 'WOLFPACK_WINDOW_HEADROOM_PCT', 15),
+    windowHours: readNumEnv(env, 'WOLFPACK_WINDOW_HOURS', 5, { pct: false }),
+  }
+}
+export function estimateFromEnv(env, nowMs, rootDir = defaultTranscriptDir(env)) {
+  const limit = Number(env.WOLFPACK_AGENT_WINDOW_LIMIT)
+  const { headroomPct, windowHours } = estimateConfigFromEnv(env)
   const windowMs = windowHours * 60 * 60 * 1000
-
-  // Only read transcripts when the gate is enabled (limit set) — no point walking the
+  // Only read transcripts when the estimate is enabled (limit set) — no point walking the
   // tree to print a "disabled" notice.
-  const nowMs = Date.now()
   let events = [], readOk = false
   if (limit && Number.isFinite(limit) && limit > 0) {
     ({ events, readOk } = collectEvents(rootDir, nowMs - windowMs))
   }
+  return computeDecision({ events, nowMs, limit, headroomPct, windowMs, readOk })
+}
 
-  const decision = computeDecision({
-    events, nowMs, limit, headroomPct, windowMs, readOk,
+function argValue(argv, flag) {
+  const i = argv.indexOf(flag)
+  return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : null
+}
+
+function main() {
+  const argv = process.argv.slice(2)
+  const jsonOnly = argv.includes('--json')
+  const rootDir = argValue(argv, '--transcripts') || defaultTranscriptDir(process.env)
+  const tier = normTier(argValue(argv, '--tier'))
+  const snapPath = argValue(argv, '--snapshot') || snapshotPathFromEnv()
+
+  let thresholds
+  try {
+    thresholds = thresholdsFromEnv(process.env)
+    // Validate the degraded-fallback knobs up front too, so a bad value hard-errors on
+    // every run — not only on the run that happens to fall back to the estimate.
+    estimateConfigFromEnv(process.env)
+  } catch (e) {
+    process.stderr.write(`wolfpack-window-gate: ERROR — ${e.message}\n`)
+    process.exit(ERROR)
+  }
+
+  const nowMs = Date.now()
+  // Degraded fallback (lazy): the original transcript estimate, unchanged.
+  const estimate = () => estimateFromEnv(process.env, nowMs, rootDir)
+
+  const snap = readSnapshot(snapPath)
+  const decision = computeUsageDecision({
+    snapshot: snap.ok ? snap.snapshot : null, snapshotError: snap.error,
+    nowMs, tier, thresholds, estimate,
   })
+
+  // Warnings go to stderr in EVERY mode (--json included): a degraded reading, an
+  // unenforced weekly cap, or an offload is never silent (AC3, A-7).
+  if (decision.degraded) {
+    process.stderr.write(`⚠ wolfpack-window-gate: DEGRADED — ${decision.degraded_reason}; ` +
+      `falling back to the transcript estimate (${decision.gateEnabled ? 'enabled' : 'NOT configured — proceeding ungated; set WOLFPACK_AGENT_WINDOW_LIMIT as the backstop'}). ` +
+      `Live 5h/weekly gating and offload are INACTIVE.\n`)
+  }
+  if (decision.weekly_note) process.stderr.write(`⚠ wolfpack-window-gate: ${decision.weekly_note}\n`)
+  if (decision.offload) process.stderr.write(`⚖ wolfpack-window-gate: OFFLOAD — ${decision.offload_reason}\n`)
 
   if (jsonOnly) {
     process.stdout.write(JSON.stringify(decision) + '\n')
   } else {
     process.stdout.write(JSON.stringify(decision, null, 2) + '\n')
-    process.stderr.write(`wolfpack-window-gate: ${decision.decision.toUpperCase()} — ${decision.reason}\n`)
+    process.stderr.write(`wolfpack-window-gate: ${decision.decision.toUpperCase()} [${decision.source}] — ${decision.reason}\n`)
+    if (decision.seven_day) {
+      process.stderr.write(`wolfpack-window-gate: week ${decision.seven_day.used_pct}% · elapsed ${Math.round(decision.seven_day.elapsed_share * 100)}% · pace ${decision.seven_day.pace > 0 ? '+' : ''}${decision.seven_day.pace}\n`)
+    }
     if (decision.decision === 'defer' && decision.reset_at) {
       process.stderr.write(`wolfpack-window-gate: resume after ${decision.reset_at}\n`)
     }

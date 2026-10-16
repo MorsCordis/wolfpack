@@ -263,3 +263,78 @@ test('pinsFromMeta: architect_recommended is ADVISORY; model_assignments.shepher
   assert.deepEqual(pinsFromMeta({ model_assignments: { shepherd: 'reviewer-c' } }), { shepherd: 'reviewer-c' })
   assert.deepEqual(pinsFromMeta({ model_assignments: { shepherd: 'reviewer-c' }, model_pins: { shepherd: 'judgment' } }), { shepherd: 'judgment' })
 })
+
+// ─── usage-limit-gate (AC6): usage offload — coder-alt Shepherd on EVERY tier ────
+import { complianceCriticalFromMeta } from './wolfpack-routing.mjs'
+
+const noCoderAltReviewer = (a) => {
+  for (const role of ['pointer', 'watchdog']) {
+    assert.notEqual(a[role].model, 'reviewer-c', role)
+    assert.equal(a[role].chain.includes('reviewer-c'), false, `${role} chain: ${a[role].chain}`)
+  }
+}
+
+test('offload: Red ⇒ coder-alt Shepherd (fallback judgment), claudeFinalReview, no coder-alt reviewer', () => {
+  const r = recommendModels({ tier: 'Red', dimensions: dims(), pool: POOL3, offload: true })
+  const a = r.assignments
+  assert.equal(a.shepherd.model, 'reviewer-c')
+  assert.equal(a.shepherd.fallback, 'judgment')
+  assert.equal(a.shepherd.source, 'offload')
+  assert.match(a.shepherd.rationale, /usage offload/)
+  assert.equal(r.claudeFinalReview, true)
+  noCoderAltReviewer(a)
+  assert.doesNotThrow(() => assertConstraints(a, [], POOL3))
+})
+
+test('offload: Orange ⇒ coder-alt; Orange compliance-critical ⇒ claudeFinalReview; plain Orange ⇒ false', () => {
+  const o = recommendModels({ tier: 'Orange', dimensions: dims(), pool: POOL3, offload: true })
+  assert.equal(o.assignments.shepherd.model, 'reviewer-c')
+  assert.equal(o.claudeFinalReview, false)
+  assert.equal(recommendModels({ tier: 'Orange', dimensions: dims(), pool: POOL3, offload: true, complianceCritical: true }).claudeFinalReview, true)
+  const comp = recommendModels({ tier: 'Yellow', dimensions: dims({ domain_sensitivity: 4 }), pool: POOL3, offload: true })
+  assert.equal(comp.assignments.shepherd.model, 'reviewer-c')
+  assert.equal(comp.claudeFinalReview, true)
+  noCoderAltReviewer(comp.assignments)
+})
+
+test('offload: no coder-alt in the pool (DEFAULT_POOL) or coder-alt disabled ⇒ unchanged routing + warning', () => {
+  for (const [pool, enabled] of [[DEFAULT_POOL, null], [POOL3, new Set(['reviewer-a', 'reviewer-b'])]]) {
+    for (const tier of ['Red', 'Yellow']) {
+      const off = recommendModels({ tier, dimensions: dims(), pool, enabled, offload: true })
+      const base = recommendModels({ tier, dimensions: dims(), pool, enabled })
+      assert.deepEqual(off.assignments, base.assignments, tier)
+      assert.ok(off.warnings.some(w => /usage offload requested but no enabled coder-alt/.test(w)), tier)
+      assert.equal(off.claudeFinalReview, false)
+    }
+  }
+})
+
+test('offload regression: NO offload ⇒ deep-equal to the default output (Red / Orange / Yellow, both pools)', () => {
+  for (const pool of [DEFAULT_POOL, POOL3]) {
+    for (const tier of ['Red', 'Orange', 'Yellow']) {
+      const a = recommendModels({ tier, dimensions: dims(), pool })
+      assert.deepEqual(a, recommendModels({ tier, dimensions: dims(), pool, offload: false }))
+      assert.equal(a.claudeFinalReview, false)
+      assert.equal(a.assignments.shepherd.model === 'reviewer-c', false)
+    }
+  }
+})
+
+test('offload fuzz (POOL3): constraints hold and no reviewer shares the offloaded Shepherd family', () => {
+  for (const tier of ['Green', 'Blue', 'Yellow', 'Orange', 'Red']) {
+    for (const ds of [1, 4]) {
+      const r = recommendModels({ tier, dimensions: dims({ domain_sensitivity: ds }), pool: POOL3, offload: true })
+      assert.equal(r.assignments.shepherd.model, 'reviewer-c')
+      noCoderAltReviewer(r.assignments)
+      assert.doesNotThrow(() => assertConstraints(r.assignments, [], POOL3))
+    }
+  }
+})
+
+test('complianceCriticalFromMeta: spec flags or domain_sensitivity ≥ 3', () => {
+  assert.equal(complianceCriticalFromMeta({}), false)
+  assert.equal(complianceCriticalFromMeta({ spec: { compliance_critical: true } }), true)
+  assert.equal(complianceCriticalFromMeta({ spec: { compliance_review_required: true } }), true)
+  assert.equal(complianceCriticalFromMeta({ predicted_dimensions: { domain_sensitivity: 3 } }), true)
+  assert.equal(complianceCriticalFromMeta({ predicted_dimensions: { domain_sensitivity: 2 } }), false)
+})

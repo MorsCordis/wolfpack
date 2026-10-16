@@ -160,6 +160,23 @@ The hunt will:
 
 Follow the finishing messages — each phase tells you what to do next.
 
+## Optional: usage snapshot (Claude Code)
+
+The window gate (`scripts/wolfpack-window-gate.mjs`) decides on Claude Code's **real** 5-hour /
+7-day usage when it can see it. Only the status line receives those figures, so install the
+wrapper in front of your status line (a user step — agents never edit `~/.claude/settings.json`):
+
+```json
+"statusLine": { "type": "command", "command": "/usr/bin/node <path-to-wolfpack>/scripts/wolfpack-statusline.mjs" }
+```
+
+The wrapper passes the status JSON through to claude-hud unchanged (it auto-discovers the newest
+installed claude-hud; to keep an existing command verbatim, append `-- bash -c '<old command>'`)
+and snapshots only `rate_limits` + a timestamp to `~/.cache/wolfpack/claude-usage.json`. Check it
+with `scripts/wolfpack-usage`. Without a fresh snapshot (no interactive session rendering the
+status line for > 10 min) the gate falls back to the transcript estimate, labelled `degraded`.
+Revert by restoring the old command.
+
 ## Asking your agent to set it up
 
 If you'd rather have your agent configure everything:

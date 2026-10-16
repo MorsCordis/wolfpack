@@ -397,6 +397,10 @@ the Debrief). What it encodes (specific models per `wolfpack-config.md` → Mode
   verify; backend-heavy → review volume to the unmetered work-horse model + a **thin** verify (window
   economics — reserve the metered model for the verify it's not interchangeable on).
 - **Judgment override:** Red / Orange / compliance (`domain_sensitivity ≥ 3`) → Shepherd = **judgment tier**.
+  - **Usage offload exception:** `metadata.usage_offload` set (the window gate saw the weekly pace
+    > 15 points ahead) ⇒ the router's GLM (coder-alt) Shepherd applies on **every** tier — adopt it
+    and note it in the Debrief. On Red / compliance-critical hunts the pipeline adds a Claude
+    final review after the cross-family Pointer review.
 - **Explore / exploit:** with thin data the router runs the tier-default work horse to *accrue* data
   (explore) on Green/Blue/Yellow; with trusted ledger data it routes to the best-by-signal model
   (exploit). **Never explore on Red/Orange/compliance** — exploit known-best; a miss there is too

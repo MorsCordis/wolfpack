@@ -324,7 +324,7 @@ async function runRunner({ env = {}, protocol }) {
   const agent = async (_p, opts = {}) => {
     calls.push(opts.label)
     if (opts.label === 'parse-campaign') return { waves: [] }
-    if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol }
+    if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol, gatePresent: true, gateProtocol: 1 }
     return {}
   }
   const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'process', 'workflow', RUNNER)
@@ -557,7 +557,7 @@ async function runRunnerLogged({ env = {}, protocol }) {
   const agent = async (_p, opts = {}) => {
     calls.push(opts.label)
     if (opts.label === 'parse-campaign') return { waves: [] }
-    if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol }
+    if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol, gatePresent: true, gateProtocol: 1 }
     return {}
   }
   const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'process', 'workflow', RUNNER)
@@ -576,4 +576,303 @@ test('AC25: a protocol-2 runtime pipeline (merge→sync window) WARNS and contin
 test('AC25: protocol 1 and 0 are still BELOW the floor and fail loud', async () => {
   await assert.rejects(runRunnerLogged({ protocol: 1 }), /STALE .*examiner protocol/)
   await assert.rejects(runRunnerLogged({ protocol: 0 }), /STALE .*examiner protocol/)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// usage-limit-gate (AC6–AC10): usage offload seat, Claude final review, usage stamping,
+// offload record, infra signal.
+// ════════════════════════════════════════════════════════════════════════════
+const OFFLOAD_SEAT = { shepherdPin: '', complianceCritical: false, shepherdFamilies: [], usageOffload: true }
+const isFinalPrompt = (p) => /CLAUDE FINAL REVIEW \(usage offload, Red\/compliance\) — not a fallback/.test(p)
+const pointerRoundOf = (c) => Number((c.label.match(/:r(\d+)/) || [])[1])
+// Cross-family rounds answer from mistral; the forced-claude final round from claude.
+const pointerBy = ({ finalVerdicts = ['APPROVED'] } = {}) => {
+  let finalN = 0
+  return (p) => {
+    if (isFinalPrompt(p)) {
+      const v = finalVerdicts[Math.min(finalN++, finalVerdicts.length - 1)]
+      return v === 'APPROVED'
+        ? { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'claude' }
+        : { verdict: 'ISSUES_FOUND', findings: 1, findingsList: [FINDING], provider: 'claude' }
+    }
+    return { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'mistral' }
+  }
+}
+
+test('offload AC6: Red + usage offload ⇒ GLM Shepherd (judgment override suspended), Claude final review after the cross-family approval', async () => {
+  const { result, find, logs } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 3 },
+    'shepherd-seat': OFFLOAD_SEAT,
+    pointer: pointerBy(),
+  } })
+  assert.notEqual(result.status, 'parked:cross_family_violation', JSON.stringify(result))
+  assert.equal(find('shepherd-glm').length, 1, 'GLM implements on Red under offload')
+  assert.equal(find('shepherd:').length, 0, 'no Claude Shepherd')
+  assert.ok(logs.some(l => /⚖ Shepherd seat: Vibe\/GLM — USAGE OFFLOAD \(weekly pace\) on tier Red; Claude opus is the fallback\. A Claude final review follows/.test(l)), logs.join('\n'))
+  assert.equal(logs.some(l => /IGNORED/.test(l)), false)
+  const ptr = find('pointer:')
+  assert.equal(ptr.length, 2, 'one cross-family round + one Claude final round')
+  assert.equal(isFinalPrompt(ptr[0].prompt), false)
+  assert.doesNotMatch(ptr[0].prompt, /-glm'/, 'golden rule: glm never reviews GLM-written code')
+  assert.match(ptr[0].prompt, /podman-vibe\.sh' 'wolfpack-pointer'/)
+  assert.ok(isFinalPrompt(ptr[1].prompt))
+  assert.match(ptr[1].prompt, /claude_final_reviews/)
+  assert.doesNotMatch(ptr[1].prompt, /podman-vibe\.sh/, 'the final round forces the claude link only')
+  assert.ok(logs.some(l => /CLAUDE FINAL REVIEW passed/.test(l)))
+  assert.equal(find('tracker:').length, 1, 'proceeds to Test after the final review')
+  // the cross-family Watchdog still excludes glm
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /wolfpack-watchdog-glm/)
+})
+
+test('offload AC6: Claude final review ISSUES_FOUND ⇒ GLM rework ⇒ cross-family round ⇒ Claude final again', async () => {
+  const { result, find, logs } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 6 },
+    'shepherd-seat': OFFLOAD_SEAT,
+    pointer: pointerBy({ finalVerdicts: ['ISSUES_FOUND', 'APPROVED'] }),
+    'shepherd-glm': (p) => (/rework/i.test(p)
+      ? { outcome: 'done', exitCode: 0, committed: true, findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'fixed' }], allAddressed: true }
+      : BASE['shepherd-glm']),
+  } })
+  assert.notEqual(result.status && result.status.startsWith('parked'), true, JSON.stringify(result))
+  const ptr = find('pointer:')
+  assert.deepEqual(ptr.map(c => isFinalPrompt(c.prompt)), [false, true, false, true], 'cross → final(issues) → cross → final(approve)')
+  assert.deepEqual(ptr.map(pointerRoundOf), [1, 2, 3, 4])
+  const glm = find('shepherd-glm')
+  assert.equal(glm.length, 2, 'implement + one GLM rework for the Claude final findings')
+  assert.equal(find('shepherd-rewrite').length + find('shepherd-fallback').length, 0, 'rework stays on GLM')
+  for (const c of ptr) assert.doesNotMatch(c.prompt, /-glm'/)
+  assert.ok(logs.some(l => /CLAUDE FINAL REVIEW passed/.test(l)))
+  assert.equal(find('tracker:').length, 1)
+})
+
+test('offload AC6: Orange + compliance-critical ⇒ Claude final round runs; plain Orange offload ⇒ it does NOT', async () => {
+  const cc = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange', pointerRounds: 3 },
+    'shepherd-seat': { ...OFFLOAD_SEAT, complianceCritical: true },
+    'compliance-gate': { determined: true, complianceTouched: false, alreadySignedOff: true },
+    pointer: pointerBy(),
+  } })
+  assert.equal(cc.find('shepherd-glm').length, 1)
+  assert.deepEqual(cc.find('pointer:').map(c => isFinalPrompt(c.prompt)), [false, true])
+
+  const plain = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange', pointerRounds: 3 },
+    'shepherd-seat': OFFLOAD_SEAT,
+    pointer: pointerBy(),
+  } })
+  assert.equal(plain.find('shepherd-glm').length, 1, 'GLM Shepherd on Orange under offload')
+  assert.deepEqual(plain.find('pointer:').map(c => isFinalPrompt(c.prompt)), [false])
+  assert.equal(plain.logs.some(l => /A Claude final review follows/.test(l)), false)
+})
+
+test('offload: light tier (Yellow) offload ⇒ GLM Shepherd, no Claude final round', async () => {
+  const { find } = await runHunt({ answers: { 'shepherd-seat': OFFLOAD_SEAT, pointer: pointerBy() } })
+  assert.equal(find('shepherd-glm').length, 1)
+  assert.deepEqual(find('pointer:').map(c => isFinalPrompt(c.prompt)), [false])
+})
+
+test('offload: NO offload on Red ⇒ unchanged — Claude opus Shepherd, single cross-family Pointer round, no final review', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 3 },
+    'shepherd-seat': { ...OFFLOAD_SEAT, usageOffload: false },
+    pointer: { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'glm' },
+  } })
+  assert.equal(find('shepherd-glm').length, 0)
+  assert.equal(find('shepherd:')[0].opts.model, 'opus')
+  assert.equal(find('pointer:').length, 1)
+  assert.equal(logs.some(l => /USAGE OFFLOAD|CLAUDE FINAL/.test(l)), false)
+})
+
+test('offload: Claude fallback Shepherd fired ⇒ Claude final review SKIPPED (claude cannot review claude), logged + recorded', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 3 },
+    'shepherd-seat': OFFLOAD_SEAT,
+    'shepherd-glm': { outcome: 'rate_limited', exitCode: 75, evidence: 'WOLFPACK_RATE_LIMITED:glm', changedFiles: [] },
+    pointer: pointerBy(),
+  } })
+  assert.equal(find('shepherd-fallback').length, 1)
+  assert.equal(find('shepherd-fallback')[0].opts.model, 'opus', 'Red fallback is the judgment model')
+  assert.deepEqual(find('pointer:').map(c => isFinalPrompt(c.prompt)), [false])
+  assert.ok(logs.some(l => /⚠ Claude final review SKIPPED — claude wrote code on this branch; cross-family review stands/.test(l)), logs.join('\n'))
+  const rec = find('claude-final-skip-record')
+  assert.equal(rec.length, 1)
+  assert.match(rec[0].prompt, /claude_final_review_skipped/)
+  assert.match(rec[0].prompt, /preserve every field you did not compute/)
+})
+
+test('offload record: args.usageOffload ⇒ record-offload agent runs once (quoted), logs ⚖; absent ⇒ no agent', async () => {
+  const withIt = await runHunt({ args: { usageOffload: { reason: "weekly pace +16.4 — it's ahead" } },
+    answers: { 'usage-offload': { ok: true, reason: "weekly pace +16.4 — it's ahead" } } })
+  const rec = withIt.find('usage-offload:')
+  assert.equal(rec.length, 1)
+  assert.equal(rec[0].opts.model, 'sonnet')
+  assert.match(rec[0].prompt, /node '\/repo\/scripts\/wolfpack-usage\.mjs' record-offload --plan-dir '\/repo\/\.agents\/worktrees\/h\/\.wolfpack\/plans\/h' --reason 'weekly pace \+16\.4 — it'\\''s ahead'/)
+  assert.ok(withIt.logs.some(l => /⚖ usage offload: weekly pace \+16\.4/.test(l)))
+  // the record runs BEFORE the seat probe reads metadata.usage_offload
+  const idx = (p) => withIt.calls.findIndex(c => c.label.startsWith(p))
+  assert.ok(idx('usage-offload:') < idx('shepherd-seat'))
+  const failed = await runHunt({ args: { usageOffload: { reason: 'x' } }, answers: { 'usage-offload': { ok: false, error: 'metadata unparseable' } } })
+  assert.ok(failed.logs.some(l => /⚠ usage offload NOT recorded for h \(metadata unparseable\)/.test(l)))
+  const without = await runHunt()
+  assert.equal(without.find('usage-offload').length, 0)
+})
+
+test('usage stamp AC7/AC8: every timed phase heartbeat carries the GUARDED stamp (absolute CLI, -f and -w, --plan-dir); Scaffold uses -f only', async () => {
+  const { find } = await runHunt()
+  const timedStamp = `if [ -f "/repo/scripts/wolfpack-usage.mjs" ] && [ -w "${WT}/.wolfpack/plans/h" ]; then node "/repo/scripts/wolfpack-usage.mjs" stamp --heartbeat .wolfpack/heartbeats/h.json --plan-dir "${WT}/.wolfpack/plans/h"; fi`
+  for (const p of ['alpha:', 'bloodhound:', 'shepherd:', 'pointer:', 'tracker:', 'watchdog:']) {
+    const c = find(p)[0]
+    assert.ok(c, p)
+    const n = c.prompt.split(timedStamp).length - 1
+    assert.equal(n, 2, `${p} prompt: stamp after the JSON write AND after "done" (found ${n})`)
+    assert.match(c.prompt, /preserve every other heartbeat field/)
+    assert.match(c.prompt, /expected in a sandboxed seat/)
+  }
+  const sc = find('scaffold:')[0].prompt
+  assert.match(sc, /if \[ -f "scripts\/wolfpack-usage\.mjs" \]; then node "scripts\/wolfpack-usage\.mjs" stamp --heartbeat \.wolfpack\/heartbeats\/h\.json; fi/)
+  assert.doesNotMatch(sc, /stamp --heartbeat[^\n]*--plan-dir/, 'Scaffold never stamps metadata (no plan dir yet)')
+})
+
+test('metadata preserve clause: the Plan prompt and every "update metadata.json" prompt carry it', async () => {
+  const { find, calls } = await runHunt()
+  const alpha = find('alpha:')[0].prompt
+  assert.match(alpha, /preserve every field you did not compute, including `usage_delta`, `usage_offload` and `mistral_rate_limits`/)
+  assert.match(alpha, /EXCEPTION: if metadata\.usage_offload is set, the\s+router assigns glm:5\.3 on every tier \(usage offload\)\. Adopt it\./)
+  for (const c of calls) {
+    for (const m of c.prompt.matchAll(/^.*[Uu]pdate[^\n]*metadata\.json.*$/gm)) {
+      // a line that tells the agent to update metadata.json must carry the preserve note
+      // somewhere in the same prompt (it is shared, so it may be on the same line or appended)
+      assert.match(c.prompt, /read-modify-write: preserve every field you did not compute/, `${c.label}: ${m[0].trim()}`)
+    }
+  }
+  assert.equal(/WOLFPACK_USAGE_PROTOCOL=1/.test(SRC), true, 'capability marker the runner greps for')
+})
+
+test('AC10: review prompts carry the INFRA SIGNAL note; infra_error is NOT a quota status', async () => {
+  const { find } = await runHunt()
+  for (const p of ['bloodhound:', 'pointer:']) {
+    const pr = find(p)[0].prompt
+    assert.match(pr, /INFRA SIGNAL: exit code 77 OR a line starting with `WOLFPACK_INFRA_ERROR:`/)
+    assert.match(pr, /return status `infra_error`,\s+never `model_quota`/)
+    assert.match(pr, /incl\. exit 77 \/ WOLFPACK_INFRA_ERROR/)
+  }
+  const line = SRC.split('\n').find(l => /^const isQuotaStatus = /.test(l))
+  const isQuotaStatus = new Function(`${line}; return isQuotaStatus`)()
+  assert.equal(isQuotaStatus('infra_error'), false)
+  assert.equal(isQuotaStatus('model_quota'), true)
+  assert.equal(isQuotaStatus('rate_limited'), true)
+})
+
+test('AC10: a Pointer that fails with status infra_error parks review_error — never model_quota', async () => {
+  const { result } = await runHunt({ answers: { pointer: { verdict: 'ERROR', status: 'infra_error', findingsList: [] } } })
+  assert.equal(result.verdict, 'PARKED')
+  assert.notEqual(result.reason, 'model_quota')
+  assert.notEqual(result.status, 'parked:model_quota')
+})
+
+test('seat probe: the schema and prompt carry usageOffload', async () => {
+  const { find } = await runHunt()
+  const seat = find('shepherd-seat')[0]
+  assert.equal(seat.opts.schema.properties.usageOffload.type, 'boolean')
+  assert.match(seat.prompt, /usageOffload: true if metadata\.usage_offload is set/)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// usage-limit-gate Pointer r1 F1 / F3 and r2 F2.
+// ════════════════════════════════════════════════════════════════════════════
+const glmReworkAll = (p) => (/rework/i.test(p)
+  ? { outcome: 'done', exitCode: 0, committed: true, findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'fixed' }], allAddressed: true }
+  : BASE['shepherd-glm'])
+// Distinct fingerprint per round ⇒ classifyConvergence sees "converging" (all-new, flat
+// count), so ONLY the circuit breaker can park — isolates the r1 F3 round accounting.
+const findingFor = (round) => ({ ...FINDING, fingerprint: `app/x.py:defect-r${round}` })
+const issues = (round, provider) => ({ verdict: 'ISSUES_FOUND', findings: 1, findingsList: [findingFor(round)], provider })
+
+test('r1 F1: the Claude FINAL round renders its OWN review step — no fallback marker / fallback-record instruction', async () => {
+  const { find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 3 },
+    'shepherd-seat': OFFLOAD_SEAT,
+    pointer: pointerBy(),
+  } })
+  const [cross, final] = find('pointer:')
+  assert.ok(isFinalPrompt(final.prompt))
+  assert.match(final.prompt, /\[1\] CLAUDE FINAL REVIEW \(provider "claude"\)/)
+  assert.match(final.prompt, /MANDATED\s+final review/)
+  assert.match(final.prompt, /This round the ONLY link is the mandated Claude FINAL review — not a fallback/)
+  assert.doesNotMatch(final.prompt, /Claude only as the final last-resort link/)
+  // The fallback-only step's instructions must be ABSENT (they contradicted the final step).
+  assert.doesNotMatch(final.prompt, /Before you do, print\s+WOLFPACK_CLAUDE_FALLBACK/)
+  assert.doesNotMatch(final.prompt, /append \{role, round, reason, evidence\}/)
+  assert.doesNotMatch(final.prompt, /This link exists ONLY because every cross-family examiner was unavailable/)
+  assert.match(final.prompt, /do NOT print\s+WOLFPACK_CLAUDE_FALLBACK and do NOT write a claude_fallback_reviews row/)
+  assert.match(final.prompt, /claude_final_reviews/)
+  // the cross-family round keeps the normal chain intro
+  assert.match(cross.prompt, /Claude only as the final last-resort link/)
+  assert.doesNotMatch(cross.prompt, /\[1\] CLAUDE FINAL REVIEW/)
+})
+
+test('r1 F1: an APPROVED Claude-final round is NOT recorded as a claude fallback review', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 3 },
+    'shepherd-seat': OFFLOAD_SEAT,
+    pointer: pointerBy(),
+  } })
+  assert.ok(logs.some(l => /CLAUDE FINAL REVIEW passed/.test(l)))
+  assert.equal(logs.some(l => /CLAUDE LAST-RESORT examiner/.test(l)), false, logs.join("\n"))
+  assert.equal(find('claude-fallback-record').length + find('fallback-review-record').length, 0)
+})
+
+test('r1 F3: a cross-family approval AT the breaker still earns a rework after Claude-final ISSUES (Red, maxRounds 8)', async () => {
+  // r1..r7 cross ISSUES (rework each) → r8 cross APPROVED → r9 Claude final ISSUES →
+  // rework → r10 cross APPROVED → r11 Claude final APPROVED → Test. Pre-fix, r9 hit
+  // round 9 ≥ maxRounds 8 and parked non-convergence without a rework.
+  const { result, find, logs } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 3 },
+    'shepherd-seat': OFFLOAD_SEAT,
+    'shepherd-glm': glmReworkAll,
+    pointer: (p, opts) => {
+      const r = pointerRoundOf(opts)
+      if (isFinalPrompt(p)) return r === 9 ? issues(r, 'claude') : { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'claude' }
+      return r <= 7 ? issues(r, 'mistral') : { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'mistral' }
+    },
+  } })
+  assert.notEqual(String(result && result.status).startsWith('parked'), true, JSON.stringify(result) + '\n' + logs.join('\n'))
+  const ptr = find('pointer:')
+  assert.deepEqual(ptr.map(pointerRoundOf), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+  assert.deepEqual(ptr.map(c => isFinalPrompt(c.prompt)), [false, false, false, false, false, false, false, false, true, false, true])
+  assert.equal(find('shepherd-glm').length, 1 + 7 + 1, 'implement + 7 cross reworks + 1 Claude-final rework')
+  assert.equal(find('tracker:').length, 1)
+})
+
+test('r1 F3: still BOUNDED — a Claude final that never approves parks non-convergence (no infinite ping-pong)', async () => {
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 3 },
+    'shepherd-seat': OFFLOAD_SEAT,
+    'shepherd-glm': glmReworkAll,
+    pointer: (p, opts) => (isFinalPrompt(p)
+      ? issues(pointerRoundOf(opts), 'claude')
+      : { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'mistral' }),
+  } })
+  assert.equal(result.verdict, 'PARKED', JSON.stringify(result))
+  assert.match(String(result.status), /non_convergence/)
+  const n = find('pointer:').length
+  assert.ok(n <= 2 * (8 + 1), `bounded by the breaker (+1 grace) per cross/final pair — got ${n}`)
+  assert.equal(find('tracker:').length, 0, 'never proceeds to Test past an open final finding')
+})
+
+test('r1 F3: a plain (non-offload) Red hunt keeps the ORIGINAL breaker — parks at maxRounds 8', async () => {
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 3 },
+    'shepherd-seat': { ...OFFLOAD_SEAT, usageOffload: false },
+    pointer: (p, opts) => issues(pointerRoundOf(opts), 'glm'),
+  } })
+  assert.equal(result.verdict, 'PARKED')
+  assert.match(String(result.status), /non_convergence/)
+  assert.equal(find('pointer:').length, 8)
+})
+
+test('r2 F2: SHEPHERD_SEAT_SCHEMA REQUIRES usageOffload (an omitted field cannot silently read as false)', async () => {
+  const { find } = await runHunt()
+  const seat = find('shepherd-seat')[0]
+  assert.deepEqual(seat.opts.schema.required, ['shepherdPin', 'complianceCritical', 'shepherdFamilies', 'usageOffload'])
 })
