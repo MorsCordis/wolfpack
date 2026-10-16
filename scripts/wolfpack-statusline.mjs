@@ -21,7 +21,7 @@
 //
 // Settings (user step, Spark only — agents never edit ~/.claude/settings.json):
 //   "statusLine": { "type": "command",
-//     "command": "/usr/bin/node /home/cecil/Projects/wolfpack/scripts/wolfpack-statusline.mjs" }
+//     "command": "node /path/to/wolfpack/scripts/wolfpack-statusline.mjs" }
 //
 // Inner command resolution (first hit wins):
 //   a. argv after `--`                         e.g.  wolfpack-statusline.mjs -- bash -c '<old cmd>'
