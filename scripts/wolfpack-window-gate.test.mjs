@@ -566,3 +566,68 @@ test('usage CLI: non-json mode prints the pace line and the resume hint on a def
   assert.match(r.stderr, /pace/)
   assert.match(r.stderr, /resume after/)
 })
+
+// ─── Pointer r2 F1 — the degraded-fallback estimate knobs hard-error (never fail open) ───
+import { estimateConfigFromEnv, estimateFromEnv } from './wolfpack-window-gate.mjs'
+import { readFileSync as readSrc } from 'node:fs'
+
+test('r2 F1: estimateConfigFromEnv — unset/blank ⇒ defaults 15% / 5h; valid overrides parse', () => {
+  assert.deepEqual(estimateConfigFromEnv({}), { headroomPct: 15, windowHours: 5 })
+  assert.deepEqual(estimateConfigFromEnv({ WOLFPACK_WINDOW_HEADROOM_PCT: '', WOLFPACK_WINDOW_HOURS: '  ' }), { headroomPct: 15, windowHours: 5 })
+  assert.deepEqual(estimateConfigFromEnv({ WOLFPACK_WINDOW_HEADROOM_PCT: '0', WOLFPACK_WINDOW_HOURS: '2.5' }), { headroomPct: 0, windowHours: 2.5 })
+  assert.deepEqual(estimateConfigFromEnv({ WOLFPACK_WINDOW_HEADROOM_PCT: '100' }), { headroomPct: 100, windowHours: 5 })
+})
+
+test('r2 F1: estimateConfigFromEnv — malformed / out-of-range knobs THROW naming the variable', () => {
+  for (const v of ['abc', '-1', '100.5', 'NaN', 'Infinity', '15%']) {
+    assert.throws(() => estimateConfigFromEnv({ WOLFPACK_WINDOW_HEADROOM_PCT: v }), /WOLFPACK_WINDOW_HEADROOM_PCT=.*invalid/, v)
+  }
+  for (const v of ['0', '-5', 'five', 'Infinity']) {
+    assert.throws(() => estimateConfigFromEnv({ WOLFPACK_WINDOW_HOURS: v }), /WOLFPACK_WINDOW_HOURS=.*invalid.*> 0/, v)
+  }
+})
+
+test('r2 F1: estimateFromEnv throws on a malformed knob even with the estimate enabled — never NaN ⇒ always-proceed', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wfest-'))
+  try {
+    for (const env of [
+      { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HEADROOM_PCT: 'x' },
+      { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HOURS: '0' },
+      { WOLFPACK_WINDOW_HOURS: 'bogus' },                     // estimate disabled — still validated
+    ]) assert.throws(() => estimateFromEnv(env, NOW, dir), /invalid/, JSON.stringify(env))
+    // valid knobs still produce a finite decision
+    const ok = estimateFromEnv({ WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HEADROOM_PCT: '20' }, NOW, dir)
+    assert.ok(ok && typeof ok === 'object')
+    noNaN(ok)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('r2 F1 CLI: a malformed estimate knob exits 1 even when a FRESH live snapshot means the estimate is never consulted', () => {
+  for (const env of [{ WOLFPACK_WINDOW_HEADROOM_PCT: 'fifteen' }, { WOLFPACK_WINDOW_HOURS: '-1' }]) {
+    const r = runGate(['--json', '--tier', 'Yellow'], { snapshot: liveSnap({ fh: 10 }), env })
+    assert.equal(r.code, 1, `${JSON.stringify(env)}: ${r.stderr}`)
+    assert.match(r.stderr, new RegExp(Object.keys(env)[0]))
+    assert.match(r.stderr, /wolfpack-window-gate: ERROR/)
+    assert.equal(r.stdout, '', 'no decision JSON on a config error')
+  }
+  // ...and on the degraded path too (missing snapshot): exit 1, not a silent proceed
+  const deg = runGate(['--json'], { env: { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HEADROOM_PCT: 'x' } })
+  assert.equal(deg.code, 1)
+  assert.equal(deg.stdout, '')
+})
+
+test('r2 F1 CLI: WOLFPACK_CLAUDE_WINDOW_LIMIT unset / 0 stays the documented estimate opt-out (proceed, loud), not an error', () => {
+  for (const lim of [undefined, '0']) {
+    const r = runGate(['--json'], { env: lim === undefined ? {} : { WOLFPACK_CLAUDE_WINDOW_LIMIT: lim } })
+    assert.equal(r.code, 0, r.stderr)
+    assert.equal(r.json.degraded, true)
+    assert.equal(r.json.gateEnabled, false)
+  }
+})
+
+test('r1 F2: the gate carries the WOLFPACK_GATE_PROTOCOL=1 marker in the exact form the runner preflight greps', () => {
+  const src = readSrc(GATE, 'utf8')
+  const hits = src.match(/WOLFPACK_GATE_PROTOCOL=[0-9]*/g) || []
+  assert.ok(hits.length >= 1, 'marker missing — the runner would drop to the legacy-degraded gate')
+  assert.equal(hits[0], 'WOLFPACK_GATE_PROTOCOL=1', 'the FIRST match is what `grep -o … | head -1` returns')
+})

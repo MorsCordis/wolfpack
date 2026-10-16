@@ -35,7 +35,7 @@ const hunt = (slug, extra = {}) => ({ slug, description: `do ${slug}`, tier: 'Ye
 const tick = () => new Promise(r => setImmediate(r))
 
 async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usageProtocol = 1, workflowDelayTicks = 3,
-  depCheck = { allMerged: true }, workflowResult = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY' }) } = {}) {
+  capability, gatePresent = true, gateProtocol = 1, depCheck = { allMerged: true }, workflowResult = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY' }) } = {}) {
   const events = []
   const logs = []
   const gateCalls = []
@@ -45,10 +45,15 @@ async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usagePr
     const label = opts.label || ''
     events.push({ type: 'agent', label })
     if (label === 'parse-campaign') return { waves: [{ number: 1, hunts }] }
-    if (label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol: 3, usageProtocol }
-    if (label.startsWith('usage-gate:')) {
-      const slug = label.slice('usage-gate:'.length)
-      gateCalls.push({ slug, prompt, opts, inFlight: [...inFlight] })
+    if (label === 'pipeline-capability') {
+      events[events.length - 1].prompt = prompt
+      events[events.length - 1].opts = opts
+      if (capability !== undefined) return capability
+      return { path: '.claude/workflows/hunt-pipeline.js', protocol: 3, usageProtocol, gatePresent, gateProtocol }
+    }
+    if (label.startsWith('usage-gate:') || label.startsWith('usage-gate-legacy:')) {
+      const slug = label.slice(label.indexOf(':') + 1)
+      gateCalls.push({ slug, label, prompt, opts, inFlight: [...inFlight] })
       await tick()
       const v = gate(slug, gateCalls.length)
       return v == null ? null : JSON.parse(JSON.stringify(v))
@@ -232,4 +237,115 @@ test('claims stay serialised: with maxParallel 3 no hunt is claimed (or scaffold
   const { workflowCalls, gateCalls } = await runRunner({ hunts: hs, maxParallel: 3 })
   assert.deepEqual(workflowCalls.map(w => w.args.slug).sort(), ['a', 'b', 'c', 'd', 'e'])
   assert.deepEqual(gateCalls.map(g => g.slug).sort(), ['a', 'b', 'c', 'd', 'e'])
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// Pointer r1 F2 / r2 F3 — capability preflight for the GATE SCRIPT and a null probe.
+// ════════════════════════════════════════════════════════════════════════════
+// The pre-usage-limit-gate gate's REAL --json output (captured from wolfpack main@2c6a94e
+// scripts/wolfpack-window-gate.mjs, run with no limit configured). The agent adds exitCode.
+const LEGACY_PROCEED = { decision: 'proceed', exitCode: 0, gateEnabled: false,
+  reason: 'window gate DISABLED — set WOLFPACK_AGENT_WINDOW_LIMIT to enable rate-limit gating',
+  used: null, remaining: null, reset_at: null }
+const LEGACY_DEFER = { decision: 'defer', exitCode: 10, gateEnabled: true,
+  reason: 'estimated 5h window: 900/1000 used — defer', used: 900, remaining: 100, reset_at: '2026-10-16T15:00:00.000Z' }
+
+test('preflight probe: prompt greps WOLFPACK_GATE_PROTOCOL in the gate script; schema REQUIRES gatePresent + gateProtocol', async () => {
+  const { events } = await runRunner({ hunts: [hunt('a')] })
+  const cap = events.find(e => e.label === 'pipeline-capability')
+  assert.match(cap.prompt, /test -f scripts\/wolfpack-window-gate\.mjs && echo present/)
+  assert.match(cap.prompt, /grep -o 'WOLFPACK_GATE_PROTOCOL=\[0-9\]\*' scripts\/wolfpack-window-gate\.mjs/)
+  assert.deepEqual(cap.opts.schema.required, ['protocol', 'gatePresent', 'gateProtocol'])
+  assert.equal(cap.opts.schema.properties.gatePresent.type, 'boolean')
+  assert.equal(cap.opts.schema.properties.gateProtocol.type, 'number')
+})
+
+test('preflight: a current gate (protocol 1) logs capability OK and uses the full gate (no legacy)', async () => {
+  const { error, logs, gateCalls } = await runRunner({ hunts: [hunt('a')] })
+  assert.equal(error, undefined, error && error.stack)
+  assert.ok(logs.some(l => /Usage gate capability OK: gate protocol 1/.test(l)), logs.join('\n'))
+  assert.equal(logs.some(l => /STALE USAGE GATE/.test(l)), false)
+  assert.equal(gateCalls[0].label, 'usage-gate:a')
+})
+
+test('preflight: a MISSING gate script throws ONCE, naming the fix — nothing gated, nothing scaffolded', async () => {
+  const { error, gateCalls, workflowCalls, events } = await runRunner({ hunts: [hunt('a'), hunt('b')], gatePresent: false })
+  assert.ok(error, 'must throw')
+  assert.match(error.message, /scripts\/wolfpack-window-gate\.mjs is MISSING/)
+  assert.match(error.message, /wolfpack-sync-runtime\.sh/)
+  assert.equal(gateCalls.length, 0)
+  assert.equal(workflowCalls.length, 0)
+  assert.equal(events.filter(e => e.label === 'pipeline-capability').length, 1, 'probe runs once')
+})
+
+test('preflight: a gatePresent-less probe answer (pre-r1 probe shape) is treated as MISSING, never as a working gate', async () => {
+  const { error, workflowCalls } = await runRunner({ hunts: [hunt('a')],
+    capability: { path: '.claude/workflows/hunt-pipeline.js', protocol: 3, usageProtocol: 1 } })
+  assert.match(String(error && error.message), /MISSING/)
+  assert.equal(workflowCalls.length, 0)
+})
+
+test('preflight r2 F3: a NULL probe result is a PROBE failure (not a stale diagnosis) — throws before any hunt', async () => {
+  const { error, gateCalls, workflowCalls } = await runRunner({ hunts: [hunt('a')], capability: null })
+  assert.ok(error, 'must throw')
+  assert.match(error.message, /pipeline-capability probe returned no result/)
+  assert.match(error.message, /UNKNOWN/)
+  assert.match(error.message, /not a stale-pipeline diagnosis/)
+  assert.doesNotMatch(error.message, /is STALE/, 'must not send the operator to re-sync')
+  assert.equal(gateCalls.length, 0)
+  assert.equal(workflowCalls.length, 0)
+})
+
+test('preflight: an EMPTY-object probe result still fails loud (protocol 0 ⇒ STALE examiner), not a null-probe message', async () => {
+  const { error } = await runRunner({ hunts: [hunt('a')], capability: {} })
+  assert.match(String(error && error.message), /STALE .*examiner protocol 0/)
+})
+
+test('legacy gate (no WOLFPACK_GATE_PROTOCOL): loud STALE USAGE GATE warning; legacy step without --tier; LEGACY schema', async () => {
+  const { error, logs, gateCalls, result } = await runRunner({ hunts: [hunt('a', { tier: 'Red' })], gateProtocol: 0, gate: () => LEGACY_PROCEED })
+  assert.equal(error, undefined, error && error.stack)
+  assert.equal(result.verdict, 'WAVE_COMPLETE_AWAITING_RELEASE')
+  assert.ok(logs.some(l => /⚠ STALE USAGE GATE: scripts\/wolfpack-window-gate\.mjs predates usage-limit-gate/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /STALE USAGE GATE.*wolfpack-sync-runtime\.sh/.test(l)))
+  assert.equal(logs.some(l => /Usage gate capability OK/.test(l)), false)
+  assert.equal(gateCalls.length, 1)
+  const g = gateCalls[0]
+  assert.equal(g.label, 'usage-gate-legacy:a')
+  assert.equal(g.opts.model, 'sonnet')
+  assert.match(g.prompt, /READ-ONLY/)
+  assert.match(g.prompt, /node scripts\/wolfpack-window-gate\.mjs --json\n/)
+  assert.doesNotMatch(g.prompt, /--tier/, 'the legacy gate does not know --tier')
+  assert.match(g.prompt, /Never invent a proceed\/defer/)
+  assert.deepEqual(g.opts.schema.required, ['decision', 'exitCode'])
+  assert.deepEqual(g.opts.schema.properties.decision.enum, ['proceed', 'defer', 'error'])
+  // the real legacy output carries every LEGACY schema field (exitCode added by the agent)
+  for (const k of Object.keys(g.opts.schema.properties)) assert.ok(k in LEGACY_PROCEED, k)
+})
+
+test('legacy gate: proceed is LABELLED degraded (legacy_gate) and NEVER offloads, even if the agent claims offload', async () => {
+  const { workflowCalls, logs } = await runRunner({ hunts: [hunt('a'), hunt('b')], maxParallel: 1, gateProtocol: 0,
+    gate: (slug) => (slug === 'b' ? { ...LEGACY_PROCEED, offload: true, offload_reason: 'forged' } : LEGACY_PROCEED) })
+  assert.deepEqual(workflowCalls.map(w => w.args.slug), ['a', 'b'])
+  for (const w of workflowCalls) assert.equal(w.args.usageOffload, null)
+  assert.ok(logs.some(l => /⚠ USAGE GATE DEGRADED \(a\)/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /STALE gate script/.test(l)), 'the degraded reason names the stale gate')
+  assert.equal(logs.some(l => /OFFLOAD/.test(l)), false)
+})
+
+test('legacy gate: its transcript-estimate DEFER still gates ⇒ WAVE_PAUSED_QUOTA with its reset_at', async () => {
+  const { result, workflowCalls } = await runRunner({ hunts: [hunt('a'), hunt('b')], maxParallel: 1, gateProtocol: 0,
+    gate: (slug) => (slug === 'a' ? LEGACY_PROCEED : LEGACY_DEFER) })
+  assert.equal(result.verdict, 'WAVE_PAUSED_QUOTA')
+  assert.equal(result.resetAt, LEGACY_DEFER.reset_at)
+  assert.deepEqual(result.deferredHunts.map(h => h.slug), ['b'])
+  assert.deepEqual(workflowCalls.map(w => w.args.slug), ['a'])
+})
+
+test('legacy gate: failures still throw loud — null, error, exit 1, decision/exit mismatch', async () => {
+  for (const bad of [null, { decision: 'error', exitCode: 1, reason: 'boom' },
+    { decision: 'proceed', exitCode: 1 }, { decision: 'defer', exitCode: 0 }, { decision: 'proceed', exitCode: 10 }]) {
+    const { error, workflowCalls } = await runRunner({ hunts: [hunt('a')], gateProtocol: 0, gate: () => bad })
+    assert.ok(error, `must throw for ${JSON.stringify(bad)}`)
+    assert.equal(workflowCalls.length, 0, `nothing scaffolded for ${JSON.stringify(bad)}`)
+  }
 })

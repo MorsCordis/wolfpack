@@ -345,3 +345,37 @@ test('currentUsage reads the snapshot path from env', () => {
     assert.equal(u.source, 'live')
   } finally { rmSync(d, { recursive: true, force: true }) }
 })
+
+// ─── Pointer r2 F1 — the meter validates the estimate knobs on EVERY reading ───
+test('r2 F1: currentUsage throws on a malformed estimate knob even with a fresh live snapshot', () => {
+  const d = tmp()
+  try {
+    const p = join(d, 's.json')
+    writeJson(p, snapshot({ fh: 12 }))
+    assert.equal(currentUsage({ env: { WOLFPACK_USAGE_SNAPSHOT: p }, nowMs: NOW }).source, 'live')
+    assert.throws(() => currentUsage({ env: { WOLFPACK_USAGE_SNAPSHOT: p, WOLFPACK_WINDOW_HEADROOM_PCT: 'x' }, nowMs: NOW }),
+      /WOLFPACK_WINDOW_HEADROOM_PCT/)
+    assert.throws(() => currentUsage({ env: { WOLFPACK_USAGE_SNAPSHOT: p, WOLFPACK_WINDOW_HOURS: '0' }, nowMs: NOW }),
+      /WOLFPACK_WINDOW_HOURS/)
+  } finally { rmSync(d, { recursive: true, force: true }) }
+})
+
+test('r2 F1 CLI: meter + stamp exit 1 on a malformed estimate knob, and the stamp leaves heartbeat/metadata UNTOUCHED', () => {
+  const f = planFixture()
+  try {
+    writeJson(f.snapPath, snapshot({ now: Date.now(), fhReset: Date.now() + HOUR, sdReset: Date.now() + 2 * DAY }))
+    const bad = { ...f.env, WOLFPACK_WINDOW_HOURS: 'five' }
+    const m = cli([], bad)
+    assert.equal(m.status, 1)
+    assert.match(m.stderr, /wolfpack-usage: ERROR — WOLFPACK_WINDOW_HOURS/)
+    assert.equal(m.stdout, '')
+    assert.equal(cli(['--json'], bad).status, 1)
+    const hbBefore = existsSync(f.hb) ? readFileSync(f.hb, 'utf8') : null
+    const metaBefore = readFileSync(join(f.planDir, 'metadata.json'), 'utf8')
+    const s = cli(['stamp', '--heartbeat', f.hb, '--plan-dir', f.planDir], bad)
+    assert.equal(s.status, 1)
+    assert.match(s.stderr, /WOLFPACK_WINDOW_HOURS/)
+    assert.equal(existsSync(f.hb) ? readFileSync(f.hb, 'utf8') : null, hbBefore, 'heartbeat untouched')
+    assert.equal(readFileSync(join(f.planDir, 'metadata.json'), 'utf8'), metaBefore, 'metadata untouched')
+  } finally { rmSync(f.d, { recursive: true, force: true }) }
+})
