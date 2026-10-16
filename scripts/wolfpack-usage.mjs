@@ -27,7 +27,7 @@ import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 
 import { join } from 'node:path'
 import {
   readSnapshot, computeUsageDecision, thresholdsFromEnv, snapshotPathFromEnv,
-  estimateFromEnv,
+  estimateFromEnv, estimateConfigFromEnv,
 } from './wolfpack-window-gate.mjs'
 
 // claude-hud's rounding (dist/stdin.js) — the one-liner must agree with the status line.
@@ -37,6 +37,9 @@ const signed = (v) => (v > 0 ? `+${v}` : `${v}`)
 // Current usage reading (a gate decision, figures only — tier is irrelevant here).
 export function currentUsage({ env = process.env, nowMs = Date.now(), fsImpl, thresholds } = {}) {
   const th = thresholds || thresholdsFromEnv(env)
+  // Hard-error on malformed degraded-fallback knobs on EVERY reading, not only when the
+  // estimate is actually consulted (same rule as the gate CLI).
+  estimateConfigFromEnv(env)
   const snap = readSnapshot(snapshotPathFromEnv(env), fsImpl)
   return computeUsageDecision({
     snapshot: snap.ok ? snap.snapshot : null, snapshotError: snap.error,

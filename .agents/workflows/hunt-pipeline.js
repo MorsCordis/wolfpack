@@ -1762,7 +1762,9 @@ const SHEPHERD_SEAT_SCHEMA = {
     uncommittedChanges: { type: 'boolean' },  // app files dirty outside .wolfpack/
     usageOffload: { type: 'boolean' },        // metadata.usage_offload is set (an object) — usage-limit-gate
   },
-  required: ['shepherdPin', 'complianceCritical', 'shepherdFamilies'],
+  // usageOffload is REQUIRED: an omitted field would silently read as false and skip the
+  // offload + the mandated Claude final review with no warning (Pointer r2 F2).
+  required: ['shepherdPin', 'complianceCritical', 'shepherdFamilies', 'usageOffload'],
 }
 let shepherdFamily = 'claude'
 // usage-limit-gate (AC6/A-5): set from the seat probe. Offload moves the Shepherd to GLM on

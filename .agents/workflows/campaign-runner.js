@@ -341,7 +341,12 @@ the WOLFPACK_GATE_PROTOCOL marker's "=", or 0 if absent / the file is missing).
     },
     required: ['protocol', 'gatePresent', 'gateProtocol'],
   } })
-  const proto = Number(cap && cap.protocol) || 0
+  // Pointer r2 F3: a null result is a PROBE failure (agent error / schema exhaustion), not
+  // evidence of a stale pipeline — say so instead of sending the operator to re-sync.
+  if (cap == null) {
+    throw new Error(`campaign-runner: the pipeline-capability probe returned no result (agent failure) — capability is UNKNOWN, so no hunt may start. This is not a stale-pipeline diagnosis; relaunch to re-run the probe, and check the agent/model availability if it repeats.`)
+  }
+  const proto = Number(cap.protocol) || 0
   if (proto < REQUIRED_EXAMINER_PROTOCOL) {
     throw new Error(`campaign-runner: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) is STALE — examiner protocol ${proto} < ${REQUIRED_EXAMINER_PROTOCOL}; it cannot honor the ${EXAMINER_ROTATION.join('/')} examiner hints. Re-run ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh (hunt-pipeline.js + campaign-runner.js), then relaunch.`)
   }

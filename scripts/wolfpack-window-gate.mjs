@@ -252,17 +252,21 @@ export function isValidWindow(w) {
 
 // Env thresholds. Unset or empty ⇒ default. Anything else that is not a finite number in
 // range is a HARD error (throws) — fail loud, never a silent fallback to the default.
-export function thresholdsFromEnv(env = process.env) {
-  const read = (name, def, { pct = true } = {}) => {
-    const raw = env[name]
-    if (raw == null || String(raw).trim() === '') return def
-    const n = Number(raw)
-    const ok = Number.isFinite(n) && (pct ? (n >= 0 && n <= 100) : n > 0)
-    if (!ok) {
-      throw new Error(`${name}=${JSON.stringify(raw)} is invalid — expected ${pct ? 'a number in [0,100]' : 'a number > 0'}`)
-    }
-    return n
+// Read one numeric env var: unset/blank ⇒ default; anything else must parse and be in range
+// or it hard-errors (a typo must never silently disable a gate rule).
+function readNumEnv(env, name, def, { pct = true } = {}) {
+  const raw = env[name]
+  if (raw == null || String(raw).trim() === '') return def
+  const n = Number(raw)
+  const ok = Number.isFinite(n) && (pct ? (n >= 0 && n <= 100) : n > 0)
+  if (!ok) {
+    throw new Error(`${name}=${JSON.stringify(raw)} is invalid — expected ${pct ? 'a number in [0,100]' : 'a number > 0'}`)
   }
+  return n
+}
+
+export function thresholdsFromEnv(env = process.env) {
+  const read = (name, def, opts) => readNumEnv(env, name, def, opts)
   return {
     staleMinutes: read('WOLFPACK_USAGE_STALE_MINUTES', 10, { pct: false }),
     fiveHourMaxPct: read('WOLFPACK_5H_START_MAX_PCT', 80),
@@ -414,12 +418,20 @@ export function defaultTranscriptDir(env = process.env) {
   // override with WOLFPACK_TRANSCRIPT_DIR or parameterize via wolfpack-config.md.
   return env.WOLFPACK_TRANSCRIPT_DIR || join(homedir(), '.agents', 'projects')
 }
+// The estimate's tuning knobs, validated with the SAME hard-error rule as thresholdsFromEnv:
+// a malformed WOLFPACK_WINDOW_HEADROOM_PCT / WOLFPACK_WINDOW_HOURS used to yield NaN / 0 and
+// silently make the backstop always proceed (A-8). Unset/blank ⇒ default; invalid ⇒ throw.
+// (WOLFPACK_AGENT_WINDOW_LIMIT is NOT validated here: unset/0 is the documented
+// "estimate disabled" opt-out, reported loudly by computeDecision.)
+export function estimateConfigFromEnv(env = process.env) {
+  return {
+    headroomPct: readNumEnv(env, 'WOLFPACK_WINDOW_HEADROOM_PCT', 15),
+    windowHours: readNumEnv(env, 'WOLFPACK_WINDOW_HOURS', 5, { pct: false }),
+  }
+}
 export function estimateFromEnv(env, nowMs, rootDir = defaultTranscriptDir(env)) {
   const limit = Number(env.WOLFPACK_AGENT_WINDOW_LIMIT)
-  const headroomPct = env.WOLFPACK_WINDOW_HEADROOM_PCT != null
-    ? Number(env.WOLFPACK_WINDOW_HEADROOM_PCT) : 15
-  const windowHours = env.WOLFPACK_WINDOW_HOURS != null
-    ? Number(env.WOLFPACK_WINDOW_HOURS) : 5
+  const { headroomPct, windowHours } = estimateConfigFromEnv(env)
   const windowMs = windowHours * 60 * 60 * 1000
   // Only read transcripts when the estimate is enabled (limit set) — no point walking the
   // tree to print a "disabled" notice.
@@ -445,6 +457,9 @@ function main() {
   let thresholds
   try {
     thresholds = thresholdsFromEnv(process.env)
+    // Validate the degraded-fallback knobs up front too, so a bad value hard-errors on
+    // every run — not only on the run that happens to fall back to the estimate.
+    estimateConfigFromEnv(process.env)
   } catch (e) {
     process.stderr.write(`wolfpack-window-gate: ERROR — ${e.message}\n`)
     process.exit(ERROR)
