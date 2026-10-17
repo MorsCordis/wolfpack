@@ -888,3 +888,21 @@ test('shim wait: every non-Claude review/certify link runs via rc-file + foregro
     assert.match(p, /NEVER end your turn/)
   }
 })
+
+test('resume into Review continues the round numbering from the newest plan-revised-K.md', async () => {
+  const probe = { fresh: false, status: 'reviewing', resumePhase: 'Debrief', tier: 'Orange', bloodhoundRounds: 2,
+    pointerRounds: 2, trackerRounds: 2, bloodhoundModel: 'glm', worktreePath: WT, planDir: PD,
+    worktreeExists: true, branchExists: true, humanNotesPresent: true, latestRevisedPlan: 3 }
+  const { find } = await runHunt({ rawArgs: 'h', answers: { 'resume-probe': probe } })
+  const bh = find('bloodhound:')
+  assert.ok(bh.length >= 1)
+  assert.match(bh[0].opts.label, /:r4(:|$)/)
+  assert.match(bh[0].prompt, /plan-revised-3\.md/)
+  assert.doesNotMatch(bh[0].prompt, /Plan file to review: plan\.md/)
+})
+
+test('a fresh hunt still starts the plan review at round 1 of plan.md', async () => {
+  const { find } = await runHunt()
+  assert.match(find('bloodhound:')[0].opts.label, /:r1(:|$)/)
+  assert.match(find('bloodhound:')[0].prompt, /Plan file to review: plan\.md/)
+})
