@@ -876,3 +876,15 @@ test('r2 F2: SHEPHERD_SEAT_SCHEMA REQUIRES usageOffload (an omitted field cannot
   const seat = find('shepherd-seat')[0]
   assert.deepEqual(seat.opts.schema.required, ['shepherdPin', 'complianceCritical', 'shepherdFamilies', 'usageOffload'])
 })
+
+test('shim wait: every non-Claude review/certify link runs via rc-file + foreground polls, never a turn-ending wait', async () => {
+  const { find } = await runHunt()
+  const prompts = [...find('bloodhound:'), ...find('pointer:'), ...find('watchdog')].map(c => c.prompt)
+  assert.ok(prompts.length >= 3, 'expected bloodhound, pointer and watchdog shim prompts')
+  for (const p of prompts) {
+    assert.match(p, /podman-vibe\.sh[^\n]*> \S+-l1\.out 2> \S+-l1\.err; echo \$\? > \S+-l1\.rc \) &/)
+    assert.match(p, /timeout 540 bash -c 'until \[ -f "\$1" \]/)
+    assert.match(p, /WAITING ON A SHIM \(hard rule\)/)
+    assert.match(p, /NEVER end your turn/)
+  }
+})

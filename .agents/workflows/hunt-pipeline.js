@@ -1032,10 +1032,33 @@ const reviewCmd = (who, vibeAgent, promptFile, role = 'reviewer') =>
     ? `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} ${shq(`${vibeAgent}-glm`)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(GLM_REVIEW_TURNS)}`
     : CLAUDE_SELF_REVIEW_STEP(promptFile, role)
 
+// Prompt fragment: how a shim agent runs ONE non-Claude shim command and waits for it.
+// A GLM/Mistral review or certification can outlast one shell call (10 min max), and an
+// agent that backgrounds it and then ends its turn ("Waiting for the review…") kills the
+// shim and returns ERROR — pipeline-automation wave 2 parked two hunts on exactly that
+// (review_error at r4/r5 of plans that were converging). Same proven pattern as the
+// GLM-Shepherd wrapper: subshell + rc file + bounded foreground polls.
+const shimRun = (cmd, base) => `( ${cmd} > ${base}.out 2> ${base}.err; echo $? > ${base}.rc ) &
+       then, in the FOREGROUND, repeat
+         timeout 540 bash -c 'until [ -f "$1" ]; do sleep 20; done' _ ${base}.rc
+       until ${base}.rc exists (give up after ~60 minutes → this attempt FAILED, evidence "shim did not finish").
+       The exit code is the content of ${base}.rc; the review text is ${base}.out (stderr: ${base}.err).
+       Before a retry: rm -f ${base}.out ${base}.err ${base}.rc`
+const SHIM_WAIT_RULE = `   WAITING ON A SHIM (hard rule): a shim stays alive only while YOU keep working. Wait ONLY with
+   the foreground \`timeout 540 … until [ -f <rc> ]\` poll above, issued again and again until the rc file
+   exists. Do NOT use Monitor, ScheduleWakeup, or the Bash tool's run_in_background, do NOT stop the
+   shim's task, and NEVER end your turn or reply with a "waiting…" message while a shim runs —
+   ending your turn kills the shim and the round is lost as an ERROR.`
+const shimBase = (tmpFile, i) => `${tmpFile.replace(/\.txt$/, '')}-l${i + 1}`
+const linkCmd = (who, vibeAgent, tmpFile, role, i) => who === 'claude'
+  ? reviewCmd(who, vibeAgent, tmpFile, role)
+  : shimRun(reviewCmd(who, vibeAgent, tmpFile, role), shimBase(tmpFile, i))
+
 // Prompt fragment: the ordered examiner-chain steps for a review shim agent.
 const chainSteps = (chain, vibeAgent, tmpFile, role = 'reviewer') => chain.map((who, i) => i === 0
-  ? `   [1] PRIMARY ${EXAMINER_LABEL[who]} (provider "${who}") — on a NON-rate-limit failure wait 5s and retry ONCE:\n       ${reviewCmd(who, vibeAgent, tmpFile, role)}`
-  : `   [${i + 1}] FALLBACK ${EXAMINER_LABEL[who]} (provider "${who}") — one attempt:\n       ${reviewCmd(who, vibeAgent, tmpFile, role)}`).join('\n')
+  ? `   [1] PRIMARY ${EXAMINER_LABEL[who]} (provider "${who}") — on a NON-rate-limit failure wait 5s and retry ONCE:\n       ${linkCmd(who, vibeAgent, tmpFile, role, i)}`
+  : `   [${i + 1}] FALLBACK ${EXAMINER_LABEL[who]} (provider "${who}") — one attempt:\n       ${linkCmd(who, vibeAgent, tmpFile, role, i)}`).join('\n')
+  + (chain.some(w => w !== 'claude') ? `\n${SHIM_WAIT_RULE}` : '')
 
 // Prompt fragment: the hard cross-family boundary for a review shim agent.
 const chainBoundary = (chain, writers) => `CROSS-FAMILY BOUNDARY (hard rule): use ONLY the chain above, in order — ${chain.map(f => `"${f}"`).join(', ')}.
@@ -3041,10 +3064,11 @@ if (!wdChain.length) {
 }
 log(`Watchdog chain: ${chainLabel(wdChain)} (code writers: ${[...codeWriterFamilies].join(', ')})`)
 const certifySteps = wdChain.map((who, i) => `   [${i + 1}] ${i === 0 ? 'PRIMARY' : 'FALLBACK'} ${EXAMINER_LABEL[who]} (provider "${who}"):
-       ${certifyStep(who)}
+       ${who === 'claude' ? certifyStep(who) : shimRun(certifyStep(who), `/tmp/watchdog-${slug}-l${i + 1}`)}
        ${who === 'claude'
           ? 'This link IS you — follow the step above and write certification.md / pedigree.json yourself.'
           : `${EXAMINER_LABEL[who]} is read-only — capture its stdout and YOU write certification.md / pedigree.json from it.`}`).join('\n')
+  + (wdChain.some(w => w !== 'claude') ? `\n${SHIM_WAIT_RULE}` : '')
 
 watchdogResult = await agent(`
 You are a shim agent orchestrating Watchdog certification. The certifier chain for this
