@@ -53,12 +53,16 @@ Watchdog, and the smoke step.
 <What the user actually wants to be true after this ships.>
 
 ## Acceptance criteria (the contract)
-Each criterion is a single, checkable, user-observable statement. Tag each:
-- `[auto]`  — verifiable by an automated test or MCP browser step
-- `[manual]`— needs human eyes (visual/judgment)
+Each criterion is a single, checkable, user-observable statement that **names its check**. Tag each:
+- `[auto]` — the pipeline verifies it without a human. Name the check: the command and its expected
+  exit/output, the test that proves it, or the browser steps (URL, the label to click, the expected
+  text or state).
+- `[manual]` — genuine human judgement only ("looks right", "workable on a phone"). **At most 2 per
+  hunt.** A criterion a command, test or browser steps could check is NOT `[manual]`; tagging it so is
+  a spec defect.
 - `[compliance]` — touches a compliance-critical area (see `wolfpack-config.md` → Compliance Requirements); never auto-degrade
 
-- AC1 [auto] When <precondition>, <action> results in <observable outcome>.
+- AC1 [auto] When <precondition>, <action> results in <observable outcome>. Check: <command | test | browser steps>.
 - AC2 [manual] The <screen> shows <state> with <copy/affordance>.
 - AC3 [compliance] The <record> retains <field> per the project's **Compliance Requirements** (`wolfpack-config.md`).
 
@@ -89,22 +93,31 @@ without ever seeing the gaps. The fix: **make the gaps the output.**
 1. **Read the ticket + codebase context.** `metadata.scope`, `wolfpack-config.md`, the touched app,
    prior art. Same read-discipline as Alpha — grep before read, targeted line ranges, no
    wide re-reads. Do NOT read `docs/wolfpack*.md` or other hunts' plan dirs.
+   **Source plan.** If the hunt names a source plan (a `Spec: <path> §…` reference in its description or Trigger, or a plan path the launcher hands you), read that plan's principles, its architecture and decision sections (including any decisions table), and the hunt's own row or section. When a launcher gives you a path, read that copy (it is the current one). A source plan is neither `docs/wolfpack*.md` nor another hunt's plan dir.
 2. **Separate KNOWN from ASSUMED.** What is grounded in the report vs. invented to fill a
    hole. Both go in `acceptance.md` — KNOWN drives the criteria, ASSUMED becomes rated
    entries under § Known assumptions.
+   **The source plan is KNOWN.** Anything it settles counts as KNOWN: a stated principle, an architecture decision, and every decisions-table row whose status is **Decided**. Cite it in the criterion or assumption it drives (e.g. "per D<n>", "per P<n>"). Never ask it again and never rate it as an assumption. A question whose answer is already a decided row is a **Spec defect**: drop it and cite the row.
 3. **Generate ranked ambiguity questions** — the 3–5 that actually change the build, not
    trivia. Rank by `load_bearing` then `confidence`. If you cannot produce sharp questions,
    the ticket is too vague → confidence is `low` → park (see Confidence gate).
 4. **Draft acceptance criteria** from KNOWN + best-guess for ASSUMED. **Every `[auto]`
-   criterion must be MCP-executable** — exact URL/selector + expected DOM/network/response
-   shape, never a vague outcome (per `feedback_smoke_test_authoring`). Validate each
+   criterion must be executable**: it names its check (a command + expected exit/output, a
+   test, or browser steps — exact URL, the label to click, the expected
+   DOM/text/network/response), never a vague outcome (per `feedback_smoke_test_authoring`). Validate each
    `[auto]` is concrete enough to run *before accepting it*; a vague `[auto]` is a spec bug,
-   caught here, not at smoke time. If you can't make it concrete, tag it `[manual]`.
+   caught here, not at smoke time. If you can't make it concrete, make it concrete.
+   Do not fall back to `[manual]`. `[manual]` is only for genuine human judgement, **at most 2 per hunt** (raise
+   the budget only on the user's say-so). An automatable criterion tagged `[manual]` is a spec defect.
 5. **For bugs: attempt repro-first.** Write a test that demonstrates the reported bug.
    Red = reproduced → confidence boost, record the test path in § Repro. Can't reproduce =
    strong "intent not captured" signal → record "NOT REPRODUCIBLE" and lean toward park.
    (Best-effort: a repro test is a confidence input, not a hard requirement — Tracker owns
    the real test suite. Write the repro under the worktree, never in the main repo.)
+6. **Lint before finishing.** Run `node scripts/wolfpack-prespec.mjs lint .wolfpack/plans/$ARGUMENTS/acceptance.md`.
+   Fix the criteria or re-tag them until it exits 0. If the project doesn't ship that script, apply its rules by
+   hand (≤2 `[manual]`; every `- AC<n>` line tagged `[auto]`, `[manual]` or `[compliance]` and followed by text;
+   no duplicate ids) and say so in the finishing message. A lint failure you can't fix is a park, not a pass.
 
 ### The interview interface (interactive `/spec` only)
 
@@ -113,20 +126,43 @@ likely answers (which doubles as a "did the agent understand the domain?" check)
 picks or overrides. Stating what you want beats spotting what's wrong, so this is far
 higher-signal than asking the user to review a prose draft.
 
+- **Never ask what the plan already decided.** Check every candidate question against the source plan's principles and decided rows (step 2). One that is already answered there is a Spec defect: cite the row instead of asking.
 - **One question per load-bearing ambiguity**, ranked, max ~5. Each option is a concrete
   answer that would change the build, not a vague preference.
-- **Batchable.** In workorder/batch mode, collect the questions for **every** hunt and
-  present them in **one** `AskUserQuestion` sitting at kickoff (answer the ambiguous few in
-  ~15 min, then build overnight). The interview is front-loaded, never scattered.
+- **Batchable / sweep (draft-only) mode.** When a launcher specs many hunts and asks the questions itself in
+  one sitting (e.g. a campaign pre-spec sweep), run steps 1–6 **without `AskUserQuestion`**:
+  - write `acceptance.md` from KNOWN + best guesses;
+  - if any load-bearing question is open, set the spec block `ambiguity_open: true`, `mode_for_build: "parked"`
+    and status `needs_spec`;
+  - otherwise rate confidence on the gate as usual: a no-question draft that does not clear the gate stays
+    `needs_spec` (`ambiguity_open: false`, `mode_for_build: "parked"`) and says why in the finishing message;
+  - write the questions to `.wolfpack/plans/$ARGUMENTS/spec-questions.json`.
+  The launcher asks them, then applies the answers.
+
+  ```json
+  { "hunt": "<slug>", "questions": [
+    { "id": "Q1", "scope": "plan|hunt", "acs": ["AC3"], "load_bearing": true,
+      "question": "<one line>?", "options": [ { "label": "<≤5 words>", "description": "<what the build does>" } ],
+      "recommended": "<label>" } ] }
+  ```
+
+  Give each question 2–3 options (the launcher adds a Skip option, and the tool takes ≤4). `scope: "plan"` means the
+  answer settles something the source plan should record, `"hunt"` means a detail only this hunt needs; `acs`
+  names the criteria the answer changes. No questions → write `{"hunt": …, "questions": []}`. The launcher later
+  adds `"answer"` to each question it got an answer for; Spec never writes that field.
+- **Record the answers.** When the interview produced answers, apply them
+  to the criteria and append them to § Source as one `- Interview answers (<who>, <YYYY-MM-DD>): …` line. That
+  line is how a later sweep knows the hunt is already answered.
 - **Unanswered ≠ assumed.** If the user leaves a `load_bearing` question unanswered, that
   hunt stays `needs_spec` and **does not build**. An unanswered load-bearing question is a
   park, not a silent collapse into a best-guess default.
 
 > **Headless/autonomous note:** when the Spec phase runs inside `hunt-pipeline.js` (no user
-> present), you CANNOT call `AskUserQuestion`. There, do steps 1–5, rate confidence on the
+> present), you CANNOT call `AskUserQuestion`. There, do steps 1–6, rate confidence on the
 > checklist, and let the gate decide: high-confidence non-compliance builds unattended;
 > anything that would need a question parks `needs_spec` for the morning. The interactive
 > `/spec` run is where the questions actually get asked — front-load it.
+> The source-plan, `[manual]`-budget and lint rules (steps 1–6) apply headless too.
 
 ## The confidence gate (anchored, fail-toward-asking)
 

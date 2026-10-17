@@ -17,6 +17,13 @@ keep their original filing dates.
 
 ## Orchestration layer
 
+- [ ] **Role prompts name a skill path consumers don't have** (Low, 2026-10-17; from prespec-sweep AC10):
+  `hunt-pipeline.js` tells each headless role to "read `.agents/skills/<role>/SKILL.md`". The runtime sync
+  rewrites that to `.claude/skills/<role>/SKILL.md`, and that path is absent in a consumer that loads the
+  Wolfpack skills user-level (`~/.claude/skills` → this repo's `.agents/skills`). Agents fall back to the
+  user-level skill, but each phase starts with a dead read. **Fix:** name the skill ("the `spec` skill") or
+  `~/.claude/skills/<role>/SKILL.md` in the prompts, then re-sync consumers.
+
 - [ ] **Heartbeat: write to an absolute mount path so the host can observe post-Scaffold phases**
   (Low, 2026-05-29; from pawpims): the per-hunt heartbeat in `hunt-pipeline.js` writes a *relative*
   `.wolfpack/heartbeats/<slug>.json`. Every phase after Scaffold runs inside the worktree, so those
