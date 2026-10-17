@@ -40,6 +40,15 @@ CHECK=0
 [ "${1:-}" = "--check" ] && { CHECK=1; TARGET="$HOME/Projects/pawpims/.claude/workflows/hunt-pipeline.js"; }
 [ "${2:-}" = "--check" ] && CHECK=1
 
+# A directory is the common mistake (passing the consumer repo): name the real targets.
+if [ -d "$TARGET" ]; then
+  echo "ERROR: $TARGET is a directory; pass the runtime FILE to sync, e.g.:" >&2
+  for f in "$REPO_ROOT"/.agents/workflows/*.js; do
+    echo "  $0 $TARGET/.claude/workflows/$(basename "$f") --check" >&2
+  done
+  exit 2
+fi
+
 # Canonical source = the same-named workflow in this repo (hunt-pipeline.js,
 # campaign-runner.js, …). A target whose basename has no canonical twin is an error.
 CANONICAL="$REPO_ROOT/.agents/workflows/$(basename "$TARGET")"
