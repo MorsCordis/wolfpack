@@ -184,6 +184,33 @@ Per-hunt override: `/hunt --shepherd=opus <slug>` forces Opus Shepherd on a know
 
 The legacy `scripts/howl.sh` orchestrator was retired 2026-04-21. Slash commands only.
 
+### Chain mode (`--chain`)
+
+Opt-in campaign mode with **no wave barriers**. Barrier mode stays the default and is unchanged.
+- **Integration branch.** The runner (`args.chain: true`) creates or adopts a LOCAL `campaign/<slug>`
+  (never pushed) and records `chain` (`mode`, `branch`, `graph`, …) in `.wolfpack/campaigns/<slug>/metadata.json`.
+  Chain mode is sticky: a re-run without the flag continues in chain mode and logs it.
+- **Hunts** get `baseBranch: "campaign/<slug>"` (`metadata.base_branch`): they fork from it, Shepherd rebases onto
+  it (`git rebase campaign/<slug>`, no `origin/`), and every diff (Pointer/Tracker/Watchdog/compliance gate) uses it.
+- **Per wave:** `main` is merged into the branch first (`--no-ff`; a conflict returns `CAMPAIGN_PARKED_MAIN_CONFLICT`),
+  hunts run, and each certified hunt is rebased and merged `--no-ff` into the branch, one at a time (no tag, no push).
+- **Statuses** (none equals `merged`/`certified`): `merged_to_campaign`; `merged_to_campaign_pending_compliance` (Red,
+  merged unsigned; dependents may build on it); `certified_pending_compliance`; `certified_held_overlap`;
+  `parked:campaign_merge_conflict`; `parked:reverted_from_campaign`; `reverted_with_dependency` (auto re-merges).
+- **Push-through.** A blocked hunt (parked, `needs_spec`, merge conflict, reverted) only holds the hunts that conflict
+  with it: (a) depends on it, transitively; (b) shares a migration app; (c) its diff overlaps (judged at merge time —
+  the hunt certifies but stays unmerged). Everything else keeps running and merging.
+- **Three CLIs.** `scripts/wolfpack-chain.mjs` (`init`, `sync-main`, `overlap`, `merge-hunt` — the runner's git steps),
+  `scripts/wolfpack-release.mjs` (`revert`, `sign-off`, `check`, `summary`, `deploy`, `changelog`, `merge-commands`,
+  `stamp-released` — the release), and the runner itself. All git logic is deterministic, temp-repo-tested code.
+- **Revert** a campaign-merged hunt (and its dependents, newest first) with
+  `node scripts/wolfpack-release.mjs revert --campaign <c> --hunt <slug> --reason "<why>"`.
+- **End states:** `CAMPAIGN_READY_FOR_RELEASE`, `CAMPAIGN_AWAITING_HUMAN` (each blocked hunt + its `/resolve` + who
+  waits on it), `WAVE_PAUSED_QUOTA` / `WAVE_PAUSED_BUDGET` (resume mid-chain).
+- **Release** is a project-provided command (PawPIMS: `/release-campaign <slug> [--checkpoint]`): one dev deploy of the
+  branch, Red sign-offs (fail closed), one aggregated version, one CHANGELOG stamp, then one `--no-ff` merge into
+  `main` + one tag after the human approves. `/merge-wave` and `/merge` refuse chain campaigns.
+
 ## Directory Layout
 
 ```

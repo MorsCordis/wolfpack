@@ -49,6 +49,7 @@ Read these before forming any opinion:
 2. **`$PLAN_DIR/shepherd-log.md`** — what the Shepherd says did happen
 3. **`$PLAN_DIR/debrief.md`** — what the Bloodhound's concerns were
 4. **`git diff main..HEAD`** — what actually happened in code
+   (Chain-mode hunt: when `metadata.base_branch` is set, use it in place of `main` everywhere in this skill.)
 5. **`wolfpack-config.md` + AGENTS.md** — the rules you're enforcing
 6. **`.wolfpack/known-broken-tests.md`** — pre-existing failures to skip during cert
 7. **`.wolfpack/cross-cutting-debt.md`** — known infra issues; you append to this when you spot a new one

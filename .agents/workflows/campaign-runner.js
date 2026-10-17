@@ -33,23 +33,38 @@ const CAMPAIGN_SCHEMA = {
                 migrationRisk: { type: 'string' },
                 rationale: { type: 'string' },
                 status: { type: 'string' },
+                // Chain mode (campaign-chain-mode). REQUIRED, so a dropped field fails schema
+                // validation instead of silently disabling AC9 rule (b) / the A-12 reapply /
+                // heldHunts (the usageOffload lesson). Barrier code ignores all of them.
+                migrationApps: { type: 'array', items: { type: 'string' } },
+                revertedBecause: { type: ['string', 'null'] },
+                heldOn: { type: 'array', items: { type: 'string' } },
+                baseBranch: { type: 'string' },
               },
-              required: ['slug', 'description'],
+              required: ['slug', 'description', 'migrationApps', 'revertedBecause', 'heldOn'],
             },
           },
         },
         required: ['number', 'hunts'],
       },
     },
+    // Chain mode: REQUIRED (a barrier campaign returns false / "") so a dropped field can never
+    // silently read as barrier mode over a chain campaign.
+    chainMode: { type: 'boolean' },
+    chainBranch: { type: 'string' },
   },
-  required: ['waves'],
+  required: ['waves', 'chainMode', 'chainBranch'],
 }
 
 // args may arrive as an object or, when the invoker stringifies it, as a JSON
 // string. Parse defensively so campaignSlug never silently resolves to undefined.
 const parsedArgs = typeof args === 'string' ? JSON.parse(args) : (args || {})
-const { campaignSlug, maxParallel } = parsedArgs
+const { campaignSlug, maxParallel, chain: chainArg } = parsedArgs
 const parallelCap = maxParallel || 2
+// Chain mode (`--chain`, campaign-chain-mode): the launch command greps this marker.
+// WOLFPACK_CHAIN_RUNNER=1
+// POSIX single-quote a value for a shell command string (same as hunt-pipeline's shq).
+const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
 
 // Alternate the cross-examiner per hunt so two parallel hunts never
 // stack their reviews on the same model (which trips Mistral rate limits).
@@ -291,10 +306,22 @@ normalize it:
   - "needs_spec" or "parked:<reason>" (parked:open_critical, parked:compliance_review,
     parked:non_convergence, parked:model_quota, …) — await a human via /resolve (except
     parked:model_quota, which auto-resumes). Pass through verbatim; do NOT drop them.
+  - CHAIN MODE statuses (pass through verbatim, never normalize): "merged_to_campaign",
+    "merged_to_campaign_pending_compliance" (merged into the campaign branch, awaiting the
+    campaign release), "certified_pending_compliance", "certified_held_overlap" (certified,
+    not yet merged into the campaign branch), "parked:campaign_merge_conflict",
+    "parked:reverted_from_campaign", "reverted_with_dependency".
   - anything else (ready_for_alpha, reviewing, reviewed, implementing, …) — mid-pipeline, resumable.
 - LEGACY FALLBACK ONLY: if an OLD hunt's status is still "certified" but feat/<slug> is gone AND
   its merge commit is on main, you MAY return "merged". New hunts are stamped "merged" directly,
   so this git inference should not normally be needed.
+
+Chain-mode fields — ALWAYS return them for every hunt (barrier campaigns too):
+- migrationApps (ALWAYS return it; from the "Migration app(s)" field — a JSON-ish list like ["billing"]; [] if absent or "[]")
+- revertedBecause: metadata.reverted_because if set, else null;  heldOn: slugs in metadata.held_on, else []
+- baseBranch: metadata.base_branch if a non-empty string, else ""
+Top level (ALWAYS return both): chainMode = true iff .wolfpack/campaigns/${campaignSlug}/metadata.json has chain.mode === "chain",
+else false; chainBranch = chain.branch whenever the metadata has a chain block with a non-empty branch, WHATEVER chain.mode reads (else "").
 
 Return the structured wave data. Exclude BLOCKED hunts. Include done, certified, and
 parked/needs_spec hunts with their verbatim status.
@@ -320,6 +347,7 @@ log(`Campaign parsed: ${campaign.waves.length} waves, ${campaign.waves.reduce((n
 // falls back to its own gemini-first chain otherwise.
 const REQUIRED_EXAMINER_PROTOCOL = 2   // FLOOR: understands the examiner chain / crossExaminer hint at all
 const LATEST_EXAMINER_PROTOCOL   = 3   // what the current canonical hunt-pipeline emits
+let chainCapability = null   // the probe result, read by the chain-mode checks below
 {
   const cap = await agent(`
 READ-ONLY check — modify nothing. From the current repo root, pick the runtime workflow file:
@@ -328,16 +356,21 @@ Run: grep -o 'WOLFPACK_EXAMINER_PROTOCOL=[0-9]*' <that file> | head -1
 Also run: grep -o 'WOLFPACK_USAGE_PROTOCOL=[0-9]*' <that file> | head -1
 Then, for the usage gate script, run: test -f scripts/wolfpack-window-gate.mjs && echo present
 and: grep -o 'WOLFPACK_GATE_PROTOCOL=[0-9]*' scripts/wolfpack-window-gate.mjs | head -1
+Chain mode: grep -o 'WOLFPACK_CHAIN_PROTOCOL=[0-9]*' <the runtime workflow file> | head -1
+and: test -f scripts/wolfpack-chain.mjs && echo present
 Return path (the file you checked, or "" if neither exists), protocol (the integer after
 the first marker's "=", or 0 if the marker is absent / the file is missing),
 usageProtocol (the integer after the second marker's "=", or 0 if absent), gatePresent
 (true only if scripts/wolfpack-window-gate.mjs exists) and gateProtocol (the integer after
-the WOLFPACK_GATE_PROTOCOL marker's "=", or 0 if absent / the file is missing).
+the WOLFPACK_GATE_PROTOCOL marker's "=", or 0 if absent / the file is missing),
+chainProtocol (the integer after the WOLFPACK_CHAIN_PROTOCOL marker's "=", or 0 if absent)
+and chainScriptPresent (true only if scripts/wolfpack-chain.mjs exists).
 `, { label: 'pipeline-capability', phase: 'Parse', model: 'sonnet', schema: {
     type: 'object',
     properties: {
       path: { type: 'string' }, protocol: { type: 'number' }, usageProtocol: { type: 'number' },
       gatePresent: { type: 'boolean' }, gateProtocol: { type: 'number' },
+      chainProtocol: { type: 'number' }, chainScriptPresent: { type: 'boolean' },
     },
     required: ['protocol', 'gatePresent', 'gateProtocol'],
   } })
@@ -346,6 +379,7 @@ the WOLFPACK_GATE_PROTOCOL marker's "=", or 0 if absent / the file is missing).
   if (cap == null) {
     throw new Error(`campaign-runner: the pipeline-capability probe returned no result (agent failure) — capability is UNKNOWN, so no hunt may start. This is not a stale-pipeline diagnosis; relaunch to re-run the probe, and check the agent/model availability if it repeats.`)
   }
+  chainCapability = cap
   const proto = Number(cap.protocol) || 0
   if (proto < REQUIRED_EXAMINER_PROTOCOL) {
     throw new Error(`campaign-runner: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) is STALE — examiner protocol ${proto} < ${REQUIRED_EXAMINER_PROTOCOL}; it cannot honor the ${EXAMINER_ROTATION.join('/')} examiner hints. Re-run ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh (hunt-pipeline.js + campaign-runner.js), then relaunch.`)
@@ -375,6 +409,549 @@ the WOLFPACK_GATE_PROTOCOL marker's "=", or 0 if absent / the file is missing).
   } else {
     log(`Usage gate capability OK: gate protocol ${cap.gateProtocol}`)
   }
+}
+
+// ─── Chain mode (`--chain`, campaign-chain-mode) ───────────────
+// Chain mode moves the integration target from `main` to a LOCAL `campaign/<slug>` branch:
+// waves auto-merge into it (`--no-ff`, no tag, no push), later waves fork from it, `main` is
+// merged in at each wave start, and a blocked hunt only holds the hunts that CONFLICT with it
+// (dependency, shared migration app, or overlapping files). One `/release-campaign` merges the
+// branch into `main` with one tag, after the human approves. This file cannot run git, so every git
+// step goes through scripts/wolfpack-chain.mjs (a deterministic, temp-repo-tested CLI) via a
+// sonnet agent that returns its JSON verbatim. The BARRIER loop below is untouched: runChain()
+// is a separate path (its rolling pool deliberately duplicates the barrier pool's claim logic —
+// keep the two twins in step).
+//
+// The pure core block is byte-identical (minus `export `) to the one in
+// scripts/wolfpack-chain.mjs; a drift test fails if they differ.
+// ── BEGIN wolfpack-chain core (keep byte-identical: scripts/wolfpack-chain.mjs ⇄ campaign-runner.js) ──
+const CHAIN_STATUS = Object.freeze({
+  MERGED: 'merged_to_campaign',
+  MERGED_PENDING_COMPLIANCE: 'merged_to_campaign_pending_compliance',
+  CERTIFIED_PENDING_COMPLIANCE: 'certified_pending_compliance',
+  HELD_OVERLAP: 'certified_held_overlap',
+  MERGE_CONFLICT: 'parked:campaign_merge_conflict',
+  REVERTED: 'parked:reverted_from_campaign',
+  REVERTED_WITH_DEP: 'reverted_with_dependency',
+})
+// 'released' | 'campaign_merged' | 'awaiting_merge' | 'reverted_dep' | 'quota' | 'blocked' | 'pending'
+function chainClass(status) {
+  const s = String(status || '')
+  if (s === 'merged') return 'released'
+  if (s === CHAIN_STATUS.MERGED || s === CHAIN_STATUS.MERGED_PENDING_COMPLIANCE) return 'campaign_merged'
+  if (['certified', 'certified_not_merged', CHAIN_STATUS.CERTIFIED_PENDING_COMPLIANCE, CHAIN_STATUS.HELD_OVERLAP].includes(s)) return 'awaiting_merge'
+  if (s === CHAIN_STATUS.REVERTED_WITH_DEP) return 'reverted_dep'
+  if (s === 'parked:model_quota') return 'quota'
+  if (s === 'needs_spec' || s.startsWith('parked:')) return 'blocked'
+  return 'pending'
+}
+const isDependencyMet = (status) => ['released', 'campaign_merged'].includes(chainClass(status))
+const isBlockedStatus = (status) => ['blocked', 'reverted_dep'].includes(chainClass(status))
+// graph: { [slug]: { dependsOn: string[], migrationApps: string[] } }
+// Returns Map dep → path, where path is the slug chain from `slug` to that dep inclusive
+// (x→y→b gives b → ['x','y','b']). Breadth-first, so each path is a shortest one; a
+// visited set makes it cycle-safe.
+function dependencyClosure(slug, graph) {
+  const out = new Map()
+  const g = graph || {}
+  const queue = [[slug, [slug]]]
+  const seen = new Set([slug])
+  while (queue.length) {
+    const [cur, path] = queue.shift()
+    const deps = (g[cur] && Array.isArray(g[cur].dependsOn)) ? g[cur].dependsOn : []
+    for (const d of deps) {
+      if (seen.has(d)) continue
+      seen.add(d)
+      const p = [...path, d]
+      out.set(d, p)
+      queue.push([d, p])
+    }
+  }
+  return out
+}
+// overlaps: { [blockedSlug]: string[] } (rule c, precomputed by the CLI). Returns [] when no conflict.
+// One entry per (blocker, rule): a = depends on it (directly or transitively), b = shares a
+// migration app with it (case-insensitive), c = its diff overlaps the blocker's diff.
+function chainConflicts(slug, blockedSlugs, graph, overlaps = {}) {
+  const g = graph || {}
+  const out = []
+  const closure = dependencyClosure(slug, g)
+  const appsOf = (s) => ((g[s] && Array.isArray(g[s].migrationApps)) ? g[s].migrationApps : [])
+    .map(a => String(a).trim().toLowerCase()).filter(Boolean)
+  const mine = new Set(appsOf(slug))
+  for (const b of blockedSlugs || []) {
+    if (b === slug) continue
+    if (closure.has(b)) out.push({ rule: 'a', with: b, via: closure.get(b) })
+    const shared = [...new Set(appsOf(b))].filter(a => mine.has(a))
+    if (shared.length) out.push({ rule: 'b', with: b, apps: shared })
+    const files = (overlaps && Array.isArray(overlaps[b])) ? overlaps[b] : []
+    if (files.length) out.push({ rule: 'c', with: b, files: [...files] })
+  }
+  return out
+}
+// ── END wolfpack-chain core ──
+
+// The CLI result shapes the chain agents return (verbatim JSON + exitCode).
+const CHAIN_CLI_SCHEMA = {
+  type: 'object',
+  properties: {
+    status: { type: 'string' }, reason: { type: 'string' }, branch: { type: 'string' }, sha: { type: 'string' },
+    files: { type: 'array', items: { type: 'string' } }, warning: { type: ['string', 'null'] },
+    commit: { type: 'string' }, stamped: { type: 'string' }, stage: { type: 'string' }, exitCode: { type: 'integer' },
+  },
+  required: ['status'],
+}
+const CHAIN_OVERLAP_SCHEMA = {
+  type: 'object',
+  properties: {
+    overlaps: { type: 'object' }, noDiff: { type: 'array', items: { type: 'string' } }, held: { type: 'boolean' },
+    status: { type: 'string' }, reason: { type: 'string' }, exitCode: { type: 'integer' },
+  },
+  required: ['held'],
+}
+
+// One deterministic chain-mode git step. A null or error result THROWS with the step named:
+// that is safe, because anything already certified is merged on the next run (merge
+// candidates come from on-disk status).
+async function chainCli(cliArgs, label, schema = CHAIN_CLI_SCHEMA) {
+  const r = await agent(`
+You run ONE deterministic chain-mode git step for campaign ${campaignSlug}. The script does ALL
+the git work — you do NOT run any git command yourself, do NOT edit any file, and do NOT retry.
+From the MAIN repo root (the current directory — not a hunt worktree) run exactly:
+  node scripts/wolfpack-chain.mjs ${cliArgs}
+Exit code 0 means the step DECIDED — a "conflict" or held:true result is a normal, decided outcome.
+Read the JSON the script prints on stdout and return it VERBATIM (every field it printed), plus
+exitCode = the script's real exit code. Never invent or "fix up" a result.
+If the script is missing, exits with anything other than 0, or prints no parseable JSON on stdout,
+return exactly {status:'error', held:false, exitCode:<the real exit code, or -1 if it did not run>,
+reason:<the JSON "reason" field if there is one, else the first stderr line>}.
+`, { label, phase: 'Execute', model: 'sonnet', schema })
+  if (r == null) {
+    throw new Error(`campaign-runner: chain step ${label} returned no result (agent failure) — nothing was assumed. Re-run the campaign; anything already certified is merged on the next run.`)
+  }
+  if (r.status === 'error' || (typeof r.exitCode === 'number' && r.exitCode !== 0)) {
+    throw new Error(`campaign-runner: chain step ${label} failed${r.reason ? `: ${r.reason}` : ''} (exit ${r.exitCode ?? '?'}) — fix it and re-run the campaign; anything already certified is merged on the next run.`)
+  }
+  return r
+}
+
+async function runChain(campaign) {
+  // Reverted-dependent guard: `revert` always stamps reverted_because, so a parsed
+  // reverted_with_dependency hunt without it means the parse dropped the field. Never "waits".
+  const orphan = campaign.waves.flatMap(w => w.hunts)
+    .filter(h => h.status === CHAIN_STATUS.REVERTED_WITH_DEP && !(typeof h.revertedBecause === 'string' && h.revertedBecause !== ''))
+  if (orphan.length) throw new Error(`REVERTED DEPENDENT WITHOUT reverted_because: ${orphan.map(h => h.slug).join(', ')} — the parse dropped the field (or metadata is corrupt); check .wolfpack/plans/<slug>/metadata.json reverted_because and re-run.`)
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(String(campaignSlug || ''))) {
+    throw new Error(`campaign-runner: invalid campaign slug ${JSON.stringify(campaignSlug)} for chain mode — must match ^[a-z0-9][a-z0-9-]*$ (it names the branch campaign/<slug>)`)
+  }
+  const branch = `campaign/${campaignSlug}`
+  const chainCap = maxParallel || 1   // chain mode defaults to sequential (max-parallel > 1 is allowed, untested)
+  const hunts = []
+  for (const w of campaign.waves) for (const h of w.hunts) { h.__wave = w.number; hunts.push(h) }
+  const bySlug = new Map(hunts.map(h => [h.slug, h]))
+  const graph = {}
+  for (const h of hunts) {
+    graph[h.slug] = {
+      dependsOn: Array.isArray(h.dependsOn) ? h.dependsOn : [],
+      migrationApps: Array.isArray(h.migrationApps) ? h.migrationApps : [],
+    }
+  }
+  const status = new Map(hunts.map(h => [h.slug, String(h.status || '')]))   // live, updated as this run progresses
+  const revertedBecause = new Map(hunts.map(h => [h.slug, h.revertedBecause || null]))
+  const heldOn = new Map(hunts.filter(h => Array.isArray(h.heldOn) && h.heldOn.length).map(h => [h.slug, [...h.heldOn]]))
+  const failed = new Set()          // non-certified, non-park results this run — blocked for the rest of the run
+  const quotaDeferred = []          // parked:model_quota results this run
+  const waiting = new Map()         // slug → { slug, on, rule }
+  const cls = (s) => chainClass(status.get(s))
+  const blocked = () => hunts.filter(h => isBlockedStatus(status.get(h.slug)) || failed.has(h.slug)).map(h => h.slug)
+  const depMet = (d) => bySlug.has(d) && isDependencyMet(status.get(d))
+  const depsMet = (h) => graph[h.slug].dependsOn.every(depMet)
+  const firstUnmetDep = (h) => graph[h.slug].dependsOn.find(d => !depMet(d))
+  const reapplyReady = (h) => { const d = revertedBecause.get(h.slug); return !!d && depMet(d) }
+  const ruleText = (c) => {
+    if (c.rule === 'a') return `depends on blocked ${c.with}${Array.isArray(c.via) && c.via.length > 2 ? ` (via ${c.via.join(' → ')})` : ''}`
+    if (c.rule === 'b') return `shares migration app(s) ${(c.apps || []).join(', ')} with blocked ${c.with}`
+    if (c.rule === 'c') return `its diff overlaps blocked ${c.with} (${(c.files || []).join(', ')})`
+    if (c.rule === 'unknown_dep') return `depends on ${c.with}, which is not a hunt of this campaign (cannot be verified — fix the campaign's "Depends on")`
+    return `waits for ${c.with} to be campaign-merged`
+  }
+  const markWaiting = (slug, c) => {
+    const prev = waiting.get(slug)
+    waiting.set(slug, { slug, on: c.with, rule: c.rule })
+    if (!(prev && prev.on === c.with && prev.rule === c.rule)) log(`  ⏳ ${slug} waits: ${ruleText(c)}`)
+  }
+  const chainBase = { campaign: campaignSlug, mode: 'chain', branch }
+
+  log(`⛓ CHAIN MODE: ${campaignSlug} → ${branch} (max-parallel ${chainCap}; no wave barriers — release with /release-campaign ${campaignSlug})`)
+  const init = await chainCli(`init --campaign ${shq(campaignSlug)} --graph ${shq(JSON.stringify(graph))}`, 'chain-init')
+  log(`Chain branch ${init.status === 'adopted' ? 'adopted' : 'created'}: ${init.branch || branch}${init.sha ? ` @ ${String(init.sha).slice(0, 12)}` : ''}`)
+
+  const mainConflictReturn = (sync, where) => {
+    log(``)
+    log(`⛔ main → ${branch} merge CONFLICTED (${where}): ${(sync.files || []).join(', ') || '(files not reported)'} — the merge was aborted and nothing was scaffolded.`)
+    log(`Resolve it by hand (merge main into ${branch} in a scratch worktree, fix, commit), then re-run the campaign.`)
+    return { ...chainBase, completed: false, verdict: 'CAMPAIGN_PARKED_MAIN_CONFLICT', conflictFiles: sync.files || [], at: where }
+  }
+
+  const recordResult = (hunt, r) => {
+    waiting.delete(hunt.slug)
+    if (!r) {
+      failed.add(hunt.slug)
+      status.set(hunt.slug, 'failed')
+      log(`  ✗ ${hunt.slug}: no result — treated as blocked for the rest of this run`)
+      return
+    }
+    log(`  ${r.slug || hunt.slug}: ${r.verdict}`)
+    if (r.verdict === 'CERTIFIED_AWAITING_DEPLOY') status.set(hunt.slug, 'certified')
+    else if (r.verdict === 'CERTIFIED_PENDING_COMPLIANCE') status.set(hunt.slug, CHAIN_STATUS.CERTIFIED_PENDING_COMPLIANCE)
+    else if (r.verdict === 'PARKED' || r.verdict === 'NEEDS_SPEC') {
+      const st = (r.status === 'parked:model_quota' || r.reason === 'model_quota') ? 'parked:model_quota'
+        : (r.status || (r.verdict === 'NEEDS_SPEC' ? 'needs_spec' : `parked:${r.reason || 'unknown'}`))
+      status.set(hunt.slug, st)
+      if (st === 'parked:model_quota') quotaDeferred.push(hunt.slug)
+    } else {
+      failed.add(hunt.slug)
+      status.set(hunt.slug, 'failed')
+      log(`  ✗ ${hunt.slug}: ${r.verdict}${r.status ? ` (${r.status})` : ''} — did not certify; treated as blocked for the rest of this run`)
+    }
+  }
+
+  // Merge every awaiting-merge hunt (and every reapply-ready reverted dependent) of waves ≤ N,
+  // one at a time, dependencies first. Rules a/b first, then rule c (only when blockers exist).
+  // Candidates come from the LIVE status map seeded from on-disk status, so a hunt that
+  // certified in a crashed run (on disk: certified) is merged here on the next run.
+  const mergeStep = async (waveNumber, mergedLog, heldLog) => {
+    const overlapChecked = new Set()   // a hold is judged once per merge step
+    let progress = true
+    while (progress) {
+      progress = false
+      const cands = hunts.filter(h => h.__wave <= waveNumber && ['awaiting_merge', 'reverted_dep'].includes(cls(h.slug)))
+      for (const h of cands) {
+        if (overlapChecked.has(h.slug)) continue
+        if (cls(h.slug) === 'reverted_dep') {
+          if (!reapplyReady(h)) { markWaiting(h.slug, { rule: 'dep', with: revertedBecause.get(h.slug) }); continue }
+        } else if (!depsMet(h)) {
+          const d = firstUnmetDep(h)
+          markWaiting(h.slug, bySlug.has(d) ? { rule: (isBlockedStatus(status.get(d)) || failed.has(d)) ? 'a' : 'dep', with: d } : { rule: 'unknown_dep', with: d })
+          continue
+        }
+        const blockers = blocked().filter(b => b !== h.slug)
+        const conf = chainConflicts(h.slug, blockers, graph)
+        if (conf.length) { markWaiting(h.slug, conf[0]); continue }
+        if (blockers.length) {
+          const ov = await chainCli(`overlap --campaign ${shq(campaignSlug)} --hunt ${shq(h.slug)} --blockers ${shq(blockers.join(','))}`, `chain-overlap:${h.slug}`, CHAIN_OVERLAP_SCHEMA)
+          overlapChecked.add(h.slug)
+          if (Array.isArray(ov.noDiff) && ov.noDiff.length) log(`  ${h.slug}: no diff yet for ${ov.noDiff.join(', ')} — only rules a/b applied against them`)
+          if (ov.held === true) {
+            const on = Object.keys(ov.overlaps || {})
+            heldOn.set(h.slug, on)
+            if (status.get(h.slug) !== CHAIN_STATUS.CERTIFIED_PENDING_COMPLIANCE) status.set(h.slug, CHAIN_STATUS.HELD_OVERLAP)
+            waiting.delete(h.slug)
+            heldLog.push(h.slug)
+            const files = [...new Set(on.flatMap(b => (ov.overlaps || {})[b] || []))]
+            log(`  ⏸ ${h.slug}: certified but HELD unmerged — ${ruleText({ rule: 'c', with: on.join(', '), files })}; it merges once ${on.join(', ')} is merged`)
+            continue
+          }
+        }
+        const m = await chainCli(`merge-hunt --campaign ${shq(campaignSlug)} --hunt ${shq(h.slug)}`, `chain-merge:${h.slug}`)
+        if (m.status === 'merged') {
+          status.set(h.slug, m.stamped || CHAIN_STATUS.MERGED)
+          heldOn.delete(h.slug)
+          waiting.delete(h.slug)
+          mergedLog.push(h.slug)
+          progress = true
+          log(`  ⛓ ${h.slug} → ${branch}${m.commit ? ` (${String(m.commit).slice(0, 12)})` : ''}${m.stamped === CHAIN_STATUS.MERGED_PENDING_COMPLIANCE ? ' — merged, awaiting compliance sign-off at the release' : ''}`)
+        } else if (m.status === 'conflict') {
+          status.set(h.slug, CHAIN_STATUS.MERGE_CONFLICT)
+          waiting.delete(h.slug)
+          log(`  ⛔ ${h.slug}: auto-merge into ${branch} CONFLICTED (${m.stage || '?'}: ${(m.files || []).join(', ') || 'files not reported'}) — aborted, ${branch} unchanged; held as ${CHAIN_STATUS.MERGE_CONFLICT} → /resolve ${h.slug}`)
+        } else {
+          throw new Error(`campaign-runner: chain step chain-merge:${h.slug} returned an unknown status ${JSON.stringify(m.status)}`)
+        }
+      }
+    }
+  }
+
+  phase('Execute')
+
+  for (const wave of campaign.waves) {
+    const pending = wave.hunts.filter(h => ['pending', 'quota'].includes(cls(h.slug)) && !failed.has(h.slug))
+    const hasCandidates = hunts.some(h => h.__wave <= wave.number && ['awaiting_merge', 'reverted_dep'].includes(cls(h.slug)))
+    if (!pending.length && !hasCandidates) {
+      log(`Wave ${wave.number}: nothing to run or merge — skipping`)
+      continue
+    }
+    log(`=== Wave ${wave.number} (chain → ${branch}): ${pending.length} pending ===`)
+    const mergedThisWave = []
+    const heldThisWave = []
+    const waveResults = []
+
+    if (pending.length) {
+      // AC7: main is merged in BEFORE anything of this wave is scaffolded.
+      const sync = await chainCli(`sync-main --campaign ${shq(campaignSlug)}`, `chain-sync-main:w${wave.number}`)
+      if (sync.warning) log(`⚠ ${sync.warning}`)
+      if (sync.status === 'conflict') return mainConflictReturn(sync, `wave ${wave.number} start`)
+      log(`main → ${branch}: ${sync.status}`)
+    }
+
+    // AC9 rules a/b (and unknown dependencies) decide who runs now; rule c is judged at merge time.
+    const runnable = []
+    for (const h of pending) {
+      const unknown = graph[h.slug].dependsOn.find(d => !bySlug.has(d))
+      if (unknown) { markWaiting(h.slug, { rule: 'unknown_dep', with: unknown }); continue }
+      const conf = chainConflicts(h.slug, blocked(), graph)
+      if (conf.length) { markWaiting(h.slug, conf[0]); continue }
+      waiting.delete(h.slug)
+      runnable.push(h)
+    }
+    const independent = runnable.filter(depsMet)
+    const dependent = runnable.filter(h => !depsMet(h))
+
+    // ─── Independent hunts: rolling worker pool (TWIN of the barrier pool below) ───
+    let cursor = 0
+    let inFlightReserved = 0
+    let budgetPause = null
+    let usagePause = null
+    let usageGateError = null
+    if (independent.length > 0) {
+      log(`Wave ${wave.number}: ${independent.length} independent hunts (rolling pool, cap: ${chainCap})`)
+      const claimOnce = async () => {
+        if (budgetPause || usagePause || usageGateError || cursor >= independent.length) return null
+        const hunt = independent[cursor]
+        let g
+        try { g = await usageGate(hunt) } catch (e) { usageGateError = e; return null }
+        if (g.decision === 'defer') {
+          usagePause = { slug: hunt.slug, tier: normTier(hunt.tier), reason: g.reason, reset_at: g.reset_at, source: g.source }
+          return null
+        }
+        if (typeof budget !== 'undefined' && budget && budget.total) {
+          const need = estimatedHuntCost(hunt.tier) + inFlightReserved
+          const have = budget.remaining()
+          if (have < need) {
+            budgetPause = { need, have, tier: normTier(hunt.tier), slug: hunt.slug }
+            return null
+          }
+        }
+        cursor++
+        inFlightReserved += estimatedHuntCost(hunt.tier)
+        hunt.__usageOffload = g.offload ? { reason: g.offload_reason || g.reason } : null
+        return hunt
+      }
+      let claimChain = Promise.resolve(null)
+      const claimNext = () => (claimChain = claimChain.then(claimOnce))
+      const worker = async () => {
+        for (let hunt = await claimNext(); hunt; hunt = await claimNext()) {
+          log(`Wave ${wave.number}: ▶ ${hunt.slug} [${normTier(hunt.tier)}] starting on ${branch}`)
+          let result = null
+          try {
+            result = await workflow('hunt-pipeline', {
+              slug: hunt.slug,
+              description: hunt.description,
+              campaign: campaignSlug,
+              tier: hunt.tier,
+              mode: hunt.mode,
+              ticketRefs: hunt.ticketRefs,
+              todoItemsCleared: hunt.todoItemsCleared,
+              migrationRisk: hunt.migrationRisk,
+              rationale: hunt.rationale,
+              crossExaminer: nextCrossExaminer(),
+              usageOffload: hunt.__usageOffload || null,
+              baseBranch: branch,
+            })
+          } finally {
+            inFlightReserved -= estimatedHuntCost(hunt.tier)
+          }
+          if (result) waveResults.push(result)
+          recordResult(hunt, result)
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(chainCap, independent.length) }, () => worker()))
+    }
+
+    if (budgetPause) {
+      const deferred = independent.slice(cursor).concat(dependent)
+      log(``)
+      log(`⛔ Budget breaker: ~${budgetPause.have} output tokens left < ~${budgetPause.need} to start ${budgetPause.slug} (${budgetPause.tier}) alongside in-flight work.`)
+      log(`Stopping before scaffolding a hunt we can't finish. Deferred ${deferred.length} hunt(s): ${deferred.map(h => h.slug).join(', ')} — re-run to resume mid-chain.`)
+      return {
+        campaign: campaignSlug,
+        completed: false,
+        verdict: 'WAVE_PAUSED_BUDGET',
+        certifiedHunts: waveResults.filter(r => r.verdict === 'CERTIFIED_AWAITING_DEPLOY').map(r => r.slug),
+        parkedHunts: [],
+        deferredHunts: deferred.map(h => ({ slug: h.slug, tier: h.tier })),
+        failedHunts: [],
+        completedWave: wave.number,
+        budget: { remaining: budgetPause.have, neededForNext: budgetPause.need },
+        mode: 'chain',
+        branch,
+      }
+    }
+    if (usageGateError) throw usageGateError   // loud, AFTER in-flight hunts finished
+    if (usagePause) {
+      return { ...usagePausedReturn(usagePause, waveResults, independent.slice(cursor).concat(dependent), wave.number), mode: 'chain', branch }
+    }
+
+    // AC5: merge what certified, BEFORE the dependents (A-14: a same-wave dependent then forks
+    // from a branch that already holds its dependency).
+    await mergeStep(wave.number, mergedThisWave, heldThisWave)
+
+    // Dependents, one at a time; each is merged right after it certifies.
+    for (let di = 0; di < dependent.length; di++) {
+      const hunt = dependent[di]
+      if (!depsMet(hunt)) {
+        const d = firstUnmetDep(hunt)
+        markWaiting(hunt.slug, { rule: (isBlockedStatus(status.get(d)) || failed.has(d)) ? 'a' : 'dep', with: d })
+        continue
+      }
+      const conf = chainConflicts(hunt.slug, blocked(), graph)   // a dependency may have blocked during this wave
+      if (conf.length) { markWaiting(hunt.slug, conf[0]); continue }
+      const depShortfall = budgetShortfall(hunt.tier)
+      if (depShortfall) {
+        const deferred = dependent.slice(di)
+        log(``)
+        log(`⛔ Budget breaker: ~${depShortfall.have} output tokens left < ~${depShortfall.need} for a ${depShortfall.tier} hunt. Stopping before ${hunt.slug}.`)
+        log(`Deferred ${deferred.length} dependent hunt(s): ${deferred.map(h => h.slug).join(', ')} — re-run to resume mid-chain.`)
+        return {
+          campaign: campaignSlug,
+          completed: false,
+          verdict: 'WAVE_PAUSED_BUDGET',
+          certifiedHunts: waveResults.filter(r => r.verdict === 'CERTIFIED_AWAITING_DEPLOY').map(r => r.slug),
+          parkedHunts: [],
+          deferredHunts: deferred.map(h => ({ slug: h.slug, tier: h.tier })),
+          failedHunts: [],
+          completedWave: wave.number,
+          budget: { remaining: depShortfall.have, neededForNext: depShortfall.need },
+          mode: 'chain',
+          branch,
+        }
+      }
+      log(`Wave ${wave.number} dependent: ${hunt.slug} (depends on: ${graph[hunt.slug].dependsOn.join(', ')} — all on ${branch})`)
+      const depGate = await usageGate(hunt)
+      if (depGate.decision === 'defer') {
+        return {
+          ...usagePausedReturn(
+            { slug: hunt.slug, tier: normTier(hunt.tier), reason: depGate.reason, reset_at: depGate.reset_at, source: depGate.source },
+            waveResults, dependent.slice(di), wave.number),
+          mode: 'chain',
+          branch,
+        }
+      }
+      const result = await workflow('hunt-pipeline', {
+        slug: hunt.slug,
+        description: hunt.description,
+        campaign: campaignSlug,
+        tier: hunt.tier,
+        mode: hunt.mode,
+        crossExaminer: nextCrossExaminer(),
+        usageOffload: depGate.offload ? { reason: depGate.offload_reason || depGate.reason } : null,
+        baseBranch: branch,
+      })
+      if (result) waveResults.push(result)
+      recordResult(hunt, result)
+      await mergeStep(wave.number, mergedThisWave, heldThisWave)
+    }
+
+    const waitingNow = [...waiting.values()].filter(w => bySlug.has(w.slug) && bySlug.get(w.slug).__wave <= wave.number).map(w => w.slug)
+    log(`Wave ${wave.number} → ${branch}: merged [${mergedThisWave.join(', ')}], held [${heldThisWave.join(', ')}], waiting [${waitingNow.join(', ')}]`)
+  }
+
+  // ─── End state (AC13) ───
+  const campaignMergedHunts = hunts.filter(h => cls(h.slug) === 'campaign_merged').map(h => h.slug)
+  const pendingComplianceHunts = hunts.filter(h => status.get(h.slug) === CHAIN_STATUS.MERGED_PENDING_COMPLIANCE).map(h => h.slug)
+  const heldHunts = hunts
+    .filter(h => cls(h.slug) === 'awaiting_merge' && (status.get(h.slug) === CHAIN_STATUS.HELD_OVERLAP || (heldOn.get(h.slug) || []).length))
+    .map(h => ({ slug: h.slug, status: status.get(h.slug), heldOn: heldOn.get(h.slug) || [] }))
+  const waitingHunts = [...waiting.values()]
+  const waitersOf = (b) => waitingHunts.filter(w => w.on === b).map(w => w.slug)
+  const resolveFor = (h) => {
+    const st = status.get(h.slug)
+    if (st === 'needs_spec') return `/spec ${h.slug}`
+    if (st === CHAIN_STATUS.REVERTED_WITH_DEP) return `auto: re-merges after ${revertedBecause.get(h.slug)}`
+    return `/resolve ${h.slug}`
+  }
+  const blockedHunts = hunts.filter(h => isBlockedStatus(status.get(h.slug)))
+    .map(h => ({ slug: h.slug, status: status.get(h.slug), resolve: resolveFor(h), waiting: waitersOf(h.slug) }))
+  const failedHunts = [...failed]
+  const unaccounted = hunts.filter(h => !['released', 'campaign_merged'].includes(cls(h.slug)) &&
+    !blockedHunts.some(b => b.slug === h.slug) && !heldHunts.some(x => x.slug === h.slug) &&
+    !waiting.has(h.slug) && !failed.has(h.slug) && !quotaDeferred.includes(h.slug)).map(h => ({ slug: h.slug, status: status.get(h.slug) }))
+
+  // Precedence: any quota result → WAVE_PAUSED_QUOTA (auto-resumes; the human lists still return);
+  // else anything blocked/waiting/held/failed/unexplained → CAMPAIGN_AWAITING_HUMAN; else every
+  // hunt is released or campaign-merged → CAMPAIGN_READY_FOR_RELEASE.
+  let verdict
+  if (quotaDeferred.length) verdict = 'WAVE_PAUSED_QUOTA'
+  else if (blockedHunts.length || waitingHunts.length || heldHunts.length || failedHunts.length || unaccounted.length) verdict = 'CAMPAIGN_AWAITING_HUMAN'
+  else verdict = 'CAMPAIGN_READY_FOR_RELEASE'
+
+  if (verdict === 'CAMPAIGN_READY_FOR_RELEASE') {
+    // Reconcile a main that advanced after the last wave start (always; the CLI no-ops when
+    // main is already an ancestor), so /release-campaign's main_not_merged check never dead-ends.
+    const sync = await chainCli(`sync-main --campaign ${shq(campaignSlug)}`, 'chain-sync-main:final')
+    if (sync.warning) log(`⚠ ${sync.warning}`)
+    if (sync.status === 'conflict') return mainConflictReturn(sync, 'final sync before release')
+    log(`main → ${branch}: ${sync.status}`)
+  }
+
+  log(``)
+  log(`=== Chain campaign ${campaignSlug} → ${branch}: ${campaignMergedHunts.length} campaign-merged (${pendingComplianceHunts.length} awaiting compliance sign-off), ${heldHunts.length} held, ${blockedHunts.length} blocked, ${waitingHunts.length} waiting, ${failedHunts.length} failed, ${quotaDeferred.length} quota-deferred ===`)
+  if (quotaDeferred.length) {
+    log(`These hunts hit MODEL QUOTA — transient, NO action needed; re-run the campaign once the window frees: ${quotaDeferred.join(', ')}`)
+  }
+  for (const b of blockedHunts) {
+    log(`  ⛔ ${b.slug} [${b.status}]  →  ${b.resolve}${b.waiting.length ? `   (waiting on it: ${b.waiting.join(', ')})` : ''}`)
+  }
+  for (const x of heldHunts) {
+    log(`  ⏸ ${x.slug} [${x.status}] held — overlaps ${x.heldOn.join(', ') || 'a blocked hunt'}; merges once that is merged`)
+  }
+  for (const w of waitingHunts.filter(w => !blockedHunts.some(b => b.slug === w.on))) {
+    log(`  ⏳ ${w.slug} waits: ${ruleText({ rule: w.rule, with: w.on })}`)
+  }
+  for (const f of failedHunts) log(`  ✗ ${f}: did not certify — inspect .wolfpack/plans/${f}/ before re-running`)
+  for (const u of unaccounted) log(`  ? ${u.slug} [${u.status}] — not runnable and not explained; inspect it`)
+  if (verdict === 'CAMPAIGN_READY_FOR_RELEASE') {
+    log(`Every hunt is campaign-merged. Release it: /release-campaign ${campaignSlug}   (one deploy, Red sign-offs, one version, one --no-ff merge into main + one tag; never pushes)`)
+  } else if (verdict === 'CAMPAIGN_AWAITING_HUMAN') {
+    log(`Answer the blocked hunts above, then re-run the campaign. To ship what is already merged now: /release-campaign ${campaignSlug} --checkpoint`)
+  }
+
+  return {
+    ...chainBase,
+    completed: verdict === 'CAMPAIGN_READY_FOR_RELEASE',
+    verdict,
+    campaignMergedHunts,
+    pendingComplianceHunts,
+    heldHunts,
+    blockedHunts,
+    waitingHunts,
+    failedHunts,
+    quotaDeferredHunts: [...quotaDeferred],
+    ...(unaccounted.length ? { unaccounted } : {}),
+  }
+}
+
+// ─── Mode dispatch: chain (runChain above) vs barrier (below, unchanged) ───
+const chainMode = chainArg === true || campaign.chainMode === true
+if (!chainMode) {                                   // consistency guard: chain state on disk ⇒ never barrier
+  const CHAIN_VALUES = Object.values(CHAIN_STATUS)
+  const stray = campaign.waves.flatMap(w => w.hunts)
+    .filter(h => CHAIN_VALUES.includes(h.status) || (typeof h.baseBranch === 'string' && h.baseBranch !== ''))
+  const chainBlock = typeof campaign.chainBranch === 'string' && campaign.chainBranch !== ''   // campaign-level chain block (crash after chain-init, before any scaffold)
+  if (stray.length || chainBlock) throw new Error(`CHAIN STATE WITHOUT CHAIN MODE: ${campaignSlug} has ${chainBlock ? `a chain block (${campaign.chainBranch}) and ` : ''}chain-mode hunts (${stray.map(h => `${h.slug}=${h.status}${h.baseBranch ? `@${h.baseBranch}` : ''}`).join(', ') || 'none'}) but the parse reported chainMode=${campaign.chainMode} — refusing to run barrier mode over a chain campaign. Re-run with --chain (and check .wolfpack/campaigns/${campaignSlug}/metadata.json chain.mode).`)
+}
+if (campaign.chainMode === true && chainArg !== true) log(`⚠ CHAIN MODE (sticky): ${campaignSlug} was started with --chain — continuing in chain mode on ${campaign.chainBranch || `campaign/${campaignSlug}`}. Pass --chain to silence this.`)
+if (chainMode) {
+  // Fail closed on a missing field: a stale runtime hunt-pipeline would fork hunts from `main`
+  // and rebase them onto origin/main — silently wrong for a chain campaign.
+  const ccap = chainCapability || {}
+  if (!(Number(ccap.chainProtocol) >= 1)) {
+    throw new Error(`campaign-runner: STALE PIPELINE for chain mode — the runtime hunt-pipeline (${ccap.path || 'not found'}) reports chain protocol ${Number(ccap.chainProtocol) || 0} < 1 (no WOLFPACK_CHAIN_PROTOCOL marker), so its hunts would fork from main and rebase onto origin/main. Re-run ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh <repo>/.claude/workflows/hunt-pipeline.js, then relaunch.`)
+  }
+  if (ccap.chainScriptPresent !== true) {
+    throw new Error(`campaign-runner: scripts/wolfpack-chain.mjs is MISSING (or the probe could not confirm it) — chain mode cannot run its git steps. Copy it from wolfpack canonical scripts/, then relaunch.`)
+  }
+  return await runChain(campaign)   // the barrier loop below is byte-identical to today
 }
 
 // ─── Phase: Execute Waves ──────────────────────────────────────
