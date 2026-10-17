@@ -135,7 +135,9 @@ const RESUME_SCHEMA = {
     driftWarning: { type: 'string' },      // [Fix 3] diagnostic: main/worktree divergence one-liner, else null
     latestRevisedPlan: { type: 'number' }, // highest K of plan-revised-K.md in the plan dir, else 0
   },
-  required: ['fresh'],
+  // latestRevisedPlan is REQUIRED: as an optional field the probe silently dropped it and a
+  // resumed review restarted at round 1 (wave 2, second relaunch).
+  required: ['fresh', 'latestRevisedPlan'],
 }
 
 // [02] Park / resolve / resume. A hunt that can't safely proceed halts CLEANLY:
@@ -706,7 +708,7 @@ Steps:
    read metadata.json from the WORKTREE plan dir ONLY. If the worktree dir does NOT
    exist (the --no-worktree path), fall back to the main plan dir. If NEITHER the
    worktree metadata.json nor (when there's no worktree) the main metadata.json
-   exists, this is a brand-new hunt: return { fresh: true }.
+   exists, this is a brand-new hunt: return { fresh: true, latestRevisedPlan: 0 }.
 3. Use that single metadata.json as authoritative — do NOT cross-compare a main and a
    worktree copy. (flawed_plan means the plan failed
    certification — treat it as needing a replan; needs_spec means the Spec phase

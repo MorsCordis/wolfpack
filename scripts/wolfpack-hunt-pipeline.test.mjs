@@ -906,3 +906,8 @@ test('a fresh hunt still starts the plan review at round 1 of plan.md', async ()
   assert.match(find('bloodhound:')[0].opts.label, /:r1(:|$)/)
   assert.match(find('bloodhound:')[0].prompt, /Plan file to review: plan\.md/)
 })
+
+test('the resume probe schema REQUIRES latestRevisedPlan (an optional field was silently dropped)', async () => {
+  const { find } = await runHunt()
+  assert.ok(find('resume-probe')[0].opts.schema.required.includes('latestRevisedPlan'))
+})
