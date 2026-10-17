@@ -133,6 +133,7 @@ const RESUME_SCHEMA = {
     resolutionType: { type: 'string' },   // metadata.park.resolution_type, or null
     humanNotesPresent: { type: 'boolean' },// human-notes.md exists (a /resolve answer landed)
     driftWarning: { type: 'string' },      // [Fix 3] diagnostic: main/worktree divergence one-liner, else null
+    latestRevisedPlan: { type: 'number' }, // highest K of plan-revised-K.md in the plan dir, else 0
   },
   required: ['fresh'],
 }
@@ -767,6 +768,8 @@ Steps:
      from step 2 (the worktree plan dir, or the main plan dir only when there is no
      worktree) — a /resolve answer has landed and the hunt is ready to resume.
    - driftWarning: the one-line string from the DRIFT CHECK (step 4.5), or null.
+   - latestRevisedPlan: the highest K among plan-revised-K.md files in the authoritative
+     plan dir (ls it; K is an integer), or 0 if there are none.
 Return ONLY these fields.
 `, { label: `resume-probe:${slug}`, phase: 'Scaffold', schema: RESUME_SCHEMA })
 
@@ -2020,7 +2023,12 @@ if (at('Review')) {
   phase('Review')
 
   let approved = false
-  let round = 0
+  // A resume INTO Review continues the round numbering: with plan-revised-K.md on disk the
+  // next review is round K+1 of plan-revised-K.md. Restarting at round 1 re-reviews plan.md
+  // under a stale round number and the reviewer refuses it (pipeline-automation wave 2:
+  // both resolved review_error parks re-parked as round_mismatch_not_run).
+  let round = (!fresh && resumeFrom === 'Review') ? Math.max(0, Math.floor(Number(resumeProbe.latestRevisedPlan) || 0)) : 0
+  if (round > 0) log(`▶ ${slug}: resuming the plan review at round ${round + 1} (plan-revised-${round}.md)`)
   // [03] Part B — CONVERGENCE-GATED review loop. Replaces the count-based severity
   // ceiling (CRIT_CEILING/HIGH_CEILING/roundCap++ and the "proceed-anyway-at-cap with
   // ≤HIGH open" branch are GONE — that branch is the seam [02] left open). The base
