@@ -882,7 +882,7 @@ test('shim wait: every non-Claude review/certify link runs via rc-file + foregro
   const prompts = [...find('bloodhound:'), ...find('pointer:'), ...find('watchdog')].map(c => c.prompt)
   assert.ok(prompts.length >= 3, 'expected bloodhound, pointer and watchdog shim prompts')
   for (const p of prompts) {
-    assert.match(p, /podman-vibe\.sh[^\n]*> \S+-l1\.out 2> \S+-l1\.err; echo \$\? > \S+-l1\.rc \) &/)
+    assert.match(p, /podman-vibe\.sh[^\n]*> \S+-l1\.out 2> \S+-l1\.err; echo \$\? > \S+-l1\.rc \) <\/dev\/null >\/dev\/null 2>&1 &/)
     assert.match(p, /timeout 540 bash -c 'until \[ -f "\$1" \]/)
     assert.match(p, /WAITING ON A SHIM \(hard rule\)/)
     assert.match(p, /NEVER end your turn/)

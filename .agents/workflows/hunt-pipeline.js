@@ -1043,7 +1043,7 @@ const reviewCmd = (who, vibeAgent, promptFile, role = 'reviewer') =>
 // shim and returns ERROR — pipeline-automation wave 2 parked two hunts on exactly that
 // (review_error at r4/r5 of plans that were converging). Same proven pattern as the
 // GLM-Shepherd wrapper: subshell + rc file + bounded foreground polls.
-const shimRun = (cmd, base) => `( ${cmd} > ${base}.out 2> ${base}.err; echo $? > ${base}.rc ) &
+const shimRun = (cmd, base) => `( ${cmd} > ${base}.out 2> ${base}.err; echo $? > ${base}.rc ) </dev/null >/dev/null 2>&1 &
        then, in the FOREGROUND, repeat
          timeout 540 bash -c 'until [ -f "$1" ]; do sleep 20; done' _ ${base}.rc
        until ${base}.rc exists (give up after ~60 minutes → this attempt FAILED, evidence "shim did not finish").
@@ -1931,7 +1931,7 @@ ${task}
    this, the resume probe still sees GLM as a possible writer — the safe direction.)
 4. Run the shim. It can run for up to an hour — longer than one shell call may block — so
    start it in the BACKGROUND and poll:
-     ( ${cmd} > ${q('.out')} 2> ${q('.err')}; echo $? > ${q('.rc')} ) &
+     ( ${cmd} > ${q('.out')} 2> ${q('.err')}; echo $? > ${q('.rc')} ) </dev/null >/dev/null 2>&1 &
    then repeat \`timeout 540 bash -c 'until [ -f "$1" ]; do sleep 20; done' _ ${q('.rc')}\` until
    ${base}.rc exists (give up after ~80 minutes total → outcome "failed", evidence "shim did not finish").
    Run the shim EXACTLY as given — no extra flags, never a second copy in parallel.
