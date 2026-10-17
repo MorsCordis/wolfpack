@@ -361,7 +361,12 @@ export function main(argv) {
         console.error(USAGE)
         return 2
       }
-      const out = selectHunts(pos[0], { wave: flags.wave === true, root: flags.root })
+      if (flags.wave !== undefined && flags.wave !== true && flags.wave !== 'true') {
+        console.error(`--wave takes no value (got --wave=${flags.wave})`)
+        console.error(USAGE)
+        return 2
+      }
+      const out = selectHunts(pos[0], { wave: flags.wave !== undefined, root: flags.root })
       console.log(JSON.stringify(out, null, 2))
       return 0
     }

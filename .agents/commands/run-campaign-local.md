@@ -97,9 +97,9 @@ else `null` (answers go in `acceptance.md` only; `spec_plan_note` says why).
 ### Phase B — One sitting: ask every question
 1. Collect every hunt's `spec-questions.json`.
 2. Drop any question the source plan already answers (a principle or a **Decided** D# row) and list it in the
-   summary as a Spec defect. A dropped question is **resolved, not open**: set `"answer": "per D<n> — already
-   decided"` (or `per P<n>`) on it in `spec-questions.json`. It counts as answered for the Phase C gate, so a
-   hunt whose only questions were dropped goes straight to Phase C. Phase C cites the row in `acceptance.md`; it
+   summary as a Spec defect. A dropped question is **resolved, not open**: set
+   `"answer": "per D<n> — already decided"` (or `per P<n>`) on it in `spec-questions.json`. It counts as answered
+   for the Phase C gate, so a hunt whose only questions were dropped goes straight to Phase C. Phase C cites the row in `acceptance.md`; it
    adds nothing to the `Interview answers` line and runs no `record-decision` for it.
 3. Ask ALL remaining questions back to back, in consecutive `AskUserQuestion` calls (≤4 questions per call),
    in hunt order, then rank. Nothing else happens between the calls: no drafting, no file writes.

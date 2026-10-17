@@ -307,6 +307,7 @@ test('AC9 real files', (t) => {
 test('CLI usage', () => {
   assert.equal(run([]).status, 2)
   assert.equal(run(['bogus']).status, 2)
+  assert.equal(run(['list', 'x.md', '--wave=bogus']).status, 2)
 })
 
 test('answered-but-parked hunts are not re-drafted', () => {
