@@ -911,3 +911,55 @@ test('the resume probe schema REQUIRES latestRevisedPlan (an optional field was 
   const { find } = await runHunt()
   assert.ok(find('resume-probe')[0].opts.schema.required.includes('latestRevisedPlan'))
 })
+
+test('protected paths: the Debrief flags hook/settings edits and every Shepherd prompt stages them as patches', async () => {
+  const { find } = await runHunt()
+  const debrief = find('debrief:')[0].prompt
+  assert.match(debrief, /PROTECTED-PATH CHECK \(mandatory\)/)
+  assert.match(debrief, /\.claude\/hooks\//)
+  assert.match(debrief, /## Human-Applied Edits/)
+  const shep = find('shepherd:')[0].prompt
+  assert.match(shep, /PROTECTED AGENT-CONFIG PATHS/)
+  assert.match(shep, /human-patches\/<NN>-<short-name>\.patch/)
+  assert.match(shep, /git apply --check <patch>/)
+})
+
+test('protected paths: the GLM Shepherd task also routes protected edits to human-patches/', async () => {
+  const { find } = await runHunt({ answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })
+  const g = find('shepherd-glm')[0].prompt
+  assert.match(g, /NEVER edit a file under \.claude\/hooks\//)
+  assert.match(g, /human-patches\/<NN>-<short-name>\.patch/)
+})
+
+test('human-patch gate: no staged patches → no park, Code Review runs', async () => {
+  const { result, find } = await runHunt()
+  assert.equal(find('human-patch-check').length >= 1, true)
+  assert.notEqual(result.status, 'parked:human_patch')
+  assert.ok(find('pointer:').length >= 1)
+})
+
+test('human-patch gate: an unapplied patch parks human_patch at Implement, before any code review', async () => {
+  const patch = `${PD}/human-patches/01-guard.patch`
+  const { result, find } = await runHunt({ answers: {
+    'human-patch-check': { pending: [{ patch, paths: ['.claude/hooks/bash-guards.sh'], applies: true }] },
+  } })
+  assert.equal(result.verdict, 'PARKED')
+  assert.equal(result.status, 'parked:human_patch')
+  assert.equal(find('pointer:').length, 0, 'never reviews code that is missing the staged change')
+  const park = find('park:h:human_patch')
+  assert.equal(park.length, 1)
+  assert.match(park[0].prompt, /resume_phase: Code Review/)
+  assert.ok(park[0].prompt.includes(`apply ${patch}`))
+  assert.match(park[0].prompt, /add \.claude\/hooks\/bash-guards\.sh/)
+})
+
+test('human-patch gate: a patch staged during a Pointer rework parks before the next review round', async () => {
+  const { result, find } = await runHunt({ answers: {
+    pointer: (p, opts) => issues(pointerRoundOf(opts), 'glm'),
+    'human-patch-check': (p, opts, n) => n === 1 ? { pending: [] }
+      : { pending: [{ patch: `${PD}/human-patches/01-guard.patch`, paths: ['.claude/hooks/bash-guards.sh'], applies: false }] },
+  } })
+  assert.equal(result.status, 'parked:human_patch')
+  assert.equal(find('pointer:').length, 1, 'parks after the round-1 rework, before round 2')
+  assert.match(find('park:h:human_patch')[0].prompt, /does NOT apply cleanly/)
+})

@@ -1277,6 +1277,30 @@ const COMPLIANCE_PATHS = [
   'records/models.py',
 ]
 
+// Agent-config paths the Claude Code permission classifier refuses to let an agent edit
+// ("Self-Modification"): guard hooks and settings. A plan item that changes one of these
+// cannot be implemented by any Shepherd, so it would only surface later as a failed test
+// (seen 2026-10-17). Instead the Debrief flags such items, the
+// Shepherd stages each change as a patch under human-patches/, and the human-patch gate
+// below parks the hunt with the commands to apply them.
+const PROTECTED_AGENT_PATHS = [
+  '.claude/hooks/',
+  '.claude/settings.json',
+  '.claude/settings.local.json',
+  '.agents/hooks/',
+]
+const HUMAN_PATCH_DIR = `${planDir}/human-patches`
+const PROTECTED_PATCH_RULE = `
+PROTECTED AGENT-CONFIG PATHS (the permission classifier refuses agent edits to these):
+${PROTECTED_AGENT_PATHS.map(p => `  - ${p}`).join('\n')}
+NEVER edit or commit a file under these paths, and do not retry a refused edit. For each change
+the plan needs there, write a unified diff with worktree-relative a/ b/ paths (the format
+git diff prints) to ${HUMAN_PATCH_DIR}/<NN>-<short-name>.patch: copy the file to /tmp, edit the
+copy, then diff -u it against the original and fix the header paths. Confirm it applies with
+git apply --check <patch> from the worktree root. Commit everything else as usual, and list
+each patch in shepherd-log.md under "## Human-Applied Patches". The pipeline parks the hunt so
+the human applies and commits them.`
+
 // [02] Resumed-agent override channel. When /resolve has written human-notes.md,
 // the resumed phase MUST read it first — it carries authoritative human direction
 // that overrides prior plan assumptions where they conflict. Appended to every
@@ -2411,10 +2435,59 @@ Shepherd tasks; MEDIUM/LOW may be folded in or explicitly deferred with a reason
 List the disposition of every final-round finding in debrief.md under a
 "## Final-Round Skip-Check" heading.
 
+PROTECTED-PATH CHECK (mandatory): agents cannot edit these paths (the permission
+classifier refuses them):
+${PROTECTED_AGENT_PATHS.map(p => `  - ${p}`).join('\n')}
+If plan-final.md changes any file under them, add a "## Human-Applied Edits" section to
+debrief.md listing each such file and the exact change, and mark those plan-final items
+"(human-applied patch)". The Shepherd stages them as patches in ${HUMAN_PATCH_DIR}/ and the
+hunt parks for the human to apply them. If none, write "## Human-Applied Edits\nNone." Where
+a plan item can reach its goal without touching a protected path, prefer that.
+
 For model selection, use pedigree-driven algorithm from your skill.
 Do NOT ask the user.
 ${heartbeat('Debrief', 'synthesizing plan-final')}${HUMAN_NOTES_DIRECTIVE}
 `, { label: `debrief:${slug}`, phase: 'Debrief' })
+}
+
+// Human-patch gate. After the Shepherd runs, any patch in human-patches/ that is not yet
+// applied to the worktree (git apply --check -R fails) means a protected-path change is
+// still waiting for the human, so the hunt parks rather than reviewing and testing code
+// that is missing it. /resolve after the human applies + commits → clarify → Code Review.
+const HUMAN_PATCH_SCHEMA = {
+  type: 'object',
+  properties: {
+    pending: { type: 'array', items: { type: 'object', properties: {
+      patch: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } }, applies: { type: 'boolean' },
+    }, required: ['patch', 'paths', 'applies'] } },
+  },
+  required: ['pending'],
+}
+async function humanPatchGate(phaseLabel) {
+  const check = await agent(`
+You are a READ-ONLY probe. Do NOT modify, apply, stage or commit anything.
+cd to ${worktreePath}. If ${HUMAN_PATCH_DIR}/ does not exist or has no *.patch files, return { pending: [] }.
+For each ${HUMAN_PATCH_DIR}/*.patch, in name order:
+  - if \`git apply --check -R <patch>\` succeeds, it is already applied: skip it;
+  - otherwise add { patch: <absolute path>, paths: <the b/ paths it touches, without the b/>,
+    applies: <true if \`git apply --check <patch>\` succeeds, else false> }.
+Return { pending: [...] }.
+`, { label: `human-patch-check:${slug}`, phase: phaseLabel, schema: HUMAN_PATCH_SCHEMA, model: 'sonnet' })
+  const pending = (check && Array.isArray(check.pending)) ? check.pending : []
+  if (pending.length === 0) return null
+  log(`⏸ ${slug}: ${pending.length} protected-path patch(es) need the human — parking human_patch`)
+  const files = [...new Set(pending.flatMap(x => x.paths || []))]
+  const steps = pending.map(x => `  git -C ${worktreePath} apply ${x.patch}${x.applies ? '' : '   # does NOT apply cleanly: inspect it first'}`).join('\n')
+  await parkHunt({
+    reason: 'human_patch',
+    resumePhase: 'Code Review',
+    resolutionTypeExpected: 'clarify',
+    phaseLabel,
+    needFromUser: `The plan changes protected agent-config files that agents cannot edit (${files.join(', ')}). The Shepherd staged the change as ${pending.length} patch(es). Review, apply and commit them on feat/${slug}, then /resolve (clarify) to resume at Code Review.`,
+    context: `Apply (from any shell):\n${steps}\n  git -C ${worktreePath} add ${files.join(' ')}\n  git -C ${worktreePath} commit -m "fix(hooks): apply the Shepherd's staged patch"\nThe change is described in ${planDir}/shepherd-log.md under "## Human-Applied Patches".`,
+    options: `- A (clarify): applied and committed — resume at Code Review.\n- B (redirect): the change is wrong — re-plan.`,
+  })
+  return { slug, verdict: 'PARKED', status: 'parked:human_patch', reason: 'human_patch', tier, worktreePath }
 }
 
 // ─── Phase 4: Shepherd Implementation (skipped on resume) ──────
@@ -2483,6 +2556,7 @@ SAFETY RULES:
 - Do NOT run the test suite. Running tests is the TRACKER phase's job, not yours (your SKILL.md says this too). To confirm your code loads, the MOST you may do is a fast syntax/import check or "python manage.py check <app>" / "showmigrations <app>". NEVER invoke scripts/run_tests.sh — the full suite (especially against Cloud SQL via the proxy) can hang 30+ minutes and livelock the whole pipeline. Tracker runs the suite, scoped, in its own phase.
 - Do NOT modify files outside the worktree
 - Do NOT run git add . or git add -A
+${PROTECTED_PATCH_RULE}
 
 Do NOT ask the user. If you need to deviate from the plan, document it in shepherd-log.md.
 ${fallbackNote ? '' : CLAUDE_WRITER_RECORD}
@@ -2511,6 +2585,10 @@ ${rewriteDirective ? `${rewriteDirective}(A wrapper commits your changes after y
    documenting what you did, file by file, and any deviation from the plan with its reason.
 4. Do NOT modify files outside ${worktreePath}. Under .wolfpack/ touch ONLY shepherd-log.md.
    Do not write or edit test files unless the plan explicitly lists them as implementation.
+   NEVER edit a file under ${PROTECTED_AGENT_PATHS.join(', ')}: for each change the plan needs
+   there, write_file a unified diff (worktree-relative a/ b/ paths) to
+   ${HUMAN_PATCH_DIR}/<NN>-<short-name>.patch and list it in shepherd-log.md under
+   "## Human-Applied Patches". A human applies it.
 EFFICIENCY: start from dev_cortex_repo_map / dev_cortex_file_outline and grep; read only the
 line ranges you need — never whole 1000+ line files. Make ONE tool call at a time.
 End your response with a short list of every file you created or changed.`
@@ -2530,6 +2608,8 @@ End your response with a short list of every file you created or changed.`
   noteClaudeWrote()
 }
 log(`Code-writer families after Implement: ${[...codeWriterFamilies].join(', ')} (last writer: ${lastWriterFamily || 'none'})`)
+const implPatchPark = await humanPatchGate('Implement')
+if (implPatchPark) return implPatchPark
 }
 
 // ─── Phase 5: Pointer Code Review Loop (skipped on resume) ─────
@@ -2861,7 +2941,9 @@ REJECTED (say specifically why the finding is wrong). Skipping a finding is NOT 
 ${pointerChecklist}
 --- END CHECKLIST ---
 Update ${planDir}/shepherd-log.md (edit) with the disposition of each finding. Touch nothing
-outside ${worktreePath}; under .wolfpack/ touch ONLY shepherd-log.md. One tool call at a time.
+outside ${worktreePath}; under .wolfpack/ touch ONLY shepherd-log.md and ${HUMAN_PATCH_DIR}/.
+NEVER edit a file under ${PROTECTED_AGENT_PATHS.join(', ')}: write_file the change as a unified diff
+(worktree-relative a/ b/ paths) to ${HUMAN_PATCH_DIR}/<NN>-<short-name>.patch instead. One tool call at a time.
 End your response with EXACTLY ONE block, strict JSON, nothing after it:
 <dispositions>{"findingsAddressed":[{"id":1,"severity":"HIGH","title":"...","disposition":"ACCEPTED","justification":"..."}],"allAddressed":true}</dispositions>`
       const g = await runGlmShepherd({ mode: 'rewrite', round: pRound, task: glmRework, phaseLabel: 'Code Review' })
@@ -2904,6 +2986,7 @@ Return the findingsAddressed array with disposition (ACCEPTED or REJECTED) and j
 Set allAddressed to true only if every finding has a disposition.
 
 SAFETY: No git push, no deploy, no git add .
+${PROTECTED_PATCH_RULE}
 ${rewriteFallbackNote ? '' : CLAUDE_WRITER_RECORD}
 ${heartbeat('Code Review', `Shepherd rewrite round ${pRound}`)}${HUMAN_NOTES_DIRECTIVE}${convergenceMetaInstruction(planDir, pEntry, pv.detail.startsWith('converging') ? 'converging' : 'continue', pCumCrit)}
 `, { label: `shepherd-rewrite:${slug}:r${pRound}`, phase: 'Code Review', schema: REVISION_SCHEMA, model: shepherdModel })
@@ -2921,6 +3004,8 @@ ${heartbeat('Code Review', `Shepherd rewrite round ${pRound}`)}${HUMAN_NOTES_DIR
     } else {
       log(`Shepherd addressed all ${totalPtrFindings} Pointer findings`)
     }
+    const reworkPatchPark = await humanPatchGate('Code Review')
+    if (reworkPatchPark) return reworkPatchPark
   }
 }
 
