@@ -262,10 +262,14 @@ export function findWorktree(root, slug) {
 }
 
 // Tracked changes outside .wolfpack/ (untracked convenience symlinks never count).
-export function dirtyPaths(dir) {
+// Tracked uncommitted changes. `.wolfpack/` bookkeeping is exempt unless includeWolfpack is
+// set: a `git rebase` refuses ANY tracked dirt (pedigree index.md / pedigree.json included).
+export function dirtyPaths(dir, { includeWolfpack = false } = {}) {
   return git(['status', '--porcelain', '--untracked-files=no'], { cwd: dir }).stdout
-    .split('\n').filter(Boolean).map(l => l.slice(3).trim())
-    .filter(p => !p.startsWith('.wolfpack/'))
+    // git() trims stdout, so the FIRST line may have lost its leading status space: strip the
+    // XY code by shape, not by a fixed slice(3) (which ate the first path's first character).
+    .split('\n').filter(Boolean).map(l => l.replace(/^\s*\S{1,2}\s+/, '').replace(/^.* -> /, '').trim())
+    .filter(p => includeWolfpack || !p.startsWith('.wolfpack/'))
 }
 
 // Run fn(dir) in a temporary worktree checked out at `ref` (a branch name checks the branch
@@ -363,7 +367,8 @@ export function readCampaignMeta(root, c) {
 }
 export function writeCampaignMeta(root, c, meta) { writeJson(campaignMetaPath(root, c), meta) }
 
-// The campaign's hunts: the chain graph's keys (written by init), else metadata.hunts.
+// The campaign's hunts: the chain graph's keys (written by the runner's init), else
+// metadata.hunts (written by /expedition).
 export function campaignHunts(campaignMeta) {
   const m = campaignMeta || {}
   const g = (m.chain && m.chain.graph) || {}
@@ -401,8 +406,12 @@ export function cmdInit(root, { campaign, graph, at }) {
     created_at: prior.created_at || now,
     created_from: prior.created_from || (status === 'created' ? `main@${revParse(root, 'refs/heads/main')}` : `adopted@${sha}`),
     ...(status === 'adopted' ? { adopted_at: now } : {}),
-    graph: graph || prior.graph || {},
   }
+  // A graph-less init (the /run-campaign-local preflight) never writes an empty graph: the
+  // runner's own init supplies it, and until then campaignHunts reads metadata.hunts.
+  const g = graph || prior.graph
+  if (g && Object.keys(g).length) meta.chain.graph = g
+  else delete meta.chain.graph
   writeCampaignMeta(root, c, meta)
   return { status, branch, sha }
 }
@@ -503,11 +512,18 @@ export function cmdMergeHunt(root, { campaign, hunt, at }) {
   if (dirty.length) throw new ChainError(`${h}'s worktree has uncommitted changes outside .wolfpack/: ${dirty.join(', ')}`)
   const { meta: before } = readHuntMeta(root, h)
   if (!before) throw new ChainError(`no metadata.json for hunt ${h}`)
+  // Allow-list: only a certified (awaiting-merge) hunt or a reverted dependent. A mid-pipeline,
+  // quota-parked, blocked, merged or released hunt is refused — never merged uncertified.
   const cls = chainClass(before.status)
-  if (['released', 'campaign_merged', 'blocked'].includes(cls)) {
-    throw new ChainError(`${h} is ${before.status} — merge-hunt only merges a certified hunt or reapplies a reverted dependent`)
+  if (!['awaiting_merge', 'reverted_dep'].includes(cls)) {
+    throw new ChainError(`${h} is ${before.status || '(no status)'} — merge-hunt only merges a certified hunt or reapplies a reverted dependent`)
   }
   const reapply = before.status === CHAIN_STATUS.REVERTED_WITH_DEP
+  if (!reapply) {
+    // Normal mode rebases IN this worktree, and git rebase refuses tracked .wolfpack/ dirt too.
+    const wolfDirt = dirtyPaths(wt, { includeWolfpack: true }).filter(p => p.startsWith('.wolfpack/'))
+    if (wolfDirt.length) throw new ChainError(`${h}'s worktree has uncommitted tracked .wolfpack/ changes the rebase would refuse: ${wolfDirt.join(', ')} — commit or discard them, then re-run`)
+  }
 
   let commit
   if (reapply) {
@@ -615,7 +631,11 @@ export function cmdMergeHunt(root, { campaign, hunt, at }) {
 
 // ─── CLI ──────────────────────────────────────────────────────────
 
-export function parseFlags(argv) {
+// Free-text flags always take the next argument, even one that starts with "--" (a
+// `--reason "--force was wrong"` must not lose its value). Other flags stay boolean when
+// followed by another flag (`--version --apply`).
+export const TEXT_FLAGS = Object.freeze(['reason', 'by', 'deploy-cmd', 'migrate-cmd', 'graph'])
+export function parseFlags(argv, { text = TEXT_FLAGS } = {}) {
   const out = { _: [] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -624,7 +644,7 @@ export function parseFlags(argv) {
       if (eq !== -1) { out[a.slice(2, eq)] = a.slice(eq + 1); continue }
       const k = a.slice(2)
       const v = argv[i + 1]
-      if (v === undefined || v.startsWith('--')) out[k] = true
+      if (v === undefined || (v.startsWith('--') && !text.includes(k))) out[k] = true
       else { out[k] = v; i++ }
     } else out._.push(a)
   }

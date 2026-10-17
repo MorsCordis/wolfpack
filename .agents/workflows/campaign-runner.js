@@ -563,7 +563,13 @@ async function runChain(campaign) {
   const quotaDeferred = []          // parked:model_quota results this run
   const waiting = new Map()         // slug → { slug, on, rule }
   const cls = (s) => chainClass(status.get(s))
-  const blocked = () => hunts.filter(h => isBlockedStatus(status.get(h.slug)) || failed.has(h.slug)).map(h => h.slug)
+  // The hunts that block `slug`: every blocked/failed hunt except `slug` itself and the
+  // reverted dependents waiting on `slug` (reverted_because === slug). Those re-merge only
+  // AFTER `slug` is campaign-merged again, so counting them would be a circular wait (A-12).
+  const blockersFor = (slug) => hunts
+    .filter(h => h.slug !== slug && (isBlockedStatus(status.get(h.slug)) || failed.has(h.slug)))
+    .filter(h => !(cls(h.slug) === 'reverted_dep' && revertedBecause.get(h.slug) === slug))
+    .map(h => h.slug)
   const depMet = (d) => bySlug.has(d) && isDependencyMet(status.get(d))
   const depsMet = (h) => graph[h.slug].dependsOn.every(depMet)
   const firstUnmetDep = (h) => graph[h.slug].dependsOn.find(d => !depMet(d))
@@ -581,6 +587,10 @@ async function runChain(campaign) {
     if (!(prev && prev.on === c.with && prev.rule === c.rule)) log(`  ⏳ ${slug} waits: ${ruleText(c)}`)
   }
   const chainBase = { campaign: campaignSlug, mode: 'chain', branch }
+  // Pause returns: a compliance-held certification is still certified (recordResult agrees).
+  // The barrier-mode usagePausedReturn is shared and left unchanged (AC1), so chain overrides it.
+  const chainCertified = (rs) => rs
+    .filter(r => r.verdict === 'CERTIFIED_AWAITING_DEPLOY' || r.verdict === 'CERTIFIED_PENDING_COMPLIANCE').map(r => r.slug)
 
   log(`⛓ CHAIN MODE: ${campaignSlug} → ${branch} (max-parallel ${chainCap}; no wave barriers — release with /release-campaign ${campaignSlug})`)
   const init = await chainCli(`init --campaign ${shq(campaignSlug)} --graph ${shq(JSON.stringify(graph))}`, 'chain-init')
@@ -635,7 +645,7 @@ async function runChain(campaign) {
           markWaiting(h.slug, bySlug.has(d) ? { rule: (isBlockedStatus(status.get(d)) || failed.has(d)) ? 'a' : 'dep', with: d } : { rule: 'unknown_dep', with: d })
           continue
         }
-        const blockers = blocked().filter(b => b !== h.slug)
+        const blockers = blockersFor(h.slug)
         const conf = chainConflicts(h.slug, blockers, graph)
         if (conf.length) { markWaiting(h.slug, conf[0]); continue }
         if (blockers.length) {
@@ -647,9 +657,10 @@ async function runChain(campaign) {
             heldOn.set(h.slug, on)
             if (status.get(h.slug) !== CHAIN_STATUS.CERTIFIED_PENDING_COMPLIANCE) status.set(h.slug, CHAIN_STATUS.HELD_OVERLAP)
             waiting.delete(h.slug)
-            heldLog.push(h.slug)
+            const reHeld = heldLog.includes(h.slug)   // mergeStep runs again after each dependent
+            if (!reHeld) heldLog.push(h.slug)
             const files = [...new Set(on.flatMap(b => (ov.overlaps || {})[b] || []))]
-            log(`  ⏸ ${h.slug}: certified but HELD unmerged — ${ruleText({ rule: 'c', with: on.join(', '), files })}; it merges once ${on.join(', ')} is merged`)
+            if (!reHeld) log(`  ⏸ ${h.slug}: certified but HELD unmerged — ${ruleText({ rule: 'c', with: on.join(', '), files })}; it merges once ${on.join(', ')} is merged`)
             continue
           }
         }
@@ -699,7 +710,7 @@ async function runChain(campaign) {
     for (const h of pending) {
       const unknown = graph[h.slug].dependsOn.find(d => !bySlug.has(d))
       if (unknown) { markWaiting(h.slug, { rule: 'unknown_dep', with: unknown }); continue }
-      const conf = chainConflicts(h.slug, blocked(), graph)
+      const conf = chainConflicts(h.slug, blockersFor(h.slug), graph)
       if (conf.length) { markWaiting(h.slug, conf[0]); continue }
       waiting.delete(h.slug)
       runnable.push(h)
@@ -777,7 +788,7 @@ async function runChain(campaign) {
         campaign: campaignSlug,
         completed: false,
         verdict: 'WAVE_PAUSED_BUDGET',
-        certifiedHunts: waveResults.filter(r => r.verdict === 'CERTIFIED_AWAITING_DEPLOY').map(r => r.slug),
+        certifiedHunts: chainCertified(waveResults),
         parkedHunts: [],
         deferredHunts: deferred.map(h => ({ slug: h.slug, tier: h.tier })),
         failedHunts: [],
@@ -789,7 +800,7 @@ async function runChain(campaign) {
     }
     if (usageGateError) throw usageGateError   // loud, AFTER in-flight hunts finished
     if (usagePause) {
-      return { ...usagePausedReturn(usagePause, waveResults, independent.slice(cursor).concat(dependent), wave.number), mode: 'chain', branch }
+      return { ...usagePausedReturn(usagePause, waveResults, independent.slice(cursor).concat(dependent), wave.number), certifiedHunts: chainCertified(waveResults), mode: 'chain', branch }
     }
 
     // AC5: merge what certified, BEFORE the dependents (A-14: a same-wave dependent then forks
@@ -804,7 +815,7 @@ async function runChain(campaign) {
         markWaiting(hunt.slug, { rule: (isBlockedStatus(status.get(d)) || failed.has(d)) ? 'a' : 'dep', with: d })
         continue
       }
-      const conf = chainConflicts(hunt.slug, blocked(), graph)   // a dependency may have blocked during this wave
+      const conf = chainConflicts(hunt.slug, blockersFor(hunt.slug), graph)   // a dependency may have blocked during this wave
       if (conf.length) { markWaiting(hunt.slug, conf[0]); continue }
       const depShortfall = budgetShortfall(hunt.tier)
       if (depShortfall) {
@@ -816,7 +827,7 @@ async function runChain(campaign) {
           campaign: campaignSlug,
           completed: false,
           verdict: 'WAVE_PAUSED_BUDGET',
-          certifiedHunts: waveResults.filter(r => r.verdict === 'CERTIFIED_AWAITING_DEPLOY').map(r => r.slug),
+          certifiedHunts: chainCertified(waveResults),
           parkedHunts: [],
           deferredHunts: deferred.map(h => ({ slug: h.slug, tier: h.tier })),
           failedHunts: [],
@@ -833,6 +844,7 @@ async function runChain(campaign) {
           ...usagePausedReturn(
             { slug: hunt.slug, tier: normTier(hunt.tier), reason: depGate.reason, reset_at: depGate.reset_at, source: depGate.source },
             waveResults, dependent.slice(di), wave.number),
+          certifiedHunts: chainCertified(waveResults),
           mode: 'chain',
           branch,
         }

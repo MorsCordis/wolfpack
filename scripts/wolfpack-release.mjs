@@ -18,7 +18,7 @@
 //   sign-off       --campaign C --hunt H --by NAME [--at ISO]         record a Red/compliance sign-off
 //   check          --campaign C [--checkpoint]                        release preflight {ok, refusals, hunts}
 //   summary        --campaign C [--checkpoint]                        readable release summary (text)
-//   deploy         --campaign C --deploy-cmd CMD --migrate-cmd CMD    deploy campaign/C to dev, always back on main
+//   deploy         --campaign C --deploy-cmd CMD --migrate-cmd CMD    deploy campaign/C to dev, always back on the prior checkout
 //   changelog      --campaign C --version V [--apply] [--at ISO]      stamp included hunts' CHANGELOG lines under one heading
 //   merge-commands --campaign C --version V                           print the main merge (+ tag) commands (text)
 //   stamp-released --campaign C --version V [--at ISO]                stamp included hunts merged after the main merge
@@ -215,7 +215,10 @@ export function loadCampaign(root, campaign) {
   if (!meta || !meta.chain || meta.chain.mode !== 'chain') {
     throw new ChainError(`${campaign} is not a chain campaign (.wolfpack/campaigns/${campaign}/metadata.json has no chain.mode "chain") — use /merge-wave`)
   }
-  const hunts = campaignHunts(meta).map(slug => {
+  const slugs = campaignHunts(meta)
+  // Fail loud: an empty hunt list would let check/summary/changelog "pass" on nothing.
+  if (!slugs.length) throw new ChainError(`${campaign} has no hunts recorded (no chain.graph and no metadata.hunts in .wolfpack/campaigns/${campaign}/metadata.json) — run the campaign with /run-campaign-local ${campaign} --chain first`)
+  const hunts = slugs.map(slug => {
     const { meta: m } = readHuntMeta(root, slug)
     return { slug, ...(m || {}), status: m ? m.status : 'missing', __meta: m }
   })
@@ -431,6 +434,9 @@ export function cmdDeploy(root, { campaign, deployCmd, migrateCmd }) {
   if (!branchExists(root, branch)) throw new ChainError(`${branch} does not exist`)
   const dirty = git(['status', '--porcelain', '--untracked-files=no'], { cwd: root }).stdout
   if (dirty) throw new ChainError(`refusing: the main-repo tree has uncommitted changes (${dirty.split('\n').map(l => l.slice(3)).join(', ')})`)
+  // Restore whatever the operator had checked out (a branch by name, else the detached SHA).
+  const sym = git(['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: root, allowFail: true })
+  const original = sym.code === 0 && sym.stdout.trim() ? sym.stdout.trim() : revParse(root, 'HEAD')
   git(['checkout', '--quiet', '--detach', `refs/heads/${branch}`], { cwd: root })
   // The commands' own stdout goes to stderr so this CLI's stdout stays one parseable JSON object.
   const run = (cmd) => {
@@ -444,9 +450,9 @@ export function cmdDeploy(root, { campaign, deployCmd, migrateCmd }) {
     deployExit = run(deployCmd)
     if (deployExit === 0) migrateExit = run(migrateCmd)
   } finally {
-    restored = git(['checkout', '--quiet', 'main'], { cwd: root, allowFail: true }).code === 0
+    restored = git(['checkout', '--quiet', original], { cwd: root, allowFail: true }).code === 0
   }
-  return { deployExit, migrateExit, restored, branch }
+  return { deployExit, migrateExit, restored, restored_to: original, branch }
 }
 
 export function cmdChangelog(root, { campaign, version, apply, at }) {
