@@ -912,6 +912,149 @@ test('the resume probe schema REQUIRES latestRevisedPlan (an optional field was 
   assert.ok(find('resume-probe')[0].opts.schema.required.includes('latestRevisedPlan'))
 })
 
+// ════════════════════════════════════════════════════════════════════════════
+// CHAIN MODE (campaign-chain-mode): args.baseBranch "campaign/<slug>" — fork from, rebase onto
+// and diff against the LOCAL campaign branch; merge-and-await compliance; no per-hunt Verify.
+// ════════════════════════════════════════════════════════════════════════════
+const CHAIN_ARGS = { baseBranch: 'campaign/c1' }
+const OLD_BASE_RE = /main\.\.HEAD|origin\/main|pre-hunt-h main/
+const allPrompts = (calls) => calls.map(c => c.prompt).join('\n')
+
+test('AC3 chain: no prompt diffs against main or rebases onto origin/main; the scaffold forks from + tags the campaign branch and records base_branch', async () => {
+  const { calls, find, logs, result } = await runHunt({ args: CHAIN_ARGS })
+  for (const c of calls) assert.doesNotMatch(c.prompt, OLD_BASE_RE, `${c.label} still names main`)
+  const sc = find('scaffold')[0].prompt
+  assert.match(sc, /git worktree add \.agents\/worktrees\/h -b feat\/h campaign\/c1/)
+  assert.match(sc, /git tag -f pre-hunt-h campaign\/c1/)
+  assert.match(sc, /base_branch: "campaign\/c1"/)
+  assert.match(sc, /rollback point on campaign\/c1/)
+  assert.ok(logs.some(l => /⛓ h: chain mode — forks from, rebases onto and diffs against campaign\/c1/.test(l)))
+  // the code-review and certify seats diff against the campaign branch
+  assert.match(find('pointer:')[0].prompt, /git diff campaign\/c1\.\.HEAD/)
+  assert.match(find('watchdog:')[0].prompt, /git diff campaign\/c1\.\.HEAD/)
+  assert.match(find('compliance-gate')[0].prompt, /git diff --name-only campaign\/c1\.\.HEAD/)
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+})
+test('AC3 barrier: a run without baseBranch still carries all three main-based strings and no base_branch', async () => {
+  const { calls, find } = await runHunt()
+  const all = allPrompts(calls)
+  assert.match(all, /main\.\.HEAD/)
+  assert.match(all, /origin\/main/)
+  assert.match(all, /pre-hunt-h main/)
+  const sc = find('scaffold')[0].prompt
+  assert.match(sc, /git worktree add \.agents\/worktrees\/h -b feat\/h\n/)
+  assert.doesNotMatch(sc, /base_branch/)
+  assert.doesNotMatch(all, /campaign\//)
+})
+test('AC4 chain: both Shepherd paths rebase onto the LOCAL campaign branch (no fetch, no origin/), conflict handling unchanged', async () => {
+  const claude = await runHunt({ args: CHAIN_ARGS })
+  const sp = claude.find('shepherd:')[0].prompt
+  assert.match(sp, /CRITICAL FIRST STEP: Rebase onto campaign\/c1/)
+  assert.match(sp, /git rebase campaign\/c1/)
+  assert.doesNotMatch(sp, /git fetch|origin\//)
+  assert.match(sp, /git rebase --abort/)
+  assert.match(sp, /REBASE_CONFLICT/)
+  assert.match(sp, /"base_branch": "campaign\/c1"/)
+  assert.match(sp, /Self-check: git diff campaign\/c1\.\.HEAD/)
+  const glm = await runHunt({ args: CHAIN_ARGS, answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })
+  const gp = glm.find('shepherd-glm')[0].prompt
+  assert.match(gp, /REBASE FIRST \(worktree drift\): git rebase campaign\/c1\n/)
+  assert.doesNotMatch(gp, /git fetch|origin\//)
+  assert.match(gp, /git rebase --abort and return outcome "rebase_conflict"/)
+  assert.match(gp, /"base_branch": "campaign\/c1"/)
+  // barrier: the GLM wrapper still fetches + rebases onto origin/main, no base_branch line
+  const bglm = await runHunt({ answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })
+  const bgp = bglm.find('shepherd-glm')[0].prompt
+  assert.match(bgp, /git fetch origin && git rebase origin\/main/)
+  assert.doesNotMatch(bgp, /base_branch/)
+})
+test('AC4 chain: rewrite entries (Pointer / Tracker bounce) self-check against the campaign branch', async () => {
+  const probe = { ...RESUME_AT_CODE_REVIEW, status: 'code_rewrite_needed', resumePhase: 'Implement', baseBranch: 'campaign/c1', latestRevisedPlan: 0 }
+  const { find } = await runHunt({ rawArgs: 'h', answers: { 'resume-probe': probe } })
+  const sp = find('shepherd:')[0].prompt
+  assert.match(sp, /REWRITE ENTRY — Pointer round 1/)
+  assert.match(sp, /re-run your self-check \(git diff campaign\/c1\.\.HEAD\)/)
+})
+test('baseBranch validation: main, traversal and non-campaign values throw at hunt start', async () => {
+  for (const bad of ['main', 'campaign/../x', 'campaign/', 'feature/x', 'campaign/C1', 'campaign/a b']) {
+    await assert.rejects(runHunt({ args: { baseBranch: bad } }), /invalid baseBranch/, bad)
+  }
+})
+test('baseBranch sticks per hunt: probe-only → chain prompts; a conflicting arg throws; "" → barrier; a non-campaign stored value throws', async () => {
+  await assert.rejects(runHunt({ args: CHAIN_ARGS, answers: { 'resume-probe': { fresh: true, baseBranch: 'campaign/c2' } } }),
+    /base_branch campaign\/c2 ≠ args\.baseBranch campaign\/c1/)
+  const sticky = await runHunt({ answers: { 'resume-probe': { fresh: true, baseBranch: 'campaign/c1' } } })
+  for (const c of sticky.calls) assert.doesNotMatch(c.prompt, OLD_BASE_RE, c.label)
+  assert.match(sticky.find('scaffold')[0].prompt, /-b feat\/h campaign\/c1/)
+  const same = await runHunt({ args: CHAIN_ARGS, answers: { 'resume-probe': { fresh: true, baseBranch: 'campaign/c1' } } })
+  assert.match(same.find('shepherd:')[0].prompt, /git rebase campaign\/c1/)
+  const barrier = await runHunt({ answers: { 'resume-probe': { fresh: true, baseBranch: '' } } })
+  assert.match(allPrompts(barrier.calls), /pre-hunt-h main/)
+  assert.match(barrier.find('shepherd:')[0].prompt, /git fetch origin && git rebase origin\/main/)
+  await assert.rejects(runHunt({ answers: { 'resume-probe': { fresh: true, baseBranch: 'main' } } }), /is not a campaign branch/)
+})
+test('the resume probe REQUIRES baseBranch, checks commits against the base, and treats the chain statuses as DONE', async () => {
+  const { find } = await runHunt({ args: CHAIN_ARGS })
+  const p = find('resume-probe')[0]
+  assert.ok(p.opts.schema.required.includes('baseBranch'))
+  assert.equal(p.opts.schema.properties.baseBranch.type, 'string')
+  assert.match(p.prompt, /git log campaign\/c1\.\.feat\/h/)
+  assert.match(p.prompt, /"merged_to_campaign" \/ "merged_to_campaign_pending_compliance" \/ "certified_held_overlap" → "DONE"/)
+  assert.match(p.prompt, /baseBranch: ALWAYS return it/)
+  const b = await runHunt()
+  assert.match(b.find('resume-probe')[0].prompt, /git log main\.\.feat\/h/)
+})
+test('the pipeline carries the WOLFPACK_CHAIN_PROTOCOL marker the chain runner greps for', () => {
+  assert.match(SRC, /^\/\/ WOLFPACK_CHAIN_PROTOCOL=1$/m)
+})
+test('AC11 chain: the compliance gate firing → compliance-hold write (no park), CERTIFIED_PENDING_COMPLIANCE, no Verify', async () => {
+  const gate = { determined: true, complianceTouched: true, alreadySignedOff: false, touchedPaths: ['billing/services/payments.py'] }
+  const { result, find, logs } = await runHunt({ args: CHAIN_ARGS, answers: { 'compliance-gate': gate } })
+  assert.equal(find('park:').length, 0, 'no park payload in chain mode')
+  const hold = find('compliance-hold:h')
+  assert.equal(hold.length, 1)
+  assert.equal(hold[0].opts.model, 'sonnet')
+  assert.match(hold[0].prompt, /"status" = "certified_pending_compliance"/)
+  assert.match(hold[0].prompt, /"compliance_hold" block/)
+  assert.match(hold[0].prompt, /billing\/services\/payments\.py/)
+  assert.match(hold[0].prompt, /spec\.compliance_review_required = true/)
+  assert.match(hold[0].prompt, /Do NOT write parked\.md\. Do NOT touch the "park" block/)
+  assert.match(find('compliance-gate')[0].prompt, /git diff --name-only campaign\/c1\.\.HEAD/)
+  assert.match(find('compliance-gate')[0].prompt, /git diff --stat campaign\/c1\.\.HEAD/)
+  assert.equal(find('verify').length, 0)
+  assert.equal(result.verdict, 'CERTIFIED_PENDING_COMPLIANCE')
+  assert.equal(result.status, 'certified_pending_compliance')
+  assert.equal(result.reason, 'compliance_review')
+  assert.ok(logs.some(l => /chain mode: certified, will merge into campaign\/c1 as merged_to_campaign_pending_compliance/.test(l)))
+  // fail-closed: an INCONCLUSIVE gate in chain mode also holds (never a clean certify)
+  const inc = await runHunt({ args: CHAIN_ARGS, answers: { 'compliance-gate': { determined: false, complianceTouched: null, alreadySignedOff: false } } })
+  assert.equal(inc.result.verdict, 'CERTIFIED_PENDING_COMPLIANCE')
+  assert.match(inc.find('compliance-hold:h')[0].prompt, /path detection was inconclusive — failing closed/)
+})
+test('AC11 barrier: the same gate answer still parks compliance_review exactly as before', async () => {
+  const gate = { determined: true, complianceTouched: true, alreadySignedOff: false, touchedPaths: ['billing/x.py'] }
+  const { result, find } = await runHunt({ answers: { 'compliance-gate': gate } })
+  assert.equal(find('compliance-hold').length, 0)
+  assert.equal(find('park:h:compliance_review').length, 1)
+  assert.match(find('park:h:compliance_review')[0].prompt, /git -C .* diff main\.\.HEAD/)
+  assert.equal(result.verdict, 'PARKED')
+  assert.equal(result.status, 'parked:compliance_review')
+})
+test('A-13 chain: no per-hunt dev deploy (no verify call); the result is certified for the runner to merge', async () => {
+  const { result, find, logs } = await runHunt({ args: CHAIN_ARGS })
+  assert.equal(find('verify').length, 0)
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  assert.equal(result.status, 'certified')
+  assert.ok(logs.some(l => /per-hunt dev deploy skipped — \/release-campaign deploys campaign\/c1 once/.test(l)))
+  // a signed-off chain hunt also skips Verify
+  const signed = await runHunt({ args: CHAIN_ARGS, answers: { 'compliance-gate': { determined: true, complianceTouched: true, alreadySignedOff: true } } })
+  assert.equal(signed.find('verify').length, 0)
+  assert.equal(signed.result.status, 'certified')
+  // barrier still verifies
+  const b = await runHunt()
+  assert.equal(b.find('verify').length, 1)
+})
+
 test('protected paths: the Debrief flags hook/settings edits and every Shepherd prompt stages them as patches', async () => {
   const { find } = await runHunt()
   const debrief = find('debrief:')[0].prompt

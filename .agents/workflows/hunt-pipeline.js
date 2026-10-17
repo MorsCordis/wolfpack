@@ -134,10 +134,12 @@ const RESUME_SCHEMA = {
     humanNotesPresent: { type: 'boolean' },// human-notes.md exists (a /resolve answer landed)
     driftWarning: { type: 'string' },      // [Fix 3] diagnostic: main/worktree divergence one-liner, else null
     latestRevisedPlan: { type: 'number' }, // highest K of plan-revised-K.md in the plan dir, else 0
+    baseBranch: { type: 'string' },        // chain mode: metadata.base_branch, else "" (campaign-chain-mode)
   },
   // latestRevisedPlan is REQUIRED: as an optional field the probe silently dropped it and a
-  // resumed review restarted at round 1 (wave 2, second relaunch).
-  required: ['fresh', 'latestRevisedPlan'],
+  // resumed review restarted at round 1 (wave 2, second relaunch). baseBranch is REQUIRED for
+  // the same reason: a dropped field would silently diff a chain-mode hunt against main.
+  required: ['fresh', 'latestRevisedPlan', 'baseBranch'],
 }
 
 // [02] Park / resolve / resume. A hunt that can't safely proceed halts CLEANLY:
@@ -380,7 +382,7 @@ const _parseArgs = (a) => {
 }
 const _args = _parseArgs(args)
 const { slug, campaign, tier: campaignTier, mode: campaignMode,
-        ticketRefs, todoItemsCleared, migrationRisk, rationale, usageOffload } = _args
+        ticketRefs, todoItemsCleared, migrationRisk, rationale, usageOffload, baseBranch: argBase } = _args
 const descriptionPassed = typeof _args.description === 'string' && _args.description.trim() !== ''
 const description = descriptionPassed
   ? _args.description
@@ -391,6 +393,13 @@ const description = descriptionPassed
 // quoting our way around a hostile/garbled value later.
 if (!/^[a-z0-9][a-z0-9-]*$/.test(String(slug || ''))) {
   throw new Error(`hunt-pipeline: invalid slug ${JSON.stringify(slug)} — must match ^[a-z0-9][a-z0-9-]*$ (it is used in shell commands and paths)`)
+}
+
+// Chain mode (campaign-chain-mode): the campaign runner passes baseBranch "campaign/<slug>" — a
+// LOCAL integration branch the hunt forks from, rebases onto and diffs against (never pushed).
+// Validated like the slug: it is interpolated into git commands.
+if (!(argBase == null || /^campaign\/[a-z0-9][a-z0-9-]*$/.test(argBase))) {
+  throw new Error(`hunt-pipeline: invalid baseBranch ${JSON.stringify(argBase)} — must be campaign/<slug> (^campaign\\/[a-z0-9][a-z0-9-]*$) or absent`)
 }
 
 // POSIX single-quote a value for a shell command string: 'it'\''s' form. Every path /
@@ -408,8 +417,14 @@ const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
 // GLM Shepherd on every tier + Claude final review on Red/compliance) and stamps usage into
 // every host-side heartbeat + metadata.usage_delta. campaign-runner warns when it is absent.
 // WOLFPACK_USAGE_PROTOCOL=1
+// campaign-chain-mode: chain protocol 1 = honors args.baseBranch (fork from / rebase onto / diff
+// against campaign/<slug>, merge-and-await compliance, no per-hunt Verify). campaign-runner's
+// chain mode refuses to start without it (a stale copy would fork from main).
+// WOLFPACK_CHAIN_PROTOCOL=1
 const EXAMINER_PROTOCOL = 3
 void EXAMINER_PROTOCOL
+const CHAIN_PROTOCOL = 1
+void CHAIN_PROTOCOL
 
 // Git trailer stamped on every Shepherd AND Tracker commit ("Wolfpack-Writer: glm|claude|
 // mistral") — the DURABLE, git-side code-writer record. Tests are code on the branch, so the
@@ -727,9 +742,11 @@ Steps:
    - status "flawed_plan" → "Plan"           (the plan itself was rejected)
    - status "needs_spec" → "Spec"            (Spec parked it — re-spec/re-gate)
    - status "awaiting_user_deploy" → "DONE"
+   - status "merged_to_campaign" / "merged_to_campaign_pending_compliance" / "certified_held_overlap" → "DONE"
    - certification.md present → "Verify"
    - pointer-review-*.md present → "Test"
-   - shepherd-log.md present OR commits on feat/${slug} (git log main..feat/${slug}) → "Code Review"
+   - shepherd-log.md present OR commits on feat/${slug} (git log ${argBase || 'main'}..feat/${slug}) → "Code Review"
+     (use metadata.base_branch instead of main when it is set)
    - plan-final.md present → "Implement"
    - review-*.md present → "Debrief"
    - plan.md present → "Review"
@@ -772,6 +789,7 @@ Steps:
    - driftWarning: the one-line string from the DRIFT CHECK (step 4.5), or null.
    - latestRevisedPlan: the highest K among plan-revised-K.md files in the authoritative
      plan dir (ls it; K is an integer), or 0 if there are none.
+   - baseBranch: ALWAYS return it — metadata.base_branch if a non-empty string, else ""
 Return ONLY these fields.
 `, { label: `resume-probe:${slug}`, phase: 'Scaffold', schema: RESUME_SCHEMA })
 
@@ -783,6 +801,15 @@ Return ONLY these fields.
 if (resumeProbe.driftWarning) {
   log(`⚠️ DRIFT [${slug}]: main plan dir diverges from the worktree — ${resumeProbe.driftWarning}. Worktree is authoritative (resume unaffected), but main should NOT be written mid-hunt; investigate a phase writing main, or a legacy split.`)
 }
+
+// Chain mode sticks PER HUNT: a hunt scaffolded on campaign/<slug> keeps diffing against it on
+// every resume, even if a later invocation forgets the arg. A conflicting arg fails loud.
+const storedBase = (resumeProbe && resumeProbe.baseBranch) || null   // "" → null; stubs without the field read as barrier
+if (storedBase && !/^campaign\/[a-z0-9][a-z0-9-]*$/.test(storedBase)) throw new Error(`hunt-pipeline: ${slug} metadata.base_branch ${storedBase} is not a campaign branch`)
+if (argBase && storedBase && argBase !== storedBase) throw new Error(`hunt-pipeline: ${slug} base_branch ${storedBase} ≠ args.baseBranch ${argBase} — refusing to rebase a hunt onto a different campaign`)
+const baseBranch = argBase || storedBase || null        // chain sticks per hunt
+const BASE = baseBranch || 'main'                       // every diff site
+if (baseBranch) log(`⛓ ${slug}: chain mode — forks from, rebases onto and diffs against ${baseBranch} (local; never pushed)`)
 
 const fresh = resumeProbe.fresh !== false
 let resumeFrom = 'Scaffold'
@@ -917,11 +944,12 @@ Steps:
    - models: {} (Alpha will fill)
    - model_assignments: {} (Debrief will fill)
    - spec: { confidence: null, mode_for_build: null, ambiguity_open: false, compliance_critical: false, compliance_review_required: false } (the Spec phase will fill)
-   - proposed_version: { bump: null, tag: null }
+   - proposed_version: { bump: null, tag: null }${baseBranch ? `
+   - base_branch: "${baseBranch}"   (chain mode: the LOCAL campaign integration branch this hunt forks from, rebases onto and diffs against)` : ''}
 4. Create (or ADOPT) the git worktree — idempotent so a resumed/retried hunt never collides:
    - If .agents/worktrees/${slug} already EXISTS, do NOT recreate it — adopt it as-is and skip to step 5.
    - Else if branch feat/${slug} exists but the dir does not: git worktree add .agents/worktrees/${slug} feat/${slug}
-   - Else create fresh: git worktree add .agents/worktrees/${slug} -b feat/${slug}
+   - Else create fresh: git worktree add .agents/worktrees/${slug} -b feat/${slug}${baseBranch ? ` ${baseBranch}` : ''}
 5. Copy .wolfpack/plans/${slug}/ into the worktree:
    mkdir -p .agents/worktrees/${slug}/.wolfpack/plans/${slug}/
    cp .wolfpack/plans/${slug}/metadata.json .agents/worktrees/${slug}/.wolfpack/plans/${slug}/
@@ -932,12 +960,12 @@ Steps:
    If it succeeds, return adcValid: true
    If it fails, return adcValid: false — do NOT stop, just report
 
-9. SAFETY TAG — Create a rollback point on main BEFORE any work begins:
-   git tag -f pre-hunt-${slug} main   # -f so a resumed hunt re-tags cleanly
-   This tag marks the exact state of main before the hunt. If anything goes wrong:
+9. SAFETY TAG — Create a rollback point on ${BASE} BEFORE any work begins:
+   git tag -f pre-hunt-${slug} ${BASE}   # -f so a resumed hunt re-tags cleanly
+   This tag marks the exact state of ${BASE} before the hunt. If anything goes wrong:
    - git worktree remove --force .agents/worktrees/${slug}
    - git branch -D feat/${slug}
-   - main is unchanged (the tag proves it)
+   - ${BASE} is unchanged (the tag proves it)
 
 Return the worktree absolute path, tier (null at this stage), and adcValid boolean.
 Do NOT ask questions. Do NOT run Alpha or any planning.
@@ -1809,7 +1837,7 @@ const SHEPHERD_SEAT_SCHEMA = {
     testWriterFamilies: { type: 'array', items: { type: 'string' } },  // metadata.test_writer_families
     lastShepherdFamily: { type: 'string' },   // metadata.last_shepherd_family, or ""
     glmWritePending: { type: 'boolean' },     // metadata.glm_write_pending === true
-    gitWriterFamilies: { type: 'array', items: { type: 'string' } },  // Wolfpack-Writer trailers on main..HEAD
+    gitWriterFamilies: { type: 'array', items: { type: 'string' } },  // Wolfpack-Writer trailers on BASE..HEAD
     gitHeadWriter: { type: 'string' },        // the trailer on the newest trailer-bearing commit, or ""
     uncommittedChanges: { type: 'boolean' },  // app files dirty outside .wolfpack/
     usageOffload: { type: 'boolean' },        // metadata.usage_offload is set (an object) — usage-limit-gate
@@ -1840,9 +1868,9 @@ You are a READ-ONLY probe. Do NOT modify anything. Read ${planDir}/metadata.json
 - glmWritePending: metadata.glm_write_pending === true (else false).
 - gitWriterFamilies: the DISTINCT lowercase values of every "${WRITER_TRAILER}:" trailer on the
   branch's commits. Run (if the worktree exists; else []):
-    git -C ${shq(worktreePath)} log --format='%(trailers:key=${WRITER_TRAILER},valueonly)' main..HEAD
+    git -C ${shq(worktreePath)} log --format='%(trailers:key=${WRITER_TRAILER},valueonly)' ${BASE}..HEAD
   Also count a commit whose subject ends in "[glm-shepherd]" as "glm" (legacy/untrailered).
-- gitHeadWriter: the trailer value of the NEWEST commit in main..HEAD that has one, else "".
+- gitHeadWriter: the trailer value of the NEWEST commit in ${BASE}..HEAD that has one, else "".
 - uncommittedChanges: true if \`git -C ${shq(worktreePath)} status --porcelain\` lists any path
   outside .wolfpack/, else false.
 - usageOffload: true if metadata.usage_offload is set (a non-null object), else false.
@@ -1917,6 +1945,14 @@ const GLM_SHEPHERD_SCHEMA = {
 // (rebase, write the task file, run the shim, commit GLM's files by name). mode is
 // 'implement' (fresh build / reviewer-bounce entry) or 'rewrite' (a Pointer round).
 // Returns the wrapper's result, or a synthetic { outcome: 'failed' } if it dropped.
+// Chain mode: both Shepherd paths rebase onto the LOCAL campaign branch (no fetch, no origin/ —
+// it is never pushed) and make sure metadata records base_branch (heals a hunt scaffolded
+// before the campaign switched to chain mode). Barrier text is unchanged.
+const REBASE_CMD = baseBranch ? `git rebase ${baseBranch}` : 'git fetch origin && git rebase origin/main'
+const REBASE_LABEL = baseBranch || 'main'
+const BASE_META_LINE = baseBranch
+  ? `Ensure ${planDir}/metadata.json has "base_branch": "${baseBranch}" (set it if absent; preserve all other fields).`
+  : ''
 async function runGlmShepherd({ mode, round, task, phaseLabel }) {
   const tag = mode === 'implement' ? 'impl' : `r${round}`
   const base = `/tmp/shepherd-glm-${slug}-${tag}`
@@ -1939,8 +1975,9 @@ Plan dir: ${planDir}
 Steps:
 1. cd ${worktreePath}
 ${mode === 'implement'
-  ? `2. REBASE FIRST (worktree drift): git fetch origin && git rebase origin/main
-   If it fails: git rebase --abort and return outcome "rebase_conflict" immediately.`
+  ? `2. REBASE FIRST (worktree drift): ${REBASE_CMD}
+   If it fails: git rebase --abort and return outcome "rebase_conflict" immediately.${BASE_META_LINE ? `
+   ${BASE_META_LINE}` : ''}`
   : `2. No rebase for a rework round. Check the tree: git status --porcelain (ignore .wolfpack/).
    If app files are already modified/uncommitted, return outcome "failed", evidence "dirty tree before GLM rework".`}
 3. Write the GLM task to ${base}.txt with EXACTLY the text between the markers (use your
@@ -2508,7 +2545,7 @@ if (resumeStatus === 'test_rewrite_needed') {
 REWRITE ENTRY — Tracker round ${n} (NOT a fresh build): the code is already implemented and
 committed on feat/${slug}; the Tracker bounced it back. Read ${planDir}/tracker-report-${n}.md
 and fix EVERY finding it lists (all severities) — do not re-scaffold or re-implement settled
-plan items. After fixing, re-run your self-check (git diff main..HEAD) and commit on feat/${slug}.
+plan items. After fixing, re-run your self-check (git diff ${BASE}..HEAD) and commit on feat/${slug}.
 `
 } else if (resumeStatus === 'code_rewrite_needed') {
   const n = resumeProbe.pointerRounds || 1
@@ -2516,7 +2553,7 @@ plan items. After fixing, re-run your self-check (git diff main..HEAD) and commi
 REWRITE ENTRY — Pointer round ${n} (NOT a fresh build): the code is already implemented and
 committed on feat/${slug}; the Pointer bounced it back. Read ${planDir}/pointer-review-${n}.md
 and fix EVERY finding it lists (all severities) — do not re-scaffold or re-implement settled
-plan items. After fixing, re-run your self-check (git diff main..HEAD) and commit on feat/${slug}.
+plan items. After fixing, re-run your self-check (git diff ${BASE}..HEAD) and commit on feat/${slug}.
 `
 }
 
@@ -2535,18 +2572,19 @@ cd to ${worktreePath} before doing any work.
 ${fallbackNote ? `
 (Rebase already done by the GLM wrapper — skip it.)
 ` : `
-CRITICAL FIRST STEP: Rebase onto main to avoid worktree drift.
-  cd ${worktreePath} && git fetch origin && git rebase origin/main
+CRITICAL FIRST STEP: Rebase onto ${REBASE_LABEL} to avoid worktree drift.
+  cd ${worktreePath} && ${REBASE_CMD}
   If the rebase FAILS (conflict, diverged history, etc.):
   - Run: git rebase --abort
   - Return verdict "REBASE_CONFLICT" immediately — do NOT proceed with implementation
   - The user must resolve the conflict manually
 `}
-Only if rebase succeeds, execute ALL Shepherd instructions:
+Only if rebase succeeds, execute ALL Shepherd instructions:${BASE_META_LINE ? `
+- ${BASE_META_LINE}` : ''}
 - Read ${planDir}/plan-final.md and ${planDir}/debrief.md
 - Implement all plan items
 - Write ${planDir}/shepherd-log.md documenting what was done, any deviations
-- Self-check: git diff main..HEAD vs plan items
+- Self-check: git diff ${BASE}..HEAD vs plan items
 - Commit on feat/${slug} with conventional commit messages
 - Stage files by name only — NEVER git add . or git add -A
 
@@ -2692,7 +2730,7 @@ Steps:
 
 2. Write the review prompt to a temp file:
    Write to ${tmpFile}:
-   "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff main..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
+   "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff ${BASE}..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
 
 3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
 ${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChain, 'wolfpack-pointer', tmpFile, 'pointer')}
@@ -3188,7 +3226,7 @@ Steps:
    Build the prompt: "You are the Watchdog certifier for hunt '${slug}', tier ${tier}.
    Follow the Watchdog skill instructions.${tier === 'Red' ? ' SINGLE-PASS CERTIFICATION (mandatory, all models): do NOT spawn sub-agents or use the task tool. Run all certification lenses in ONE comprehensive pass, then emit the verdict block. Cross-model sub-agent fan-out is disabled.' : ''}
    Read plan-final.md at ${planDir}/plan-final.md,
-   shepherd-log.md, debrief.md, metadata.json. Run git diff main..HEAD for the code diff.
+   shepherd-log.md, debrief.md, metadata.json. Run git diff ${BASE}..HEAD for the code diff.
    Read .wolfpack/known-broken-tests.md and .wolfpack/cross-cutting-debt.md.
    EFFICIENCY (mandatory): certify from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the certification request.
    Write certification.md to ${planDir}/certification.md.
@@ -3345,7 +3383,7 @@ cd to ${worktreePath}.
    the park payload references this file by path, so it MUST exist (a missing summary
    here is the recurring bug this branch fixes: the spec-flag path used to STOP before
    the step-4 write). The whole diff is the compliance surface (no narrow path match), so:
-   run \`git diff --stat main..HEAD\` for the file list, then \`git diff main..HEAD\` and
+   run \`git diff --stat ${BASE}..HEAD\` for the file list, then \`git diff ${BASE}..HEAD\` and
    quote the risk-bearing hunks (controlled_substances; billing money/tax/PCI; records
    retention / soft-delete), noting each against the [compliance] criteria in
    ${planDir}/acceptance.md (if present). Keep it readable in under a minute. Do NOT
@@ -3357,7 +3395,7 @@ cd to ${worktreePath}.
    where a Spec-flagged hunt whose diff misses the narrow allowlist — e.g. an
    invoice-email feature touching billing/views.py — certified without sign-off.)
 
-2. Compute the touched files: \`git diff --name-only main..HEAD\` (run from the
+2. Compute the touched files: \`git diff --name-only ${BASE}..HEAD\` (run from the
    worktree). If that fails for any reason, return determined:false (the pipeline
    fails closed and parks). Otherwise determined:true.
 
@@ -3370,7 +3408,7 @@ ${COMPLIANCE_PATHS.map(p => `   - ${p}`).join('\n')}
 
 4. If any touched file matches, set complianceTouched:true and write a tight
    ${planDir}/compliance-summary.md: list the matched files, quote the relevant diff
-   hunks (\`git diff main..HEAD -- <file>\`, trimmed to the risk-bearing lines), and
+   hunks (\`git diff ${BASE}..HEAD -- <file>\`, trimmed to the risk-bearing lines), and
    note each against the [compliance] criteria in ${planDir}/acceptance.md (if present).
    Keep it readable in under a minute. Do NOT commit it.
 
@@ -3394,6 +3432,33 @@ ${heartbeat('Certify', 'compliance-review gate: scanning touched paths')}
     const why = complianceGate.determined === false
       ? 'path detection was inconclusive — failing closed'
       : `touches compliance risk surfaces: ${(complianceGate.touchedPaths || []).join(', ') || 'see compliance-summary.md'}`
+    if (baseBranch) {
+      // AC11 chain mode: merge-and-await, no park payload. The hunt certifies, merges into the
+      // campaign branch as merged_to_campaign_pending_compliance (its dependents may build on
+      // it), and the sign-off moves to the campaign release. Fail-closed is preserved: an
+      // inconclusive gate also lands here, so the hunt still cannot reach main unsigned
+      // (compliance_hold + spec.compliance_review_required survive every later status change).
+      log(`⏸ ${slug}: compliance surface (${why}) — chain mode: certified, will merge into ${baseBranch} as merged_to_campaign_pending_compliance; sign-off moves to the campaign release.`)
+      await agent(`
+You ONLY update metadata.json for Wolfpack hunt ${slug} — write-only bookkeeping. Do NOT plan,
+review, fix, merge or commit anything.
+
+cd to ${worktreePath}. Use absolute paths.
+
+1. Get the timestamp: run \`date -u +%Y-%m-%dT%H:%M:%SZ\` — call it NOW.
+2. Edit ${planDir}/metadata.json ${META_PRESERVE_NOTE}:
+   - set top-level "status" = "certified_pending_compliance"
+   - set a "compliance_hold" block:
+     { "reason": ${JSON.stringify(why)}, "touched_paths": ${JSON.stringify(complianceGate.touchedPaths || [])},
+       "summary": "${planDir}/compliance-summary.md", "held_at": "<NOW>" }
+   - and set spec.compliance_review_required = true (create "spec" if absent; keep its other fields)
+   Preserve every other field.
+Do NOT write parked.md. Do NOT touch the "park" block. Do NOT commit. Do NOT push. Do NOT git add.
+Return {ok:true}.
+${heartbeat('Certify', 'chain mode: recording compliance hold (merge-and-await)')}
+`, { label: `compliance-hold:${slug}`, phase: 'Certify', model: 'sonnet', schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } })
+      return { slug, verdict: 'CERTIFIED_PENDING_COMPLIANCE', status: 'certified_pending_compliance', reason: 'compliance_review', tier, worktreePath }
+    }
     log(`⛔ ${slug}: compliance-review checkpoint (${why}). Parking compliance_review before the release queue.`)
     await parkHunt({
       reason: 'compliance_review',
@@ -3401,7 +3466,7 @@ ${heartbeat('Certify', 'compliance-review gate: scanning touched paths')}
       resolutionTypeExpected: 'clarify',
       phaseLabel: 'Certify',
       needFromUser: `This certified hunt's diff ${why}. Read the compliance summary and sign off (or send it back). DEA: CS records ≥2yr, exact unit flow. NM: medical records ≥4yr, no hard-delete. PCI: card flow is SAQ A-EP.`,
-      context: `Compliance summary: ${planDir}/compliance-summary.md\nMatched surfaces: ${(complianceGate.touchedPaths || []).join(', ') || '(detection inconclusive — failing closed)'}\nFull diff: \`git -C ${worktreePath} diff main..HEAD\``,
+      context: `Compliance summary: ${planDir}/compliance-summary.md\nMatched surfaces: ${(complianceGate.touchedPaths || []).join(', ') || '(detection inconclusive — failing closed)'}\nFull diff: \`git -C ${worktreePath} diff ${BASE}..HEAD\``,
       options: `- A (clarify): compliant — sign off, proceed to deploy + smoke.\n- B (redirect): a compliance defect — send back to re-plan/rework.`,
     })
     return { slug, verdict: 'PARKED', status: 'parked:compliance_review', reason: 'compliance_review', tier, worktreePath }
@@ -3415,6 +3480,12 @@ ${heartbeat('Certify', 'compliance-review gate: scanning touched paths')}
 // Deploy the FEATURE BRANCH to dev (not main). Smoke test there.
 // Main stays clean until the user manually runs /merge after verification.
 phase('Verify')
+// A-13 chain mode: no per-hunt deploy guidance — /release-campaign deploys the campaign branch
+// ONCE for the whole campaign (AC14). The certified hunt goes back to the runner, which merges it.
+if (baseBranch) {
+  log(`Chain mode: per-hunt dev deploy skipped — /release-campaign deploys ${baseBranch} once.`)
+  return { slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', tier, findings: watchdogResult?.findings, worktreePath, status: 'certified' }
+}
 log(`Deploying feat/${slug} to dev for pre-merge verification`)
 
 const verifyResult = await agent(`

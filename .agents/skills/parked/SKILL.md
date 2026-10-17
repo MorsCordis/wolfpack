@@ -26,6 +26,7 @@ ready / <in-flight>   actionable / mid-pipeline           (cron)
 running               in pipeline                         (auto)
 parked:<reason>       halted, needs you                   (YOU)
 certified             done, in the release queue          (YOU, batched) [04]
+merged_to_campaign[_pending_compliance]  chain-mode done, awaiting the campaign release
 merged                terminal
 ```
 
@@ -41,6 +42,8 @@ merged                terminal
 | ⏳ | `model_quota` | both cross-model CLIs rate-limited [05] | usually just re-run later |
 | 🚧 | `smoke_pending_human` | wave smoke has un-runnable criteria [04] | run the manual criteria |
 | ⚠ | `rebase_conflict` | Shepherd rebase failed | resolve the conflict, then resume |
+| 🔀 | campaign_merge_conflict | chain auto-merge into campaign/<slug> conflicted | resolve: rebase feat/<slug> onto the campaign branch in its worktree, then clarify (resumes at Code Review) |
+| ↩ | reverted_from_campaign | reverted out of campaign/<slug> (smoke/review) | redirect or clarify with the fix; resumes at Implement on the rebuilt branch |
 | ❓ | `needs_spec` | Spec parked a low-confidence/ambiguous hunt [01] | answer the spec questions |
 
 `needs_spec` is shown by `/parked` but is resolved by re-running **`/spec <slug>`** (the

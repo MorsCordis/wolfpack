@@ -33,7 +33,12 @@ Before reading the plan or doing any git work:
 
 If `metadata.is_worktree` is true, the worktree may be stale — other hunts may have merged to main since this worktree was scaffolded. Working from stale files causes **silent regressions**: Shepherd writes code around old file state, which reverts changes from hunts that merged during planning/review. This has caused real regressions in production (tab behavior, template state).
 
-**Run immediately after Preflight, before reading any source files:**
+**Run immediately after Preflight, before reading any source files.** Read `metadata.base_branch` first.
+
+**If `metadata.base_branch` is set** (a chain-mode hunt, e.g. `campaign/<slug>`): run `git rebase <base_branch>`.
+It is a LOCAL ref: no fetch, no `origin/`, never push it.
+
+**Otherwise** run the two lines below unchanged:
 ```bash
 git fetch origin main
 git rebase origin/main
@@ -161,7 +166,7 @@ Pointer uses this file to understand what was implemented. Watchdog uses it to s
 Before handing off to Pointer (or Watchdog on Green tier):
 
 1. **shepherd-log.md is complete** — all items accounted for.
-2. **Mandatory Self-Check — `git diff` vs plan.** Before staging, run `git diff --stat main..HEAD` (or `HEAD~N` if you've committed progressively). Cross-reference the dirty + committed files against `plan-final.md`'s "Files to Modify" + "Files to Create" sections:
+2. **Mandatory Self-Check — `git diff` vs plan.** Before staging, run `git diff --stat <base>..HEAD` (`<base>` = `metadata.base_branch`, else `main`) (or `HEAD~N` if you've committed progressively). Cross-reference the dirty + committed files against `plan-final.md`'s "Files to Modify" + "Files to Create" sections:
    - **File changed that isn't in the plan** → stop. Flag to user: "Unexpected touch in `path/to/file` — is this scope creep or an accidental edit?"
    - **File in the plan that wasn't touched** → stop. Flag to user: "Plan calls for changes in `path/to/file` but diff shows no touch — was this item skipped or merged elsewhere?"
    - Both of these are hard stops. Don't commit past them — either surface to user, or fix and re-run the check.
@@ -302,7 +307,7 @@ Use model: the Tracker model (per `wolfpack-config.md` → Model Pool) with /tra
 
 **Self-verify before returning:**
 - [ ] All plan items addressed OR explicitly deviated+justified in shepherd-log.
-- [ ] Mandatory Self-Check passed: `git diff --stat main..HEAD` cross-references cleanly against plan's Files to Modify / Files to Create.
+- [ ] Mandatory Self-Check passed: `git diff --stat <base>..HEAD` (`<base>` = `metadata.base_branch`, else `main`) cross-references cleanly against plan's Files to Modify / Files to Create.
 - [ ] `shepherd-log.md` complete: plan items, files changed, human interventions, deviations, outstanding concerns.
 - [ ] `model_assignments.shepherd` written with current model in metadata.json.
 - [ ] Commit made on `feat/<slug>`, NOT on main.
