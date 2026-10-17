@@ -111,6 +111,7 @@ Match review depth to plan size. Read `metadata.json`'s `tier` and the plan's "F
 - Plan touches a compliance-sensitive area (per the project's **Compliance Requirements**) but proposes no new tests
 - Plan adds a model but no model-level test
 - Plan adds an API endpoint but no serializer test + permission test
+- `acceptance.md` with an automatable criterion (a command, test or browser steps could check it) tagged `[manual]`, or more than 2 `[manual]` criteria → MEDIUM: re-tag/rewrite as `[auto]` with its check
 
 **Deployment**
 - Plan violates the project's deployment invariants or runs a forbidden command (see the project's **Deployment** / **Rules** in `wolfpack-config.md`)
