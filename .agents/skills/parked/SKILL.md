@@ -38,6 +38,7 @@ merged                terminal
 | 🔒 | `compliance_review` | diff touched a CS/billing/records risk surface | clarify (sign off) or redirect (defect) |
 | 🔁 | `non_convergence` | a review loop never converged | clarify (proceed) or redirect (rework) |
 | 🐛 | `repro_failed` | bug not reproducible [01] | clarify (more repro detail) or redirect |
+| 🩹 | `human_patch` | the plan changes a protected agent-config file (`.claude/hooks/`, `.claude/settings*.json`) that agents cannot edit; the Shepherd staged it in `human-patches/` | apply + commit the patches (commands in parked.md), then clarify → resume at **Code Review** (`implementing_done`) |
 | ⏳ | `model_quota` | both cross-model CLIs rate-limited [05] | usually just re-run later |
 | 🚧 | `smoke_pending_human` | wave smoke has un-runnable criteria [04] | run the manual criteria |
 | ⚠ | `rebase_conflict` | Shepherd rebase failed | resolve the conflict, then resume |
