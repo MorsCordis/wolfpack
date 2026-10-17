@@ -234,8 +234,8 @@ export function releaseCheck(root, { campaign, checkpoint }) {
     refusals.push({ code: 'no_campaign_branch', detail: `${branch} does not exist` })
     return { ok: false, refusals, hunts: hunts.map(h => ({ slug: h.slug, status: h.status })) }
   }
-  const dirty = git(['status', '--porcelain', '--untracked-files=no'], { cwd: root }).stdout
-  if (dirty) refusals.push({ code: 'dirty_tree', detail: `the main-repo tree has uncommitted changes: ${dirty.split('\n').map(l => l.slice(3)).join(', ')}` })
+  const dirty = dirtyPaths(root, { includeWolfpack: true })
+  if (dirty.length) refusals.push({ code: 'dirty_tree', detail: `the main-repo tree has uncommitted changes: ${dirty.join(', ')}` })
   if (!isAncestor(root, 'refs/heads/main', `refs/heads/${branch}`)) refusals.push({ code: 'main_not_merged', detail: SYNC_REMEDY(campaign) })
   const included = new Set(includedHunts(hunts).map(h => h.slug))
   // Fail closed: ANY included hunt that still owes a sign-off refuses, whatever its status reads.
@@ -358,6 +358,11 @@ export function cmdRevert(root, { campaign, hunt, reason, at }) {
   if (!wt) throw new ChainError(`no worktree has feat/${hunt} checked out — cannot rebuild it after the revert`)
   const dirty = dirtyPaths(wt)
   if (dirty.length) throw new ChainError(`${hunt}'s worktree has uncommitted changes outside .wolfpack/: ${dirty.join(', ')}`)
+  // The rebuild runs `checkout --detach` + `revert` IN this worktree, and both refuse tracked
+  // .wolfpack/ dirt too (pedigree stragglers), so refuse it here, before anything is reverted,
+  // the same way cmdMergeHunt does before its rebase.
+  const wolfDirt = dirtyPaths(wt, { includeWolfpack: true }).filter(p => p.startsWith('.wolfpack/'))
+  if (wolfDirt.length) throw new ChainError(`${hunt}'s worktree has uncommitted tracked .wolfpack/ changes the rebuild would refuse: ${wolfDirt.join(', ')} — commit or discard them, then re-run`)
   const preSha = revParse(root, `refs/heads/${branch}`)
   const preTip = revParse(root, `refs/heads/feat/${hunt}`)
   const preRef = `refs/wolfpack/pre-revert/${hunt}`
@@ -432,8 +437,8 @@ export function cmdDeploy(root, { campaign, deployCmd, migrateCmd }) {
   if (/prod/i.test(deployCmd) || /prod/i.test(migrateCmd)) throw new ChainError('refusing: a deploy/migrate command mentions prod — this command deploys dev only')
   const { branch } = loadCampaign(root, campaign)
   if (!branchExists(root, branch)) throw new ChainError(`${branch} does not exist`)
-  const dirty = git(['status', '--porcelain', '--untracked-files=no'], { cwd: root }).stdout
-  if (dirty) throw new ChainError(`refusing: the main-repo tree has uncommitted changes (${dirty.split('\n').map(l => l.slice(3)).join(', ')})`)
+  const dirty = dirtyPaths(root, { includeWolfpack: true })
+  if (dirty.length) throw new ChainError(`refusing: the main-repo tree has uncommitted changes (${dirty.join(', ')})`)
   // Restore whatever the operator had checked out (a branch by name, else the detached SHA).
   const sym = git(['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: root, allowFail: true })
   const original = sym.code === 0 && sym.stdout.trim() ? sym.stdout.trim() : revParse(root, 'HEAD')

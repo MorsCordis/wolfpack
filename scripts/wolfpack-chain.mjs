@@ -54,6 +54,10 @@ export function chainClass(status) {
 }
 export const isDependencyMet = (status) => ['released', 'campaign_merged'].includes(chainClass(status))
 export const isBlockedStatus = (status) => ['blocked', 'reverted_dep'].includes(chainClass(status))
+// The statuses an overlap hold (rule c) may overwrite with HELD_OVERLAP. A pending-compliance
+// certification keeps its compliance flag, and a reverted_with_dependency hunt keeps its
+// reapply resolution and stays a blocker, so neither is in the list. Runner and CLI share it.
+export const HOLDABLE_STATUSES = Object.freeze(['certified', 'certified_not_merged', CHAIN_STATUS.HELD_OVERLAP])
 // graph: { [slug]: { dependsOn: string[], migrationApps: string[] } }
 // Returns Map dep → path, where path is the slug chain from `slug` to that dep inclusive
 // (x→y→b gives b → ['x','y','b']). Breadth-first, so each path is a shortest one; a
@@ -367,13 +371,15 @@ export function readCampaignMeta(root, c) {
 }
 export function writeCampaignMeta(root, c, meta) { writeJson(campaignMetaPath(root, c), meta) }
 
-// The campaign's hunts: the chain graph's keys (written by the runner's init), else
-// metadata.hunts (written by /expedition).
+// The campaign's hunts: the chain graph's keys (written by the runner's init) plus
+// metadata.hunts (written by /expedition), graph keys first, de-duplicated. A union, not a
+// fallback: the graph excludes BLOCKED-wave hunts, and a hunt missing from it must still count
+// (it reads status 'missing' → pending → an `unfinished` release refusal, failing closed).
 export function campaignHunts(campaignMeta) {
   const m = campaignMeta || {}
   const g = (m.chain && m.chain.graph) || {}
   const keys = Object.keys(g)
-  return keys.length ? keys : (Array.isArray(m.hunts) ? m.hunts : [])
+  return [...new Set([...keys, ...(Array.isArray(m.hunts) ? m.hunts : [])])]
 }
 
 // ─── Subcommands ──────────────────────────────────────────────────
@@ -452,8 +458,6 @@ const diffNames = (root, branch, slug) => {
     .split('\n').filter(Boolean).filter(p => !isBookkeepingPath(p))
 }
 
-const HOLDABLE = ['certified', 'certified_not_merged', CHAIN_STATUS.HELD_OVERLAP]
-
 export function cmdOverlap(root, { campaign, hunt, blockers }) {
   const c = need(campaign, 'campaign')
   const h = need(hunt, 'hunt')
@@ -476,7 +480,7 @@ export function cmdOverlap(root, { campaign, hunt, blockers }) {
       meta.held_on = Object.entries(overlaps).map(([slug, files]) => ({ slug, files }))
       // A certified_pending_compliance hunt KEEPS that status: the hold never erases the
       // compliance flag (chainClass already reads it as awaiting merge).
-      if (HOLDABLE.includes(meta.status)) meta.status = CHAIN_STATUS.HELD_OVERLAP
+      if (HOLDABLE_STATUSES.includes(meta.status)) meta.status = CHAIN_STATUS.HELD_OVERLAP
     })
   }
   return { overlaps, noDiff, held }

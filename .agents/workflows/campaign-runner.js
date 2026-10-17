@@ -447,6 +447,10 @@ function chainClass(status) {
 }
 const isDependencyMet = (status) => ['released', 'campaign_merged'].includes(chainClass(status))
 const isBlockedStatus = (status) => ['blocked', 'reverted_dep'].includes(chainClass(status))
+// The statuses an overlap hold (rule c) may overwrite with HELD_OVERLAP. A pending-compliance
+// certification keeps its compliance flag, and a reverted_with_dependency hunt keeps its
+// reapply resolution and stays a blocker, so neither is in the list. Runner and CLI share it.
+const HOLDABLE_STATUSES = Object.freeze(['certified', 'certified_not_merged', CHAIN_STATUS.HELD_OVERLAP])
 // graph: { [slug]: { dependsOn: string[], migrationApps: string[] } }
 // Returns Map dep → path, where path is the slug chain from `slug` to that dep inclusive
 // (x→y→b gives b → ['x','y','b']). Breadth-first, so each path is a shortest one; a
@@ -655,7 +659,8 @@ async function runChain(campaign) {
           if (ov.held === true) {
             const on = Object.keys(ov.overlaps || {})
             heldOn.set(h.slug, on)
-            if (status.get(h.slug) !== CHAIN_STATUS.CERTIFIED_PENDING_COMPLIANCE) status.set(h.slug, CHAIN_STATUS.HELD_OVERLAP)
+            // Same rule as the CLI's on-disk stamp: only HOLDABLE_STATUSES become HELD_OVERLAP.
+            if (HOLDABLE_STATUSES.includes(status.get(h.slug))) status.set(h.slug, CHAIN_STATUS.HELD_OVERLAP)
             waiting.delete(h.slug)
             const reHeld = heldLog.includes(h.slug)   // mergeStep runs again after each dependent
             if (!reHeld) heldLog.push(h.slug)
