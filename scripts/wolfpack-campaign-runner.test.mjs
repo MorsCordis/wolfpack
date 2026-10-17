@@ -885,3 +885,44 @@ test('15a: a run ending CAMPAIGN_AWAITING_HUMAN makes no final sync and points a
   assert.equal(r.labels.includes('chain-sync-main:final'), false)
   assert.ok(r.logs.some(l => /\/release-campaign c1 --checkpoint/.test(l)))
 })
+
+// ── Pointer r1 (round 3) F1: the runner's rule-(c) hold shares the CLI's HOLDABLE_STATUSES ──
+test('Pointer r1 F1 (round 3): a reapply-ready reverted dependent held by rule c KEEPS reverted_with_dependency and still blocks an overlapping hunt', async () => {
+  // b is parked (an unrelated blocker). h re-certified and merges first, so d (reverted because
+  // of h) is reapply-ready; d's diff overlaps b → held. d must stay reverted_with_dependency in the
+  // live map, so it is still a blocker when g is judged: g's overlap call names b AND d.
+  const r = await runChainRunner([[
+    ch('b', { status: 'parked:open_critical' }),
+    ch('h', { status: 'certified' }),
+    ch('d', { status: 'reverted_with_dependency', revertedBecause: 'h', dependsOn: ['h'] }),
+    ch('g', { status: 'certified' }),
+  ]], {
+    overlap: (slug) => (slug === 'd' ? { held: true, overlaps: { b: ['app/shared.py'] }, noDiff: [], exitCode: 0 }
+      : slug === 'g' ? { held: true, overlaps: { d: ['app/d.py'] }, noDiff: [], exitCode: 0 }
+        : { held: false, overlaps: {}, noDiff: [], exitCode: 0 }) })
+  noErr(r)
+  assert.deepEqual(r.labels.filter(l => l.startsWith('chain-merge:')), ['chain-merge:h'], 'only h merges: d is held, g is held on d')
+  assert.match(r.agentCalls.find(c => c.label === 'chain-overlap:d').prompt, /--hunt 'd' --blockers 'b'/)
+  assert.match(r.agentCalls.find(c => c.label === 'chain-overlap:g').prompt, /--hunt 'g' --blockers 'b,d'/,
+    'the held reverted dependent is still a blocker for g')
+  const bd = r.result.blockedHunts.find(x => x.slug === 'd')
+  assert.ok(bd, 'd is reported among the blocked hunts (its status was not clobbered)')
+  assert.equal(bd.status, 'reverted_with_dependency')
+  assert.equal(r.result.heldHunts.some(x => x.slug === 'd'), false, 'd is not misclassified as certified_held_overlap')
+  assert.deepEqual(r.result.heldHunts, [{ slug: 'g', status: 'certified_held_overlap', heldOn: ['d'] }])
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+  assert.ok(r.logs.some(l => /⏸ d: certified but HELD unmerged — its diff overlaps blocked b \(app\/shared\.py\)/.test(l)), r.logs.join('\n'))
+})
+test('Pointer r1 F1 (round 3): a held certified_pending_compliance hunt keeps its status in the live map; a plain certified one becomes certified_held_overlap', async () => {
+  const r = await runChainRunner([[
+    ch('b', { status: 'parked:open_critical' }),
+    ch('red', { status: 'certified_pending_compliance' }),
+    ch('g', { status: 'certified' }),
+  ]], { overlap: () => ({ held: true, overlaps: { b: ['x.py'] }, noDiff: [], exitCode: 0 }) })
+  noErr(r)
+  assert.equal(r.labels.some(l => l.startsWith('chain-merge:')), false)
+  assert.deepEqual(r.result.heldHunts, [
+    { slug: 'red', status: 'certified_pending_compliance', heldOn: ['b'] },
+    { slug: 'g', status: 'certified_held_overlap', heldOn: ['b'] },
+  ])
+})

@@ -20,7 +20,7 @@ import {
   CHAIN_STATUS, chainClass, isDependencyMet, isBlockedStatus, dependencyClosure, chainConflicts,
   isBookkeepingPath, isLineMergeablePath, mergeLineSets, needsComplianceHold, renderParkRecord, parkBlock,
   revertTargets, parseFlags, TEXT_FLAGS, campaignHunts, dirtyPaths, findWorktree, readCampaignMeta,
-  cmdInit, cmdSyncMain, cmdOverlap, cmdMergeHunt, ChainError,
+  cmdInit, cmdSyncMain, cmdOverlap, cmdMergeHunt, ChainError, HOLDABLE_STATUSES,
 } from './wolfpack-chain.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -722,6 +722,38 @@ test('overlap: a certified_pending_compliance hunt that overlaps is held but KEE
   assert.equal(r.held, true)
   const m = metaWt(root, 'red')
   assert.equal(m.status, CHAIN_STATUS.CERTIFIED_PENDING_COMPLIANCE)
+  assert.deepEqual(m.held_on, [{ slug: 'b', files: ['app.txt'] }])
+})
+test('HOLDABLE_STATUSES (Pointer r1 round 3 F1): exactly the plain certified statuses; frozen; never pending-compliance or a reverted dependent', () => {
+  assert.deepEqual([...HOLDABLE_STATUSES], ['certified', 'certified_not_merged', CHAIN_STATUS.HELD_OVERLAP])
+  assert.equal(Object.isFrozen(HOLDABLE_STATUSES), true)
+  for (const s of [CHAIN_STATUS.CERTIFIED_PENDING_COMPLIANCE, CHAIN_STATUS.REVERTED_WITH_DEP, CHAIN_STATUS.MERGED, CHAIN_STATUS.MERGE_CONFLICT, 'parked:open_critical']) {
+    assert.equal(HOLDABLE_STATUSES.includes(s), false, s)
+  }
+  // every holdable status reads as awaiting a merge (the hold never moves a hunt between classes)
+  for (const s of HOLDABLE_STATUSES) assert.equal(chainClass(s), 'awaiting_merge', s)
+})
+test('overlap (Pointer r1 round 3 F1): a held reverted_with_dependency hunt KEEPS its status and reverted_because; held_on is still written', () => {
+  const root = mkRepo()
+  addHunt(root, 'b', { edits: { 'app.txt': APP.replace('l4', 'b') }, status: 'parked:open_critical' })
+  addHunt(root, 'd', { edits: { 'app.txt': APP.replace('l1', 'd') }, status: CHAIN_STATUS.REVERTED_WITH_DEP, meta: { reverted_because: 'h' } })
+  writeMeta(root, 'd', { feature: 'd', status: CHAIN_STATUS.REVERTED_WITH_DEP, reverted_because: 'h' }, { main: true })
+  const r = cmdOverlap(root, { campaign: 'c', hunt: 'd', blockers: 'b' })
+  assert.deepEqual(r, { overlaps: { b: ['app.txt'] }, noDiff: [], held: true })
+  for (const m of Object.values(metaBoth(root, 'd'))) {
+    assert.equal(m.status, CHAIN_STATUS.REVERTED_WITH_DEP)
+    assert.equal(m.reverted_because, 'h')
+    assert.deepEqual(m.held_on, [{ slug: 'b', files: ['app.txt'] }])
+  }
+})
+test('overlap: re-holding an already certified_held_overlap hunt keeps that status and refreshes held_on', () => {
+  const root = mkRepo()
+  addHunt(root, 'b', { edits: { 'app.txt': APP.replace('l4', 'b') }, status: 'parked:open_critical' })
+  addHunt(root, 'g', { edits: { 'app.txt': APP.replace('l1', 'g') }, status: CHAIN_STATUS.HELD_OVERLAP, meta: { held_on: [{ slug: 'old', files: ['z'] }] } })
+  const r = cmdOverlap(root, { campaign: 'c', hunt: 'g', blockers: 'b' })
+  assert.equal(r.held, true)
+  const m = metaWt(root, 'g')
+  assert.equal(m.status, CHAIN_STATUS.HELD_OVERLAP)
   assert.deepEqual(m.held_on, [{ slug: 'b', files: ['app.txt'] }])
 })
 test('overlap: validates slugs and the campaign branch', () => {

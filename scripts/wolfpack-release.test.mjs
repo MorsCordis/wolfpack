@@ -475,6 +475,50 @@ test('AC10: a dirty H worktree → refused BEFORE any revert (nothing touched)',
   assert.equal(rGetMeta(root, 'h').status, CS.MERGED)
   assert.equal(rGetMeta(root, 'd').status, CS.MERGED)
 })
+test('AC10 (Pointer r1 round 3 F3): tracked .wolfpack/ dirt in H\'s worktree → refused BEFORE any revert, naming the path (nothing touched)', () => {
+  const root = rRepo({ graph: REV_GRAPH })
+  const hwt = rHunt(root, 'h', { edits: { 'h.txt': 'h\n', '.wolfpack/pedigree/h.md': '# h pedigree\n' } })
+  rHunt(root, 'd')
+  const before = rsha(root, 'campaign/c')
+  const tip = rsha(root, 'feat/h')
+  writeFileSync(join(hwt, '.wolfpack', 'pedigree', 'h.md'), '# h pedigree\nstraggler\n')
+  assert.throws(() => cmdRevert(root, { campaign: 'c', hunt: 'h', reason: 'smoke failed', at: RAT }),
+    /h's worktree has uncommitted tracked \.wolfpack\/ changes the rebuild would refuse: \.wolfpack\/pedigree\/h\.md — commit or discard them, then re-run/)
+  assert.equal(rsha(root, 'campaign/c'), before, 'campaign branch unchanged')
+  assert.equal(rsha(root, 'feat/h'), tip, 'feat/h unchanged')
+  assert.equal(rg(hwt, 'branch', '--show-current'), 'feat/h')
+  assert.equal(rGetMeta(root, 'h').status, CS.MERGED)
+  assert.equal(rGetMeta(root, 'd').status, CS.MERGED)
+  assert.equal(rgOk(root, 'rev-parse', '--verify', '--quiet', 'refs/wolfpack/pre-revert/h'), false, 'no pre-revert ref written')
+  assert.equal(rg(root, 'worktree', 'list', '--porcelain').includes('wolfpack-chain-'), false)
+  // the dirt is the operator's: still there, untouched
+  assert.equal(nfs.readFileSync(join(hwt, '.wolfpack', 'pedigree', 'h.md'), 'utf8'), '# h pedigree\nstraggler\n')
+  // the CLI reports it as exit 2 with the same message
+  const cli = rCli(root, {}, 'revert', '--campaign', 'c', '--hunt', 'h', '--reason', 'smoke failed')
+  assert.equal(cli.code, 2)
+  assert.equal(cli.json.status, 'error')
+  assert.equal(rsha(root, 'campaign/c'), before)
+  // ignored plan-dir files and untracked .wolfpack/ files are NOT dirt: once the tracked file is
+  // restored the revert proceeds even with them present
+  rg(hwt, 'checkout', '--', '.wolfpack/pedigree/h.md')
+  writeFileSync(join(hwt, '.wolfpack', 'pedigree', 'untracked.md'), 'new\n')
+  const r = cmdRevert(root, { campaign: 'c', hunt: 'h', reason: 'smoke failed', at: RAT })
+  assert.equal(r.status, 'reverted')
+  assert.deepEqual(r.reverted.map(t => t.slug), ['d', 'h'])
+})
+test('check / deploy: a dirty .wolfpack/ tracked file in the MAIN repo counts as dirt (includeWolfpack), named in full', () => {
+  const root = rRepo({ graph: { a: { dependsOn: [] } } })
+  rput(root, '.wolfpack/pedigree/index.md', '# pedigree\n')
+  rg(root, 'add', '--', '.wolfpack/pedigree/index.md')
+  rg(root, 'commit', '-q', '-m', 'pedigree')
+  rput(root, '.wolfpack/pedigree/index.md', '# pedigree\nedited\n')
+  const c = releaseCheck(root, { campaign: 'c', checkpoint: true })
+  const dt = c.refusals.find(x => x.code === 'dirty_tree')
+  assert.ok(dt, JSON.stringify(c.refusals))
+  assert.equal(dt.detail, 'the main-repo tree has uncommitted changes: .wolfpack/pedigree/index.md')
+  assert.throws(() => cmdDeploy(root, { campaign: 'c', deployCmd: 'true', migrateCmd: 'true' }),
+    /refusing: the main-repo tree has uncommitted changes \(\.wolfpack\/pedigree\/index\.md\)/)
+})
 test('AC10: a rebuild that fails (WOLFPACK_CHAIN_FAULT=rebuild) rolls the campaign branch back and leaves feat/H checked out, nothing stamped', () => {
   const root = rRepo({ graph: REV_GRAPH })
   const hwt = rHunt(root, 'h')
