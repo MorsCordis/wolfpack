@@ -47,6 +47,7 @@ Before reading any files:
 3. **Read Pointer reviews.** `$PLAN_DIR/pointer-review-*.md` — code review findings (may inform edge cases to test).
 4. **Read prior Tracker logs** if this is a re-run: `$PLAN_DIR/tracker-log.md`, `$PLAN_DIR/tracker-report-*.md`.
 5. **Get the diff.** `git diff main..HEAD` — the actual code changes to test.
+   (Chain-mode hunt: when `metadata.base_branch` is set, use it in place of `main` everywhere in this skill.)
 6. **Read `wolfpack-config.md` and AGENTS.md.** Non-negotiable rules live there.
 
 ## Test-Environment Preflight

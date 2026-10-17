@@ -349,3 +349,580 @@ test('legacy gate: failures still throw loud — null, error, exit 1, decision/e
     assert.equal(workflowCalls.length, 0, `nothing scaffolded for ${JSON.stringify(bad)}`)
   }
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// CHAIN MODE (campaign-chain-mode) — runChain() driven through the whole runner body.
+// The chain-* agents are the deterministic wolfpack-chain.mjs CLI steps; here they are
+// stubbed by label so each scenario controls init / sync-main / overlap / merge-hunt results.
+// ════════════════════════════════════════════════════════════════════════════
+import { execFileSync as chainExec } from 'node:child_process'
+
+const CHAIN_CAP = { path: '.claude/workflows/hunt-pipeline.js', protocol: 3, usageProtocol: 1, gatePresent: true, gateProtocol: 1,
+  chainProtocol: 1, chainScriptPresent: true }
+const ch = (slug, extra = {}) => ({ slug, description: `do ${slug}`, tier: 'Yellow', mode: 'feature', dependsOn: [], status: 'ready_for_alpha',
+  migrationApps: [], revertedBecause: null, heldOn: [], ...extra })
+const CERT = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', status: 'certified' })
+
+// Generic runner: any runner source, a parse result, and per-label stubs.
+async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => PROCEED, workflowResult = CERT,
+  init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] } } = {}) {
+  const events = []
+  const logs = []
+  const workflowCalls = []
+  const agentCalls = []
+  const counts = {}
+  const agent = async (prompt, opts = {}) => {
+    const label = opts.label || ''
+    agentCalls.push({ label, prompt, opts })
+    events.push({ type: 'agent', label })
+    if (label === 'parse-campaign') return JSON.parse(JSON.stringify(parse))
+    if (label === 'pipeline-capability') return capability == null ? null : { ...capability }
+    if (label.startsWith('usage-gate:') || label.startsWith('usage-gate-legacy:')) {
+      const v = gate(label.slice(label.indexOf(':') + 1)); return v == null ? null : JSON.parse(JSON.stringify(v))
+    }
+    if (label.startsWith('dep-check:')) return depCheck
+    if (label === 'crosswave-dep-check') return crosswave
+    counts[label] = (counts[label] || 0) + 1
+    if (label === 'chain-init') return init ? init(prompt) : { status: 'created', branch: 'campaign/c1', sha: 'a1b2c3d4e5f6a7b8', exitCode: 0 }
+    if (label.startsWith('chain-sync-main:')) return sync ? sync(label, counts[label]) : { status: 'up_to_date', sha: 's', files: [], warning: null, exitCode: 0 }
+    if (label.startsWith('chain-overlap:')) return overlap ? overlap(label.slice('chain-overlap:'.length), counts[label]) : { held: false, overlaps: {}, noDiff: [], exitCode: 0 }
+    if (label.startsWith('chain-merge:')) {
+      const slug = label.slice('chain-merge:'.length)
+      return merge ? merge(slug, counts[label]) : { status: 'merged', commit: `merge-${slug}-0000000`, stamped: 'merged_to_campaign', exitCode: 0 }
+    }
+    return {}
+  }
+  const workflow = async (name, a) => {
+    workflowCalls.push({ name, args: a })
+    events.push({ type: 'workflow-start', slug: a.slug })
+    await tick()
+    events.push({ type: 'workflow-end', slug: a.slug })
+    return workflowResult(a)
+  }
+  const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'process', 'workflow', src)
+  let result, error
+  try {
+    result = await fn(args, agent, async (f) => Promise.all(f.map(x => x())), (m) => logs.push(String(m)), () => {},
+      { total: 0, remaining: () => 1e12 }, { env: {} }, workflow)
+  } catch (e) { error = e }
+  events.push({ type: 'return' })
+  const idx = (pred) => events.findIndex(pred)
+  return { result, error, events, logs, workflowCalls, agentCalls, idx,
+    labels: events.filter(e => e.type === 'agent').map(e => e.label),
+    wf: workflowCalls.map(w => w.args.slug) }
+}
+const parseOf = (waves, top = {}) => ({ waves: waves.map((hunts, i) => ({ number: i + 1, hunts })), ...top })
+const runChainRunner = (waves, { top = { chainMode: false, chainBranch: '' }, args = {}, ...rest } = {}) =>
+  runAny(RUNNER, { parse: parseOf(waves, top), args: { campaignSlug: 'c1', chain: true, ...args }, ...rest })
+const mergedStamp = (stamped) => (slug) => ({ status: 'merged', commit: `merge-${slug}-0000000`, stamped: typeof stamped === 'function' ? stamped(slug) : stamped, exitCode: 0 })
+const noErr = (r) => assert.equal(r.error, undefined, r.error && r.error.stack)
+
+// ── 1. AC1 differential: barrier mode vs the pre-hunt runner ─────────────────
+// Pinned to the last pre-hunt commit that touched the runner (plan A-16); overridable.
+const BARRIER_BASELINE_REF = process.env.WOLFPACK_BARRIER_BASELINE_REF || 'df56d3f40d43ca14f1a7647c0343813307173de7'
+function baselineRunner() {
+  try {
+    return chainExec('git', ['show', `${BARRIER_BASELINE_REF}:.agents/workflows/campaign-runner.js`], { cwd: join(here, '..'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+      .replace(/^export const meta/m, 'const meta')
+  } catch { return null }
+}
+test('AC1: barrier mode (no chain) is identical to the pre-hunt runner — labels, workflow args, return value', async (t) => {
+  const base = baselineRunner()
+  if (!base) {
+    // A skip means AC1's differential was NOT executed — report it as uncovered, never as a pass.
+    t.skip(`AC1 NOT EXECUTED: baseline ref ${BARRIER_BASELINE_REF} cannot be resolved (shallow clone?) — set WOLFPACK_BARRIER_BASELINE_REF`)
+    return
+  }
+  assert.doesNotMatch(base, /runChain|WOLFPACK_CHAIN_RUNNER/, 'the baseline really predates chain mode')
+  const waves = [[hunt('a'), hunt('b'), hunt('c')], [hunt('d')]]
+  const results = {
+    a: { slug: 'a', verdict: 'CERTIFIED_AWAITING_DEPLOY' },
+    b: { slug: 'b', verdict: 'PARKED', status: 'parked:open_critical', reason: 'open_critical' },
+    c: { slug: 'c', verdict: 'PARKED', status: 'parked:compliance_review', reason: 'compliance_review' },
+    d: { slug: 'd', verdict: 'CERTIFIED_AWAITING_DEPLOY' },
+  }
+  const opts = { parse: parseOf(waves), args: { campaignSlug: 'c1', maxParallel: 1 }, capability: { ...CHAIN_CAP, chainProtocol: 0, chainScriptPresent: false },
+    workflowResult: (a) => ({ ...results[a.slug] }) }
+  const old = await runAny(base, opts)
+  const now = await runAny(RUNNER, opts)
+  noErr(old); noErr(now)
+  assert.deepEqual(now.labels, old.labels)
+  assert.deepEqual(now.workflowCalls, old.workflowCalls)
+  for (const w of now.workflowCalls) assert.equal('baseBranch' in w.args, false)
+  assert.deepEqual(now.result, old.result)
+  assert.equal(now.labels.some(l => l.startsWith('chain-')), false)
+  // also with the parse returning the new chain fields set to their barrier values
+  const now2 = await runAny(RUNNER, { ...opts, parse: parseOf(waves.map(w => w.map(h => ({ ...h, migrationApps: [], revertedBecause: null, heldOn: [], baseBranch: '' }))), { chainMode: false, chainBranch: '' }) })
+  noErr(now2)
+  assert.deepEqual(now2.labels, old.labels)
+  assert.deepEqual(now2.result, old.result)
+})
+
+// ── 2–4. AC2 opt-in and sticky ───────────────────────────────────────────────
+test('AC2 first run: chain:true → chain-init (with --graph) before any workflow; every workflow gets baseBranch campaign/c1', async () => {
+  const r = await runChainRunner([[ch('a', { migrationApps: ['billing'] }), ch('b', { dependsOn: ['a'] })]], { top: {} })
+  noErr(r)
+  const init = r.agentCalls.find(c => c.label === 'chain-init')
+  assert.ok(init, 'chain-init ran')
+  assert.ok(r.idx(e => e.label === 'chain-init') < r.idx(e => e.type === 'workflow-start'))
+  assert.match(init.prompt, /node scripts\/wolfpack-chain\.mjs init --campaign 'c1' --graph '/)
+  const graph = JSON.parse(init.prompt.match(/--graph '([^']*)'/)[1])
+  assert.deepEqual(graph, { a: { dependsOn: [], migrationApps: ['billing'] }, b: { dependsOn: ['a'], migrationApps: [] } })
+  assert.equal(init.opts.model, 'sonnet')
+  assert.deepEqual(r.wf, ['a', 'b'])
+  for (const w of r.workflowCalls) assert.equal(w.args.baseBranch, 'campaign/c1')
+  assert.ok(r.logs.some(l => /⛓ CHAIN MODE: c1 → campaign\/c1 \(max-parallel 1/.test(l)), r.logs.join('\n'))
+  assert.ok(r.logs.some(l => /Chain branch created: campaign\/c1 @ a1b2c3d4e5f6/.test(l)))
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  assert.equal(r.result.mode, 'chain')
+  assert.equal(r.result.branch, 'campaign/c1')
+})
+test('AC2 adopt: chain-init returns adopted → the run proceeds and logs it', async () => {
+  const r = await runChainRunner([[ch('a')]], { init: () => ({ status: 'adopted', branch: 'campaign/c1', sha: 'ffffeeeeddddcccc', exitCode: 0 }) })
+  noErr(r)
+  assert.ok(r.logs.some(l => /Chain branch adopted: campaign\/c1 @ ffffeeeedddd/.test(l)), r.logs.join('\n'))
+  assert.deepEqual(r.wf, ['a'])
+})
+test('AC2 sticky: parse chainMode:true without the chain arg → loud sticky log, then the chain path', async () => {
+  const r = await runChainRunner([[ch('a')]], { args: { chain: undefined }, top: { chainMode: true, chainBranch: 'campaign/c1' } })
+  noErr(r)
+  assert.ok(r.logs.some(l => /⚠ CHAIN MODE \(sticky\): c1 was started with --chain — continuing in chain mode on campaign\/c1/.test(l)), r.logs.join('\n'))
+  assert.ok(r.labels.includes('chain-init'))
+  assert.equal(r.workflowCalls[0].args.baseBranch, 'campaign/c1')
+  // with the flag given, no sticky warning
+  const r2 = await runChainRunner([[ch('a')]], { top: { chainMode: true, chainBranch: 'campaign/c1' } })
+  assert.equal(r2.logs.some(l => /sticky/.test(l)), false)
+})
+test('AC2 dropped-field guard: chain state on disk with chainMode absent/false and no flag → throws, nothing runs', async () => {
+  const cases = [
+    { name: 'merged_to_campaign hunt, chainMode absent', waves: [[ch('a', { status: 'merged_to_campaign' }), ch('b')]], top: {} },
+    { name: 'merged_to_campaign hunt, chainMode false', waves: [[ch('a', { status: 'merged_to_campaign' }), ch('b')]], top: { chainMode: false, chainBranch: '' } },
+    { name: 'pending hunt with baseBranch', waves: [[ch('b', { baseBranch: 'campaign/c1' })]], top: { chainMode: false, chainBranch: '' } },
+    { name: 'held hunt', waves: [[ch('b', { status: 'certified_held_overlap' })]], top: {} },
+    { name: 'chain block only (crash after chain-init)', waves: [[ch('b')]], top: { chainMode: false, chainBranch: 'campaign/c1' } },
+  ]
+  for (const c of cases) {
+    const r = await runChainRunner(c.waves, { args: { chain: undefined }, top: c.top })
+    assert.ok(r.error, `${c.name}: must throw`)
+    assert.match(r.error.message, /CHAIN STATE WITHOUT CHAIN MODE/, c.name)
+    assert.match(r.error.message, /Re-run with --chain/, c.name)
+    assert.equal(r.workflowCalls.length, 0, c.name)
+    assert.equal(r.labels.some(l => l.startsWith('chain-')), false, c.name)
+  }
+})
+test('AC2: the parse schema REQUIRES chainMode/chainBranch and the per-hunt chain fields', async () => {
+  const r = await runChainRunner([[ch('a')]])
+  const p = r.agentCalls.find(c => c.label === 'parse-campaign')
+  const sch = p.opts.schema
+  for (const k of ['waves', 'chainMode', 'chainBranch']) assert.ok(sch.required.includes(k), k)
+  const item = sch.properties.waves.items.properties.hunts.items
+  for (const k of ['slug', 'description', 'migrationApps', 'revertedBecause', 'heldOn']) assert.ok(item.required.includes(k), k)
+  assert.equal(item.required.includes('baseBranch'), false, 'baseBranch is optional')
+  assert.match(p.prompt, /chainMode = true iff \.wolfpack\/campaigns\/c1\/metadata\.json has chain\.mode === "chain"/)
+  assert.match(p.prompt, /"merged_to_campaign"/)
+})
+test('AC2 reverted-dependent guard: reverted_with_dependency with revertedBecause absent / null / "" → throws naming it, before chain-init', async () => {
+  for (const rb of [undefined, null, '']) {
+    const h = ch('x', { status: 'reverted_with_dependency', revertedBecause: rb })
+    if (rb === undefined) delete h.revertedBecause
+    const r = await runChainRunner([[ch('h', { status: 'merged_to_campaign' }), h]])
+    assert.ok(r.error, `revertedBecause=${JSON.stringify(rb)}`)
+    assert.match(r.error.message, /REVERTED DEPENDENT WITHOUT reverted_because: x/)
+    assert.equal(r.labels.includes('chain-init'), false)
+    assert.equal(r.workflowCalls.length, 0)
+  }
+})
+test('chain mode validates the campaign slug before naming the branch', async () => {
+  const r = await runChainRunner([[ch('a')]], { args: { campaignSlug: 'Bad Slug' } })
+  assert.match(String(r.error && r.error.message), /invalid campaign slug "Bad Slug" for chain mode/)
+  assert.equal(r.labels.includes('chain-init'), false)
+})
+
+// ── 5. AC2 switch a barrier campaign to chain at a wave start ────────────────
+test('AC2 switch: barrier wave 1 already merged to main, chain:true → wave 1 is skipped (not re-run), wave 2 runs on the campaign branch', async () => {
+  const r = await runChainRunner([[ch('a', { status: 'merged' }), ch('b', { status: 'merged' })], [ch('c', { dependsOn: ['a'] })]])
+  noErr(r)
+  assert.deepEqual(r.wf, ['c'])
+  assert.equal(r.workflowCalls[0].args.baseBranch, 'campaign/c1')
+  assert.ok(r.logs.some(l => /Wave 1: nothing to run or merge — skipping/.test(l)))
+  assert.equal(r.labels.includes('chain-merge:a'), false)
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+})
+
+// ── 6. AC5 waves don't stop ──────────────────────────────────────────────────
+test('AC5: 3 waves in ONE run — one workflow per hunt, each merged after it certifies and before the next wave starts; no barrier printout', async () => {
+  const r = await runChainRunner([[ch('a'), ch('b')], [ch('c')], [ch('d'), ch('e')]])
+  noErr(r)
+  assert.deepEqual(r.wf, ['a', 'b', 'c', 'd', 'e'])
+  const waveOf = { a: 1, b: 1, c: 2, d: 3, e: 3 }
+  for (const s of Object.keys(waveOf)) {
+    const end = r.idx(e => e.type === 'workflow-end' && e.slug === s)
+    const m = r.idx(e => e.label === `chain-merge:${s}`)
+    assert.ok(m > end, `${s} merged after it certified`)
+    const nextWaveStart = r.idx(e => e.type === 'workflow-start' && waveOf[e.slug] === waveOf[s] + 1)
+    if (nextWaveStart !== -1) assert.ok(m < nextWaveStart, `${s} merged before wave ${waveOf[s] + 1} starts`)
+    assert.equal(r.labels.filter(l => l === `chain-merge:${s}`).length, 1)
+  }
+  assert.equal(r.logs.some(l => /Pipeline STOPS here|RELEASE QUEUE/.test(l)), false, r.logs.join('\n'))
+  assert.ok(r.logs.some(l => /Wave 1 → campaign\/c1: merged \[a, b\], held \[\], waiting \[\]/.test(l)))
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  assert.equal(r.result.completed, true)
+  assert.deepEqual(r.result.campaignMergedHunts, ['a', 'b', 'c', 'd', 'e'])
+  const mergeCall = r.agentCalls.find(c => c.label === 'chain-merge:a')
+  assert.match(mergeCall.prompt, /node scripts\/wolfpack-chain\.mjs merge-hunt --campaign 'c1' --hunt 'a'/)
+  assert.match(mergeCall.prompt, /do NOT run any git command yourself/)
+  assert.equal(mergeCall.opts.model, 'sonnet')
+})
+test('A-14: a same-wave dependent forks only after its dependency is merged into the campaign branch', async () => {
+  const r = await runChainRunner([[ch('a'), ch('b', { dependsOn: ['a'] })]])
+  noErr(r)
+  assert.ok(r.idx(e => e.label === 'chain-merge:a') < r.idx(e => e.type === 'workflow-start' && e.slug === 'b'))
+  assert.ok(r.idx(e => e.label === 'chain-merge:b') > r.idx(e => e.type === 'workflow-end' && e.slug === 'b'))
+})
+
+// ── 7. AC7 main merged in at each wave start ─────────────────────────────────
+test('AC7: chain-sync-main:w<N> runs before each wave is scaffolded; a conflict → CAMPAIGN_PARKED_MAIN_CONFLICT, nothing scaffolded', async () => {
+  const ok = await runChainRunner([[ch('a')], [ch('b')]])
+  noErr(ok)
+  assert.ok(ok.idx(e => e.label === 'chain-sync-main:w1') < ok.idx(e => e.type === 'workflow-start' && e.slug === 'a'))
+  assert.ok(ok.idx(e => e.label === 'chain-sync-main:w2') < ok.idx(e => e.type === 'workflow-start' && e.slug === 'b'))
+  assert.ok(ok.idx(e => e.label === 'chain-sync-main:w2') > ok.idx(e => e.label === 'chain-merge:a'))
+  assert.match(ok.agentCalls.find(c => c.label === 'chain-sync-main:w1').prompt, /wolfpack-chain\.mjs sync-main --campaign 'c1'/)
+  const bad = await runChainRunner([[ch('a')], [ch('b')]], { sync: () => ({ status: 'conflict', files: ['app/models.py', 'TODO.md'], sha: 's', exitCode: 0 }) })
+  noErr(bad)
+  assert.equal(bad.result.verdict, 'CAMPAIGN_PARKED_MAIN_CONFLICT')
+  assert.deepEqual(bad.result.conflictFiles, ['app/models.py', 'TODO.md'])
+  assert.equal(bad.result.completed, false)
+  assert.equal(bad.workflowCalls.length, 0)
+  assert.ok(bad.logs.some(l => /main → campaign\/c1 merge CONFLICTED \(wave 1 start\): app\/models\.py, TODO\.md/.test(l)))
+  // a conflict at a LATER wave start keeps the earlier wave's merges and stops before wave 2
+  const late = await runChainRunner([[ch('a')], [ch('b')]], { sync: (label) => (label === 'chain-sync-main:w2' ? { status: 'conflict', files: ['x'], exitCode: 0 } : { status: 'up_to_date', exitCode: 0 }) })
+  assert.equal(late.result.verdict, 'CAMPAIGN_PARKED_MAIN_CONFLICT')
+  assert.deepEqual(late.wf, ['a'])
+  assert.ok(late.labels.includes('chain-merge:a'))
+})
+test('AC7: the sync-main warning (origin/main not an ancestor) is logged', async () => {
+  const r = await runChainRunner([[ch('a')]], { sync: () => ({ status: 'merged', sha: 's', files: [], warning: 'origin/main is not an ancestor of local main', exitCode: 0 }) })
+  noErr(r)
+  assert.ok(r.logs.some(l => /⚠ origin\/main is not an ancestor of local main/.test(l)))
+})
+test('chain CLI failures throw loud with the step named (null result, status error, non-zero exit)', async () => {
+  for (const bad of [null, { status: 'error', reason: 'boom', exitCode: 2 }, { status: 'merged', exitCode: 2 }]) {
+    const r = await runChainRunner([[ch('a')]], { merge: () => bad })
+    assert.ok(r.error, JSON.stringify(bad))
+    assert.match(r.error.message, /chain step chain-merge:a (returned no result|failed)/)
+  }
+  const r2 = await runChainRunner([[ch('a')]], { merge: () => ({ status: 'weird', exitCode: 0 }) })
+  assert.match(String(r2.error && r2.error.message), /returned an unknown status "weird"/)
+  const r3 = await runChainRunner([[ch('a')]], { init: () => ({ status: 'error', reason: 'no main', exitCode: 2 }) })
+  assert.match(String(r3.error && r3.error.message), /chain step chain-init failed: no main/)
+  assert.equal(r3.workflowCalls.length, 0)
+})
+
+// ── 8. AC6 runner side ───────────────────────────────────────────────────────
+test('AC6 (runner): one hunt\'s merge conflict holds only that hunt; the rest of the wave still merges', async () => {
+  const r = await runChainRunner([[ch('b'), ch('c')]], {
+    merge: (slug) => (slug === 'b' ? { status: 'conflict', stage: 'rebase', files: ['CHANGELOG.md'], exitCode: 0 } : mergedStamp('merged_to_campaign')(slug)) })
+  noErr(r)
+  assert.ok(r.labels.includes('chain-merge:c'))
+  assert.deepEqual(r.result.blockedHunts.map(b => [b.slug, b.status, b.resolve]), [['b', 'parked:campaign_merge_conflict', '/resolve b']])
+  assert.deepEqual(r.result.campaignMergedHunts, ['c'])
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+  assert.ok(r.logs.some(l => /b: auto-merge into campaign\/c1 CONFLICTED \(rebase: CHANGELOG\.md\)/.test(l)))
+})
+
+// ── 9. AC8 dependencies satisfied by the campaign branch ─────────────────────
+test('AC8: a wave-2 hunt depending on a campaign-merged wave-1 hunt runs (no BLOCKED, no main dep-check)', async () => {
+  const r = await runChainRunner([[ch('a', { status: 'merged_to_campaign' })], [ch('d', { dependsOn: ['a'] })]])
+  noErr(r)
+  assert.deepEqual(r.wf, ['d'])
+  assert.equal(r.logs.some(l => /BLOCKED/.test(l)), false)
+  assert.equal(r.labels.some(l => l.startsWith('dep-check') || l === 'crosswave-dep-check'), false)
+  // pending-compliance and released deps count as met too (A1)
+  const r2 = await runChainRunner([[ch('a', { status: 'merged_to_campaign_pending_compliance' }), ch('m', { status: 'merged' })], [ch('d', { dependsOn: ['a', 'm'] })]])
+  assert.deepEqual(r2.wf, ['d'])
+})
+test('a dependency on a slug outside the campaign waits loudly (unknown_dep), never assumed met', async () => {
+  const r = await runChainRunner([[ch('a', { dependsOn: ['ghost'] }), ch('b')]])
+  noErr(r)
+  assert.deepEqual(r.wf, ['b'])
+  assert.deepEqual(r.result.waitingHunts, [{ slug: 'a', on: 'ghost', rule: 'unknown_dep' }])
+  assert.ok(r.logs.some(l => /a waits: depends on ghost, which is not a hunt of this campaign/.test(l)))
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+})
+
+// ── 10 / 12. AC9 push-through + AC13 awaiting-human verdict ──────────────────
+test('AC9/AC13: past a parked hunt — rule a and rule b waiters wait, an independent hunt runs; overlap is judged before its merge', async () => {
+  const waves = [[ch('b', { migrationApps: ['Billing'] })], [ch('e', { dependsOn: ['b'] }), ch('f', { migrationApps: ['billing'] }), ch('g')], [ch('t', { dependsOn: ['e'] })]]
+  const r = await runChainRunner(waves, {
+    workflowResult: (a) => (a.slug === 'b' ? { slug: 'b', verdict: 'PARKED', status: 'parked:open_critical', reason: 'open_critical' } : CERT(a)) })
+  noErr(r)
+  assert.deepEqual(r.wf, ['b', 'g'])
+  assert.ok(r.idx(e => e.label === 'chain-overlap:g') < r.idx(e => e.label === 'chain-merge:g'))
+  assert.match(r.agentCalls.find(c => c.label === 'chain-overlap:g').prompt, /overlap --campaign 'c1' --hunt 'g' --blockers 'b'/)
+  assert.deepEqual(r.result.waitingHunts, [
+    { slug: 'e', on: 'b', rule: 'a' },
+    { slug: 'f', on: 'b', rule: 'b' },
+    { slug: 't', on: 'b', rule: 'a' },
+  ])
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+  assert.deepEqual(r.result.blockedHunts, [{ slug: 'b', status: 'parked:open_critical', resolve: '/resolve b', waiting: ['e', 'f', 't'] }])
+  assert.deepEqual(r.result.campaignMergedHunts, ['g'])
+  assert.ok(r.logs.some(l => /⛔ b \[parked:open_critical\] {2}→ {2}\/resolve b {3}\(waiting on it: e, f, t\)/.test(l)), r.logs.join('\n'))
+  assert.ok(r.logs.some(l => /f waits: shares migration app\(s\) billing with blocked b/.test(l)))
+  assert.ok(r.logs.some(l => /t waits: depends on blocked b \(via t → e → b\)/.test(l)))
+  assert.equal(r.labels.some(l => l === 'chain-sync-main:final'), false, 'no final sync when not ready')
+})
+test('AC9 rule c: overlap held:true → no merge, the hunt is listed held (certified, unmerged)', async () => {
+  const r = await runChainRunner([[ch('b', { status: 'parked:open_critical' }), ch('g')]], {
+    overlap: () => ({ held: true, overlaps: { b: ['app/views.py'] }, noDiff: [], exitCode: 0 }) })
+  noErr(r)
+  assert.equal(r.labels.includes('chain-merge:g'), false)
+  assert.deepEqual(r.result.heldHunts, [{ slug: 'g', status: 'certified_held_overlap', heldOn: ['b'] }])
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+  assert.ok(r.logs.some(l => /⏸ g: certified but HELD unmerged — its diff overlaps blocked b \(app\/views\.py\)/.test(l)))
+})
+test('AC9: a blocker with no diff yet is logged (rules a/b only) and the hunt still merges', async () => {
+  const r = await runChainRunner([[ch('b', { status: 'needs_spec' }), ch('g')]], {
+    overlap: () => ({ held: false, overlaps: {}, noDiff: ['b'], exitCode: 0 }) })
+  noErr(r)
+  assert.ok(r.labels.includes('chain-merge:g'))
+  assert.ok(r.logs.some(l => /g: no diff yet for b — only rules a\/b applied against them/.test(l)))
+  assert.deepEqual(r.result.blockedHunts.map(b => [b.slug, b.resolve]), [['b', '/spec b']])
+})
+test('AC9: without blockers no overlap step runs at all', async () => {
+  const r = await runChainRunner([[ch('a'), ch('b')]])
+  assert.equal(r.labels.some(l => l.startsWith('chain-overlap:')), false)
+})
+test('Pointer r1 F6: a held hunt re-judged by a later merge step is logged and listed ONCE', async () => {
+  const r = await runChainRunner([[ch('b', { status: 'parked:open_critical' }), ch('g', { status: 'certified' }), ch('a'), ch('x', { dependsOn: ['a'] }), ch('y', { dependsOn: ['a'] })]], {
+    overlap: (slug) => (slug === 'g' ? { held: true, overlaps: { b: ['f.py'] }, noDiff: [], exitCode: 0 } : { held: false, overlaps: {}, noDiff: [], exitCode: 0 }) })
+  noErr(r)
+  assert.ok(r.labels.filter(l => l === 'chain-overlap:g').length >= 2, 'g is re-judged by each merge step')
+  assert.equal(r.logs.filter(l => /⏸ g: certified but HELD unmerged/.test(l)).length, 1)
+  assert.ok(r.logs.some(l => /Wave 1 → campaign\/c1: merged \[a, x, y\], held \[g\], waiting \[\]/.test(l)), r.logs.join('\n'))
+  assert.deepEqual(r.result.heldHunts.map(h => h.slug), ['g'])
+})
+test('a hunt that did not certify (no result / FLAWED_PLAN) is failed and blocks only its conflicts for the rest of the run', async () => {
+  const r = await runChainRunner([[ch('a'), ch('z')], [ch('b', { dependsOn: ['a'] }), ch('c')]], {
+    workflowResult: (a) => (a.slug === 'a' ? { slug: 'a', verdict: 'FLAWED_PLAN' } : a.slug === 'z' ? null : CERT(a)) })
+  noErr(r)
+  assert.deepEqual(r.wf, ['a', 'z', 'c'])
+  assert.deepEqual(r.result.failedHunts, ['a', 'z'])
+  assert.deepEqual(r.result.waitingHunts, [{ slug: 'b', on: 'a', rule: 'a' }])
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+})
+
+// ── 11. AC11 merged-awaiting-compliance ──────────────────────────────────────
+test('AC11 (runner): a CERTIFIED_PENDING_COMPLIANCE hunt is merged (pending compliance), its dependent builds on it, verdict READY', async () => {
+  const r = await runChainRunner([[ch('r', { tier: 'Red' })], [ch('x', { dependsOn: ['r'] })]], {
+    workflowResult: (a) => (a.slug === 'r' ? { slug: 'r', verdict: 'CERTIFIED_PENDING_COMPLIANCE', status: 'certified_pending_compliance', reason: 'compliance_review' } : CERT(a)),
+    merge: mergedStamp((s) => (s === 'r' ? 'merged_to_campaign_pending_compliance' : 'merged_to_campaign')) })
+  noErr(r)
+  assert.deepEqual(r.wf, ['r', 'x'])
+  assert.ok(r.labels.includes('chain-merge:r'))
+  assert.deepEqual(r.result.pendingComplianceHunts, ['r'])
+  assert.deepEqual(r.result.campaignMergedHunts, ['r', 'x'])
+  assert.deepEqual(r.result.blockedHunts, [])
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  assert.ok(r.logs.some(l => /r → campaign\/c1 .*merged, awaiting compliance sign-off at the release/.test(l)))
+})
+
+// ── 12. AC13 resume + quota ──────────────────────────────────────────────────
+test('AC13 resume: campaign-merged hunts are never re-run', async () => {
+  const r = await runChainRunner([[ch('a', { status: 'merged_to_campaign' }), ch('b', { status: 'merged_to_campaign_pending_compliance' })], [ch('c')]])
+  noErr(r)
+  assert.deepEqual(r.wf, ['c'])
+  assert.equal(r.labels.includes('chain-merge:a'), false)
+})
+test('AC13: a usage defer mid-chain → WAVE_PAUSED_QUOTA with mode chain; a re-run resumes from the deferred hunt', async () => {
+  const r = await runChainRunner([[ch('a'), ch('b')], [ch('c')]], { gate: (slug) => (slug === 'b' ? DEFER5H : PROCEED) })
+  noErr(r)
+  assert.equal(r.result.verdict, 'WAVE_PAUSED_QUOTA')
+  assert.equal(r.result.mode, 'chain')
+  assert.equal(r.result.branch, 'campaign/c1')
+  assert.equal(r.result.resetAt, DEFER5H.reset_at)
+  assert.deepEqual(r.wf, ['a'])
+  assert.deepEqual(r.result.deferredHunts.map(h => h.slug), ['b'])
+  assert.deepEqual(r.result.certifiedHunts, ['a'])
+  // the pause returns BEFORE the merge step; the certified hunt is merged on the re-run (on-disk status)
+  const again = await runChainRunner([[ch('a', { status: 'certified' }), ch('b')], [ch('c')]])
+  noErr(again)
+  assert.deepEqual(again.wf, ['b', 'c'])
+  assert.ok(again.labels.includes('chain-merge:a'))
+  assert.equal(again.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+})
+test('Pointer r1 F7: chain pause returns count a pending-compliance certification as certified', async () => {
+  const r = await runChainRunner([[ch('r'), ch('b')]], {
+    gate: (slug) => (slug === 'b' ? DEFER5H : PROCEED),
+    workflowResult: (a) => ({ slug: a.slug, verdict: 'CERTIFIED_PENDING_COMPLIANCE', status: 'certified_pending_compliance' }) })
+  noErr(r)
+  assert.equal(r.result.verdict, 'WAVE_PAUSED_QUOTA')
+  assert.deepEqual(r.result.certifiedHunts, ['r'])
+  // the dependent-tail defer path too
+  const r2 = await runChainRunner([[ch('r'), ch('d', { dependsOn: ['r'] })]], {
+    gate: (slug) => (slug === 'd' ? DEFER5H : PROCEED),
+    workflowResult: (a) => ({ slug: a.slug, verdict: 'CERTIFIED_PENDING_COMPLIANCE', status: 'certified_pending_compliance' }),
+    merge: mergedStamp('merged_to_campaign_pending_compliance') })
+  noErr(r2)
+  assert.equal(r2.result.verdict, 'WAVE_PAUSED_QUOTA')
+  assert.deepEqual(r2.result.certifiedHunts, ['r'])
+  assert.equal(r2.result.mode, 'chain')
+})
+test('AC13: a parked:model_quota result → WAVE_PAUSED_QUOTA at the end (auto-resumes), other hunts still merge', async () => {
+  const r = await runChainRunner([[ch('a'), ch('q')]], {
+    workflowResult: (a) => (a.slug === 'q' ? { slug: 'q', verdict: 'PARKED', status: 'parked:model_quota', reason: 'model_quota' } : CERT(a)) })
+  noErr(r)
+  assert.equal(r.result.verdict, 'WAVE_PAUSED_QUOTA')
+  assert.deepEqual(r.result.quotaDeferredHunts, ['q'])
+  assert.deepEqual(r.result.campaignMergedHunts, ['a'])
+  // a parsed model-quota hunt is re-run (it is pending, not blocked)
+  const again = await runChainRunner([[ch('a', { status: 'merged_to_campaign' }), ch('q', { status: 'parked:model_quota' })]])
+  assert.deepEqual(again.wf, ['q'])
+})
+test('AC13: a gate failure throws loud after in-flight hunts finish', async () => {
+  const r = await runChainRunner([[ch('a'), ch('b')]], { gate: (slug) => (slug === 'b' ? null : PROCEED) })
+  assert.match(String(r.error && r.error.message), /usage gate unavailable .* not starting b/)
+  assert.deepEqual(r.wf, ['a'])
+})
+
+// ── 13. crash-safety ─────────────────────────────────────────────────────────
+test('crash-safety: a hunt that certified in a crashed run (on disk: certified) is merged in its wave, with no workflow', async () => {
+  const r = await runChainRunner([[ch('a', { status: 'certified' })], [ch('b')]])
+  noErr(r)
+  assert.deepEqual(r.wf, ['b'])
+  assert.ok(r.idx(e => e.label === 'chain-merge:a') < r.idx(e => e.type === 'workflow-start' && e.slug === 'b'))
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+})
+
+// ── 14. preflight ────────────────────────────────────────────────────────────
+test('preflight: chain mode with chainProtocol 0 or absent → STALE PIPELINE for chain mode; missing chain script → MISSING; barrier unaffected', async () => {
+  for (const cap of [{ ...CHAIN_CAP, chainProtocol: 0 }, (({ chainProtocol, ...rest }) => rest)(CHAIN_CAP)]) {
+    const r = await runChainRunner([[ch('a')]], { capability: cap })
+    assert.match(String(r.error && r.error.message), /STALE PIPELINE for chain mode/)
+    assert.equal(r.workflowCalls.length, 0)
+    assert.equal(r.labels.includes('chain-init'), false)
+  }
+  const ns = await runChainRunner([[ch('a')]], { capability: { ...CHAIN_CAP, chainScriptPresent: false } })
+  assert.match(String(ns.error && ns.error.message), /scripts\/wolfpack-chain\.mjs is MISSING/)
+  const barrier = await runChainRunner([[ch('a')]], { args: { chain: undefined }, capability: { ...CHAIN_CAP, chainProtocol: 0, chainScriptPresent: false } })
+  noErr(barrier)
+  assert.equal(barrier.result.verdict, 'WAVE_COMPLETE_AWAITING_RELEASE')
+  const cap = barrier.agentCalls.find(c => c.label === 'pipeline-capability')
+  assert.match(cap.prompt, /grep -o 'WOLFPACK_CHAIN_PROTOCOL=\[0-9\]\*'/)
+  assert.match(cap.prompt, /test -f scripts\/wolfpack-chain\.mjs && echo present/)
+})
+test('the runner carries the WOLFPACK_CHAIN_RUNNER=1 marker the launch command greps for', () => {
+  assert.match(RUNNER, /^\/\/ WOLFPACK_CHAIN_RUNNER=1$/m)
+})
+
+// ── 15. reapply (A-12) ───────────────────────────────────────────────────────
+test('A-12 reapply: a reverted dependent merges once its reverted_because hunt is campaign-merged again; otherwise it waits', async () => {
+  const ready = await runChainRunner([[ch('h', { status: 'merged_to_campaign' }), ch('x', { status: 'reverted_with_dependency', revertedBecause: 'h', dependsOn: ['h'] })]])
+  noErr(ready)
+  assert.ok(ready.labels.includes('chain-merge:x'))
+  assert.equal(ready.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  const wait = await runChainRunner([[ch('h', { status: 'parked:reverted_from_campaign' }), ch('x', { status: 'reverted_with_dependency', revertedBecause: 'h', dependsOn: ['h'] })]])
+  noErr(wait)
+  assert.equal(wait.labels.includes('chain-merge:x'), false)
+  assert.equal(wait.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+  const bx = wait.result.blockedHunts.find(b => b.slug === 'x')
+  assert.equal(bx.resolve, 'auto: re-merges after h')
+  assert.deepEqual(wait.result.blockedHunts.find(b => b.slug === 'h').waiting, ['x'])
+})
+test('Pointer r1 F1 (A-12 circular wait): a re-certified H merges FIRST, then its reverted dependent reapplies — even when they share an app and D depends on H', async () => {
+  const D = ch('d', { status: 'reverted_with_dependency', revertedBecause: 'h', dependsOn: ['h'], migrationApps: ['billing'] })
+  const recert = await runChainRunner([[ch('h', { status: 'certified', migrationApps: ['billing'] }), D]])
+  noErr(recert)
+  assert.ok(recert.idx(e => e.label === 'chain-merge:h') >= 0)
+  assert.ok(recert.idx(e => e.label === 'chain-merge:h') < recert.idx(e => e.label === 'chain-merge:d'))
+  assert.equal(recert.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  // H still pending (resumed after /resolve): it runs, certifies, merges, then D reapplies
+  const pend = await runChainRunner([[ch('h', { status: 'implementing', migrationApps: ['billing'] }), D]])
+  noErr(pend)
+  assert.deepEqual(pend.wf, ['h'])
+  assert.ok(pend.idx(e => e.label === 'chain-merge:h') < pend.idx(e => e.label === 'chain-merge:d'))
+  assert.equal(pend.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  // an UNRELATED parked hunt sharing the app still blocks H (rule b)
+  const other = await runChainRunner([[ch('z', { status: 'parked:open_critical', migrationApps: ['billing'] }), ch('h', { status: 'certified', migrationApps: ['billing'] }), D]])
+  noErr(other)
+  assert.equal(other.labels.includes('chain-merge:h'), false)
+  assert.deepEqual(other.result.waitingHunts.find(w => w.slug === 'h'), { slug: 'h', on: 'z', rule: 'b' })
+})
+test('Pointer r2 F1: a reapply waits for its OWN dependency\'s reapply (D before E when E depends on D, both reverted because of H)', async () => {
+  // E is listed BEFORE D; both were reverted with H; E depends on D. Reapplying E onto a tip
+  // without D's change can apply cleanly and still be semantically broken.
+  const r = await runChainRunner([[
+    ch('h', { status: 'certified' }),
+    ch('e', { status: 'reverted_with_dependency', revertedBecause: 'h', dependsOn: ['d'] }),
+    ch('d', { status: 'reverted_with_dependency', revertedBecause: 'h', dependsOn: ['h'] }),
+  ]])
+  noErr(r)
+  const order = r.labels.filter(l => l.startsWith('chain-merge:'))
+  assert.deepEqual(order, ['chain-merge:h', 'chain-merge:d', 'chain-merge:e'])
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+})
+
+// ── 15a. final sync ──────────────────────────────────────────────────────────
+test('15a final sync: everything already campaign-merged → zero workflows, exactly one chain-sync-main:final, READY; a conflict there → MAIN_CONFLICT', async () => {
+  const waves = [[ch('a', { status: 'merged_to_campaign' })], [ch('b', { status: 'merged_to_campaign' })]]
+  const r = await runChainRunner(waves)
+  noErr(r)
+  assert.equal(r.workflowCalls.length, 0)
+  assert.deepEqual(r.labels.filter(l => l.startsWith('chain-sync-main')), ['chain-sync-main:final'])
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  assert.ok(r.logs.some(l => /Release it: \/release-campaign c1/.test(l)))
+  const c = await runChainRunner(waves, { sync: () => ({ status: 'conflict', files: ['README.md'], exitCode: 0 }) })
+  noErr(c)
+  assert.equal(c.result.verdict, 'CAMPAIGN_PARKED_MAIN_CONFLICT')
+  assert.equal(c.result.at, 'final sync before release')
+  assert.deepEqual(c.result.conflictFiles, ['README.md'])
+})
+test('15a: a run ending CAMPAIGN_AWAITING_HUMAN makes no final sync and points at --checkpoint', async () => {
+  const r = await runChainRunner([[ch('a'), ch('b', { status: 'parked:open_critical' })]])
+  noErr(r)
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+  assert.equal(r.labels.includes('chain-sync-main:final'), false)
+  assert.ok(r.logs.some(l => /\/release-campaign c1 --checkpoint/.test(l)))
+})
+
+// ── Pointer r1 (round 3) F1: the runner's rule-(c) hold shares the CLI's HOLDABLE_STATUSES ──
+test('Pointer r1 F1 (round 3): a reapply-ready reverted dependent held by rule c KEEPS reverted_with_dependency and still blocks an overlapping hunt', async () => {
+  // b is parked (an unrelated blocker). h re-certified and merges first, so d (reverted because
+  // of h) is reapply-ready; d's diff overlaps b → held. d must stay reverted_with_dependency in the
+  // live map, so it is still a blocker when g is judged: g's overlap call names b AND d.
+  const r = await runChainRunner([[
+    ch('b', { status: 'parked:open_critical' }),
+    ch('h', { status: 'certified' }),
+    ch('d', { status: 'reverted_with_dependency', revertedBecause: 'h', dependsOn: ['h'] }),
+    ch('g', { status: 'certified' }),
+  ]], {
+    overlap: (slug) => (slug === 'd' ? { held: true, overlaps: { b: ['app/shared.py'] }, noDiff: [], exitCode: 0 }
+      : slug === 'g' ? { held: true, overlaps: { d: ['app/d.py'] }, noDiff: [], exitCode: 0 }
+        : { held: false, overlaps: {}, noDiff: [], exitCode: 0 }) })
+  noErr(r)
+  assert.deepEqual(r.labels.filter(l => l.startsWith('chain-merge:')), ['chain-merge:h'], 'only h merges: d is held, g is held on d')
+  assert.match(r.agentCalls.find(c => c.label === 'chain-overlap:d').prompt, /--hunt 'd' --blockers 'b'/)
+  assert.match(r.agentCalls.find(c => c.label === 'chain-overlap:g').prompt, /--hunt 'g' --blockers 'b,d'/,
+    'the held reverted dependent is still a blocker for g')
+  const bd = r.result.blockedHunts.find(x => x.slug === 'd')
+  assert.ok(bd, 'd is reported among the blocked hunts (its status was not clobbered)')
+  assert.equal(bd.status, 'reverted_with_dependency')
+  assert.equal(r.result.heldHunts.some(x => x.slug === 'd'), false, 'd is not misclassified as certified_held_overlap')
+  assert.deepEqual(r.result.heldHunts, [{ slug: 'g', status: 'certified_held_overlap', heldOn: ['d'] }])
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+  assert.ok(r.logs.some(l => /⏸ d: certified but HELD unmerged — its diff overlaps blocked b \(app\/shared\.py\)/.test(l)), r.logs.join('\n'))
+})
+test('Pointer r1 F1 (round 3): a held certified_pending_compliance hunt keeps its status in the live map; a plain certified one becomes certified_held_overlap', async () => {
+  const r = await runChainRunner([[
+    ch('b', { status: 'parked:open_critical' }),
+    ch('red', { status: 'certified_pending_compliance' }),
+    ch('g', { status: 'certified' }),
+  ]], { overlap: () => ({ held: true, overlaps: { b: ['x.py'] }, noDiff: [], exitCode: 0 }) })
+  noErr(r)
+  assert.equal(r.labels.some(l => l.startsWith('chain-merge:')), false)
+  assert.deepEqual(r.result.heldHunts, [
+    { slug: 'red', status: 'certified_pending_compliance', heldOn: ['b'] },
+    { slug: 'g', status: 'certified_held_overlap', heldOn: ['b'] },
+  ])
+})

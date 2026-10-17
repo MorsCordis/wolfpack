@@ -51,6 +51,7 @@ Check `metadata.json` for `"smoke_fix": true`. This determines which entry path 
 2. **Read the shepherd-log.** `$PLAN_DIR/shepherd-log.md` — what the Shepherd says was done, any deviations, outstanding concerns.
 3. **Read prior Pointer reviews** if this is round 2+: `$PLAN_DIR/pointer-review-*.md`.
 4. **Get the diff.** `git diff main..HEAD` — the actual code changes.
+   (Chain-mode hunt: when `metadata.base_branch` is set, use it in place of `main` everywhere in this skill.)
 5. **Read `wolfpack-config.md` and `AGENTS.md`.** Non-negotiable rules live there.
 
 ### Smoke-fix entry (smoke_fix: true)
@@ -58,6 +59,7 @@ Smoke-fix reviews have no plan-final.md or shepherd-log. The context is simpler:
 1. **Read the parent hunt's smoke-tests.md** at `.wolfpack/plans/<parent_hunt>/smoke-tests.md` — this tells you what failed and why fixes were made. `parent_hunt` is in `metadata.parent_hunt`.
 2. **Read prior Pointer reviews** if this is round 2+: `$PLAN_DIR/pointer-review-*.md`.
 3. **Get the diff.** `git diff main..HEAD` — the smoke fix changes.
+   (Chain-mode hunt: when `metadata.base_branch` is set, use it in place of `main` everywhere in this skill.)
 4. **Read `wolfpack-config.md` and `AGENTS.md`.** Non-negotiable rules live there.
 
 For smoke-fix reviews, focus on: are the fixes proportionate to the smoke failures? Is there scope creep beyond what the smoke tests identified? Are the fixes correct, or are they bandaids?
