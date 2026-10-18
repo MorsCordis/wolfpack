@@ -1200,7 +1200,10 @@ const noteAuditOnly = async (role, round, result, artifactPath, phaseLabel) => {
     const prov = (result && (result.provider || result.status)) || 'unknown'
     const fam = familyOf(prov)
     const ev = role === 'watchdog' ? certAuditEvidence(result, tier) : auditEvidence(result)
-    const hasTA = !!(result && result.toolAccess && typeof result.toolAccess === 'object')
+    // A tool_access object without a recognised shell state ({} or a garbled value) proves no
+    // more than an omitted one, so it is recorded "unreported" too (Pointer r2 F2).
+    const ta = result && result.toolAccess
+    const hasTA = !!(ta && typeof ta === 'object' && ['ok', 'denied', 'unused'].includes(String(ta.shell || '').toLowerCase()))
     const r = round || 0
     const schema = { type: 'object', properties: { recorded: { type: 'boolean' } }, required: ['recorded'] }
     if (ev.length) {
@@ -1221,7 +1224,7 @@ Do NOT alter any other file. Do NOT commit. Return recorded: true when both are 
       return
     }
     if (!hasTA && (role === 'watchdog' || fam === 'glm' || fam === 'mistral')) {
-      log(`${slug}: ${role} r${r} (${prov}) did not report tool_access — recording tool_access "unreported" in metadata.audit_only_seats (not audit-only).`)
+      log(`${slug}: ${role} r${r} (${prov}) did not report a tool_access shell state — recording tool_access "unreported" in metadata.audit_only_seats (not audit-only).`)
       await agent(`
 You are a minimal RECORD writer. Do exactly one thing, then return.
 

@@ -1298,6 +1298,21 @@ test('AC6a: a review with a working shell (tool_access ok, no denial lines) reco
   assert.equal(find('audit-only-record:').length, 0)
 })
 
+test('AC6: a review whose tool_access has no recognised shell state → "unreported" row, not audit_only', async () => {
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange' },
+    bloodhound: { ...BASE.bloodhound, deniedTools: [], toolAccess: {} },
+    pointer: { ...BASE.pointer, deniedTools: [], toolAccess: { shell: 'maybe', denied_tools: [] } },
+  } })
+  assert.notEqual(String(result.status).startsWith('parked'), true, JSON.stringify(result))
+  for (const role of ['bloodhound', 'pointer']) {
+    const rec = auditRecords(find, role)
+    assert.ok(rec.length >= 1, role)
+    assert.match(rec[0].prompt, /"tool_access": "unreported"/, role)
+    assert.doesNotMatch(rec[0].prompt, /"audit_only": true/, role)
+  }
+})
+
 test('AC6: a Vibe review that omits tool_access → "unreported" row (measured), not audit_only, never parks', async () => {
   const { result, find, logs } = await runHunt({ answers: { alpha: { ...BASE.alpha, tier: 'Orange' } } })
   assert.notEqual(String(result.status).startsWith('parked'), true, JSON.stringify(result))
@@ -1307,7 +1322,7 @@ test('AC6: a Vibe review that omits tool_access → "unreported" row (measured),
     assert.match(rec[0].prompt, /"tool_access": "unreported"/, role)
     assert.doesNotMatch(rec[0].prompt, /"audit_only": true/, role)
   }
-  assert.ok(logs.some(l => /pointer r1 \(mistral\) did not report tool_access/.test(l)))
+  assert.ok(logs.some(l => /pointer r1 \(mistral\) did not report a tool_access shell state/.test(l)))
 })
 
 test('AC6: the review verdict contract and the Watchdog verdict instruction both demand tool_access', async () => {
