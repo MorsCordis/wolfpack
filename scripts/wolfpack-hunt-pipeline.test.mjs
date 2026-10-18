@@ -10,9 +10,12 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, readdirSync, copyFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
+import { TOOL_DENIAL_PATTERN as TOOLCHECK_DENIAL_PATTERN } from './wolfpack-toolcheck.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const SRC = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8')
@@ -24,6 +27,9 @@ const PD = `${WT}/.wolfpack/plans/h`
 // Default happy-path answers; a scenario overrides by label prefix (value or fn(prompt, opts, n)).
 const BASE = {
   'resume-probe': { fresh: true },
+  // seat-profiles-into-pack: the toolcheck preflight passes by default (a missing answer
+  // correctly parks toolcheck_failed — fail closed).
+  'toolcheck-preflight': { ok: true, exitCode: 0, output: '✓' },
   scaffold: { worktreePath: WT, planDir: PD, adcValid: true },
   spec: { modeForBuild: 'autonomous', confidence: 'high', complianceCritical: false },
   alpha: { verdict: 'PLANNED', tier: 'Yellow', bloodhoundRounds: 1, pointerRounds: 1, trackerRounds: 1, bloodhoundModel: 'glm' },
@@ -34,7 +40,9 @@ const BASE = {
   shepherd: { verdict: 'DONE' },
   pointer: { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'mistral', status: 'mistral' },
   tracker: { verdict: 'TESTS_PASS' },
-  watchdog: { verdict: 'PASS', provider: 'mistral', status: 'mistral' },
+  // seat-profiles-into-pack: a certifier whose shell ran reports tool_access (mandatory on
+  // Orange/Red — a PASS without it parks audit_only_certification there).
+  watchdog: { verdict: 'PASS', provider: 'mistral', status: 'mistral', deniedTools: [], toolAccess: { shell: 'ok', denied_tools: [] } },
   'compliance-gate': { determined: true, complianceTouched: false, alreadySignedOff: false },
   verify: { verdict: 'PASS' },
   park: {},
@@ -1105,4 +1113,355 @@ test('human-patch gate: a patch staged during a Pointer rework parks before the 
   assert.equal(result.status, 'parked:human_patch')
   assert.equal(find('pointer:').length, 1, 'parks after the round-1 rework, before round 2')
   assert.match(find('park:h:human_patch')[0].prompt, /does NOT apply cleanly/)
+})
+
+// ─── seat-profiles-into-pack: toolcheck preflight (AC5) + audit_only (AC6) ───
+
+// A capable fixture shim carrying both halves the toolcheck reads (Mistral loop + GLM lists).
+const FIXTURE_SHIM = `VIBE_TOOLS_DEFAULT="read grep edit write_file bash"
+VIBE_TOOL_FLAGS=()
+for _t in \${WOLFPACK_VIBE_TOOLS:-$VIBE_TOOLS_DEFAULT}; do
+    VIBE_TOOL_FLAGS+=(--enabled-tools "$_t")
+done
+GLM_REVIEW_TOOLS_DEFAULT="read_file grep bash dev_cortex_repo_map dev_cortex_file_outline"
+GLM_IMPLEMENT_TOOLS_DEFAULT="read_file grep write_file edit dev_cortex_repo_map dev_cortex_file_outline"
+GLM_REVIEW_DROP="task"
+GLM_IMPLEMENT_DROP="bash task"
+`
+const TOOLCHECK = join(here, 'wolfpack-toolcheck.mjs')
+const TEMPLATES = join(here, '..', 'vibe-agents')
+
+// A temp fixture: the shim above + the tracked templates as the "installed" profiles, with an
+// optional mutation of one profile. Returns { shim, profiles, cleanup }.
+function toolcheckFixture(mutate = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'hp-toolcheck-'))
+  const shim = join(root, 'podman-vibe.sh')
+  writeFileSync(shim, FIXTURE_SHIM)
+  const profiles = join(root, 'agents')
+  execFileSync('mkdir', ['-p', profiles])
+  for (const n of readdirSync(TEMPLATES)) copyFileSync(join(TEMPLATES, n), join(profiles, n))
+  for (const [name, fn] of Object.entries(mutate)) {
+    const f = join(profiles, `${name}.toml`)
+    writeFileSync(f, fn(readFileSync(f, 'utf8')))
+  }
+  return { shim, profiles, cleanup: () => rmSync(root, { recursive: true, force: true }) }
+}
+// The preflight answer: REALLY runs the toolcheck CLI against the fixture and returns what
+// the preflight agent would (exit code + stdout/stderr verbatim).
+const realToolcheck = (fx) => () => {
+  try {
+    const out = execFileSync(process.execPath, [TOOLCHECK, '--shim', fx.shim, '--profiles', fx.profiles], { encoding: 'utf8', stdio: 'pipe' })
+    return { ok: true, exitCode: 0, output: out }
+  } catch (e) {
+    return { ok: false, exitCode: e.status, output: `${e.stdout || ''}${e.stderr || ''}` }
+  }
+}
+const bashNever = (t) => t.replace(/\[tools\.bash\]\npermission = "always"/, '[tools.bash]\npermission = "never"')
+  .replace(/\[tools\.git_bash\]\npermission = "always"/, '[tools.git_bash]\npermission = "never"')
+const SEAT_CALLS = ['bloodhound:', 'pointer:', 'watchdog:', 'alpha:', 'shepherd:', 'tracker:']
+
+test('AC5: a pointer-glm profile with bash = "never" → the REAL toolcheck exits 1 → the run parks toolcheck_failed before any seat', async () => {
+  const fx = toolcheckFixture({ 'wolfpack-pointer-glm': bashNever })
+  try {
+    const { result, calls, find, logs } = await runHunt({ answers: { 'toolcheck-preflight': realToolcheck(fx) } })
+    assert.equal(result.status, 'parked:toolcheck_failed', JSON.stringify(result))
+    assert.equal(result.reason, 'toolcheck_failed')
+    for (const p of SEAT_CALLS) assert.equal(find(p).length, 0, `${p} never ran`)
+    const pf = find('toolcheck-preflight:')
+    assert.equal(pf.length, 1)
+    assert.match(pf[0].prompt, /wolfpack-toolcheck\.mjs' --shim '\/repo\/scripts\/podman-vibe\.sh'/, 'targets the current shim root')
+    const park = find('park:h:toolcheck_failed')
+    assert.equal(park.length, 1)
+    assert.match(park[0].prompt, /wolfpack-pointer-glm/)
+    assert.match(park[0].prompt, /profile denies "bash"/)
+    assert.match(park[0].prompt, /resume_phase: Spec/, 'a fresh hunt resumes at Spec once fixed')
+    assert.match(park[0].prompt, /resolution_type_expected: redirect/)
+    assert.match(park[0].prompt, /wolfpack-install-vibe-agents\.mjs/)
+    const stop = logs.find(l => /seat toolcheck FAILED \(exit 1\)/.test(l))
+    assert.ok(stop, logs.join('\n'))
+    assert.match(stop, /wolfpack-pointer-glm/)
+    assert.match(stop, /bash/)
+    // the preflight runs right after scaffold — Spec never started
+    assert.equal(find('spec').length, 0)
+    assert.ok(calls.findIndex(c => c.label.startsWith('toolcheck-preflight')) > calls.findIndex(c => c.label === 'scaffold' || c.label.startsWith('scaffold')))
+  } finally { fx.cleanup() }
+})
+
+test('AC5: matching profiles → the REAL toolcheck exits 0 → the run proceeds through every seat to Verify', async () => {
+  const fx = toolcheckFixture()
+  try {
+    const { result, find, logs } = await runHunt({ answers: { 'toolcheck-preflight': realToolcheck(fx) } })
+    assert.notEqual(String(result.status).startsWith('parked'), true, JSON.stringify(result))
+    assert.ok(logs.some(l => /✓ seat toolcheck: profiles match the shim/.test(l)))
+    for (const p of ['bloodhound:', 'pointer:', 'watchdog:']) assert.equal(find(p).length >= 1, true, p)
+    assert.equal(find('verify').length, 1)
+  } finally { fx.cleanup() }
+})
+
+test('AC5: fail closed — an empty / garbled / non-zero preflight result parks (never a silent continue)', async () => {
+  for (const ans of [{}, { exitCode: '0', output: 'x' }, { ok: true, exitCode: 2, output: 'shim not found' }, null]) {
+    const { result, find } = await runHunt({ answers: { 'toolcheck-preflight': () => ans } })
+    assert.equal(result.status, 'parked:toolcheck_failed', JSON.stringify(ans))
+    assert.equal(find('bloodhound:').length, 0, JSON.stringify(ans))
+  }
+})
+
+test('AC5: no Vibe family enabled → no preflight call (nothing to guard), the run still completes', async () => {
+  const { result, find, logs } = await runHunt({ env: { WOLFPACK_ENABLE_GLM: '0', WOLFPACK_ENABLE_MISTRAL_AUTO: '0' },
+    answers: {
+      'toolcheck-preflight': () => { throw new Error('preflight must not run') },
+      bloodhound: { ...BASE.bloodhound, provider: 'claude' },
+    } })
+  assert.equal(find('toolcheck-preflight').length, 0)
+  assert.ok(logs.some(l => /Seat toolcheck preflight skipped — no Vibe examiner family enabled/.test(l)))
+  void result
+})
+
+test('AC5: one Vibe family enabled is enough to require the preflight', async () => {
+  const { result, find } = await runHunt({ env: { WOLFPACK_ENABLE_GLM: '0' }, answers: { 'toolcheck-preflight': {} } })
+  assert.equal(find('toolcheck-preflight').length, 1)
+  assert.equal(result.status, 'parked:toolcheck_failed')
+})
+
+test('AC5: a resume at Code Review re-runs the preflight and parks with resume_phase Code Review', async () => {
+  const fx = toolcheckFixture({ 'wolfpack-watchdog': bashNever })
+  try {
+    const { result, find } = await runHunt({ answers: { 'resume-probe': RESUME_AT_CODE_REVIEW, 'toolcheck-preflight': realToolcheck(fx) } })
+    assert.equal(result.status, 'parked:toolcheck_failed')
+    assert.equal(find('pointer:').length, 0)
+    assert.match(find('park:h:toolcheck_failed')[0].prompt, /resume_phase: Code Review/)
+    assert.match(find('park:h:toolcheck_failed')[0].prompt, /wolfpack-watchdog: profile denies "bash"/)
+  } finally { fx.cleanup() }
+})
+
+test('AC5: a resume past Certify (Verify) skips the preflight — no shim seat lies ahead', async () => {
+  const probe = { ...RESUME_AT_CODE_REVIEW, status: 'certified', resumePhase: 'Verify' }
+  const { find, logs } = await runHunt({ answers: { 'resume-probe': probe, 'toolcheck-preflight': {} } })
+  assert.equal(find('toolcheck-preflight').length, 0)
+  assert.ok(logs.some(l => /Seat toolcheck preflight skipped — no shim seat lies ahead/.test(l)), logs.join('\n'))
+})
+
+test('TOOL_DENIAL_PATTERN in hunt-pipeline.js is byte-equal to the toolcheck export', () => {
+  const m = SRC.match(/const TOOL_DENIAL_PATTERN =\s*\n?\s*'([^']*)'/)
+  assert.ok(m, 'literal found in the workflow source')
+  assert.equal(m[1], TOOLCHECK_DENIAL_PATTERN)
+  // and the TOOL-DENIAL CHECK prompt carries it shell-quoted, verbatim
+  assert.ok(SRC.includes('grep -E -i -h -o ${shq(TOOL_DENIAL_PATTERN)} <base>.out <base>.err'))
+})
+
+// A Vibe transcript of a boxed seat, grepped IN-TEST with the shared pattern — exactly what the
+// shim agent's TOOL-DENIAL CHECK returns as deniedTools.
+const BOXED_TRANSCRIPT = `I'll start by running the diff.
+<tool_result>Tool 'bash' is permanently disabled</tool_result>
+I cannot run git diff; reading files instead.
+<tool_result>Unknown tool 'git_bash'</tool_result>
+<verdict>{"verdict":"APPROVED","findings":[]}</verdict>`
+const deniedFrom = (text) => [...new Set((text.match(new RegExp(TOOLCHECK_DENIAL_PATTERN, 'ig')) || []))].sort()
+const auditRecords = (find, role) => find(`audit-only-record:h:${role}:`)
+
+test('AC6a: a Pointer transcript with denied tool calls → audit_only recorded (metadata + pointer-review header), loud log', async () => {
+  const denied = deniedFrom(BOXED_TRANSCRIPT)
+  assert.deepEqual(denied, ['Unknown tool', 'permanently disabled'])
+  const { result, find, logs } = await runHunt({ answers: {
+    pointer: { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'mistral', deniedTools: denied },
+  } })
+  assert.notEqual(String(result.status).startsWith('parked'), true, 'a review seat never parks on audit_only')
+  const rec = auditRecords(find, 'pointer')
+  assert.equal(rec.length, 1)
+  assert.match(rec[0].prompt, /"audit_only": true/)
+  assert.match(rec[0].prompt, /audit_only_seats/)
+  assert.match(rec[0].prompt, /pointer-review-1\.md/)
+  assert.match(rec[0].prompt, /"evidence": \["Unknown tool","permanently disabled"\]/)
+  assert.match(rec[0].prompt, /> audit_only: true — pointer r1 \(mistral\) ran without a working shell: Unknown tool; permanently disabled/)
+  assert.equal(rec[0].opts.model, 'sonnet')
+  assert.ok(logs.some(l => /⚠ h: pointer r1 \(mistral\) was audit_only/.test(l)), logs.join('\n'))
+})
+
+test('AC6a: a Bloodhound self-report tool_access.shell = "denied" → audit_only recorded against review-1.md', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    bloodhound: { ...BASE.bloodhound, deniedTools: [], toolAccess: { shell: 'denied', denied_tools: ['bash'] } },
+  } })
+  const rec = auditRecords(find, 'bloodhound')
+  assert.equal(rec.length, 1)
+  assert.match(rec[0].prompt, /"audit_only": true/)
+  assert.match(rec[0].prompt, /review-1\.md/)
+  assert.match(rec[0].prompt, /seat reported tool_access\.shell = denied/)
+  assert.match(rec[0].prompt, /seat reported denied tool: bash/)
+  assert.ok(logs.some(l => /⚠ h: bloodhound r1 \(glm\) was audit_only/.test(l)))
+})
+
+test('AC6a: a review with a working shell (tool_access ok, no denial lines) records nothing', async () => {
+  const { find } = await runHunt({ answers: {
+    bloodhound: { ...BASE.bloodhound, deniedTools: [], toolAccess: { shell: 'ok', denied_tools: [] } },
+    pointer: { ...BASE.pointer, deniedTools: [], toolAccess: { shell: 'ok', denied_tools: [] } },
+  } })
+  assert.equal(find('audit-only-record:').length, 0)
+})
+
+test('AC6: a Vibe review that omits tool_access → "unreported" row (measured), not audit_only, never parks', async () => {
+  const { result, find, logs } = await runHunt({ answers: { alpha: { ...BASE.alpha, tier: 'Orange' } } })
+  assert.notEqual(String(result.status).startsWith('parked'), true, JSON.stringify(result))
+  for (const role of ['bloodhound', 'pointer']) {
+    const rec = auditRecords(find, role)
+    assert.ok(rec.length >= 1, role)
+    assert.match(rec[0].prompt, /"tool_access": "unreported"/, role)
+    assert.doesNotMatch(rec[0].prompt, /"audit_only": true/, role)
+  }
+  assert.ok(logs.some(l => /pointer r1 \(mistral\) did not report tool_access/.test(l)))
+})
+
+test('AC6: the review verdict contract and the Watchdog verdict instruction both demand tool_access', async () => {
+  const { find } = await runHunt({})
+  for (const p of ['bloodhound:', 'pointer:']) {
+    const prompt = find(p)[0].prompt
+    assert.match(prompt, /"tool_access": \{ "shell": "ok" \| "denied" \| "unused", "denied_tools": \[\] \}/, p)
+    assert.match(prompt, /"tool_access" is MANDATORY/, p)
+    assert.match(prompt, /TOOL-DENIAL CHECK/, p)
+  }
+  const wd = find('watchdog:')[0].prompt
+  assert.match(wd, /tool_access: \{shell: ok\|denied\|unused, denied_tools: \[\]\}/)
+  assert.match(wd, /4a\. TOOL-DENIAL CHECK/)
+  assert.match(wd, /4\.5 AUDIT-ONLY GATE \(tier Yellow\): an audit-only certification is allowed on this tier but recorded/)
+})
+
+test('AC6: on Orange the Watchdog prompt forbids the PASS-only side effects of an audit-only certification', async () => {
+  const { find } = await runHunt({ answers: { alpha: { ...BASE.alpha, tier: 'Orange' } } })
+  const wd = find('watchdog:')[0].prompt
+  assert.match(wd, /4\.5 AUDIT-ONLY GATE \(tier Orange\): this tier cannot certify on audit alone/)
+  assert.match(wd, /do not append to \.wolfpack\/pedigree\/index\.md, do not commit/)
+})
+
+const AUDIT_PASS = { verdict: 'PASS', provider: 'mistral', status: 'mistral', deniedTools: ["Tool 'bash' is permanently disabled"] }
+
+test('AC6b: Orange + an audit-only PASS → parks audit_only_certification, not PASS; no Verify', async () => {
+  for (const tier of ['Orange', 'Red', 'Purple' /* unknown tier fails closed */]) {
+    const { result, find, logs } = await runHunt({ answers: { alpha: { ...BASE.alpha, tier }, watchdog: AUDIT_PASS } })
+    assert.equal(result.status, 'parked:audit_only_certification', `${tier}: ${JSON.stringify(result)}`)
+    assert.equal(result.verdict, 'PARKED', tier)
+    assert.equal(find('verify').length, 0, `${tier}: no Verify`)
+    const park = find('park:h:audit_only_certification')
+    assert.equal(park.length, 1, tier)
+    assert.match(park[0].prompt, /resume_phase: Certify/, tier)
+    assert.match(park[0].prompt, /permanently disabled/, tier)
+    assert.match(park[0].prompt, /cannot certify on audit alone/, tier)
+    // recorded too (metadata + certification.md header)
+    const rec = auditRecords(find, 'watchdog')
+    assert.equal(rec.length, 1, tier)
+    assert.match(rec[0].prompt, /certification\.md/, tier)
+    assert.match(rec[0].prompt, /"audit_only": true/, tier)
+    assert.ok(logs.some(l => /certification was AUDIT-ONLY .* PASS not accepted/.test(l)), tier)
+  }
+})
+
+test('AC6b: Orange + a self-reported denied shell (no denial lines) also parks', async () => {
+  const { result } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange' },
+    watchdog: { verdict: 'PASS', provider: 'glm', deniedTools: [], toolAccess: { shell: 'denied', denied_tools: ['bash'] } },
+  } })
+  assert.equal(result.status, 'parked:audit_only_certification')
+})
+
+test('AC6c: Yellow + an audit-only PASS → allowed (Verify runs) but recorded against certification.md', async () => {
+  const { result, find } = await runHunt({ answers: { watchdog: AUDIT_PASS } })
+  assert.notEqual(String(result.status).startsWith('parked'), true, JSON.stringify(result))
+  assert.equal(find('verify').length, 1)
+  const rec = auditRecords(find, 'watchdog')
+  assert.equal(rec.length, 1)
+  assert.match(rec[0].prompt, /"audit_only": true/)
+  assert.match(rec[0].prompt, /certification\.md/)
+  assert.match(rec[0].prompt, /> audit_only: true — watchdog r0 \(mistral\) ran without a working shell/)
+})
+
+test('AC6: a clean Orange PASS (tool_access ok, no denial lines) → no record, no park', async () => {
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange' },
+    bloodhound: { ...BASE.bloodhound, deniedTools: [], toolAccess: { shell: 'ok', denied_tools: [] } },
+    pointer: { ...BASE.pointer, deniedTools: [], toolAccess: { shell: 'ok', denied_tools: [] } },
+    watchdog: { verdict: 'PASS', provider: 'mistral', deniedTools: [], toolAccess: { shell: 'ok', denied_tools: [] } },
+  } })
+  assert.notEqual(String(result.status).startsWith('parked'), true, JSON.stringify(result))
+  assert.equal(find('audit-only-record:').length, 0)
+  assert.equal(find('verify').length, 1)
+})
+
+test('AC6 (Bloodhound r1 MEDIUM): an Orange/Red/unknown PASS that OMITS tool_access parks (glm and mistral certifiers)', async () => {
+  for (const [tier, provider] of [['Orange', 'glm'], ['Red', 'glm'], ['Purple', 'glm'], ['Orange', 'mistral']]) {
+    const { result, find } = await runHunt({ answers: { alpha: { ...BASE.alpha, tier }, watchdog: { verdict: 'PASS', provider, deniedTools: [] } } })
+    assert.equal(result.status, 'parked:audit_only_certification', `${tier}/${provider}: ${JSON.stringify(result)}`)
+    assert.equal(find('verify').length, 0, `${tier}/${provider}`)
+    assert.match(find('park:h:audit_only_certification')[0].prompt, /certifier omitted the mandatory tool_access field/)
+    assert.match(find('audit-only-record:h:watchdog:')[0].prompt, /"audit_only": true/)
+  }
+})
+
+test('AC6: the missing-tool_access rule is provider-agnostic (a claude-attributed certification is held to it too)', () => {
+  // Exercise the deployed helpers directly: certAuditEvidence never looks at the provider.
+  const body = SRC.match(/const SINGLE_LENS = .*\n/)[0] + SRC.match(/const TIER_CONFIG = \{[\s\S]*?\n\}\n/)[0]
+  const helpers = SRC.match(/const auditEvidence = [\s\S]*?\nconst certAuditEvidence = [\s\S]*?\n\}\n/)[0]
+  const mk = new Function(`${body}\n${helpers}\nreturn { auditEvidence, isAuditOnly, HEAVY, certAuditEvidence }`)
+  const { auditEvidence, isAuditOnly, HEAVY, certAuditEvidence } = mk()
+  assert.deepEqual(certAuditEvidence({ verdict: 'PASS', provider: 'claude', deniedTools: [] }, 'Orange'),
+    ['certifier omitted the mandatory tool_access field'])
+  assert.deepEqual(certAuditEvidence({ verdict: 'PASS', provider: 'claude', deniedTools: [] }, 'Yellow'), [])
+  assert.equal(HEAVY('Orange'), true); assert.equal(HEAVY('Red'), true); assert.equal(HEAVY(undefined), true)
+  assert.equal(HEAVY('Yellow'), false); assert.equal(HEAVY('Blue'), false); assert.equal(HEAVY('Green'), false)
+  assert.equal(isAuditOnly({ deniedTools: ['  ', ''] }), false, 'blank grep lines are not evidence')
+  assert.equal(isAuditOnly({ toolAccess: { shell: 'unused', denied_tools: [] } }), false)
+  assert.equal(isAuditOnly({ toolAccess: { shell: 'DENIED' } }), true, 'case-insensitive')
+  assert.deepEqual(auditEvidence({ auditOnly: true }), ['shim agent reported auditOnly'])
+  assert.deepEqual(auditEvidence(null), [])
+})
+
+test('AC6: Yellow PASS that omits tool_access → not parked, "unreported" row for the Watchdog', async () => {
+  const { result, find } = await runHunt({ answers: { watchdog: { verdict: 'PASS', provider: 'mistral', deniedTools: [] } } })
+  assert.notEqual(String(result.status).startsWith('parked'), true)
+  assert.equal(find('verify').length, 1)
+  const rec = auditRecords(find, 'watchdog')
+  assert.equal(rec.length, 1)
+  assert.match(rec[0].prompt, /"tool_access": "unreported"/)
+})
+
+test('AC6: a non-PASS audit-only Orange certification is recorded but not parked as audit_only (REWORK flows as before)', async () => {
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange' },
+    watchdog: (_p, _o, n) => (n === 1 ? { ...AUDIT_PASS, verdict: 'REWORK' } : BASE.watchdog),
+  } })
+  assert.notEqual(result.status, 'parked:audit_only_certification')
+  assert.ok(auditRecords(find, 'watchdog').some(c => /"audit_only": true/.test(c.prompt)))
+})
+
+test('AC6: a failed audit-only record never discards the accepted review (noteAuditOnly never throws)', async () => {
+  const { result, logs, find } = await runHunt({ answers: {
+    pointer: { ...BASE.pointer, deniedTools: ['permanently disabled'] },
+    'audit-only-record': () => { throw new Error('disk full') },
+  } })
+  assert.notEqual(String(result.status).startsWith('parked'), true, JSON.stringify(result))
+  assert.ok(logs.some(l => /⚠ h: pointer r1 \(mistral\) was audit_only/.test(l)), 'the loud log happens either way')
+  assert.ok(logs.some(l => /could not record the pointer r1 tool-access row \(disk full\)/.test(l)))
+  assert.equal(find('tracker:').length, 1)
+})
+
+test('AC6: runReviewFanout passes deniedTools / toolAccess from the accepted review through to the record', async () => {
+  const { find } = await runHunt({ answers: {
+    pointer: { ...BASE.pointer, deniedTools: ['denied by approval policy', 'denied by approval policy'], toolAccess: { shell: 'ok', denied_tools: [] } },
+  } })
+  const rec = auditRecords(find, 'pointer')
+  assert.equal(rec.length, 1)
+  assert.match(rec[0].prompt, /"evidence": \["denied by approval policy"\]/, 'deduplicated')
+})
+
+test('AC6 (Bloodhound r1 MEDIUM): a claude last-resort certifier that omits tool_access on Orange parks too', async () => {
+  // GLM Shepherd (usage offload) + a mistral-family Tracker → writers {glm, mistral} → the only
+  // legal certifier is the claude last-resort link.
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange' },
+    'shepherd-seat': OFFLOAD_SEAT,
+    tracker: { verdict: 'TESTS_PASS', provider: 'mistral' },
+    pointer: { ...BASE.pointer, provider: 'mistral' },
+    watchdog: { verdict: 'PASS', provider: 'claude', deniedTools: [] },
+  } })
+  assert.match(find('watchdog:')[0].prompt, /Claude \(last resort\)/, 'claude is in the certifier chain')
+  assert.equal(result.status, 'parked:audit_only_certification', JSON.stringify(result))
+  assert.match(find('park:h:audit_only_certification')[0].prompt, /certifier omitted the mandatory tool_access field/)
+  assert.match(find('park:h:audit_only_certification')[0].prompt, /certifier: claude/)
 })
