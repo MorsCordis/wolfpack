@@ -17,6 +17,8 @@ keep their original filing dates.
 
 ## Orchestration layer
 
+- [ ] Unified sandbox image needs `node` for the hunt-pipeline toolcheck preflight; until it has it, container (`WOLFPACK_SANDBOX`) campaign runs park `toolcheck_failed` at the preflight.
+
 - [ ] **Role prompts name a skill path consumers don't have** (Low, 2026-10-17; from prespec-sweep AC10):
   `hunt-pipeline.js` tells each headless role to "read `.agents/skills/<role>/SKILL.md`". The runtime sync
   rewrites that to `.claude/skills/<role>/SKILL.md`, and that path is absent in a consumer that loads the

@@ -1,0 +1,43 @@
+# Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
+# Wolfpack GLM seat (watchdog). Run ONLY via the project's podman-vibe.sh shim, which passes
+# --auto-approve + a strict --enabled-tools allow-list
+# (read_file grep bash dev_cortex_repo_map dev_cortex_file_outline).
+# vibe -p hangs forever on any tool call needing approval, so nothing here is "ask".
+active_model = "glm-5.3"  # zai-glm-5-3 via the Mistral API
+agent_type = "agent"
+display_name = "Wolfpack Watchdog (GLM 5.3)"
+description = "Certifier — read-only, GLM seat (the calling shim writes certification files)"
+system_prompt_id = "wolfpack-watchdog"
+
+[tools.read_file]
+permission = "always"
+
+[tools.grep]
+permission = "always"
+
+[tools.dev_cortex_repo_map]
+permission = "always"
+
+[tools.dev_cortex_file_outline]
+permission = "always"
+
+# bash runs inside the sandbox: worktree and git dir mounted read-only, no prod
+# credentials (doc 06: the sandbox is the guardrail). The seat must be able to run
+# `git diff` and the project's test command. git_bash is Vibe's Windows-only shell
+# companion; it mirrors bash.
+[tools.bash]
+permission = "always"
+
+[tools.git_bash]
+permission = "always"
+
+# edit/write_file stay never: read-only by role. task stays never: no self-orchestration
+# (the pipeline owns fan-out).
+[tools.edit]
+permission = "never"
+
+[tools.write_file]
+permission = "never"
+
+[tools.task]
+permission = "never"

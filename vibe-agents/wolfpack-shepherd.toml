@@ -1,0 +1,32 @@
+# Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
+# Tracked as-is: the pipeline does not dispatch this seat through the shim, so the
+# toolcheck lists it as "tracked, not dispatched" and does not parity-check it.
+active_model = "mistral-medium-3.5"  # the Mistral API cross-model checker (the podman-vibe.sh shim assumes it)
+agent_type = "agent"
+display_name = "Wolfpack Shepherd"
+description = "Implementer — code only, never runs tests"
+system_prompt_id = "wolfpack-shepherd"
+
+[tools.read_file]
+permission = "always"
+
+[tools.grep]
+permission = "always"
+
+[tools.skill]
+permission = "always"
+
+[tools.write_file]
+permission = "ask"
+
+[tools.edit]
+permission = "ask"
+
+# `bash` is denied so Shepherd structurally cannot run the test suite — that is Tracker's
+# job. `git_bash` stays available because the pre-implementation `git rebase origin/main`
+# is mandatory: worktrees go stale and un-rebased work silently reverts other hunts.
+[tools.bash]
+permission = "never"
+
+[tools.git_bash]
+permission = "ask"

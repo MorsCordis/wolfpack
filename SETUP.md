@@ -160,6 +160,24 @@ The hunt will:
 
 Follow the finishing messages — each phase tells you what to do next.
 
+## Vibe seat profiles
+
+If your project runs cross-model review seats through Vibe (a `podman-vibe.sh`-style shim), the
+seat profiles are part of the pack, not hand-made local files:
+
+- The templates live in `vibe-agents/` (`wolfpack-*.toml`, one per seat).
+- Install or update them with `node scripts/wolfpack-install-vibe-agents.mjs` (default
+  destination `~/.vibe/agents-headless/`; `--dest DIR` or `WOLFPACK_VIBE_AGENTS_DIR` overrides).
+  It reports each file as installed / unchanged / replaced, backs up any file it replaces
+  (`<name>.bak-<timestamp>`), and leaves every other profile alone.
+  `--check` writes nothing and exits 1 on drift.
+- `node scripts/wolfpack-toolcheck.mjs --shim <project>/scripts/podman-vibe.sh` checks that every
+  pipeline seat profile agrees with the tools the shim enables (review/certify seats need a shell
+  to run `git diff` and the tests; implementers stay shell-free). It exits non-zero on any
+  mismatch, and `hunt-pipeline.js` runs it as a preflight before the first review seat.
+- Never hand-edit `~/.vibe/agents-headless/`: change the template, re-run the installer.
+  (A future `install.sh` takes this step over.)
+
 ## Optional: usage snapshot (Claude Code)
 
 The window gate (`scripts/wolfpack-window-gate.mjs`) decides on Claude Code's **real** 5-hour /

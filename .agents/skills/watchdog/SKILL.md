@@ -66,6 +66,8 @@ A transient infra failure (auth expired, service down, port in use, connection r
 
 Work through each systematically. Record each item's result in `$PLAN_DIR/certification.md`.
 
+**Tool access (hard rule).** You must run `git diff <base>..HEAD` and the project's test command yourself. If your shell is denied or unavailable, say so in the verdict's `tool_access` (`{"shell": "ok"|"denied"|"unused", "denied_tools": [...]}`; list every denied or unknown tool call). Never present a file-reading audit as a verified certification. On Orange and Red tiers the pipeline parks an audit-only certification (`audit_only_certification`) instead of accepting its PASS, and there a verdict that omits `tool_access`, or reports `shell` as anything other than `"ok"` (including `"unused"`: you never ran the diff or the tests), counts as audit-only. On lighter tiers it is allowed but recorded in `metadata.audit_only_seats`.
+
 ### Parallel Certification (optional)
 
 > ⚠️ **AUTONOMOUS / CROSS-MODEL RUNS — NO SUB-AGENTS.** When certification runs headless via a non-orchestrator harness, the sub-agent tool is DISABLED. Run all certification lenses in **ONE comprehensive pass**, then emit the verdict. The parallel-certification guidance below applies **only to interactive (orchestrator-driven) runs**.

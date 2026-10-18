@@ -1,0 +1,29 @@
+# Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
+# Tracked as-is: the pipeline does not dispatch this seat through the shim, so the
+# toolcheck lists it as "tracked, not dispatched" and does not parity-check it.
+active_model = "mistral-medium-3.5"  # the Mistral API cross-model checker (the podman-vibe.sh shim assumes it)
+agent_type = "agent"
+display_name = "Wolfpack Tracker"
+description = "Test writer and runner — the only role that runs the suite"
+system_prompt_id = "wolfpack-tracker"
+
+[tools.read_file]
+permission = "always"
+
+[tools.grep]
+permission = "always"
+
+[tools.skill]
+permission = "always"
+
+[tools.write_file]
+permission = "ask"
+
+[tools.edit]
+permission = "ask"
+
+[tools.bash]
+permission = "ask"
+
+[tools.git_bash]
+permission = "ask"
