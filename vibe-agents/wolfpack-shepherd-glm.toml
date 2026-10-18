@@ -1,0 +1,39 @@
+# Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
+# Wolfpack GLM Shepherd (coder-alt seat). Run ONLY via the project's
+# `podman-vibe.sh --implement` shim, which mounts the worktree read-write and passes
+# --auto-approve + --enabled-tools read_file grep write_file edit dev_cortex_repo_map
+# dev_cortex_file_outline. NO bash: the implementer never runs tests or git — the calling
+# wrapper agent commits. write_file creates NEW files only (it refuses existing ones); use
+# `edit` to modify an existing file.
+active_model = "glm-5.3"  # zai-glm-5-3 via the Mistral API
+agent_type = "agent"
+display_name = "Wolfpack Shepherd (GLM 5.3)"
+description = "Implementer — code only, no shell, never runs tests"
+system_prompt_id = "wolfpack-shepherd"
+
+[tools.read_file]
+permission = "always"
+
+[tools.grep]
+permission = "always"
+
+[tools.write_file]
+permission = "always"
+
+[tools.edit]
+permission = "always"
+
+[tools.dev_cortex_repo_map]
+permission = "always"
+
+[tools.dev_cortex_file_outline]
+permission = "always"
+
+[tools.bash]
+permission = "never"
+
+[tools.git_bash]
+permission = "never"
+
+[tools.task]
+permission = "never"

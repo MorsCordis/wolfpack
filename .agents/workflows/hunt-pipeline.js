@@ -31,6 +31,19 @@ const VERDICT_SCHEMA = {
     // Watchdog: the examiner family that actually certified (glm | mistral | claude last-resort) —
     // checked against the code writer's family by the cross-family runtime invariant.
     provider: { type: 'string' },
+    // seat-profiles-into-pack: tool-access evidence for the accepted link. deniedTools = the
+    // fixed TOOL_DENIAL_PATTERN grep over the shim's .out/.err (claude link: []); toolAccess =
+    // the seat's own <verdict> "tool_access" self-report, passed through verbatim. The JS
+    // derives audit_only from these (auditEvidence) — the shim agent never decides it.
+    auditOnly: { type: 'boolean' },
+    deniedTools: { type: 'array', items: { type: 'string' } },
+    toolAccess: {
+      type: 'object',
+      properties: {
+        shell: { type: 'string' },
+        denied_tools: { type: 'array', items: { type: 'string' } },
+      },
+    },
   },
   required: ['verdict'],
 }
@@ -52,6 +65,19 @@ const REVIEW_SCHEMA = {
     // writer family and IS inside this seat's chain (cross-family runtime invariant), and
     // parks loud if it is a writer family, outside the chain, or unresolvable.
     provider: { type: 'string' },
+    // seat-profiles-into-pack: tool-access evidence for the accepted link. deniedTools = the
+    // fixed TOOL_DENIAL_PATTERN grep over the shim's .out/.err (claude link: []); toolAccess =
+    // the seat's own <verdict> "tool_access" self-report, passed through verbatim. The JS
+    // derives audit_only from these (auditEvidence) — the shim agent never decides it.
+    auditOnly: { type: 'boolean' },
+    deniedTools: { type: 'array', items: { type: 'string' } },
+    toolAccess: {
+      type: 'object',
+      properties: {
+        shell: { type: 'string' },
+        denied_tools: { type: 'array', items: { type: 'string' } },
+      },
+    },
     grounded: { type: 'number' },   // file-bearing findings that grounded out (file exists)
     dropped: {                       // findings dropped as ungrounded (file not found)
       type: 'array',
@@ -421,6 +447,10 @@ const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
 // against campaign/<slug>, merge-and-await compliance, no per-hunt Verify). campaign-runner's
 // chain mode refuses to start without it (a stale copy would fork from main).
 // WOLFPACK_CHAIN_PROTOCOL=1
+// seat-profiles-into-pack: seats protocol 1 = the seat toolcheck runs as a preflight (profile ×
+// shim parity, park toolcheck_failed) and review/certify seats record audit_only (an Orange/Red
+// audit-only certification parks audit_only_certification). Documentation only.
+// WOLFPACK_SEATS_PROTOCOL=1 — toolcheck preflight + audit_only
 const EXAMINER_PROTOCOL = 3
 void EXAMINER_PROTOCOL
 const CHAIN_PROTOCOL = 1
@@ -1022,6 +1052,42 @@ Return ok=true and the printed JSON's reason if it exits 0; otherwise ok=false a
   else log(`⚠ usage offload NOT recorded for ${slug} (${(rec && rec.error) || 'no result'}) — the hunt routes as if no offload was requested`)
 }
 
+// seat-profiles-into-pack (AC5) — SEAT TOOLCHECK PREFLIGHT. A seat's real toolset is the
+// shim's --enabled-tools list AND its Vibe profile's permissions; when they disagreed
+// (profiles denied bash) every review/certification silently became a file-reading audit.
+// Before the first shim-backed seat runs, assert profile × shim parity with the canonical
+// toolcheck and STOP (park, loud) on any mismatch — never a silent continue. Fail closed: a
+// missing or garbled result is a failure. Skipped only when no shim seat lies ahead (no Vibe
+// family enabled, or a resume past Certify) — then there is nothing for it to guard.
+const TOOLCHECK_SCHEMA = {
+  type: 'object',
+  properties: { ok: { type: 'boolean' }, exitCode: { type: 'number' }, output: { type: 'string' } },
+  required: ['exitCode', 'output'],
+}
+if (at('Certify') && EXAMINER_ORDER.some(f => f !== 'claude')) {
+  const tcShim = `${repoRoot}/scripts/podman-vibe.sh`
+  const tc = await agent(`You ONLY run the Wolfpack seat toolcheck for hunt ${slug} — modify nothing. Run exactly:
+  node ${shq(`${repoRoot}/scripts/wolfpack-toolcheck.mjs`)} --shim ${shq(tcShim)} 2>&1; echo "TOOLCHECK_RC=$?"
+Return exitCode = the number after TOOLCHECK_RC= (a number), ok = (exitCode == 0), and output = the
+command's stdout+stderr VERBATIM (first 60 lines). If the command could not run at all, return
+exitCode 2 and the error text as output. Never fix, install or edit anything.`,
+    { label: `toolcheck-preflight:${slug}`, phase: 'Scaffold', model: 'sonnet', schema: TOOLCHECK_SCHEMA })
+  if (!(tc && tc.exitCode === 0)) {
+    const tcOut = (tc && tc.output) || '(no output)'
+    log(`⛔ ${slug}: seat toolcheck FAILED (exit ${tc && tc.exitCode}) — review/certify seats would run boxed or audit-only. Stopping.\n${tcOut}`)
+    const tcResume = PHASE_ORDER[Math.max(PHASE_ORDER.indexOf(resumeFrom), PHASE_ORDER.indexOf('Spec'))]
+    await parkHunt({
+      reason: 'toolcheck_failed', resumePhase: tcResume, resolutionTypeExpected: 'redirect', phaseLabel: 'Scaffold',
+      needFromUser: 'The seat profiles and the shim disagree (or a profile is missing). Fix them — usually `node <wolfpack>/scripts/wolfpack-install-vibe-agents.mjs` — re-run the toolcheck until it exits 0, then resume.',
+      context: `toolcheck exit ${tc && tc.exitCode} (shim ${tcShim}):\n${tcOut}`,
+    })
+    return { slug, verdict: 'PARKED', status: 'parked:toolcheck_failed', reason: 'toolcheck_failed', tier, worktreePath }
+  }
+  log(`✓ seat toolcheck: profiles match the shim (${tcShim})`)
+} else {
+  log(`Seat toolcheck preflight skipped — ${EXAMINER_ORDER.some(f => f !== 'claude') ? 'no shim seat lies ahead (resume past Certify)' : 'no Vibe examiner family enabled'}`)
+}
+
 // [07 §6] Mistral review turn budget. CORRECTED 2026-06-08: the disconnect was NOT turn
 // accumulation against a 25K-TPM cap (that theory is disproven — Medium is 200K context).
 // It was a server-side request-SIZE/gateway limit, fixed by the LEAN request config in
@@ -1121,6 +1187,55 @@ Do NOT alter any other file. Do NOT commit. Return recorded: true when the row i
      model: 'sonnet' })
 }
 
+// seat-profiles-into-pack (AC6) — DURABLE record of an AUDIT-ONLY review/certification (a seat
+// whose shell or tools were denied). Mirrors noteClaudeFallbackReview: the PIPELINE writes the
+// row (metadata.audit_only_seats) and stamps the artifact header itself, after a LOUD log, so
+// an audit never looks like a review that ran git diff and the tests. Evidence comes from
+// auditEvidence (certAuditEvidence for the Watchdog: on Orange/Red/unknown tiers a missing
+// tool_access IS audit-only). A Vibe review — or a Green/Blue/Yellow certification — that
+// omits tool_access is recorded as tool_access "unreported" (measured, not audit-only).
+// Never throws — a failed record must not discard an accepted review; the log happens either way.
+const noteAuditOnly = async (role, round, result, artifactPath, phaseLabel) => {
+  try {
+    const prov = (result && (result.provider || result.status)) || 'unknown'
+    const fam = familyOf(prov)
+    const ev = role === 'watchdog' ? certAuditEvidence(result, tier) : auditEvidence(result)
+    const hasTA = !!(result && result.toolAccess && typeof result.toolAccess === 'object')
+    const r = round || 0
+    const schema = { type: 'object', properties: { recorded: { type: 'boolean' } }, required: ['recorded'] }
+    if (ev.length) {
+      const shown = ev.slice(0, 3).join('; ')
+      log(`⚠ ${slug}: ${role} r${r} (${prov}) was audit_only — it ran without a working shell (${shown}). Recording metadata.audit_only_seats and marking ${artifactPath}.`)
+      const header = `> audit_only: true — ${role} r${r} (${prov}) ran without a working shell: ${shown}`
+      await agent(`
+You are a minimal RECORD writer. Do exactly these two things, then return.
+
+1. Append one row to the "audit_only_seats" array in ${planDir}/metadata.json (create the array
+   if absent; PRESERVE every other field — read, modify, write back):
+     {"role": ${JSON.stringify(role)}, "round": ${r}, "provider": ${JSON.stringify(prov)}, "audit_only": true, "evidence": ${JSON.stringify(ev.slice(0, 10))}}
+2. Make this the FIRST line of ${artifactPath} (create the file if absent), ONCE — if the file
+   already starts with a line beginning "> audit_only: true — ${role} r${r} ", leave it as is:
+     ${header}
+Do NOT alter any other file. Do NOT commit. Return recorded: true when both are done.
+`, { label: `audit-only-record:${slug}:${role}:r${r}`, phase: phaseLabel, schema, model: 'sonnet' })
+      return
+    }
+    if (!hasTA && (role === 'watchdog' || fam === 'glm' || fam === 'mistral')) {
+      log(`${slug}: ${role} r${r} (${prov}) did not report tool_access — recording tool_access "unreported" in metadata.audit_only_seats (not audit-only).`)
+      await agent(`
+You are a minimal RECORD writer. Do exactly one thing, then return.
+
+Append one row to the "audit_only_seats" array in ${planDir}/metadata.json (create the array if
+absent; PRESERVE every other field — read, modify, write back):
+  {"role": ${JSON.stringify(role)}, "round": ${r}, "provider": ${JSON.stringify(prov)}, "tool_access": "unreported"}
+Do NOT alter any other file. Do NOT commit. Return recorded: true when the row is in the file.
+`, { label: `audit-only-record:${slug}:${role}:r${r}`, phase: phaseLabel, schema, model: 'sonnet' })
+    }
+  } catch (e) {
+    log(`⚠ ${slug}: could not record the ${role} r${round || 0} tool-access row (${e && e.message ? e.message : e}) — the review stands; see the log line above.`)
+  }
+}
+
 // usage-limit-gate (AC6): metadata step for the Claude FINAL review round (usage offload on a
 // Red / compliance-critical hunt). It is a mandated pass, NOT a fallback — so it records into
 // claude_final_reviews and never into claude_fallback_reviews.
@@ -1161,14 +1276,16 @@ MANDATORY VERDICT CONTRACT — your response MUST end with exactly ONE machine-p
       "file": "billing/services/payments.py", "line": 142,
       "claim": "one-sentence defect statement",
       "evidence": "what in the diff or file shows it" }
-  ]
+  ],
+  "tool_access": { "shell": "ok" | "denied" | "unused", "denied_tools": [] }
 }
 </verdict>
 Rules:
 - verdict APPROVED ⇒ findings MAY be [] (empty). verdict ISSUES_FOUND ⇒ findings MUST be non-empty (an ISSUES_FOUND with no findings is a contradiction and will be discarded).
 - Every "file" MUST be repo-root-relative (e.g. billing/models.py) — never absolute, never a container mount path like /workspace/... — so the pipeline can ground it with test -f against the worktree.
 - Put "file" and "line" on every finding that points at code; "claim" and "evidence" are required on each finding.
-- Emitting NO <verdict> block, malformed JSON, or paths the grounding check cannot find means your review is DISCARDED (counts as no review at all).`
+- Emitting NO <verdict> block, malformed JSON, or paths the grounding check cannot find means your review is DISCARDED (counts as no review at all).
+- "tool_access" is MANDATORY: report honestly whether your shell ran (\`git diff\`, the project's test command). "ok" = it ran; "denied" = a shell call was refused/unavailable; "unused" = you never tried. Put every tool call that was denied or reported as an unknown tool in "denied_tools" (e.g. ["bash"]). Never present a file-reading audit as a review that ran the diff.`
 
 // [05] Part B — the rate-limit signal contract between the shims and this orchestrator.
 // The shims (podman-vibe.sh) now detect a throttle (HTTP 429 / "Server
@@ -1253,6 +1370,47 @@ read-only role: print a LOUD log line "WOLFPACK_REVIEWER_DIFF_VIOLATION: <files>
 // cross-models throttled) parks differently from a review_error (plumbing broken). Match
 // the agent-set status defensively (exact "model_quota" plus throttle-ish synonyms).
 const isQuotaStatus = (s) => /model_quota|quota|rate[_\s-]?limit|both.*(rate|throttl)|throttl/i.test(String(s || ''))
+
+// seat-profiles-into-pack — AUDIT-ONLY detection. A review/certify seat whose shell (or any
+// tool) was denied produced a file-reading audit, not a review that ran `git diff` and the
+// tests. Two signals, both deterministic here: (1) deniedTools — the fixed grep of
+// TOOL_DENIAL_PATTERN over the accepted link's shim .out/.err (the shim agent runs it); (2)
+// toolAccess — the seat's own "tool_access" self-report from its <verdict> block.
+// TOOL_DENIAL_PATTERN MUST stay byte-equal to scripts/wolfpack-toolcheck.mjs's export (a
+// harness test asserts it; this workflow body cannot import).
+const TOOL_DENIAL_PATTERN =
+  'permanently disabled|Unknown tool|denied by (the )?approval policy|tool calls? (was|were) denied|not a git repository'
+const auditEvidence = (r) => {
+  const ev = []
+  for (const l of (Array.isArray(r && r.deniedTools) ? r.deniedTools : [])) if (String(l).trim()) ev.push(String(l).trim())
+  const ta = r && r.toolAccess
+  if (ta && typeof ta === 'object') {
+    if (String(ta.shell || '').toLowerCase() === 'denied') ev.push('seat reported tool_access.shell = denied')
+    for (const t of (Array.isArray(ta.denied_tools) ? ta.denied_tools : [])) ev.push(`seat reported denied tool: ${t}`)
+  }
+  if (r && r.auditOnly === true && !ev.length) ev.push('shim agent reported auditOnly')
+  return ev
+}
+const isAuditOnly = (r) => auditEvidence(r).length > 0
+// Orange/Red — or an unknown tier (fail closed: unknown = Red) — cannot certify on audit alone,
+// and there a certifier that OMITS the mandatory tool_access field has not shown its shell ran.
+const HEAVY = (t) => t === 'Orange' || t === 'Red' || !TIER_CONFIG[t]
+const certAuditEvidence = (r, t) => {
+  const ev = auditEvidence(r)
+  if (HEAVY(t) && !(r && r.toolAccess && typeof r.toolAccess === 'object'))
+    ev.push('certifier omitted the mandatory tool_access field')
+  return ev
+}
+// Prompt fragment: the TOOL-DENIAL CHECK a shim agent runs on the link whose output it
+// accepted. Pass-through only — it reports, the JS decides.
+const toolDenialCheck = (baseHint) => `TOOL-DENIAL CHECK (mandatory, on the link whose output you ACCEPTED):
+   - Vibe link (glm / mistral): run EXACTLY
+       grep -E -i -h -o ${shq(TOOL_DENIAL_PATTERN)} <base>.out <base>.err 2>/dev/null | sort -u | head -20
+     where <base> is that link's shim output base (${baseHint}). Return every output line, verbatim,
+     as \`deniedTools\` (an empty output → \`deniedTools: []\`).
+   - claude link: \`deniedTools: []\`.
+   - Copy the verdict block's "tool_access" object VERBATIM into \`toolAccess\` (omit \`toolAccess\` if
+     the block has none — do NOT invent one). Do not set \`auditOnly\`; the pipeline derives it.`
 
 // [handoff-retry] Per-phase output VALIDATOR — the FORMAT-failure class. A reviewer
 // that PRODUCED a substantive review but whose machine-readable <verdict> block failed
@@ -1569,6 +1727,11 @@ async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
     // runtime invariant checks ALL of them, not just the first.
     providers: done.map(d => d.r.provider || d.r.status || null),
     status: (done.find(d => d.r.provider) || {}).r?.provider || null,
+    // seat-profiles-into-pack: tool-access evidence across every accepted lens (audit_only
+    // is any lens's evidence; the JS records it via noteAuditOnly).
+    deniedTools: [...new Set(done.flatMap(d => (Array.isArray(d.r.deniedTools) ? d.r.deniedTools : [])))],
+    auditOnly: done.some(d => isAuditOnly(d.r)),
+    toolAccess: (done.find(d => d.r.toolAccess) || {}).r?.toolAccess || null,
     degradeLog, unitsOk: done.length, unitsTotal: lenses.length,
   }
 }
@@ -2214,6 +2377,7 @@ ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound')}
    the DEFECT, not by wording or line number (the pipeline uses these to detect
    convergence vs oscillation; a defect re-described differently each round must still
    match). Put \`fingerprint\` on every finding in findingsList.
+7.5 ${toolDenialCheck(`${tmpFile.replace(/\.txt$/, '')}-l<N>, N = that link's number in step 3`)}
 8. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: review_round=${round}, status="reviewed",
    phase="review-${round}", and record grounded/dropped counts. Do NOT write
    review_fingerprints or convergence here — the orchestrator records those once per
@@ -2223,7 +2387,8 @@ ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound')}
     (grounded only, each with id/severity/title/file/line/claim/evidence/FINGERPRINT),
     grounded (count), dropped (the array from step 7), and the provider FAMILY that produced
     the ACCEPTED review as \`provider\` (exactly one of ${bhChain.map(f => `"${f}"`).join(', ')}). Also set
-    \`status\` to that provider.
+    \`status\` to that provider. Also return \`deniedTools\` and (when the block had it) \`toolAccess\`
+    from step 7.5.
 
 If NO link produced an acceptable review — every CLI in the chain failed to run, OR every run
 lacked a parseable <verdict> block / was malformed / was an empty-findings
@@ -2258,6 +2423,7 @@ ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + un
         return { slug, verdict: 'PARKED', status: 'parked:cross_family_violation', reason: 'cross_family_violation', tier, worktreePath }
       }
       await noteClaudeFallbackReview('bloodhound', round, reviewResult, bhChain, 'Review')
+      await noteAuditOnly('bloodhound', round, reviewResult, `${planDir}/review-${round}.md`, 'Review')
     }
 
     // Stickiness: pin whichever examiner actually answered so later rounds try it
@@ -2779,6 +2945,7 @@ ${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChai
    underlying defect in the SAME file across DIFFERENT rounds MUST yield the SAME
    fingerprint — bucket by the DEFECT, not by wording or line number. Put \`fingerprint\`
    on every finding in findingsList.
+7.5 ${toolDenialCheck(`${tmpFile.replace(/\.txt$/, '')}-l<N>, N = that link's number in step 3`)}
 8. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: pointer_round=${pRound}, status per verdict, record
    grounded/dropped counts. Do NOT write review_fingerprints or convergence here — the
    orchestrator records those once per round (concurrent shim writes would race).${claudeFinalRound ? CLAUDE_FINAL_REVIEW_STEP(pRound) : ''}
@@ -2786,7 +2953,8 @@ ${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChai
 10. Return: verdict, findings (count of GROUNDED items), findingsList (grounded only,
     each with id/severity/title/file/line/claim/evidence/FINGERPRINT), grounded (count),
     dropped (array), and the provider FAMILY that produced the accepted review as
-    \`provider\` (exactly one of ${ptrChain.map(f => `"${f}"`).join(', ')}).
+    \`provider\` (exactly one of ${ptrChain.map(f => `"${f}"`).join(', ')}). Also return \`deniedTools\`
+    and (when the block had it) \`toolAccess\` from step 7.5.
 
 If NO link produced an acceptable review — every CLI in the chain failed, OR every run lacked a
 parseable <verdict> block / was malformed / was an empty-findings contradiction /
@@ -2822,6 +2990,7 @@ ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' +
       // The Claude FINAL review is mandated, not a last-resort fallback — it records into
       // metadata.claude_final_reviews (CLAUDE_FINAL_REVIEW_STEP), not claude_fallback_reviews.
       if (!claudeFinalRound) await noteClaudeFallbackReview('pointer', pRound, pointerResult, ptrChain, 'Code Review')
+      await noteAuditOnly('pointer', pRound, pointerResult, `${planDir}/pointer-review-${pRound}.md`, 'Code Review')
     }
 
     if (!claudeFinalRound) setExaminer(pointerResult.provider, `sticky: answered pointer round ${pRound}`)
@@ -3247,7 +3416,7 @@ Steps:
    Then \`git commit\`.
    Update ${planDir}/metadata.json with verdict ${META_PRESERVE_NOTE}.
    SAFETY: No git push. No deploy commands. No \`git add -f\` — ever.
-   End your response with a <verdict> block: {verdict, plan_adherence, code_quality, test_result}"
+   You MUST run git diff ${BASE}..HEAD and the project's test command yourself. End your response with a <verdict> block: {verdict, plan_adherence, code_quality, test_result, tool_access: {shell: ok|denied|unused, denied_tools: []}} — tool_access is MANDATORY: report honestly whether your shell ran; list every denied or unknown tool call in denied_tools; never present a file-reading audit as a verified certification."
 
 3. Walk the CERTIFIER CHAIN in order. Each wrapper caps concurrent calls on its model
    (flock). Run each EXACTLY as given, capture stdout for verdict parsing:
@@ -3260,6 +3429,17 @@ ${certifySteps}
    - Else if stdout has a <verdict> block, parse it
    - Else if stdout has a "## Status: <VERDICT>" line or a clear PASS / REWORK / FLAWED_PLAN statement, use that
    - If none of these are present, that link failed — go to step 5
+
+4a. ${toolDenialCheck(`/tmp/watchdog-${slug}-l<N>, N = that link's number in step 3`)}
+
+4.5 AUDIT-ONLY GATE (tier ${tier}): ${HEAVY(tier)
+  ? `this tier cannot certify on audit alone. If the TOOL-DENIAL CHECK found ANY line, OR the verdict's
+   tool_access shows shell "denied" or lists any denied tool, OR the verdict has NO tool_access you can
+   copy — do NOT perform the PASS-only actions: do not stamp status "certified" (step 7), do not run
+   step 8/8b, do not append to .wolfpack/pedigree/index.md, do not commit. Still write
+   certification.md, and return the verdict with \`deniedTools\` / \`toolAccess\` — the pipeline parks it.`
+  : `an audit-only certification is allowed on this tier but recorded; proceed normally and return
+   \`deniedTools\` / \`toolAccess\`.`}
 
 5. If a link failed, move to the NEXT link of the chain (step 3 list) and repeat step 4.
 
@@ -3294,7 +3474,8 @@ ${certifySteps}
    and continue — the meter is telemetry, not a gate.
 
 Return the verdict, and the provider FAMILY that produced the accepted certification in
-BOTH \`provider\` and \`status\` (exactly one of ${wdChain.map(f => `"${f}"`).join(', ')}). If EVERY link was
+BOTH \`provider\` and \`status\` (exactly one of ${wdChain.map(f => `"${f}"`).join(', ')}), plus \`deniedTools\`
+and (when the verdict block had it) \`toolAccess\` from step 4a. If EVERY link was
 rate-limited, return verdict "ERROR" with status "model_quota".
 
 SAFETY: No git push, no deploy.
@@ -3320,6 +3501,21 @@ if (watchdogResult && watchdogResult.verdict && watchdogResult.verdict !== 'ERRO
     return { slug, verdict: 'PARKED', status: 'parked:cross_family_violation', reason: 'cross_family_violation', tier, worktreePath }
   }
   await noteClaudeFallbackReview('watchdog', 0, watchdogResult, wdChain, 'Certify')
+  await noteAuditOnly('watchdog', 0, watchdogResult, `${planDir}/certification.md`, 'Certify')
+}
+
+// seat-profiles-into-pack (AC6b/c) — an Orange/Red (or unknown-tier) certification that was
+// AUDIT-ONLY (denied tools, or no mandatory tool_access) cannot PASS: it never ran git diff or
+// the tests. Park it with the evidence. Lighter tiers keep the PASS (recorded above).
+const certEv = certAuditEvidence(watchdogResult, tier)
+if (watchdogResult && watchdogResult.verdict === 'PASS' && certEv.length && HEAVY(tier)) {
+  log(`⛔ ${slug}: ${tier || 'unknown-tier'} certification was AUDIT-ONLY (${certEv.slice(0, 3).join('; ')}) — PASS not accepted.`)
+  await parkHunt({
+    reason: 'audit_only_certification', resumePhase: 'Certify', resolutionTypeExpected: 'redirect', phaseLabel: 'Certify',
+    needFromUser: `The ${tier || 'unknown-tier'} certification ran without a working shell, so it could not run git diff or the tests. Orange/Red hunts cannot certify on audit alone. Fix the seat (installer + toolcheck), then resume Certify.`,
+    context: `certifier: ${watchdogResult.provider || watchdogResult.status || '(unknown)'}; evidence: ${certEv.join(' | ')}`,
+  })
+  return { slug, verdict: 'PARKED', status: 'parked:audit_only_certification', reason: 'audit_only_certification', tier, worktreePath }
 }
 
 // [05] AC3 — both certifiers rate-limited → PARK model_quota, NOT a non-PASS that

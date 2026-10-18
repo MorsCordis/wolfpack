@@ -1,0 +1,35 @@
+# Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
+# Tracked as-is: the pipeline does not dispatch this seat through the shim, so the
+# toolcheck lists it as "tracked, not dispatched" and does not parity-check it.
+active_model = "mistral-medium-3.5"  # the Mistral API cross-model checker (the podman-vibe.sh shim assumes it)
+agent_type = "agent"
+display_name = "Wolfpack Alpha"
+description = "Planner — writes the plan, never implements"
+system_prompt_id = "wolfpack-alpha"
+
+[tools.read_file]
+permission = "always"
+
+[tools.grep]
+permission = "always"
+
+[tools.skill]
+permission = "always"
+
+[tools.task]
+permission = "always"
+allowlist = ["explore"]
+
+# Alpha creates plan.md, so write_file is allowed — but `edit` is denied so it cannot
+# modify existing source while "planning".
+[tools.write_file]
+permission = "ask"
+
+[tools.edit]
+permission = "never"
+
+[tools.bash]
+permission = "never"
+
+[tools.git_bash]
+permission = "never"

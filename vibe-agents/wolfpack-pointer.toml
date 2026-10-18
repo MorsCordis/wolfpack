@@ -1,0 +1,45 @@
+# Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
+# Wolfpack Mistral seat (pointer). Run ONLY via the project's podman-vibe.sh shim, which passes
+# one --enabled-tools flag per tool from VIBE_TOOLS_DEFAULT (read grep edit write_file bash)
+# and NO --auto-approve, so every tool the seat uses must be granted "always" here (an
+# ungranted tool falls to "ask", and a headless vibe -p run denies every ask).
+active_model = "mistral-large-4"  # EXACT id — "mistral-large-latest" still resolves to mistral-large-2512 (older, 262k). Large 4 = 1M ctx, reasoning model (thinking+text parts).
+agent_type = "agent"
+display_name = "Wolfpack Pointer"
+description = "Adversarial code reviewer — read-only"
+system_prompt_id = "wolfpack-pointer"
+
+# Live tool names: read_file (the shim's `read` is Vibe's legacy alias), grep, edit (was
+# search_replace), write_file, bash.
+[tools.read_file]
+permission = "always"
+
+[tools.grep]
+permission = "always"
+
+# bash runs inside the sandbox: worktree and git dir mounted read-only, no prod
+# credentials (doc 06: the sandbox is the guardrail). The seat must be able to run
+# `git diff` and the project's test command. git_bash is Vibe's Windows-only shell
+# companion; it mirrors bash.
+[tools.bash]
+permission = "always"
+
+[tools.git_bash]
+permission = "always"
+
+# edit/write_file stay never: read-only by role (the shim enables them; the read-only
+# mount and this profile keep the seat off source).
+[tools.edit]
+permission = "never"
+
+[tools.write_file]
+permission = "never"
+
+# The shim never enables task or skill for a Mistral seat, so both stay never (an
+# "always" here would be dead config the toolcheck flags). Seats read SKILL.md files
+# with read_file. task off = no self-orchestration (the pipeline owns fan-out).
+[tools.task]
+permission = "never"
+
+[tools.skill]
+permission = "never"
