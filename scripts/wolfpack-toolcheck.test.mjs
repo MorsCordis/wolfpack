@@ -478,13 +478,19 @@ test('TOOL_DENIAL_PATTERN compiles, matches the observed denial phrases, and spa
   const re = new RegExp(TOOL_DENIAL_PATTERN, 'i')
   for (const line of [
     "Tool 'bash' is permanently disabled",
-    'bash/`ls` denied by approval policy',
-    'the call was denied by the approval policy',
+    'Tool execution denied by approval policy',
+    'tool execution denied by the approval policy',
     "Unknown tool 'bash'",
+    "<tool_error>Tool 'bash' was denied by hook 'guard': no shell</tool_error>",
     'fatal: not a git repository (or any of the parent directories): .git',
-    'Two tool calls were denied',
-    'TOOL CALL WAS DENIED',
   ]) assert.ok(re.test(line), line)
+  // Anchored on the emitted message shapes, not prose: a seat discussing denials does not match.
+  for (const prose of [
+    'Two tool calls were denied',
+    'the toolcheck flags a profile where bash is permanently disabled',
+    'an Unknown tool error would mark the seat audit-only',
+    'the pattern matches "not a git repository" lines',
+  ]) assert.equal(re.test(prose), false, prose)
   const clean = `$ git diff --stat main..HEAD
  scripts/podman-vibe.sh | 79 +++++++--
  1 file changed, 70 insertions(+), 9 deletions(-)
@@ -494,5 +500,5 @@ OK
   assert.equal(re.test(clean), false)
   // POSIX-ERE compatible: grep -E accepts it and finds the same line
   const g = spawnSync('grep', ['-E', '-i', '-o', TOOL_DENIAL_PATTERN], { input: "x\nTool 'bash' is permanently disabled\ny\n", encoding: 'utf8' })
-  if (!g.error) assert.equal(g.stdout.trim(), 'permanently disabled')
+  if (!g.error) assert.equal(g.stdout.trim(), "Tool 'bash' is permanently disabled")
 })

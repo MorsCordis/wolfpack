@@ -1379,7 +1379,7 @@ const isQuotaStatus = (s) => /model_quota|quota|rate[_\s-]?limit|both.*(rate|thr
 // TOOL_DENIAL_PATTERN MUST stay byte-equal to scripts/wolfpack-toolcheck.mjs's export (a
 // harness test asserts it; this workflow body cannot import).
 const TOOL_DENIAL_PATTERN =
-  'permanently disabled|Unknown tool|denied by (the )?approval policy|tool calls? (was|were) denied|not a git repository'
+  "Tool '[^']+' is permanently disabled|Unknown tool '[^']+'|Tool execution denied by (the )?approval policy|Tool '[^']+' was denied by hook|fatal: not a git repository"
 const auditEvidence = (r) => {
   const ev = []
   for (const l of (Array.isArray(r && r.deniedTools) ? r.deniedTools : [])) if (String(l).trim()) ev.push(String(l).trim())
@@ -1392,13 +1392,36 @@ const auditEvidence = (r) => {
   return ev
 }
 const isAuditOnly = (r) => auditEvidence(r).length > 0
+// Multi-lens merge of the seats' tool_access self-reports: the WORST shell state wins
+// (denied > unused > unrecognised/missing > ok) and denied_tools is the union, so a non-first
+// lens's denial survives into auditEvidence(merged) with its real evidence. null when no lens
+// reported at all.
+const mergeToolAccess = (list) => {
+  const tas = list.filter(ta => ta && typeof ta === 'object')
+  if (!tas.length) return null
+  const rank = (v) => ({ denied: 4, unused: 3, ok: 1 })[v] || 2
+  let shell
+  for (const ta of tas) {
+    const v = String(ta.shell || '').toLowerCase() || null
+    if (shell === undefined || rank(v) > rank(shell)) shell = v
+  }
+  const denied = [...new Set(tas.flatMap(ta => (Array.isArray(ta.denied_tools) ? ta.denied_tools : [])))]
+  return { shell, denied_tools: denied }
+}
 // Orange/Red — or an unknown tier (fail closed: unknown = Red) — cannot certify on audit alone,
-// and there a certifier that OMITS the mandatory tool_access field has not shown its shell ran.
+// and there a certifier that OMITS the mandatory tool_access field, or reports any shell state
+// other than "ok" ("unused" = it never ran git diff or the tests), has not shown its shell ran.
 const HEAVY = (t) => t === 'Orange' || t === 'Red' || !TIER_CONFIG[t]
 const certAuditEvidence = (r, t) => {
   const ev = auditEvidence(r)
-  if (HEAVY(t) && !(r && r.toolAccess && typeof r.toolAccess === 'object'))
-    ev.push('certifier omitted the mandatory tool_access field')
+  if (!HEAVY(t)) return ev
+  const ta = r && r.toolAccess
+  if (!(ta && typeof ta === 'object')) ev.push('certifier omitted the mandatory tool_access field')
+  else {
+    const shell = String(ta.shell || '').toLowerCase()
+    // 'denied' is already evidence via auditEvidence; anything else that is not 'ok' is too.
+    if (shell !== 'ok' && shell !== 'denied') ev.push(`certifier reported tool_access.shell = ${JSON.stringify(ta.shell == null ? null : ta.shell)} (not "ok")`)
+  }
   return ev
 }
 // Prompt fragment: the TOOL-DENIAL CHECK a shim agent runs on the link whose output it
@@ -1731,7 +1754,7 @@ async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
     // is any lens's evidence; the JS records it via noteAuditOnly).
     deniedTools: [...new Set(done.flatMap(d => (Array.isArray(d.r.deniedTools) ? d.r.deniedTools : [])))],
     auditOnly: done.some(d => isAuditOnly(d.r)),
-    toolAccess: (done.find(d => d.r.toolAccess) || {}).r?.toolAccess || null,
+    toolAccess: mergeToolAccess(done.map(d => d.r.toolAccess)),
     degradeLog, unitsOk: done.length, unitsTotal: lenses.length,
   }
 }
@@ -3434,8 +3457,8 @@ ${certifySteps}
 
 4.5 AUDIT-ONLY GATE (tier ${tier}): ${HEAVY(tier)
   ? `this tier cannot certify on audit alone. If the TOOL-DENIAL CHECK found ANY line, OR the verdict's
-   tool_access shows shell "denied" or lists any denied tool, OR the verdict has NO tool_access you can
-   copy — do NOT perform the PASS-only actions: do not stamp status "certified" (step 7), do not run
+   tool_access shows shell as anything other than "ok" ("denied" or "unused") or lists any denied tool,
+   OR the verdict has NO tool_access you can copy — do NOT perform the PASS-only actions: do not stamp status "certified" (step 7), do not run
    step 8/8b, do not append to .wolfpack/pedigree/index.md, do not commit. Still write
    certification.md, and return the verdict with \`deniedTools\` / \`toolAccess\` — the pipeline parks it.`
   : `an audit-only certification is allowed on this tier but recorded; proceed normally and return

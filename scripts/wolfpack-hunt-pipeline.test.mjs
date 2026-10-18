@@ -1242,7 +1242,7 @@ test('AC5: a resume past Certify (Verify) skips the preflight — no shim seat l
 })
 
 test('TOOL_DENIAL_PATTERN in hunt-pipeline.js is byte-equal to the toolcheck export', () => {
-  const m = SRC.match(/const TOOL_DENIAL_PATTERN =\s*\n?\s*'([^']*)'/)
+  const m = SRC.match(/const TOOL_DENIAL_PATTERN =\s*\n?\s*"([^"]*)"/)
   assert.ok(m, 'literal found in the workflow source')
   assert.equal(m[1], TOOLCHECK_DENIAL_PATTERN)
   // and the TOOL-DENIAL CHECK prompt carries it shell-quoted, verbatim
@@ -1261,7 +1261,7 @@ const auditRecords = (find, role) => find(`audit-only-record:h:${role}:`)
 
 test('AC6a: a Pointer transcript with denied tool calls → audit_only recorded (metadata + pointer-review header), loud log', async () => {
   const denied = deniedFrom(BOXED_TRANSCRIPT)
-  assert.deepEqual(denied, ['Unknown tool', 'permanently disabled'])
+  assert.deepEqual(denied, ["Tool 'bash' is permanently disabled", "Unknown tool 'git_bash'"])
   const { result, find, logs } = await runHunt({ answers: {
     pointer: { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'mistral', deniedTools: denied },
   } })
@@ -1271,8 +1271,8 @@ test('AC6a: a Pointer transcript with denied tool calls → audit_only recorded 
   assert.match(rec[0].prompt, /"audit_only": true/)
   assert.match(rec[0].prompt, /audit_only_seats/)
   assert.match(rec[0].prompt, /pointer-review-1\.md/)
-  assert.match(rec[0].prompt, /"evidence": \["Unknown tool","permanently disabled"\]/)
-  assert.match(rec[0].prompt, /> audit_only: true — pointer r1 \(mistral\) ran without a working shell: Unknown tool; permanently disabled/)
+  assert.ok(rec[0].prompt.includes(`"evidence": ["Tool 'bash' is permanently disabled","Unknown tool 'git_bash'"]`), rec[0].prompt)
+  assert.ok(rec[0].prompt.includes("> audit_only: true — pointer r1 (mistral) ran without a working shell: Tool 'bash' is permanently disabled; Unknown tool 'git_bash'"), rec[0].prompt)
   assert.equal(rec[0].opts.model, 'sonnet')
   assert.ok(logs.some(l => /⚠ h: pointer r1 \(mistral\) was audit_only/.test(l)), logs.join('\n'))
 })
@@ -1353,6 +1353,16 @@ test('AC6b: Orange + an audit-only PASS → parks audit_only_certification, not 
   }
 })
 
+test('AC6b: Orange + a PASS whose certifier reports shell "unused" parks (Pointer r1 #1)', async () => {
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange' },
+    watchdog: { verdict: 'PASS', provider: 'mistral', deniedTools: [], toolAccess: { shell: 'unused', denied_tools: [] } },
+  } })
+  assert.equal(result.status, 'parked:audit_only_certification', JSON.stringify(result))
+  assert.match(find('park:h:audit_only_certification')[0].prompt, /tool_access\.shell = \\?"unused\\?" \(not \\?"ok\\?"\)/)
+  assert.equal(find('verify').length, 0)
+})
+
 test('AC6b: Orange + a self-reported denied shell (no denial lines) also parks', async () => {
   const { result } = await runHunt({ answers: {
     alpha: { ...BASE.alpha, tier: 'Orange' },
@@ -1398,8 +1408,29 @@ test('AC6: the missing-tool_access rule is provider-agnostic (a claude-attribute
   // Exercise the deployed helpers directly: certAuditEvidence never looks at the provider.
   const body = SRC.match(/const SINGLE_LENS = .*\n/)[0] + SRC.match(/const TIER_CONFIG = \{[\s\S]*?\n\}\n/)[0]
   const helpers = SRC.match(/const auditEvidence = [\s\S]*?\nconst certAuditEvidence = [\s\S]*?\n\}\n/)[0]
-  const mk = new Function(`${body}\n${helpers}\nreturn { auditEvidence, isAuditOnly, HEAVY, certAuditEvidence }`)
-  const { auditEvidence, isAuditOnly, HEAVY, certAuditEvidence } = mk()
+  const mk = new Function(`${body}\n${helpers}\nreturn { auditEvidence, isAuditOnly, HEAVY, certAuditEvidence, mergeToolAccess }`)
+  const { auditEvidence, isAuditOnly, HEAVY, certAuditEvidence, mergeToolAccess } = mk()
+  // Pointer r1 #1: on Orange/Red/unknown, any shell state other than "ok" is evidence ("unused" =
+  // never ran git diff or the tests); lighter tiers keep "unused" as not audit-only.
+  for (const t of ['Orange', 'Red', undefined]) {
+    assert.deepEqual(certAuditEvidence({ verdict: 'PASS', toolAccess: { shell: 'unused', denied_tools: [] } }, t),
+      ['certifier reported tool_access.shell = "unused" (not "ok")'], String(t))
+    assert.equal(certAuditEvidence({ verdict: 'PASS', toolAccess: {} }, t).length, 1, `${t}: missing shell`)
+    assert.deepEqual(certAuditEvidence({ verdict: 'PASS', toolAccess: { shell: 'OK', denied_tools: [] } }, t), [], `${t}: ok`)
+    assert.deepEqual(certAuditEvidence({ verdict: 'PASS', toolAccess: { shell: 'denied' } }, t),
+      ['seat reported tool_access.shell = denied'], `${t}: denied counted once`)
+  }
+  assert.deepEqual(certAuditEvidence({ verdict: 'PASS', toolAccess: { shell: 'unused', denied_tools: [] } }, 'Yellow'), [])
+  // Pointer r1 #2: the multi-lens merge keeps the worst shell state and unions denied_tools.
+  assert.equal(mergeToolAccess([null, undefined]), null)
+  assert.deepEqual(mergeToolAccess([{ shell: 'ok', denied_tools: [] }, { shell: 'denied', denied_tools: ['bash'] }]),
+    { shell: 'denied', denied_tools: ['bash'] })
+  assert.deepEqual(mergeToolAccess([{ shell: 'ok', denied_tools: ['grep'] }, null, { shell: 'ok', denied_tools: ['bash', 'grep'] }]),
+    { shell: 'ok', denied_tools: ['grep', 'bash'] })
+  assert.equal(mergeToolAccess([{ shell: 'ok' }, { shell: 'unused' }]).shell, 'unused')
+  assert.equal(mergeToolAccess([{ shell: 'ok' }, {}]).shell, null, 'a missing shell outranks ok')
+  assert.deepEqual(auditEvidence({ toolAccess: mergeToolAccess([{ shell: 'ok', denied_tools: [] }, { shell: 'denied', denied_tools: ['bash'] }]) }),
+    ['seat reported tool_access.shell = denied', 'seat reported denied tool: bash'])
   assert.deepEqual(certAuditEvidence({ verdict: 'PASS', provider: 'claude', deniedTools: [] }, 'Orange'),
     ['certifier omitted the mandatory tool_access field'])
   assert.deepEqual(certAuditEvidence({ verdict: 'PASS', provider: 'claude', deniedTools: [] }, 'Yellow'), [])

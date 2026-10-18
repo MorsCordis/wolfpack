@@ -152,11 +152,16 @@ export const PIPELINE_SEATS = {
 // pipeline — listed, not parity-checked.
 export const TRACKED_NOT_DISPATCHED = ['wolfpack-alpha', 'wolfpack-shepherd', 'wolfpack-tracker']
 // Text a seat transcript shows when its tool calls were denied or unknown, or when the
-// shell ran but git could not see the repo (both make a review audit-only). POSIX-ERE and
-// JS compatible; match case-insensitively. hunt-pipeline.js embeds the SAME string (it
-// cannot import); a harness test asserts the two are byte-equal.
+// shell ran but git could not see the repo (both make a review audit-only). Each branch is
+// anchored on the exact message shape the tool emits (Vibe: "Tool '<name>' is permanently
+// disabled", "Unknown tool '<name>'", "Tool execution denied by approval policy", "Tool
+// '<name>' was denied by hook ..."; git: "fatal: not a git repository"), never on bare prose
+// ("tool calls were denied"), so a certifier DISCUSSING denials does not park itself. A seat
+// that quotes one of these exact messages still matches; the park shows the evidence.
+// POSIX-ERE and JS compatible; match case-insensitively. hunt-pipeline.js embeds the SAME
+// string (it cannot import); a harness test asserts the two are byte-equal.
 export const TOOL_DENIAL_PATTERN =
-  'permanently disabled|Unknown tool|denied by (the )?approval policy|tool calls? (was|were) denied|not a git repository'
+  "Tool '[^']+' is permanently disabled|Unknown tool '[^']+'|Tool execution denied by (the )?approval policy|Tool '[^']+' was denied by hook|fatal: not a git repository"
 
 const PERMISSIONS = ['always', 'never', 'ask']
 
