@@ -1,0 +1,83 @@
+# Unified sandbox for the Wolfpack automated pipeline.
+# Both CLIs (Claude Code, Mistral Vibe — the latter serves both Vibe families,
+# GLM and Mistral) run in one container.
+# The Claude binary is bind-mounted from host — no version drift, smaller image.
+# Vibe installed via pip (Python dependency chain is complex, better baked in).
+#
+# Now ALSO carries the full app test environment so the Tracker phase runs the
+# Django suite hermetically against a LOCAL PostgreSQL — no Cloud SQL, gcloud, or
+# ADC in the loop. Mirrors the app Dockerfile's dependency steps and bakes in a
+# user-runnable Postgres 18 (matches prod Cloud SQL; cluster is initdb'd to /tmp
+# at runtime by run_tests.sh --local, not baked here).
+#
+# Build:  podman build -t wolfpack-sandbox:latest -f .claude/containers/Containerfile.wolfpack .
+# Run:    ./scripts/run-pipeline-sandbox.sh
+
+FROM python:3.12-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Base tooling + the PGDG apt repo key/list. Postgres 18 to match prod Cloud SQL
+# (bookworm only ships PG 15, so we add apt.postgresql.org).
+#  - git/jq/dbus/libsecret/curl/ca-certificates: Wolfpack tooling + CLI keyring auth
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates gnupg git jq dbus libsecret-1-0 \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+         -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+         > /etc/apt/sources.list.d/pgdg.list
+
+# Postgres 18 (server + client) + app build/runtime deps:
+#  - postgresql-18/-client-18: LOCAL test DB (initdb/pg_ctl/pg_isready/createdb)
+#  - gcc/libpq-dev/libffi-dev: build psycopg2 etc.       (mirrors app Dockerfile)
+#  - libpango/cairo/gdk-pixbuf: WeasyPrint PDF rendering (mirrors app Dockerfile)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    postgresql-18 \
+    postgresql-client-18 \
+    gcc \
+    libpq-dev \
+    libffi-dev \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libgdk-pixbuf2.0-0 \
+    libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# App Python deps — mirror the main Dockerfile EXACTLY, including the
+# django-tenants-q --no-deps quirk (CLAUDE.md: it is intentionally absent from
+# requirements.txt and installed separately with --no-deps; do NOT add it back).
+# Only deps are baked; the app CODE is bind-mounted at /workspace at runtime.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --upgrade pip \
+    && pip install --no-cache-dir -r /tmp/requirements.txt \
+    && pip install --no-deps django-tenants-q==1.0.0
+
+# Vibe CLI (Python — bake in, don't bind-mount)
+RUN pip install --no-cache-dir mistral-vibe
+
+# Container user matching host UID for --userns=keep-id
+RUN groupadd -g 1000 cecil && \
+    useradd -u 1000 -g cecil -m -s /bin/bash cecil
+
+# Pre-create writable dirs that CLIs need at runtime.
+# Auth files and binaries are bind-mounted read-only at run time.
+RUN mkdir -p \
+    /home/cecil/.vibe/logs \
+    /home/cecil/.vibe/vibehistory \
+    /home/cecil/.vibe/cache \
+    /home/cecil/.claude \
+    && chown -R cecil:cecil /home/cecil
+
+# Postgres 18 binaries (initdb, pg_ctl, pg_isready, createdb) on PATH so the
+# run_tests.sh --local bootstrap can run a USER-owned cluster as `cecil` (non-root).
+ENV PATH="/usr/lib/postgresql/18/bin:${PATH}"
+
+ENV HOME=/home/cecil
+WORKDIR /workspace
+USER cecil
+
+ENTRYPOINT []
+CMD ["/bin/bash"]
