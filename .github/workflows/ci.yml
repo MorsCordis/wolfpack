@@ -12,6 +12,8 @@ jobs:
       WOLFPACK_TEST_NO_PODMAN: '1'   # podman tests run locally + in acceptance (A3); they SKIP here, visibly
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # campaign-runner barrier test diffs against a baseline ref
       - uses: actions/setup-node@v4
         with:
           node-version: 22
