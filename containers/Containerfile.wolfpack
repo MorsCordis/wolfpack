@@ -1,0 +1,65 @@
+# Wolfpack sandbox — the pack's PROJECT-NEUTRAL base image.
+#
+# Seat containers (scripts/podman-vibe.sh) and the unified pipeline sandbox
+# (scripts/run-pipeline-sandbox.sh) run in it. Both CLIs (Claude Code, Mistral Vibe — the
+# latter serves both Vibe families, GLM and Mistral) run in one container. The Claude binary
+# is bind-mounted from the host (no version drift, smaller image); Vibe is baked in, in its
+# OWN venv (/opt/vibe), so a project layer's Python pins can never downgrade Vibe's
+# dependencies (and Vibe's never leak into the project's test runtime).
+#
+# Project specifics (language runtimes, app dependencies, a local test database…) do NOT
+# belong here. A project adds them through ONE optional config key,
+# wolfpack-config.md → Execution Layer → Sandbox project layer: a project-owned Containerfile
+# that starts `ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}` (this image), may switch to `USER root`,
+# ends with `USER ${WOLFPACK_USER}`, and is built with the project repo root as its context.
+#
+# The container user mirrors the host user for --userns=keep-id. USER_NAME, USER_UID,
+# USER_GID and USER_HOME are REQUIRED build args (no defaults); the build fails loudly when
+# one is missing.
+#
+# Build (from the consuming repo's root; ensures the base, the project layer and the GLM layer):
+#   bash "$WOLFPACK_HOME/scripts/wolfpack-build-images.sh" [--rebuild]
+
+FROM python:3.12-slim-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Wolfpack tooling + CLI keyring auth (git/jq/dbus/libsecret/curl/ca-certificates/gnupg).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates gnupg git jq dbus libsecret-1-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Vibe CLI in its own venv; `vibe` on PATH via a symlink, so every `vibe …` call is unchanged.
+RUN python -m venv /opt/vibe \
+    && /opt/vibe/bin/pip install --no-cache-dir mistral-vibe \
+    && ln -s /opt/vibe/bin/vibe /usr/local/bin/vibe
+
+# Container user matching the host user (build args, never a hard-coded name).
+ARG USER_NAME
+ARG USER_UID
+ARG USER_GID
+ARG USER_HOME
+RUN test -n "${USER_NAME}" && test -n "${USER_UID}" && test -n "${USER_GID}" && test -n "${USER_HOME}" \
+    || { echo "Containerfile.wolfpack: USER_NAME, USER_UID, USER_GID and USER_HOME build args are required (wolfpack-build-images.sh passes them)" >&2; exit 1; }
+RUN groupadd -g "${USER_GID}" "${USER_NAME}" \
+    && useradd -u "${USER_UID}" -g "${USER_GID}" -d "${USER_HOME}" -m -s /bin/bash "${USER_NAME}"
+
+# Pre-create writable dirs that CLIs need at runtime, owned by the seat user (without the
+# chown the user cannot write Vibe logs/history and every seat fails at dispatch).
+# Auth files and binaries are bind-mounted read-only at run time.
+RUN mkdir -p \
+    "${USER_HOME}/.vibe/logs" \
+    "${USER_HOME}/.vibe/vibehistory" \
+    "${USER_HOME}/.vibe/cache" \
+    "${USER_HOME}/.claude" \
+    && chown -R ${USER_NAME}:${USER_NAME} ${USER_HOME}
+
+ENV HOME=${USER_HOME}
+ENV WOLFPACK_USER=${USER_NAME}
+WORKDIR /workspace
+USER ${USER_NAME}
+
+ENTRYPOINT []
+CMD ["/bin/bash"]

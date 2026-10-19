@@ -4,6 +4,20 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+### Added
+- The execution layer lives in the pack: `scripts/podman-vibe.sh` (the Vibe/GLM seat shim), `scripts/run-pipeline-sandbox.sh`, `scripts/lib/wolfpack-ratelimit.sh` and the sandbox images `containers/Containerfile.wolfpack` (project-neutral base; Vibe in its own venv; the container user comes from build args) and `containers/Containerfile.wolfpack-glm`, with their tests. <!-- hunt:exec-layer-into-pack -->
+- `WOLFPACK_HOME`: both workflows resolve the pack from the env, else `wolfpack-config.md` → Project Identity → `Wolfpack home`, else stop with the fix — never from the consuming repo. <!-- hunt:exec-layer-into-pack -->
+- `## Execution Layer` config keys (sandbox + GLM image names, an optional project image layer, seat and sandbox extra mounts, secrets paths, Vibe agent dir, seat test env), read by `scripts/wolfpack-config.mjs` (new `--exec` mode) and documented in `wolfpack-config.example.md`; the shim refuses any mount that overlaps a configured secrets path. <!-- hunt:exec-layer-into-pack -->
+- `scripts/wolfpack-build-images.sh` builds (or `--rebuild`s) a project's sandbox and GLM images from the pack Containerfiles plus its configured layer. <!-- hunt:exec-layer-into-pack -->
+
+### Changed
+- Every seat shim call in `hunt-pipeline.js` (review, implement, certify, toolcheck preflight) runs `$WOLFPACK_HOME/scripts/podman-vibe.sh`; the toolcheck checks the configured Vibe agent dir; a pack without the shim still parks `shim_missing`. <!-- hunt:exec-layer-into-pack -->
+- `/run-hunt`, `/run-campaign`, `wolfpack-overnight.sh` and `wolfpack-run-local.sh` launch the pack's sandbox and shim instead of a copy in the consuming repo. <!-- hunt:exec-layer-into-pack -->
+- `wolfpack-finishing-check.sh` also enforces in `.claude/worktrees/` checkouts, not only `.agents/worktrees/`. <!-- hunt:exec-layer-into-pack -->
+
+### Removed
+- The shim's read-only mount of a second wolfpack checkout (`WOLFPACK_CANONICAL_REPO`); review seats keep the read-only git-common-dir mount. <!-- hunt:exec-layer-into-pack -->
+
 ### Fixed
 - A review or certify seat that lists only its read-only-by-role tools (`edit`, `write_file`, `task`, `skill`) as denied is no longer recorded audit-only, so a shell-verified Orange/Red PASS certifies instead of parking `audit_only_certification`. <!-- hunt:audit-only-role-denied-tools -->
 - The self-hosting changelog test checks the hunt's entries exist under `[Unreleased]` or a version heading, so it no longer fails once a wave stamps them. <!-- hunt:wolfpack-self-hosting -->

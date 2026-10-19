@@ -1,5 +1,5 @@
 export const meta = {
-// Wolfpack hunt pipeline — the canonical, durable orchestrator. Consuming projects run a GENERATED copy (scripts/wolfpack-sync-runtime.sh <target>); wolfpack itself runs this file via .claude/workflows. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here.
+// Wolfpack hunt pipeline — the canonical, durable orchestrator. Consuming projects run a GENERATED copy (scripts/wolfpack-sync-runtime.sh <target>); wolfpack itself runs this file via .claude/workflows. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here. Execution shims resolve from WOLFPACK_HOME (env, else wolfpack-config.md → Wolfpack home), never the consuming repo.
   name: 'hunt-pipeline',
   description: 'Run a full Wolfpack hunt pipeline: scaffold through certification',
   phases: [
@@ -804,6 +804,25 @@ If the command could not run at all, return exitCode 2 and the error text as out
 }
 projectConfig = await loadProjectConfig(`hunt-pipeline: ${slug}`, 'the pipeline will not guess project values', `project-config:${slug}`, 'Scaffold')
 log(`Project config: ${projectConfig.name} — tests: ${projectConfig.testCommand}; deploy: ${projectConfig.devDeployCommand || 'none'}; risk surfaces: ${projectConfig.compliancePaths.length}`)
+// exec-layer-into-pack: the pack's execution layer (seat shim) resolves from WOLFPACK_HOME —
+// env, else wolfpack-config.md → Project Identity → Wolfpack home, else STOP with the fix.
+// Never the consuming repo. TRUST BOUNDARY: the key leg reads ONLY the projectConfig returned
+// by the probe above, which runs from the main checkout's root BEFORE the resume probe and the
+// scaffold — never the worktree — so a hunt branch cannot redirect its own seat shims. Do NOT
+// move this call (or the probe) after the scaffold. Body identical in campaign-runner.js
+// (apart from the env accessor).
+const resolveWolfpackHome = (who) => {
+  const env = _env('WOLFPACK_HOME'); const key = projectConfig && projectConfig.wolfpackHome
+  const fix = 'Fix: export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add "- **Wolfpack home:** `<path>`" under ## Project Identity in wolfpack-config.md (check: node <pack>/scripts/wolfpack-config.mjs)'
+  const raw = (typeof env === 'string' && env.trim()) ? env.trim() : (typeof key === 'string' && key.trim()) ? key.trim() : ''
+  const source = (typeof env === 'string' && env.trim()) ? 'env WOLFPACK_HOME' : 'wolfpack-config.md → Project Identity → Wolfpack home'
+  if (!raw) throw new Error(`${who}: WOLFPACK_HOME is not set and wolfpack-config.md has no Wolfpack home — the pack's execution shims are never looked up in the consuming repo. ${fix}`)
+  if (!raw.startsWith('/')) throw new Error(`${who}: ${source} is not an absolute path ('${raw}'). ${fix}`)
+  return { home: raw.replace(/\/+$/, '') || '/', source }
+}
+const wolfpackHome = resolveWolfpackHome(`hunt-pipeline: ${slug}`)
+const shimPath = `${wolfpackHome.home}/scripts/podman-vibe.sh`
+log(`Pack home (WOLFPACK_HOME): ${wolfpackHome.home} — from ${wolfpackHome.source}; seat shim ${shimPath}`)
 
 const resumeProbe = await agent(`
 Read-only resume probe. Report the durable state of this hunt so the pipeline
@@ -1083,18 +1102,17 @@ ${heartbeat('Scaffold', 'creating worktree and metadata')}
 log(`Worktree: ${worktreePath}`)
 log(`Examiner chain for this hunt (reviews of Claude-written work): ${chainLabel(examinerChain(PLAN_WRITER_FAMILIES))} — enabled: ${EXAMINER_ORDER.join(', ')} (WOLFPACK_ENABLE_GLM ${GLM_ENABLED ? 'on' : 'off'}, WOLFPACK_ENABLE_MISTRAL_AUTO ${MISTRAL_AUTO ? 'on' : 'off'})`)
 
-// ALWAYS invoke the cross-model shims from the MAIN repo root, never the
-// worktree's `./scripts/`. Worktrees fork from main and can carry a STALE/drifted
-// copy of the shim in their working tree (v1-push-3 unfinalize re-runs: the
-// worktree's podman-vibe.sh was the pre-fix comma version even though the branch
-// commit + main both had the fix, so the reviewer ran blind anyway). The shim
-// takes the worktree path as an ARG, so the root copy operates on the worktree
-// correctly while always being the current/fixed version. Derive the repo root by
-// stripping the worktree suffix; fall back to the path itself for non-worktree runs.
+// The cross-model seat shims come from the PACK (shimPath = $WOLFPACK_HOME/scripts/
+// podman-vibe.sh, resolved above): always the current pack checkout, never a worktree's
+// copy (worktrees fork from main and can carry a STALE/drifted shim — v1-push-3: a
+// pre-fix comma version made the reviewer run blind) and never the consuming repo. The
+// shim takes the worktree path as an ARG. repoRoot is the MAIN checkout of the consuming
+// repo (the worktree suffix stripped; the path itself for non-worktree runs) — it still
+// serves the repo-local scripts (usage meter, toolcheck, routing, timing…).
 const repoRoot = worktreePath.includes('/.agents/worktrees/')
   ? worktreePath.split('/.agents/worktrees/')[0]
   : worktreePath
-log(`Shim root (always current): ${repoRoot}/scripts/`)
+log(`Repo root: ${repoRoot}`)
 usageCli = `${repoRoot}/scripts/wolfpack-usage.mjs`
 
 // usage-limit-gate (AC6): the campaign runner's usage gate asked for a usage offload
@@ -1127,9 +1145,11 @@ const TOOLCHECK_SCHEMA = {
   required: ['exitCode', 'output'],
 }
 if (at('Certify') && EXAMINER_ORDER.some(f => f !== 'claude')) {
-  const tcShim = `${repoRoot}/scripts/podman-vibe.sh`
+  const tcShim = shimPath
+  const tcProfiles = (cfg().exec && typeof cfg().exec.vibeAgentDir === 'string' && cfg().exec.vibeAgentDir)
+    ? ` --profiles ${shq(cfg().exec.vibeAgentDir)}` : ''
   const tc = await agent(`You ONLY run the Wolfpack seat toolcheck for hunt ${slug} — modify nothing. Run exactly:
-  node ${shq(`${repoRoot}/scripts/wolfpack-toolcheck.mjs`)} --shim ${shq(tcShim)} 2>&1; echo "TOOLCHECK_RC=$?"
+  node ${shq(`${repoRoot}/scripts/wolfpack-toolcheck.mjs`)} --shim ${shq(tcShim)}${tcProfiles} 2>&1; echo "TOOLCHECK_RC=$?"
 Return exitCode = the number after TOOLCHECK_RC= (a number), ok = (exitCode == 0), and output = the
 command's stdout+stderr VERBATIM (first 60 lines). If the command could not run at all, return
 exitCode 2 and the error text as output. Never fix, install or edit anything.`,
@@ -1144,7 +1164,7 @@ exitCode 2 and the error text as output. Never fix, install or edit anything.`,
       log(`⛔ ${slug}: cross-family seat shim MISSING at ${shimMissing[1]} — non-Claude seats cannot run, and the pipeline will NOT substitute Claude. Stopping.`)
       await parkHunt({
         reason: 'shim_missing', resumePhase: tcResume, resolutionTypeExpected: 'redirect', phaseLabel: 'Scaffold',
-        needFromUser: `The seat shim ${shimMissing[1]} does not exist. Provide it (the pack's execution layer: podman-vibe.sh + its lib), or disable the Vibe families (WOLFPACK_ENABLE_GLM=0 WOLFPACK_ENABLE_MISTRAL_AUTO=0 — reviews of Claude-written work then park no_cross_family_reviewer). Then resume.`,
+        needFromUser: `The seat shim ${shimMissing[1]} does not exist in the pack at WOLFPACK_HOME=${wolfpackHome.home} (${wolfpackHome.source}). Point WOLFPACK_HOME / Wolfpack home at a wolfpack checkout that has scripts/podman-vibe.sh (the pack's execution layer), or disable the Vibe families (WOLFPACK_ENABLE_GLM=0 WOLFPACK_ENABLE_MISTRAL_AUTO=0 — reviews of Claude-written work then park no_cross_family_reviewer). Then resume.`,
         context: tcOut,
       })
       return { slug, verdict: 'PARKED', status: 'parked:shim_missing', reason: 'shim_missing', tier, worktreePath }
@@ -1200,9 +1220,9 @@ const CLAUDE_SELF_REVIEW_STEP = (promptFile, role) => `(no shim — YOU are Clau
        your first choice.`
 const reviewCmd = (who, vibeAgent, promptFile, role = 'reviewer') =>
   who === 'mistral'
-    ? `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} ${shq(vibeAgent)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(MISTRAL_REVIEW_TURNS)}`
+    ? `${shq(shimPath)} ${shq(vibeAgent)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(MISTRAL_REVIEW_TURNS)}`
     : who === 'glm'
-    ? `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} ${shq(`${vibeAgent}-glm`)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(GLM_REVIEW_TURNS)}`
+    ? `${shq(shimPath)} ${shq(`${vibeAgent}-glm`)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(GLM_REVIEW_TURNS)}`
     : CLAUDE_SELF_REVIEW_STEP(promptFile, role)
 
 // Prompt fragment: how a shim agent runs ONE non-Claude shim command and waits for it.
@@ -2212,7 +2232,7 @@ async function runGlmShepherd({ mode, round, task, phaseLabel }) {
   const tag = mode === 'implement' ? 'impl' : `r${round}`
   const base = `/tmp/shepherd-glm-${slug}-${tag}`
   const q = (sfx) => shq(`${base}${sfx}`)
-  const cmd = `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} --implement wolfpack-shepherd-glm ${shq(worktreePath)} ${q('.txt')} ${shq(GLM_IMPLEMENT_TURNS)}`
+  const cmd = `${shq(shimPath)} --implement wolfpack-shepherd-glm ${shq(worktreePath)} ${q('.txt')} ${shq(GLM_IMPLEMENT_TURNS)}`
   let r = null
   for (let attempt = 1; attempt <= 2 && !r; attempt++) {
     if (attempt > 1) log(`↻ shepherd-glm:${slug}:${tag} wrapper dropped mid-response — retry ${attempt}/2`)
@@ -3423,7 +3443,7 @@ log(`Watchdog certifying: ${slug}`)
 const MISTRAL_CERTIFY_TURNS = (typeof process !== 'undefined' && process.env && process.env.WOLFPACK_MISTRAL_CERTIFY_TURNS) || GLM_REVIEW_TURNS
 // AC13: the Mistral certifier runs the REAL wolfpack-watchdog agent. It used to borrow
 // wolfpack-pointer, which handed the certifier the Pointer system prompt (known_traps #6).
-const vibeCertifyStep = `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} wolfpack-watchdog ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(MISTRAL_CERTIFY_TURNS)}`
+const vibeCertifyStep = `${shq(shimPath)} wolfpack-watchdog ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(MISTRAL_CERTIFY_TURNS)}`
 // The claude last-resort CERTIFY link — prose, not a command (there is no podman-claude.sh:
 // the shim agent walking this chain already IS Claude). Watchdog is the highest-stakes seat,
 // so this is spelled out in full rather than abbreviated.
@@ -3441,7 +3461,7 @@ const CLAUDE_SELF_CERTIFY_STEP = `(no shim — YOU are Claude.) Read the certify
        the code-writer families, examinerChain has already removed this link and reaching it at
        all is a bug, not a fallback.`
 // GLM certifier: its own read-only Watchdog agent (wolfpack-watchdog-glm, glm-5.3), ≥80 turns.
-const glmCertifyStep = `${shq(`${repoRoot}/scripts/podman-vibe.sh`)} wolfpack-watchdog-glm ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(GLM_REVIEW_TURNS)}`
+const glmCertifyStep = `${shq(shimPath)} wolfpack-watchdog-glm ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(GLM_REVIEW_TURNS)}`
 const certifyStep = (who) => (who === 'glm' ? glmCertifyStep : who === 'mistral' ? vibeCertifyStep : CLAUDE_SELF_CERTIFY_STEP)
 ensureCodeWriterRecord()
 ensureTestWriterRecord()

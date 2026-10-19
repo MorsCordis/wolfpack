@@ -19,10 +19,14 @@ import {
 } from './wolfpack-toolcheck.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
-// TODO(de-fracture): this shim filename is harness-specific (see wolfpack-toolcheck.mjs).
-// The "REAL committed shim" tests below auto-skip when the shim is absent so the
-// synthetic-fixture coverage still runs in a repo that doesn't ship these shims.
-const vibePath = join(here, 'podman-vibe.sh')
+// The seat shim is the PACK's (exec-layer-into-pack). Inside the pack it sits beside this
+// file; a consuming repo has no copy, so the real-shim tests then read
+// $WOLFPACK_HOME/scripts/podman-vibe.sh. They auto-skip when neither exists, so the
+// synthetic-fixture coverage still runs (`node --test` exits 0 with or without the pack).
+const localShim = join(here, 'podman-vibe.sh')
+const vibePath = existsSync(localShim) || !process.env.WOLFPACK_HOME
+  ? localShim
+  : join(process.env.WOLFPACK_HOME, 'scripts', 'podman-vibe.sh')
 
 // A minimal capable shim fragment (mirrors the real loop).
 const capableShim = `
@@ -109,7 +113,7 @@ test('CLI exits 0 on the real shims', { skip: !existsSync(vibePath) && 'harness 
   // dir is the host's live install, which this unit test must not depend on.
   const dir = fixtureProfilesDir()
   try {
-    execFileSync('node', [join(here, 'wolfpack-toolcheck.mjs'), '--profiles', dir], { encoding: 'utf8', stdio: 'pipe' })
+    execFileSync('node', [join(here, 'wolfpack-toolcheck.mjs'), '--shim', vibePath, '--profiles', dir], { encoding: 'utf8', stdio: 'pipe' })
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
@@ -501,4 +505,47 @@ OK
   // POSIX-ERE compatible: grep -E accepts it and finds the same line
   const g = spawnSync('grep', ['-E', '-i', '-o', TOOL_DENIAL_PATTERN], { input: "x\nTool 'bash' is permanently disabled\ny\n", encoding: 'utf8' })
   if (!g.error) assert.equal(g.stdout.trim(), "Tool 'bash' is permanently disabled")
+})
+
+// exec-layer-into-pack: with no --shim, the CLI's default shim is $WOLFPACK_HOME/scripts/podman-vibe.sh
+// (else the one beside the script); a pack without it is exit 2 naming the path and the fix.
+test('CLI default shim: WOLFPACK_HOME/scripts/podman-vibe.sh is the one checked', () => {
+  const home = mkdtempSync(join(tmpdir(), 'tc-home-'))
+  const dir = fixtureProfilesDir()
+  try {
+    mkdirSync(join(home, 'scripts'))
+    // A RE-BOXED shim at the WOLFPACK_HOME path: exit 1 proves that file (not the local one) was read.
+    writeFileSync(join(home, 'scripts', 'podman-vibe.sh'), 'VIBE_TOOLS_DEFAULT="read grep"\nVIBE_TOOL_FLAGS=()\nfor _t in $VIBE_TOOLS_DEFAULT; do VIBE_TOOL_FLAGS+=(--enabled-tools "$_t"); done\n')
+    const res = runCli(['--profiles', dir], { WOLFPACK_HOME: home })
+    assert.equal(res.status, 1, `${res.stdout}${res.stderr}`)
+    // --shim still wins over WOLFPACK_HOME
+    if (existsSync(vibePath)) {
+      const res2 = runCli(['--shim', vibePath, '--profiles', dir], { WOLFPACK_HOME: home })
+      assert.equal(res2.status, 0, `${res2.stdout}${res2.stderr}`)
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI default shim: a WOLFPACK_HOME without scripts/podman-vibe.sh → exit 2, the path + the fix', () => {
+  const home = mkdtempSync(join(tmpdir(), 'tc-empty-'))
+  const dir = fixtureProfilesDir()
+  try {
+    const res = runCli(['--profiles', dir], { WOLFPACK_HOME: home })
+    assert.equal(res.status, 2)
+    const want = `shim not found: ${join(home, 'scripts', 'podman-vibe.sh')}`
+    assert.ok(res.stderr.includes(want), res.stderr)
+    assert.match(res.stderr, /— pass --shim <path> or set WOLFPACK_HOME to the pack checkout/)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('CLI default shim: an explicit --shim that does not exist → exit 2 with the same prefix (the workflow regex)', () => {
+  const res = runCli(['--shim', '/nonexistent/scripts/podman-vibe.sh', '--profiles', '/nonexistent'], { WOLFPACK_HOME: '' })
+  assert.equal(res.status, 2)
+  assert.match(res.stderr, /^✗ toolcheck: shim not found: \/nonexistent\/scripts\/podman-vibe\.sh — /m)
 })

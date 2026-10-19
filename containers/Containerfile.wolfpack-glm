@@ -1,0 +1,20 @@
+# GLM layer on top of a Wolfpack sandbox image (the configured Sandbox image: the pack base
+# from Containerfile.wolfpack, plus the project's layer when one is configured).
+#
+# WHY A SEPARATE TAG: a sandbox image pins whatever mistral-vibe was current when it was
+# built, which may predate `--auto-approve` and use the old `read` tool name. GLM seats
+# REQUIRE --auto-approve (vibe -p hangs forever on any tool call needing approval) and the
+# current tool names (read_file / grep / write_file / edit). Layering the upgrade on a
+# separate tag gives GLM a current Vibe WITHOUT changing the Vibe that the Mistral path
+# (and any live hunt) runs on in the base tag.
+#
+# Build (podman-vibe.sh / wolfpack-build-images.sh build it on demand; BASE_IMAGE is
+# REQUIRED — without it the FROM is empty and the build fails):
+#   podman build --build-arg BASE_IMAGE=<sandbox image> -t <glm image> \
+#     -f "$WOLFPACK_HOME/containers/Containerfile.wolfpack-glm" "$WOLFPACK_HOME/containers"
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+RUN /opt/vibe/bin/pip install --no-cache-dir --upgrade "mistral-vibe>=2.24.1"
+USER ${WOLFPACK_USER}

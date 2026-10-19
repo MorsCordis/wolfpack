@@ -11,6 +11,7 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 - **Deploy command (dev):** none — the pack is not deployed; consumers install it.
 - **Deploy command (prod):** none.
 - **Vault root:** `~/Vault`
+- **Wolfpack home:** `~/Projects/wolfpack` — this checkout; `WOLFPACK_HOME` overrides. The workflows, the sandbox launcher and the seat shim resolve the execution layer from it.
 
 ## Hard Rules (agents will be fired for violating these)
 1. No private identifiers in any tracked file — no consuming-project names, private domains, home-directory paths, operator emails or org names. `scripts/wolfpack-leak-grep.sh` enforces it in CI; a deliberate leak-assertion needs an allow-list entry (path + justification) AND an inline `leak-grep:allow` marker.
@@ -77,6 +78,16 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 - Backlog file: `TODO.md`
 - Tag pattern: `v[0-9]*` (semver per campaign wave; `/merge-wave` stamps `## [Unreleased]` → `## [vX.Y.Z]`)
 - Dev URL: none · Prod URL: none · Never-smoke hosts: none — nothing is deployed; `/smoke-wave` does not apply.
+
+## Execution Layer
+- **Sandbox image:** `wolfpack-pack-sandbox:latest` — the pack's own seat image (project-neutral base, no layer), named apart from any consuming project's image because podman tags are host-global.
+- **GLM image:** `wolfpack-pack-sandbox-glm:latest`
+- **Sandbox project layer:** none — the pack needs only the base image.
+- **Seat extra mounts:** none
+- **Sandbox extra mounts:** none
+- **Secrets paths:** `~/.secrets`
+- **Vibe agent dir:** `~/.vibe/agents-headless`
+- **Seat test env:** none
 
 ## Existing Patterns
 - Workflow harness tests: `scripts/wolfpack-hunt-pipeline.test.mjs` (`runHunt` + label-prefix answer table; real CLIs run against temp fixtures, e.g. `realToolcheck`).

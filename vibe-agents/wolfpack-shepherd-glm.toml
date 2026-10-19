@@ -1,5 +1,5 @@
 # Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
-# Wolfpack GLM Shepherd (coder-alt seat). Run ONLY via the project's
+# Wolfpack GLM Shepherd (coder-alt seat). Run ONLY via the pack's
 # `podman-vibe.sh --implement` shim, which mounts the worktree read-write and passes
 # --auto-approve + --enabled-tools read_file grep write_file edit dev_cortex_repo_map
 # dev_cortex_file_outline. NO bash: the implementer never runs tests or git — the calling

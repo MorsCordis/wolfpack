@@ -1,5 +1,5 @@
 # Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
-# Wolfpack GLM seat (bloodhound). Run ONLY via the project's podman-vibe.sh shim, which passes
+# Wolfpack GLM seat (bloodhound). Run ONLY via the pack's podman-vibe.sh shim, which passes
 # --auto-approve + a strict --enabled-tools allow-list
 # (read_file grep bash dev_cortex_repo_map dev_cortex_file_outline).
 # vibe -p hangs forever on any tool call needing approval, so nothing here is "ask".

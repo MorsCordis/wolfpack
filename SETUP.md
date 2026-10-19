@@ -162,8 +162,9 @@ Follow the finishing messages — each phase tells you what to do next.
 
 ## Vibe seat profiles
 
-If your project runs cross-model review seats through Vibe (a `podman-vibe.sh`-style shim), the
-seat profiles are part of the pack, not hand-made local files:
+If your project runs cross-model review seats through Vibe (the pack's shim,
+`$WOLFPACK_HOME/scripts/podman-vibe.sh`), the seat profiles are part of the pack, not hand-made
+local files:
 
 - The templates live in `vibe-agents/` (`wolfpack-*.toml`, one per seat).
 - Install or update them with `node scripts/wolfpack-install-vibe-agents.mjs` (default
@@ -171,12 +172,41 @@ seat profiles are part of the pack, not hand-made local files:
   It reports each file as installed / unchanged / replaced, backs up any file it replaces
   (`<name>.bak-<timestamp>`), and leaves every other profile alone.
   `--check` writes nothing and exits 1 on drift.
-- `node scripts/wolfpack-toolcheck.mjs --shim <project>/scripts/podman-vibe.sh` checks that every
+- `node scripts/wolfpack-toolcheck.mjs --shim "$WOLFPACK_HOME/scripts/podman-vibe.sh"` (or omit
+  `--shim`: it defaults to `WOLFPACK_HOME`'s shim) checks that every
   pipeline seat profile agrees with the tools the shim enables (review/certify seats need a shell
   to run `git diff` and the tests; implementers stay shell-free). It exits non-zero on any
   mismatch, and `hunt-pipeline.js` runs it as a preflight before the first review seat.
 - Never hand-edit `~/.vibe/agents-headless/`: change the template, re-run the installer.
   (A future `install.sh` takes this step over.)
+
+## Execution layer
+
+The cross-family seat shim (`scripts/podman-vibe.sh`), the unified pipeline sandbox
+(`scripts/run-pipeline-sandbox.sh`), the rate-limit lib and the sandbox images
+(`containers/Containerfile.wolfpack`, `containers/Containerfile.wolfpack-glm`) live in the pack.
+A consuming project never copies them; the pipeline finds them through the pack home:
+
+1. Set the pack home: `export WOLFPACK_HOME=<absolute path of this checkout>`, or add
+   a `Wolfpack home` line (`- **Wolfpack home:** ` then the path in backticks) under
+   `## Project Identity` in your `wolfpack-config.md`
+   (env wins). Both workflows stop with the fix when neither is set — they never look for the
+   shim in your repo.
+2. Fill `## Execution Layer` in `wolfpack-config.md` (see `wolfpack-config.example.md`): the
+   image names, an optional project layer, extra mounts, secrets paths, the Vibe agent dir and
+   an optional seat test env. Check it with `node "$WOLFPACK_HOME/scripts/wolfpack-config.mjs" --exec`.
+3. Build the images from your repo root: `bash "$WOLFPACK_HOME/scripts/wolfpack-build-images.sh"`
+   (`--rebuild` rebuilds and prints the rollback command first). The shim also builds a missing
+   image on first use.
+
+Image names are host-global podman tags: give every project that builds a different layer its
+OWN `Sandbox image` / `GLM image` names, or one project's build replaces the other's.
+
+The project layer contract: a Containerfile that starts `ARG BASE_IMAGE` then
+`FROM ${BASE_IMAGE}` (the pack base), may switch to `USER root` for its installs, ends with
+`USER ${WOLFPACK_USER}`, and is built with your repo root as its context. The pack base carries
+only the tooling (git, jq, dbus/libsecret, curl) and Vibe in its own venv; your language
+runtime, dependencies and any local test database belong in the layer.
 
 ## Optional: usage snapshot (Claude Code)
 

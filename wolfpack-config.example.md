@@ -16,6 +16,7 @@ The pipeline itself (router, `hunt-pipeline`, `campaign-runner`) reads the machi
 - **Deploy command (dev):** `deploy-dev` or `npm run deploy:staging` or `kubectl apply -f ...`
 - **Deploy command (prod):** USER ONLY — describe the process here so agents know not to run it
 - **Vault root:** `~/Vault` — absolute path to the Obsidian vault that holds `project-notes/<project>/` (session notes, `/memory` project/lesson/reference notes, `/recall` search). Must NOT be inside the code repo or its parent workspace.
+- **Wolfpack home:** `~/src/wolfpack` — the wolfpack (pack) checkout, absolute or `~/…`. The `WOLFPACK_HOME` env var overrides it. Both workflows, `/run-hunt` / `/run-campaign` and the seat shim resolve the pack's execution layer (`scripts/podman-vibe.sh`, `scripts/run-pipeline-sandbox.sh`, `containers/`) from it; the pipeline never looks for those in this repo, and a run with neither set stops with the fix. Optional only when every run exports `WOLFPACK_HOME`.
 
 ## Hard Rules (agents will be fired for violating these)
 
@@ -175,6 +176,21 @@ VERSION=$(git describe --tags --always 2>/dev/null || echo "dev-{slug}")
 runner to a built artifact. If the migration job runs the *previously* deployed image,
 migrating first silently applies the old schema. Set `yes` and `/merge` will order the
 hand-off deploy-then-migrate and refuse to offer migrations earlier.
+
+## Execution Layer
+
+Read by the pack's seat shim (`$WOLFPACK_HOME/scripts/podman-vibe.sh`), sandbox launcher (`run-pipeline-sandbox.sh`) and image builder (`wolfpack-build-images.sh`) through `node scripts/wolfpack-config.mjs --exec`. Needed only when the project runs Vibe seats (GLM / Mistral) or the sandboxed pipeline; the shim refuses to start (exit 2, naming the key) while a key it needs is absent. `none` is legal where the line says so.
+
+- **Sandbox image:** `myproject-wolfpack-sandbox:latest` — the image the seats and the sandboxed pipeline run in (REQUIRED; never `none`; must carry a `:tag`). Podman tags are HOST-GLOBAL: give each project that builds a different layer its OWN name, or two projects overwrite each other's image.
+- **GLM image:** `myproject-wolfpack-sandbox-glm:latest` — the GLM layer built `FROM` the Sandbox image (REQUIRED; never `none`; unique per project, same rule). The `WOLFPACK_GLM_IMAGE` env var overrides it per run.
+- **Sandbox project layer:** none — or a project-owned Containerfile (a relative path resolves against this file's directory) that adds the project's own build steps (language runtime deps, a local test database…). Contract: it starts `ARG BASE_IMAGE` / `FROM ${BASE_IMAGE}`, may switch to `USER root`, ends with `USER ${WOLFPACK_USER}`, and is built with THIS repo's root as its context. Without one, the pack's project-neutral base is the Sandbox image.
+- **Seat extra mounts:** none — backticked `host` or `host:container` entries (`~` expands on both sides) mounted into REVIEW/CERTIFY seats. Always read-only (the shim appends `:ro,z`); an entry with its own options (a third `:` field) is refused; the host path must exist (never auto-created).
+- **Sandbox extra mounts:** none — the same syntax, mounted read-only into the unified pipeline sandbox (`run-pipeline-sandbox.sh`) only, e.g. a cloud CLI's config dir. Seats never get these. Absent = none.
+- **Secrets paths:** `~/.secrets` — backticked host paths no container may see. Before any podman build or podman run, the shim and the launcher refuse (exit 2) any bind mount whose host source equals one of these, lies under one, or contains one (so a mount of the whole home dir is refused while a path under it is listed). The value none disables the guard. List keys take EVERY backticked span on the line, so keep backticks out of the prose after a list value.
+- **Vibe agent dir:** `~/.vibe/agents-headless` — the host dir holding the installed seat profiles (`scripts/wolfpack-install-vibe-agents.mjs`); mounted read-only as the seat's `~/.vibe/agents` and checked by the toolcheck preflight (REQUIRED; never `none`).
+- **Seat test env:** none — optional backticked `NAME=value` entries passed to review/certify seats so the project's test command runs in the sandbox (e.g. a test-only, non-secret framework key). `HOME`, `PATH`, `WOLFPACK_*` and `GIT_*` are reserved and refused. Never put a real credential here: this file is tracked.
+
+The shim reads the config of the CALLER's checkout (`WOLFPACK_CONFIG`, else `<git toplevel of the CWD>/wolfpack-config.md`, else it stops). The pipeline invokes shims from the main checkout's root, so a hunt branch that edits this section cannot widen its own reviewer's sandbox.
 
 ## Module Map
 

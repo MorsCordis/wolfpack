@@ -30,6 +30,15 @@
 //   changelogFile    Deployment Notes → Changelog file (code)    optional
 //   tagPattern       Deployment Notes → Tag pattern (code)       optional
 //   backlogFile      Deployment Notes → Backlog file (code)      optional
+//   wolfpackHome     Project Identity → Wolfpack home (code)     optional; a leading `~` expands to
+//                    the home dir; a present, non-NONE, non-absolute value is a problem.
+//                    The WOLFPACK_HOME env var overrides it (the workflows + pack-home resolve
+//                    env → this key → fail loud; never the consuming repo).
+//   exec             ## Execution Layer (see execLayer below) — the execution-layer keys the
+//                    seat shim / sandbox launcher need. NOT part of the top-level `missing`
+//                    (a project with no Vibe seats needs none of them): exec.missing lists the
+//                    absent shim-required keys by their written names. exec.problems join the
+//                    top-level problems only when the section exists.
 //   models / pool    Model Pool → `- <role> → <token>` lines; judgment + reviewer-a required.
 //                    models is keyed by the config spelling (judgment, work-horse,
 //                    reviewer-a, reviewer-b, reviewer-c, coder-alt) → full token;
@@ -40,13 +49,21 @@
 //   problems         every Model Pool defect, each prefixed `Model Pool:`; on any pool
 //                    defect pool and models are null (never a partial object)
 //
-// CLI: node scripts/wolfpack-config.mjs [--json] [<path>]   (default ./wolfpack-config.md)
+// CLI: node scripts/wolfpack-config.mjs [--json | --exec] [<path>]   (default ./wolfpack-config.md)
 //   exit 0 — complete; prints the JSON (--json) or a short summary (bare mode)
 //   exit 2 — missing/problems non-empty (output still printed + a ✗ line on stderr),
 //            file absent (not-found message), or a usage error.
+//   --exec — for the shell side (scripts/lib/wolfpack-sandbox.sh): one `<field>\t<value>` line
+//            per value: config, sandbox_image, glm_image, project_layer (empty when none),
+//            seat_mount (`host\tcontainer`, repeated), sandbox_mount (same), secrets_path
+//            (repeated), vibe_agent_dir, seat_env (`NAME=value`, repeated). Exit 0. When
+//            exec.missing or any problem is non-empty it prints NOTHING on stdout, one ✗ line
+//            on stderr naming the keys as written (`Execution Layer: missing Sandbox image`)
+//            or the problem, and exits 2.
 
 import { readFileSync, existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { resolve, dirname, isAbsolute } from 'node:path'
+import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 
 // Config spelling → router camelCase role.
@@ -150,7 +167,111 @@ export function modelPool(body) {
   return { pool, models, unknownRoles, problems }
 }
 
-export function readConfig(text) {
+// `~` or `~/…` → the home directory; anything else unchanged.
+export function expandHome(p) {
+  if (typeof p !== 'string') return p
+  if (p === '~') return homedir()
+  if (p.startsWith('~/')) return homedir() + p.slice(1)
+  return p
+}
+
+// ## Execution Layer keys: [written name, field, shim-required, none allowed].
+export const EXEC_KEYS = [
+  ['Sandbox image', 'sandboxImage', true, false],
+  ['GLM image', 'glmImage', true, false],
+  ['Sandbox project layer', 'projectLayer', true, true],
+  ['Seat extra mounts', 'seatExtraMounts', true, true],
+  ['Sandbox extra mounts', 'sandboxExtraMounts', false, true],
+  ['Secrets paths', 'secretsPaths', true, true],
+  ['Vibe agent dir', 'vibeAgentDir', true, false],
+  ['Seat test env', 'seatTestEnv', false, true],
+]
+
+const RESERVED_ENV = /^(HOME|PATH|WOLFPACK_.*|GIT_.*)$/
+
+// An image reference must carry a `:tag` (a `:` after the last `/`; `host:5000/x` has none).
+export function imageHasTag(ref) {
+  const i = ref.lastIndexOf(':')
+  return i > 0 && i < ref.length - 1 && !ref.slice(i + 1).includes('/')
+}
+
+// Parse the ## Execution Layer body. body === undefined → section absent: every
+// shim-required key is in `missing`, no problems. configDir resolves a relative layer path.
+export function execLayer(body, configDir = process.cwd()) {
+  const missing = []
+  const problems = []
+  const out = {
+    sandboxImage: null, glmImage: null, projectLayer: null, seatExtraMounts: [],
+    sandboxExtraMounts: [], secretsPaths: [], vibeAgentDir: null, seatTestEnv: [],
+  }
+  const P = (msg) => problems.push(`Execution Layer: ${msg}`)
+  const mounts = (key, entries) => {
+    const res = []
+    for (const e of entries) {
+      const parts = e.split(':')
+      if (parts.length > 2) { P(`${key} entry '${e}' has a third ':' field — mounts are always read-only; options are not allowed`); continue }
+      const host = expandHome(parts[0].trim())
+      const container = expandHome((parts[1] ?? parts[0]).trim())
+      if (!host || !isAbsolute(host)) { P(`${key} entry '${e}' must have an absolute (or ~/…) host path`); continue }
+      if (!container || !isAbsolute(container)) { P(`${key} entry '${e}' must have an absolute (or ~/…) container path`); continue }
+      if (/\n/.test(host + container)) { P(`${key} entry '${e}' contains a newline`); continue }
+      res.push({ host, container })
+    }
+    return res
+  }
+  for (const [key, prop, required, noneOk] of EXEC_KEYS) {
+    const v = body === undefined ? undefined : field(body, key)
+    if (v === undefined) { if (required) missing.push(key); continue }
+    if (/\t/.test(v)) { P(`${key} contains a TAB`); continue }
+    if (isNone(v)) {
+      if (!noneOk && required) missing.push(key)
+      continue
+    }
+    switch (prop) {
+      case 'sandboxImage':
+      case 'glmImage': {
+        const ref = code(v).trim()
+        if (/\s/.test(ref) || !ref) P(`${key} '${ref}' must not contain whitespace`)
+        else if (!imageHasTag(ref)) P(`${key} '${ref}' must carry an explicit :tag (e.g. name:latest)`)
+        else out[prop] = ref
+        break
+      }
+      case 'projectLayer': {
+        const p = expandHome(code(v).trim())
+        out.projectLayer = isAbsolute(p) ? p : resolve(configDir, p)
+        break
+      }
+      case 'vibeAgentDir': {
+        const p = expandHome(code(v).trim())
+        if (!isAbsolute(p)) P(`${key} '${p}' must be an absolute path or ~/…`)
+        else out.vibeAgentDir = p
+        break
+      }
+      case 'seatExtraMounts':
+      case 'sandboxExtraMounts':
+        out[prop] = mounts(key, list(v))
+        break
+      case 'secretsPaths':
+        for (const e of list(v)) {
+          const p = expandHome(e)
+          if (!isAbsolute(p)) P(`${key} entry '${e}' must be an absolute path or ~/…`)
+          else out.secretsPaths.push(p)
+        }
+        break
+      case 'seatTestEnv':
+        for (const e of list(v)) {
+          const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(e)
+          if (!m) P(`${key} entry '${e}' must be NAME=value`)
+          else if (RESERVED_ENV.test(m[1])) P(`${key} entry '${e}' uses a reserved name (HOME, PATH, WOLFPACK_*, GIT_*)`)
+          else out.seatTestEnv.push(e)
+        }
+        break
+    }
+  }
+  return { ...out, missing, problems }
+}
+
+export function readConfig(text, { configDir = process.cwd() } = {}) {
   const secs = parseSections(text)
   const byKey = {}
   for (const s of secs) if (!(s.key in byKey)) byKey[s.key] = s.body
@@ -180,6 +301,17 @@ export function readConfig(text) {
 
   const { pool, models, unknownRoles, problems } = modelPool(sec('Model Pool'))
 
+  let wolfpackHome = optionalCode('Project Identity', 'Wolfpack home')
+  if (wolfpackHome !== null) {
+    wolfpackHome = expandHome(wolfpackHome.trim())
+    if (!isAbsolute(wolfpackHome)) {
+      problems.push('Project Identity → Wolfpack home must be an absolute path or ~/…')
+      wolfpackHome = null
+    }
+  }
+  const exec = execLayer(sec('Execution Layer'), configDir)
+  if (sec('Execution Layer') !== undefined) problems.push(...exec.problems)
+
   return {
     name,
     testCommand,
@@ -190,6 +322,8 @@ export function readConfig(text) {
     changelogFile: optionalCode('Deployment Notes', 'Changelog file'),
     tagPattern: optionalCode('Deployment Notes', 'Tag pattern'),
     backlogFile: optionalCode('Deployment Notes', 'Backlog file'),
+    wolfpackHome,
+    exec,
     pool,
     models,
     unknownRoles,
@@ -204,7 +338,7 @@ export function loadConfig(path = 'wolfpack-config.md') {
   if (!existsSync(abs)) {
     throw new Error(`wolfpack-config.md not found at ${abs} — copy wolfpack-config.example.md to it and fill it in`)
   }
-  return { ...readConfig(readFileSync(abs, 'utf8')), path: abs }
+  return { ...readConfig(readFileSync(abs, 'utf8'), { configDir: dirname(abs) }), path: abs }
 }
 
 export function problemLine(cfg) {
@@ -219,6 +353,10 @@ function summary(cfg) {
     `name: ${cfg.name ?? '(missing)'}`,
     `testCommand: ${cfg.testCommand ?? '(missing)'}`,
     `devDeployCommand: ${cfg.devDeployCommand ?? 'none'}`,
+    `wolfpackHome: ${cfg.wolfpackHome ?? 'none'}`,
+    cfg.exec && cfg.exec.missing.length
+      ? `exec: missing ${cfg.exec.missing.join(', ')}`
+      : `exec: sandbox ${cfg.exec?.sandboxImage} · glm ${cfg.exec?.glmImage} · layer ${cfg.exec?.projectLayer ?? 'none'}`,
   ]
   if (cfg.models) for (const [role, token] of Object.entries(cfg.models)) lines.push(`pool ${role} → ${token}`)
   if (cfg.missing.length) lines.push(`missing: ${cfg.missing.join(', ')}`)
@@ -226,23 +364,50 @@ function summary(cfg) {
   return lines.join('\n')
 }
 
-const USAGE = 'usage: node scripts/wolfpack-config.mjs [--json] [<path to wolfpack-config.md>]'
+const USAGE = 'usage: node scripts/wolfpack-config.mjs [--json | --exec] [<path to wolfpack-config.md>]'
+
+// The --exec TAB lines (see the header). Values never contain a TAB (the reader refuses one).
+export function execLines(cfg) {
+  const e = cfg.exec
+  const lines = [
+    ['config', cfg.path],
+    ['sandbox_image', e.sandboxImage],
+    ['glm_image', e.glmImage],
+    ['project_layer', e.projectLayer ?? ''],
+  ]
+  for (const m of e.seatExtraMounts) lines.push(['seat_mount', `${m.host}\t${m.container}`])
+  for (const m of e.sandboxExtraMounts) lines.push(['sandbox_mount', `${m.host}\t${m.container}`])
+  for (const s of e.secretsPaths) lines.push(['secrets_path', s])
+  lines.push(['vibe_agent_dir', e.vibeAgentDir])
+  for (const kv of e.seatTestEnv) lines.push(['seat_env', kv])
+  return lines.map(([k, v]) => `${k}\t${v}`).join('\n')
+}
 
 function main(argv) {
   let json = false
+  let exec = false
   const paths = []
   for (const a of argv) {
     if (a === '--json') json = true
+    else if (a === '--exec') exec = true
     else if (a.startsWith('-')) { process.stderr.write(`${USAGE}\n`); return 2 }
     else paths.push(a)
   }
-  if (paths.length > 1) { process.stderr.write(`${USAGE}\n`); return 2 }
+  if (paths.length > 1 || (json && exec)) { process.stderr.write(`${USAGE}\n`); return 2 }
   let cfg
   try {
     cfg = loadConfig(paths[0] ?? 'wolfpack-config.md')
   } catch (e) {
     process.stderr.write(`✗ ${e.message}\n`)
     return 2
+  }
+  if (exec) {
+    const parts = []
+    if (cfg.exec.missing.length) parts.push(`Execution Layer: missing ${cfg.exec.missing.join(', ')}`)
+    if (cfg.problems.length) parts.push(cfg.problems.join('; '))
+    if (parts.length) { process.stderr.write(`✗ wolfpack-config: ${parts.join('; ')}\n`); return 2 }
+    process.stdout.write(`${execLines(cfg)}\n`)
+    return 0
   }
   process.stdout.write(`${json ? JSON.stringify(cfg, null, 2) : summary(cfg)}\n`)
   const bad = problemLine(cfg)

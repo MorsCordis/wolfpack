@@ -17,10 +17,11 @@ TRANSCRIPT=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null || tr
 
 [[ -z "$TRANSCRIPT" || ! -f "$TRANSCRIPT" ]] && exit 0
 
-# Only run in Wolfpack context — either inside a worktree or a repo with
-# a .wolfpack/ dir. Skip otherwise so non-Wolfpack projects aren't nagged.
+# Only run in Wolfpack context — inside a hunt worktree (either harness worktree layout:
+# .agents/worktrees/ or .claude/worktrees/) or a repo with a .wolfpack/ dir. Skip otherwise
+# so non-Wolfpack projects aren't nagged.
 CWD="$(pwd)"
-if [[ "$CWD" != *".agents/worktrees/"* ]] && [[ ! -d ".wolfpack" ]]; then
+if [[ "$CWD" != *"/.agents/worktrees/"* && "$CWD" != *"/.claude/worktrees/"* ]] && [[ ! -d ".wolfpack" ]]; then
     exit 0
 fi
 

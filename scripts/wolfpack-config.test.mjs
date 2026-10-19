@@ -15,7 +15,9 @@ import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import {
   parseSections, field, code, list, isNone, modelPool, readConfig, loadConfig, problemLine,
+  expandHome, execLayer, execLines, imageHasTag, EXEC_KEYS,
 } from './wolfpack-config.mjs'
+import { homedir } from 'node:os'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(here, '..')
@@ -312,4 +314,260 @@ test('CLI bare mode: a human summary (not JSON), same exit codes', () => {
     assert.match(bad.stdout, /^devDeployCommand: make deploy-dev$/m)
     assert.match(bad.stderr, /✗ wolfpack-config: Model Pool: section absent/)
   })
+})
+
+// ─── exec-layer-into-pack: Project Identity → Wolfpack home + ## Execution Layer ──────────
+const HOME_DIR = homedir()
+const withHome = (line) => FULL.replace('- **Worktree links:**', `${line}\n- **Worktree links:**`)
+const EXEC = `## Execution Layer
+- **Sandbox image:** \`demo-sandbox:latest\` — prose after the value
+- **GLM image:** \`demo-sandbox-glm:v2\`
+- **Sandbox project layer:** \`containers/Layer.demo\` — a relative path
+- **Seat extra mounts:** \`/opt/ref\` \`~/data:/data\`
+- **Sandbox extra mounts:** \`~/.config/tool\`
+- **Secrets paths:** \`~/.secrets\` \`/etc/demo-keys\`
+- **Vibe agent dir:** \`~/.vibe/agents-headless\`
+- **Seat test env:** \`APP_KEY=test-only\` \`EMPTY=\`
+`
+const withExec = (exec = EXEC) => `${FULL}\n${exec}`
+const execWith = (key, value) => EXEC.replace(new RegExp(`^- \\*\\*${key}:\\*\\*.*$`, 'm'), `- **${key}:** ${value}`)
+const execWithout = (key) => EXEC.replace(new RegExp(`^- \\*\\*${key}:\\*\\*.*\\n`, 'm'), '')
+
+test('Wolfpack home: absent / none → null, no problem; ~ and ~/x expand; absolute kept; relative → problem', () => {
+  assert.equal(readConfig(FULL).wolfpackHome, null)
+  assert.deepEqual(readConfig(FULL).problems, [])
+  for (const v of ['none', '`none`', 'none — every run exports it', 'n/a']) {
+    const c = readConfig(withHome(`- **Wolfpack home:** ${v}`))
+    assert.equal(c.wolfpackHome, null, v)
+    assert.deepEqual(c.problems, [], v)
+  }
+  assert.equal(readConfig(withHome('- **Wolfpack home:** `~/src/pack` — prose with `ticks`')).wolfpackHome, join(HOME_DIR, 'src/pack'))
+  assert.equal(readConfig(withHome('- **Wolfpack home:** `~`')).wolfpackHome, HOME_DIR)
+  assert.equal(readConfig(withHome('- Wolfpack home: /opt/pack')).wolfpackHome, '/opt/pack')
+  assert.equal(readConfig(withHome('- **Wolfpack home:** `/opt/pack`')).wolfpackHome, '/opt/pack')
+  for (const v of ['`src/pack`', '`./pack`', '`~user/pack`', '`/opt/pack` ', '`pack`']) {
+    const c = readConfig(withHome(`- **Wolfpack home:** ${v}`))
+    if (v.startsWith('`/')) { assert.equal(c.wolfpackHome, '/opt/pack'); continue }
+    assert.equal(c.wolfpackHome, null, v)
+    assert.ok(c.problems.includes('Project Identity → Wolfpack home must be an absolute path or ~/…'), `${v}: ${c.problems}`)
+  }
+  // only Project Identity counts
+  const elsewhere = FULL.replace('## Deployment Notes\n', '## Deployment Notes\n- **Wolfpack home:** `/opt/other`\n')
+  assert.equal(readConfig(elsewhere).wolfpackHome, null)
+})
+
+test('expandHome: ~ and ~/… only; anything else unchanged', () => {
+  assert.equal(expandHome('~'), HOME_DIR)
+  assert.equal(expandHome('~/a/b'), `${HOME_DIR}/a/b`)
+  assert.equal(expandHome('~user/a'), '~user/a')
+  assert.equal(expandHome('/x/~/y'), '/x/~/y')
+  assert.equal(expandHome('rel'), 'rel')
+  assert.equal(expandHome(undefined), undefined)
+})
+
+test('imageHasTag: a tag after the last / only (registry ports are not tags)', () => {
+  for (const ok of ['a:latest', 'reg.io/a/b:v1', 'localhost:5000/a:1.2']) assert.equal(imageHasTag(ok), true, ok)
+  for (const bad of ['a', 'localhost:5000/a', 'a:', ':x', 'reg:5000/a/b']) assert.equal(imageHasTag(bad), false, bad)
+})
+
+test('Execution Layer absent: exit-0 config, every shim-required key in exec.missing, nothing in the top-level missing/problems', () => {
+  const c = readConfig(FULL)
+  assert.deepEqual(c.missing, [])
+  assert.deepEqual(c.problems, [])
+  assert.deepEqual(c.exec.missing, ['Sandbox image', 'GLM image', 'Sandbox project layer', 'Seat extra mounts', 'Secrets paths', 'Vibe agent dir'])
+  assert.deepEqual(c.exec.missing, EXEC_KEYS.filter(k => k[2]).map(k => k[0]), 'exactly the shim-required keys, as written')
+  withTemp((dir) => {
+    const r = runCli([writeCfg(dir, FULL)])
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stdout, /^exec: missing Sandbox image, GLM image, Sandbox project layer, Seat extra mounts, Secrets paths, Vibe agent dir$/m)
+    assert.match(r.stdout, /^wolfpackHome: none$/m)
+  })
+})
+
+test('Execution Layer: every key parses (~ expansion, layer resolved against the config dir, list syntax, prose ignored)', () => {
+  const c = readConfig(withExec(), { configDir: '/cfg/dir' })
+  assert.deepEqual(c.problems, [])
+  assert.deepEqual(c.exec.missing, [])
+  assert.deepEqual(c.exec.problems, [])
+  const e = c.exec
+  assert.equal(e.sandboxImage, 'demo-sandbox:latest')
+  assert.equal(e.glmImage, 'demo-sandbox-glm:v2')
+  assert.equal(e.projectLayer, '/cfg/dir/containers/Layer.demo')
+  assert.deepEqual(e.seatExtraMounts, [{ host: '/opt/ref', container: '/opt/ref' }, { host: `${HOME_DIR}/data`, container: '/data' }])
+  assert.deepEqual(e.sandboxExtraMounts, [{ host: `${HOME_DIR}/.config/tool`, container: `${HOME_DIR}/.config/tool` }])
+  assert.deepEqual(e.secretsPaths, [`${HOME_DIR}/.secrets`, '/etc/demo-keys'])
+  assert.equal(e.vibeAgentDir, `${HOME_DIR}/.vibe/agents-headless`)
+  assert.deepEqual(e.seatTestEnv, ['APP_KEY=test-only', 'EMPTY='])
+  // absolute / ~ layer paths are kept as given (not re-resolved)
+  assert.equal(readConfig(withExec(execWith('Sandbox project layer', '`/abs/Layer`')), { configDir: '/cfg' }).exec.projectLayer, '/abs/Layer')
+  assert.equal(readConfig(withExec(execWith('Sandbox project layer', '`~/Layer`')), { configDir: '/cfg' }).exec.projectLayer, `${HOME_DIR}/Layer`)
+  // loadConfig passes the FILE's directory as configDir
+  withTemp((dir) => {
+    const l = loadConfig(writeCfg(dir, withExec()))
+    assert.equal(l.exec.projectLayer, join(dir, 'containers/Layer.demo'))
+  })
+})
+
+test('Execution Layer: none handling — legal for layer / mounts / secrets / seat env, never for the images or the agent dir', () => {
+  const c = readConfig(withExec([
+    ['Sandbox project layer', 'none — the base is enough'], ['Seat extra mounts', 'none'], ['Sandbox extra mounts', 'none'],
+    ['Secrets paths', 'none'], ['Seat test env', '`none`'],
+  ].reduce((t, [k, v]) => t.replace(new RegExp(`^- \\*\\*${k}:\\*\\*.*$`, 'm'), `- **${k}:** ${v}`), EXEC)))
+  assert.deepEqual(c.exec.missing, [])
+  assert.deepEqual(c.problems, [])
+  assert.equal(c.exec.projectLayer, null)
+  assert.deepEqual([c.exec.seatExtraMounts, c.exec.sandboxExtraMounts, c.exec.secretsPaths, c.exec.seatTestEnv], [[], [], [], []])
+  for (const k of ['Sandbox image', 'GLM image', 'Vibe agent dir']) {
+    const n = readConfig(withExec(execWith(k, 'none')))
+    assert.deepEqual(n.exec.missing, [k], `${k}: none → missing`)
+  }
+  // optional keys may be absent entirely
+  const opt = readConfig(withExec(execWithout('Sandbox extra mounts').replace(/^- \*\*Seat test env:\*\*.*\n/m, '')))
+  assert.deepEqual(opt.exec.missing, [])
+  assert.deepEqual(opt.exec.sandboxExtraMounts, [])
+  assert.deepEqual(opt.exec.seatTestEnv, [])
+  // each required key, when absent, is named as written
+  for (const [k, , required] of EXEC_KEYS) {
+    const m = readConfig(withExec(execWithout(k)))
+    assert.deepEqual(m.exec.missing, required ? [k] : [], k)
+  }
+})
+
+test('Execution Layer: every validation defect is a reader problem (exit 2), merged only when the section exists', () => {
+  const cases = [
+    ['Sandbox image', '`demo sandbox:latest`', /Sandbox image 'demo sandbox:latest' must not contain whitespace/],
+    ['Sandbox image', '`demo-sandbox`', /Sandbox image 'demo-sandbox' must carry an explicit :tag/],
+    ['GLM image', '`localhost:5000/glm`', /GLM image 'localhost:5000\/glm' must carry an explicit :tag/],
+    ['Seat extra mounts', '`/a:/b:rw`', /Seat extra mounts entry '\/a:\/b:rw' has a third ':' field/],
+    ['Seat extra mounts', '`rel/dir`', /Seat extra mounts entry 'rel\/dir' must have an absolute \(or ~\/…\) host path/],
+    ['Seat extra mounts', '`/a:rel`', /Seat extra mounts entry '\/a:rel' must have an absolute \(or ~\/…\) container path/],
+    ['Sandbox extra mounts', '`/a:/b:ro`', /Sandbox extra mounts entry '\/a:\/b:ro' has a third ':' field/],
+    ['Secrets paths', '`.secrets`', /Secrets paths entry '\.secrets' must be an absolute path or ~\/…/],
+    ['Vibe agent dir', '`agents`', /Vibe agent dir 'agents' must be an absolute path or ~\/…/],
+    ['Seat test env', '`novalue`', /Seat test env entry 'novalue' must be NAME=value/],
+    ['Seat test env', '`1BAD=x`', /Seat test env entry '1BAD=x' must be NAME=value/],
+    ['Seat test env', '`HOME=/x`', /Seat test env entry 'HOME=\/x' uses a reserved name/],
+    ['Seat test env', '`PATH=/x`', /reserved name/],
+    ['Seat test env', '`WOLFPACK_SANDBOX=0`', /reserved name/],
+    ['Seat test env', '`GIT_DIR=/x`', /reserved name/],
+    ['Sandbox image', '`a:latest`\tx', /Sandbox image contains a TAB/],
+  ]
+  for (const [k, v, re] of cases) {
+    const c = readConfig(withExec(execWith(k, v)))
+    assert.ok(c.problems.some(p => re.test(p)), `${k}=${v}: ${JSON.stringify(c.problems)}`)
+    assert.ok(c.problems.every(p => !/^Execution Layer/.test(p) || c.exec.problems.includes(p)))
+    assert.ok(problemLine(c), `${k}=${v}: problemLine is non-empty → exit 2`)
+  }
+  // Reserved names do not over-match ordinary ones.
+  assert.deepEqual(readConfig(withExec(execWith('Seat test env', '`HOMEPAGE=x` `MYPATH=y` `GITHUB_X=z`'))).exec.seatTestEnv, ['HOMEPAGE=x', 'MYPATH=y', 'GITHUB_X=z'])
+  // An absent section never contributes problems; execLayer(undefined) has none either.
+  assert.deepEqual(execLayer(undefined).problems, [])
+  withTemp((dir) => {
+    const r = runCli([writeCfg(dir, withExec(execWith('Secrets paths', '`rel`')))])
+    assert.equal(r.status, 2)
+    assert.match(r.stderr, /Execution Layer: Secrets paths entry 'rel' must be an absolute path/)
+  })
+})
+
+test('CLI --exec: the exact TAB lines (stdout), exit 0', () => {
+  withTemp((dir) => {
+    const p = writeCfg(dir, withExec())
+    const r = runCli(['--exec', p], { env: { ...process.env, HOME: HOME_DIR } })
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(r.stderr, '')
+    assert.equal(r.stdout, [
+      `config\t${p}`,
+      'sandbox_image\tdemo-sandbox:latest',
+      'glm_image\tdemo-sandbox-glm:v2',
+      `project_layer\t${join(dir, 'containers/Layer.demo')}`,
+      'seat_mount\t/opt/ref\t/opt/ref',
+      `seat_mount\t${HOME_DIR}/data\t/data`,
+      `sandbox_mount\t${HOME_DIR}/.config/tool\t${HOME_DIR}/.config/tool`,
+      `secrets_path\t${HOME_DIR}/.secrets`,
+      'secrets_path\t/etc/demo-keys',
+      `vibe_agent_dir\t${HOME_DIR}/.vibe/agents-headless`,
+      'seat_env\tAPP_KEY=test-only',
+      'seat_env\tEMPTY=',
+      '',
+    ].join('\n'))
+    // execLines (the same function) — none layer → an EMPTY project_layer value, no mount lines
+    const none = readConfig(withExec(execWith('Sandbox project layer', 'none').replace(/^- \*\*Seat extra mounts:\*\*.*$/m, '- **Seat extra mounts:** none')))
+    const lines = execLines({ ...none, path: '/x/wolfpack-config.md' }).split('\n')
+    assert.ok(lines.includes('project_layer\t'))
+    assert.equal(lines.some(l => l.startsWith('seat_mount\t')), false)
+  })
+})
+
+test('CLI --exec: a missing key → stdout EMPTY, stderr names the keys as written, exit 2; a problem likewise', () => {
+  withTemp((dir) => {
+    const r = runCli(['--exec', writeCfg(dir, withExec(execWithout('Sandbox image').replace(/^- \*\*Vibe agent dir:\*\*.*\n/m, '')))])
+    assert.equal(r.status, 2)
+    assert.equal(r.stdout, '')
+    assert.equal(r.stderr, '✗ wolfpack-config: Execution Layer: missing Sandbox image, Vibe agent dir\n')
+    const r2 = runCli(['--exec', writeCfg(dir, FULL, 'b.md')])
+    assert.equal(r2.status, 2)
+    assert.equal(r2.stdout, '')
+    assert.match(r2.stderr, /^✗ wolfpack-config: Execution Layer: missing Sandbox image, GLM image, Sandbox project layer, Seat extra mounts, Secrets paths, Vibe agent dir\n$/)
+    const r3 = runCli(['--exec', writeCfg(dir, withExec(execWith('GLM image', '`glm`')), 'c.md')])
+    assert.equal(r3.status, 2)
+    assert.equal(r3.stdout, '')
+    assert.match(r3.stderr, /GLM image 'glm' must carry an explicit :tag/)
+    // a non-exec problem (e.g. the Model Pool) also blocks --exec: the shim never runs on a broken config
+    const r4 = runCli(['--exec', writeCfg(dir, withExec().replace(/^- judgment .*\n/m, ''), 'd.md')])
+    assert.equal(r4.status, 2)
+    assert.equal(r4.stdout, '')
+    assert.match(r4.stderr, /Model Pool/)
+    // absent file
+    const r5 = runCli(['--exec', join(dir, 'nope.md')])
+    assert.equal(r5.status, 2)
+    assert.equal(r5.stdout, '')
+    assert.match(r5.stderr, /not found at/)
+  })
+})
+
+test('CLI: --exec together with --json → usage, exit 2', () => {
+  withTemp((dir) => {
+    const p = writeCfg(dir, withExec())
+    for (const args of [['--exec', '--json', p], ['--json', '--exec', p]]) {
+      const r = runCli(args)
+      assert.equal(r.status, 2)
+      assert.equal(r.stdout, '')
+      assert.match(r.stderr, /usage: node scripts\/wolfpack-config\.mjs \[--json \| --exec\]/)
+    }
+  })
+})
+
+test('CLI --json carries wolfpackHome and exec; bare mode summarises them', () => {
+  withTemp((dir) => {
+    const p = writeCfg(dir, withExec().replace('- **Worktree links:**', '- **Wolfpack home:** `/opt/pack`\n- **Worktree links:**'))
+    const j = JSON.parse(runCli(['--json', p]).stdout)
+    assert.equal(j.wolfpackHome, '/opt/pack')
+    assert.equal(j.exec.sandboxImage, 'demo-sandbox:latest')
+    assert.deepEqual(j.exec.missing, [])
+    const bare = runCli([p]).stdout
+    assert.match(bare, /^wolfpackHome: \/opt\/pack$/m)
+    assert.match(bare, new RegExp(`^exec: sandbox demo-sandbox:latest · glm demo-sandbox-glm:v2 · layer ${join(dir, 'containers/Layer.demo').replace(/[.]/g, '\\.')}$`, 'm'))
+  })
+})
+
+test('the REAL wolfpack-config.md and the example both read clean under --exec and --json', () => {
+  for (const f of [REAL, join(ROOT, 'wolfpack-config.example.md')]) {
+    const e = runCli(['--exec', f])
+    assert.equal(e.status, 0, `${f}: ${e.stderr}`)
+    assert.match(e.stdout, /^sandbox_image\t\S+:\S+$/m)
+    assert.match(e.stdout, /^vibe_agent_dir\t\//m)
+    const j = runCli(['--json', f])
+    assert.equal(j.status, 0, `${f}: ${j.stderr}`)
+    const c = JSON.parse(j.stdout)
+    assert.equal(typeof c.wolfpackHome, 'string', `${f}: Wolfpack home is set`)
+    assert.ok(c.wolfpackHome.startsWith('/'))
+  }
+  const real = loadConfig(REAL)
+  assert.equal(real.exec.sandboxImage, 'wolfpack-pack-sandbox:latest', 'the pack names its own image apart from any consumer (H13)')
+  assert.equal(real.exec.glmImage, 'wolfpack-pack-sandbox-glm:latest')
+  assert.equal(real.exec.projectLayer, null)
+  // the example documents every key
+  const ex = readFileSync(join(ROOT, 'wolfpack-config.example.md'), 'utf8')
+  for (const [k] of EXEC_KEYS) assert.match(ex, new RegExp(`^- \\*\\*${k}:\\*\\*`, 'm'), k)
+  assert.match(ex, /^- \*\*Wolfpack home:\*\*/m)
 })

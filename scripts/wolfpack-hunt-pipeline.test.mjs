@@ -30,7 +30,11 @@ const PD = `${WT}/.wolfpack/plans/h`
 // Verify path; the wolfpack-shaped scenarios below answer it by REALLY running the reader.
 const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/test-all.sh', worktreeLinks: [],
   complianceAreas: null, compliancePaths: [], devDeployCommand: 'deploy-x', changelogFile: 'CHANGELOG.md',
-  tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [] }
+  tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [],
+  // exec-layer-into-pack: the pack home (Project Identity → Wolfpack home) + the Execution Layer.
+  wolfpackHome: '/pack',
+  exec: { sandboxImage: 'fx-sandbox:latest', glmImage: 'fx-sandbox-glm:latest', projectLayer: null, seatExtraMounts: [],
+    sandboxExtraMounts: [], secretsPaths: [], vibeAgentDir: '/agents', seatTestEnv: [], missing: [], problems: [] } }
 const configAnswer = (cfg = FIXTURE_CONFIG) => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2) })
 
 const BASE = {
@@ -301,12 +305,13 @@ test('args: a JSON string still parses; a bare slug on a FRESH hunt fails loud (
   await assert.rejects(runHunt({ rawArgs: 'bad slug' }), /invalid slug/)
 })
 
-test('shell commands single-quote interpolated paths (worktree with a space and a quote)', async () => {
+test('shell commands single-quote interpolated paths (worktree AND pack home with a space and a quote)', async () => {
   const wt = "/re po/it's/.agents/worktrees/h"
-  const { find } = await runHunt({ answers: { scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
+  const { find } = await runHunt({ env: { WOLFPACK_HOME: "/pa ck/it's" }, answers: { scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
   const bh = find('bloodhound:')[0].prompt
   assert.ok(bh.includes(`'/re po/it'\\''s/.agents/worktrees/h'`), 'worktree path is POSIX single-quoted')
-  assert.ok(bh.includes(`'/re po/it'\\''s/scripts/podman-vibe.sh'`), 'shim path is quoted too')
+  assert.ok(bh.includes(`'/pa ck/it'\\''s/scripts/podman-vibe.sh'`), 'shim path (from the pack home) is quoted too')
+  assert.match(find('toolcheck-preflight:')[0].prompt, /--shim '\/pa ck\/it'\\''s\/scripts\/podman-vibe\.sh'/)
 })
 
 test('resume: a Tracker-bounce re-entry goes to the LAST writer (claude), not the glm pin', async () => {
@@ -1180,7 +1185,7 @@ test('AC5: a pointer-glm profile with bash = "never" → the REAL toolcheck exit
     for (const p of SEAT_CALLS) assert.equal(find(p).length, 0, `${p} never ran`)
     const pf = find('toolcheck-preflight:')
     assert.equal(pf.length, 1)
-    assert.match(pf[0].prompt, /wolfpack-toolcheck\.mjs' --shim '\/repo\/scripts\/podman-vibe\.sh'/, 'targets the current shim root')
+    assert.match(pf[0].prompt, /'\/repo\/scripts\/wolfpack-toolcheck\.mjs' --shim '\/pack\/scripts\/podman-vibe\.sh' --profiles '\/agents'/, 'targets the pack shim (WOLFPACK_HOME) + the configured Vibe agent dir')
     const park = find('park:h:toolcheck_failed')
     assert.equal(park.length, 1)
     assert.match(park[0].prompt, /wolfpack-pointer-glm/)
@@ -1595,9 +1600,14 @@ test('AC10 (b): the scaffold uses .agents/worktrees/h; shim + toolcheck resolve 
   assert.doesNotMatch(scaffold, /\.claude\/worktrees/)
   assert.match(scaffold, /7\. Convenience links \(wolfpack-config\.md → Worktree links\): for each of \(none configured — skip this step\)/)
   assert.doesNotMatch(scaffold, /adcValid|application-default/)
-  assert.ok(logs.some(l => l === 'Shim root (always current): /x/wolfpack/scripts/'), logs.join('\n'))
-  assert.match(find('toolcheck-preflight:')[0].prompt, /'\/x\/wolfpack\/scripts\/wolfpack-toolcheck\.mjs' --shim '\/x\/wolfpack\/scripts\/podman-vibe\.sh'/)
-  assert.match(find('pointer:')[0].prompt, /'\/x\/wolfpack\/scripts\/podman-vibe\.sh' 'wolfpack-pointer-glm'/)
+  // exec-layer-into-pack: the repo-local scripts stay under the repo root; the SHIM comes from the
+  // pack home the real config names (Project Identity → Wolfpack home, ~ expanded).
+  const packHome = JSON.parse(realConfig()().output).wolfpackHome
+  assert.ok(typeof packHome === 'string' && packHome.startsWith('/'), `the real config names a Wolfpack home (${packHome})`)
+  assert.ok(logs.some(l => l === 'Repo root: /x/wolfpack'), logs.join('\n'))
+  assert.ok(logs.some(l => l === `Pack home (WOLFPACK_HOME): ${packHome} — from wolfpack-config.md → Project Identity → Wolfpack home; seat shim ${packHome}/scripts/podman-vibe.sh`), logs.join('\n'))
+  assert.ok(find('toolcheck-preflight:')[0].prompt.includes(`'/x/wolfpack/scripts/wolfpack-toolcheck.mjs' --shim '${packHome}/scripts/podman-vibe.sh'`))
+  assert.ok(find('pointer:')[0].prompt.includes(`'${packHome}/scripts/podman-vibe.sh' 'wolfpack-pointer-glm'`))
   assert.ok(logs.some(l => /^Project config: wolfpack .* — tests: bash scripts\/test-all\.sh; deploy: none; risk surfaces: 0$/.test(l)), logs.join('\n'))
 })
 
@@ -1713,7 +1723,7 @@ test('AC10 (f): a MISSING seat shim → parked:shim_missing naming the path; NO 
     assert.equal(find('park:h:toolcheck_failed').length, 0, 'not the generic toolcheck park')
     const park = find('park:h:shim_missing')
     assert.equal(park.length, 1)
-    assert.ok(park[0].prompt.includes(`The seat shim ${fx.shim} does not exist.`), park[0].prompt)
+    assert.ok(park[0].prompt.includes(`The seat shim ${fx.shim} does not exist in the pack at WOLFPACK_HOME=`), park[0].prompt)
     assert.match(park[0].prompt, /resume_phase: Spec/)
     assert.match(park[0].prompt, /resolution_type_expected: redirect/)
     assert.match(park[0].prompt, /WOLFPACK_ENABLE_GLM=0 WOLFPACK_ENABLE_MISTRAL_AUTO=0/)
@@ -1749,4 +1759,150 @@ test('the shim_missing park reason is registered in the parked skill reason tabl
   assert.ok(row, 'a shim_missing row')
   assert.match(row, /WOLFPACK_ENABLE_GLM=0 WOLFPACK_ENABLE_MISTRAL_AUTO=0/)
   assert.match(row, /redirect/)
+})
+
+// ─── exec-layer-into-pack: WOLFPACK_HOME resolution (AC3 / AC4 / AC5) ───────────────────────
+// Every podman-vibe.sh occurrence in a recorded prompt, with the text that precedes it.
+const shimRefs = (calls) => calls.flatMap(c => [...c.prompt.matchAll(/(\S*)podman-vibe\.sh/g)].map(m => ({ label: c.label, ref: m[0] })))
+const SHIM_SEATS = ['bloodhound:', 'pointer:', 'watchdog:', 'toolcheck-preflight:']
+
+test('AC3 (a) / AC4: env WOLFPACK_HOME wins over the key — EVERY shim command (review, implement, certify, toolcheck) uses it', async () => {
+  // default run: Bloodhound + Pointer (glm + mistral links), Watchdog (glm + mistral certify), toolcheck
+  const a = await runHunt({ env: { WOLFPACK_HOME: '/envpack' } })
+  for (const p of SHIM_SEATS) assert.ok(a.find(p).length >= 1, `${p} ran`)
+  const wd = a.find('watchdog:')[0].prompt
+  assert.ok(wd.includes(`'/envpack/scripts/podman-vibe.sh' wolfpack-watchdog-glm `), 'GLM certify step')
+  assert.ok(wd.includes(`'/envpack/scripts/podman-vibe.sh' wolfpack-watchdog `), 'Mistral certify step')
+  const bh = a.find('bloodhound:')[0].prompt
+  assert.ok(bh.includes(`'/envpack/scripts/podman-vibe.sh' 'wolfpack-bloodhound-glm'`), 'GLM review')
+  assert.ok(bh.includes(`'/envpack/scripts/podman-vibe.sh' 'wolfpack-bloodhound'`), 'Mistral review')
+  assert.ok(a.find('toolcheck-preflight:')[0].prompt.includes(`--shim '/envpack/scripts/podman-vibe.sh'`), 'toolcheck --shim')
+  // GLM Shepherd (--implement) run
+  const g = await runHunt({ env: { WOLFPACK_HOME: '/envpack' }, answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })
+  assert.ok(g.find('shepherd-glm')[0].prompt.includes(`'/envpack/scripts/podman-vibe.sh' --implement wolfpack-shepherd-glm `), 'GLM implement')
+  const refs = [...shimRefs(a.calls), ...shimRefs(g.calls)]
+  assert.ok(refs.length >= 8, `found ${refs.length} shim references`)
+  for (const r of refs) assert.equal(r.ref, `'/envpack/scripts/podman-vibe.sh`, `${r.label}: ${r.ref}`)
+  assert.ok(a.logs.some(l => l === 'Pack home (WOLFPACK_HOME): /envpack — from env WOLFPACK_HOME; seat shim /envpack/scripts/podman-vibe.sh'), a.logs.join('\n'))
+  // a trailing slash is normalised
+  const t = await runHunt({ env: { WOLFPACK_HOME: '/envpack//' } })
+  for (const r of shimRefs(t.calls)) assert.equal(r.ref, `'/envpack/scripts/podman-vibe.sh`, r.label)
+})
+
+test('AC3 (b): env unset (or blank) → the config key is used, and the log names the key as the source', async () => {
+  for (const env of [{}, { WOLFPACK_HOME: '' }, { WOLFPACK_HOME: '   ' }]) {
+    const { calls, logs } = await runHunt({ env })
+    const refs = shimRefs(calls)
+    assert.ok(refs.length >= 5, JSON.stringify(env))
+    for (const r of refs) assert.equal(r.ref, `'/pack/scripts/podman-vibe.sh`, `${JSON.stringify(env)} ${r.label}`)
+    assert.ok(logs.some(l => l === 'Pack home (WOLFPACK_HOME): /pack — from wolfpack-config.md → Project Identity → Wolfpack home; seat shim /pack/scripts/podman-vibe.sh'), logs.join('\n'))
+  }
+})
+
+test('AC3 (c): neither env nor key → THROWS naming WOLFPACK_HOME and the Wolfpack home key, before any scaffold — even when the consuming repo HAS a scripts/podman-vibe.sh', async () => {
+  const repo = mkdtempSync(join(tmpdir(), 'hp-consumer-'))
+  try {
+    execFileSync('git', ['init', '-q', repo])
+    execFileSync('mkdir', ['-p', join(repo, 'scripts')])
+    writeFileSync(join(repo, 'scripts', 'podman-vibe.sh'), FIXTURE_SHIM)
+    const wt = join(repo, '.agents', 'worktrees', 'h')
+    for (const cfg of [{ ...FIXTURE_CONFIG, wolfpackHome: null }, (({ wolfpackHome, ...rest }) => rest)(FIXTURE_CONFIG)]) {
+      const calls = []
+      const record = (label) => (prompt) => { calls.push({ label, prompt }); return label === 'scaffold' ? { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } : {} }
+      let seen = null
+      await assert.rejects(runHunt({ env: {}, answers: {
+        'project-config': configAnswer(cfg), 'resume-probe': record('resume-probe'), scaffold: record('scaffold'),
+        spec: record('spec'), 'toolcheck-preflight': record('toolcheck-preflight'), bloodhound: record('bloodhound') } }), (e) => {
+        seen = e.message
+        assert.match(e.message, /^hunt-pipeline: h: WOLFPACK_HOME is not set and wolfpack-config\.md has no Wolfpack home/)
+        assert.match(e.message, /WOLFPACK_HOME/)
+        assert.match(e.message, /"- \*\*Wolfpack home:\*\* `<path>`" under ## Project Identity in wolfpack-config\.md/)
+        assert.match(e.message, /never looked up in the consuming repo/)
+        return true
+      })
+      assert.deepEqual(calls, [], `nothing after the config probe ran (${calls.map(c => c.label)})`)
+      assert.ok(!seen.includes(repo), 'the consuming repo is never named as a shim source')
+    }
+  } finally { rmSync(repo, { recursive: true, force: true }) }
+})
+
+test('AC3 (d): a relative env value or a relative key → throws "not an absolute path" before any scaffold', async () => {
+  const ran = []
+  const rec = (l) => () => { ran.push(l); return {} }
+  await assert.rejects(runHunt({ env: { WOLFPACK_HOME: 'Projects/pack' }, answers: { 'resume-probe': rec('resume-probe'), scaffold: rec('scaffold') } }),
+    /hunt-pipeline: h: env WOLFPACK_HOME is not an absolute path \('Projects\/pack'\)\. Fix: export WOLFPACK_HOME=/)
+  await assert.rejects(runHunt({ env: {}, answers: { 'project-config': configAnswer({ ...FIXTURE_CONFIG, wolfpackHome: '~/pack' }), 'resume-probe': rec('resume-probe'), scaffold: rec('scaffold') } }),
+    /wolfpack-config\.md → Project Identity → Wolfpack home is not an absolute path \('~\/pack'\)/)
+  assert.deepEqual(ran, [])
+})
+
+// The toolcheck preflight answered by REALLY running the toolcheck CLI with exactly the --shim
+// (and --profiles) the workflow put in the prompt, against fixture profiles.
+const realToolcheckFromPrompt = (profiles) => (prompt) => {
+  const shim = /--shim '([^']*)'/.exec(prompt)
+  assert.ok(shim, 'the preflight prompt names a --shim')
+  try {
+    const out = execFileSync(process.execPath, [TOOLCHECK, '--shim', shim[1], '--profiles', profiles], { encoding: 'utf8', stdio: 'pipe' })
+    return { ok: true, exitCode: 0, output: out }
+  } catch (e) {
+    return { ok: false, exitCode: e.status, output: `${e.stdout || ''}${e.stderr || ''}` }
+  }
+}
+
+test('AC5: WOLFPACK_HOME = an EMPTY pack dir → parked:shim_missing naming <home>/scripts/podman-vibe.sh; no seat, no Claude substitute', async () => {
+  const fx = toolcheckFixture()
+  const home = mkdtempSync(join(tmpdir(), 'hp-emptypack-'))
+  try {
+    const { result, find, calls } = await runHunt({ env: { WOLFPACK_HOME: home }, answers: { 'toolcheck-preflight': realToolcheckFromPrompt(fx.profiles) } })
+    assert.equal(result.status, 'parked:shim_missing', JSON.stringify(result))
+    const missing = join(home, 'scripts', 'podman-vibe.sh')
+    const park = find('park:h:shim_missing')
+    assert.equal(park.length, 1)
+    assert.ok(park[0].prompt.includes(`The seat shim ${missing} does not exist in the pack at WOLFPACK_HOME=${home} (env WOLFPACK_HOME).`), park[0].prompt)
+    assert.ok(park[0].prompt.includes(`shim not found: ${missing}`), 'the real toolcheck output is the context')
+    for (const p of [...SEAT_CALLS, 'spec', 'shepherd-glm', 'shepherd-fallback']) assert.equal(find(p).length, 0, `${p} never ran`)
+    assert.equal(calls.some(c => c.opts && c.opts.model && /review|certif/i.test(c.label)), false, 'no Claude review/certify substitute')
+  } finally { fx.cleanup(); rmSync(home, { recursive: true, force: true }) }
+})
+
+test('AC5: WOLFPACK_HOME = a pack WITH the shim → the real toolcheck passes and the run proceeds', async () => {
+  const fx = toolcheckFixture()
+  const home = mkdtempSync(join(tmpdir(), 'hp-pack-'))
+  try {
+    execFileSync('mkdir', ['-p', join(home, 'scripts')])
+    copyFileSync(fx.shim, join(home, 'scripts', 'podman-vibe.sh'))
+    const { result, logs } = await runHunt({ env: { WOLFPACK_HOME: home }, answers: { 'toolcheck-preflight': realToolcheckFromPrompt(fx.profiles) } })
+    assert.notEqual(String(result.status).startsWith('parked'), true, JSON.stringify(result))
+    assert.ok(logs.some(l => /✓ seat toolcheck: profiles match the shim/.test(l)))
+  } finally { fx.cleanup(); rmSync(home, { recursive: true, force: true }) }
+})
+
+test('toolcheck --profiles: passes the configured Vibe agent dir (shell-quoted); omitted when the config has none', async () => {
+  const a = await runHunt({ answers: { 'project-config': configAnswer({ ...FIXTURE_CONFIG, exec: { ...FIXTURE_CONFIG.exec, vibeAgentDir: "/a b/it's agents" } }) } })
+  assert.ok(a.find('toolcheck-preflight:')[0].prompt.includes(`--shim '/pack/scripts/podman-vibe.sh' --profiles '/a b/it'\\''s agents' 2>&1;`))
+  for (const exec of [undefined, { ...FIXTURE_CONFIG.exec, vibeAgentDir: null, missing: ['Vibe agent dir'] }]) {
+    const cfg = { ...FIXTURE_CONFIG, exec }
+    if (exec === undefined) delete cfg.exec
+    const b = await runHunt({ answers: { 'project-config': configAnswer(cfg) } })
+    const pf = b.find('toolcheck-preflight:')[0].prompt
+    assert.ok(pf.includes(`--shim '/pack/scripts/podman-vibe.sh' 2>&1;`), pf)
+    assert.doesNotMatch(pf, /--profiles/)
+  }
+})
+
+test('AC4 (g): source guard — no shim path is built from repoRoot in either workflow; every shim site uses shimPath', () => {
+  const runner = readFileSync(join(here, '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8')
+  const AC4 = /repoRoot\}?\/scripts\/(podman-vibe|run-pipeline-sandbox)\.sh/
+  assert.doesNotMatch(SRC, AC4)
+  assert.doesNotMatch(runner, AC4)
+  // the only place the shim FILE NAME is joined to a directory is the shimPath definition
+  const joins = [...SRC.matchAll(/\$\{[^}]*\}\/scripts\/podman-vibe\.sh/g)].map(m => m[0])
+  assert.deepEqual(joins, ['${wolfpackHome.home}/scripts/podman-vibe.sh'])
+  assert.equal((SRC.match(/shq\(shimPath\)/g) || []).length, 5, 'review ×2, implement, certify ×2')
+  assert.match(SRC, /const tcShim = shimPath\n/, 'toolcheck --shim')
+  // the resolver runs right after the pre-scaffold config probe and BEFORE the resume probe (H7 trust boundary)
+  const iProbe = SRC.indexOf('projectConfig = await loadProjectConfig(')
+  const iResolve = SRC.indexOf('const wolfpackHome = resolveWolfpackHome(')
+  const iResume = SRC.indexOf('const resumeProbe = await agent(')
+  assert.ok(iProbe > 0 && iProbe < iResolve && iResolve < iResume, `${iProbe} < ${iResolve} < ${iResume}`)
 })
