@@ -49,8 +49,10 @@ test('AC2: CHANGELOG has an [Unreleased] section and every entry carries a hunt 
   const entries = cl.split('\n').filter(l => /^- /.test(l))
   assert.ok(entries.length >= 1)
   for (const e of entries) assert.match(e, /<!-- hunt:[a-z0-9-]+ -->\s*$/, e)
-  const unreleased = cl.split(/^## /m).find(s => s.startsWith('[Unreleased]'))
-  assert.match(unreleased, /<!-- hunt:wolfpack-self-hosting -->/)
+  // The hunt's entries live under [Unreleased] until a wave stamps them, then under a version
+  // heading — assert they exist under one of the two, not which (that changes at every release).
+  const sections = cl.split(/^## /m).filter(s => /^\[(Unreleased|v[0-9][^\]]*)\]/.test(s))
+  assert.ok(sections.some(s => s.includes('<!-- hunt:wolfpack-self-hosting -->')))
 })
 
 test('CLAUDE.md points at wolfpack-config.md and the one test command; README/SETUP referenced exist', () => {

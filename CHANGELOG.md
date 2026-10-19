@@ -4,6 +4,9 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+### Fixed
+- The self-hosting changelog test checks the hunt's entries exist under `[Unreleased]` or a version heading, so it no longer fails once a wave stamps them. <!-- hunt:wolfpack-self-hosting -->
+
 ## [v0.1.0] - 2026-10-19
 
 ### Added
