@@ -4,6 +4,8 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+## [v0.2.0] - 2026-10-19
+
 ### Added
 - The execution layer lives in the pack: `scripts/podman-vibe.sh` (the Vibe/GLM seat shim), `scripts/run-pipeline-sandbox.sh`, `scripts/lib/wolfpack-ratelimit.sh` and the sandbox images `containers/Containerfile.wolfpack` (project-neutral base; Vibe in its own venv; the container user comes from build args) and `containers/Containerfile.wolfpack-glm`, with their tests. <!-- hunt:exec-layer-into-pack -->
 - `WOLFPACK_HOME`: both workflows resolve the pack from the env, else `wolfpack-config.md` → Project Identity → `Wolfpack home`, else stop with the fix — never from the consuming repo. <!-- hunt:exec-layer-into-pack -->
