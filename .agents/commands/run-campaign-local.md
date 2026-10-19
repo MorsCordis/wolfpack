@@ -199,7 +199,7 @@ wave barrier exactly like the container path. Relay the barrier verdict when the
 
 ## Wave barriers (unchanged)
 The run STOPS at every wave barrier. Release a wave the same way: `/merge-wave <slug> <wave>` →
-`deploy-dev` (+ `migrate-dev` if flagged) → `/smoke-wave <slug> <wave>`; `/resolve <slug>` for any
+the configured Dev deploy command (+ Migration command if flagged) → `/smoke-wave <slug> <wave>` — or, when wolfpack-config.md declares no deploy step, nothing after `/merge-wave`; `/resolve <slug>` for any
 human-parked hunt. Re-run `/run-campaign-local <slug>` to resume — Step 1 shows the next wave.
 
 ## What NOT to do

@@ -14,6 +14,12 @@ import {
   bestReviewerByData, providerFamily, assertConstraints, MIN_RUNS, DEFAULT_POOL,
   reviewerChain, reviewerOrder, pinsFromMeta,
 } from './wolfpack-routing.mjs'
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, readFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { spawnSync } from 'node:child_process'
+import { loadConfig } from './wolfpack-config.mjs'
 
 const dims = (o) => ({ file_spread: 1, logic_complexity: 1, domain_sensitivity: 1,
   multi_tenancy_risk: 1, test_authoring: 1, api_surface: 1, frontend_complexity: 1, ...o })
@@ -337,4 +343,146 @@ test('complianceCriticalFromMeta: spec flags or domain_sensitivity ≥ 3', () =>
   assert.equal(complianceCriticalFromMeta({ spec: { compliance_review_required: true } }), true)
   assert.equal(complianceCriticalFromMeta({ predicted_dimensions: { domain_sensitivity: 3 } }), true)
   assert.equal(complianceCriticalFromMeta({ predicted_dimensions: { domain_sensitivity: 2 } }), false)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// wolfpack-self-hosting (AC3): the router reads the consuming project's Model Pool through
+// scripts/wolfpack-config.mjs. With an EMPTY public pedigree every seat falls back to the
+// config pool's order (tier defaults), never to data it does not have.
+// ════════════════════════════════════════════════════════════════════════════
+
+const HERE_CFG = dirname(fileURLToPath(import.meta.url))
+const REAL_CONFIG = join(HERE_CFG, '..', 'wolfpack-config.md')
+const ROUTER_CLI = join(HERE_CFG, 'wolfpack-routing.mjs')
+const TIERS = ['Green', 'Blue', 'Yellow', 'Orange', 'Red']
+
+test('AC3 (a): empty pedigree + the REAL config pool → every seat is the config-order tier default, per tier', () => {
+  const { pool } = loadConfig(REAL_CONFIG)
+  assert.ok(pool, 'the real config has a usable pool')
+  const order = reviewerOrder(pool)
+  assert.equal(order[0], 'glm', 'reviewer-a is the first examiner')
+  for (const tier of TIERS) {
+    const rec = recommendModels({ tier, dimensions: { frontend_complexity: 0 }, stats: {}, pool })
+    const A = rec.assignments
+    assert.equal(A.alpha.model, pool.judgment, `${tier} alpha`)
+    const heavy = tier === 'Orange' || tier === 'Red'
+    assert.equal(A.shepherd.model, heavy ? pool.judgment : pool.workHorse, `${tier} shepherd`)
+    assert.equal(A.tracker.model, pool.judgment, `${tier} tracker`)
+    assert.equal(A.bloodhound.model, order[0], `${tier} bloodhound`)
+    const firstNotShepherd = order.find(f => f !== A.shepherd.model)
+    assert.equal(A.pointer.model, firstNotShepherd, `${tier} pointer`)
+    assert.equal(A.watchdog.model, firstNotShepherd, `${tier} watchdog`)
+    for (const [role, a] of Object.entries(A)) {
+      assert.ok(['fixed', 'default', 'explore'].includes(a.source), `${tier} ${role} source ${a.source}`)
+      assert.notEqual(a.source, 'exploit', `${tier} ${role}: nothing to exploit in an empty pedigree`)
+    }
+    // concrete pool families, never the neutral DEFAULT_POOL role names
+    for (const a of Object.values(A)) assert.ok(!Object.values(DEFAULT_POOL).includes(a.model), `${tier}: ${a.model}`)
+  }
+})
+
+// A temp consuming root: <root>/wolfpack-config.md (optional) + <root>/.wolfpack/plans/x/metadata.json
+function routerRoot({ config, tier = 'Orange' } = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'wp-route-'))
+  const planDir = join(root, '.wolfpack', 'plans', 'x')
+  mkdirSync(planDir, { recursive: true })
+  writeFileSync(join(planDir, 'metadata.json'), JSON.stringify({ tier, predicted_dimensions: { frontend_complexity: 0 } }))
+  if (config !== undefined) writeFileSync(join(root, 'wolfpack-config.md'), config)
+  return { root, planDir, cleanup: () => rmSync(root, { recursive: true, force: true }) }
+}
+const routeCli = (args) => spawnSync(process.execPath, [ROUTER_CLI, ...args], { encoding: 'utf8' })
+const REAL_TEXT = readFileSync(REAL_CONFIG, 'utf8')
+
+test('AC3 (b): CLI with <root>/wolfpack-config.md → pool_source config + concrete families', () => {
+  const fx = routerRoot({ config: REAL_TEXT })
+  try {
+    const r = routeCli([fx.planDir])
+    assert.equal(r.status, 0, r.stderr)
+    assert.doesNotMatch(r.stderr, /DEFAULT_POOL/)
+    const j = JSON.parse(r.stdout)
+    assert.equal(j.pool_source, 'config')
+    assert.equal(j.config, resolve(fx.root, 'wolfpack-config.md'))
+    assert.equal(j.assignments.alpha.model, 'claude')
+    assert.equal(j.assignments.shepherd.model, 'claude')
+    for (const r2 of ['bloodhound', 'pointer', 'watchdog']) assert.equal(j.assignments[r2].model, 'glm', r2)
+    assert.deepEqual(j.assignments.pointer.chain, ['glm', 'mistral'])
+    assert.ok(!(j.warnings || []).some(w => /DEFAULT_POOL/.test(w)))
+  } finally { fx.cleanup() }
+})
+
+test('AC3 (c): CLI with NO config → pool_source default, stderr warning, the warning also in warnings (disclosed)', () => {
+  const fx = routerRoot()
+  try {
+    const r = routeCli([fx.planDir])
+    assert.equal(r.status, 0, r.stderr)
+    assert.match(r.stderr, /⚠ wolfpack-routing: no wolfpack-config\.md at .* — using the neutral DEFAULT_POOL/)
+    const j = JSON.parse(r.stdout)
+    assert.equal(j.pool_source, 'default')
+    assert.equal('config' in j, false)
+    assert.ok(j.warnings.some(w => /no wolfpack-config\.md at .*DEFAULT_POOL/.test(w)), JSON.stringify(j.warnings))
+    assert.equal(j.assignments.alpha.model, DEFAULT_POOL.judgment)
+  } finally { fx.cleanup() }
+})
+
+for (const role of ['judgment', 'reviewer-a']) {
+  test(`AC3 (d): a config with no ${role} line → exit 2 "Model Pool unusable", no assignments JSON`, () => {
+    const fx = routerRoot({ config: REAL_TEXT.replace(new RegExp(`^- ${role} .*\\n`, 'm'), '') })
+    try {
+      const r = routeCli([fx.planDir])
+      assert.equal(r.status, 2)
+      assert.match(r.stderr, new RegExp(`✗ wolfpack-routing: .*Model Pool unusable — Model Pool: missing required role\\(s\\) ${role}`))
+      assert.equal(r.stdout, '')
+    } finally { fx.cleanup() }
+  })
+}
+
+test('AC3 (d): no Model Pool section at all → exit 2, while a non-pool missing key (Test command) does NOT block routing', () => {
+  const noPool = REAL_TEXT.replace(/^## Model Pool[\s\S]*?(?=^## )/m, '')
+  assert.doesNotMatch(noPool, /^## Model Pool/m)
+  const fx = routerRoot({ config: noPool })
+  try {
+    const r = routeCli([fx.planDir])
+    assert.equal(r.status, 2)
+    assert.match(r.stderr, /Model Pool unusable — Model Pool: section absent/)
+  } finally { fx.cleanup() }
+  const fx2 = routerRoot({ config: REAL_TEXT.replace(/^- \*\*Test command:\*\*.*\n/m, '') })
+  try {
+    const r = routeCli([fx2.planDir])
+    assert.equal(r.status, 0, r.stderr)
+    assert.equal(JSON.parse(r.stdout).pool_source, 'config')
+  } finally { fx2.cleanup() }
+})
+
+test('AC3 (e): --config <path> outside the default location → used (pool_source config, config = that path)', () => {
+  const fx = routerRoot()   // nothing at <root>/wolfpack-config.md
+  const elsewhere = mkdtempSync(join(tmpdir(), 'wp-route-cfg-'))
+  try {
+    const p = join(elsewhere, 'custom-config.md')
+    writeFileSync(p, REAL_TEXT)
+    const r = routeCli([fx.planDir, '--config', p])
+    assert.equal(r.status, 0, r.stderr)
+    assert.doesNotMatch(r.stderr, /DEFAULT_POOL/)
+    const j = JSON.parse(r.stdout)
+    assert.equal(j.pool_source, 'config')
+    assert.equal(j.config, p)
+    assert.equal(j.assignments.bloodhound.model, 'glm')
+  } finally { fx.cleanup(); rmSync(elsewhere, { recursive: true, force: true }) }
+})
+
+test('AC3 (e): CLI argument discipline — --config before <planDir>, a dangling --config, or an unknown flag → usage, exit 2', () => {
+  const fx = routerRoot({ config: REAL_TEXT })
+  try {
+    for (const args of [
+      ['--config', join(fx.root, 'wolfpack-config.md'), fx.planDir],
+      [fx.planDir, '--config'],
+      [fx.planDir, '--bogus', 'x'],
+      [fx.planDir, '--config', 'a', 'b'],
+      [],
+    ]) {
+      const r = routeCli(args)
+      assert.equal(r.status, 2, JSON.stringify(args))
+      assert.match(r.stderr, /usage: node scripts\/wolfpack-routing\.mjs <planDir> \[--config/, JSON.stringify(args))
+      assert.equal(r.stdout, '')
+    }
+  } finally { fx.cleanup() }
 })

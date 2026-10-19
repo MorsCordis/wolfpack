@@ -37,9 +37,10 @@ of genuine failures on v1-push-3 wave 2 — per-hunt batching is the fix.)
 4. **Smoke FIXES go back through review, never Shepherd-direct.** A failure that needs a fix
    (not a clean revert) re-enters as a mini-cycle (see § Fix-forward). Same adversarial bar as
    the original code.
-5. **URL safety** (`feedback_smoke_url_verification`): resolve host+path against the real
-   env/router before presenting. Dev = `*.pawpims.dev`, prod = `*.pawpims.vet`, never
-   `pawpims.com`. Never relay an Alpha-authored URL verbatim.
+5. **URL safety**: resolve host+path against the real env/router before presenting.
+   Dev = the host in wolfpack-config.md → Deployment Notes → **Dev URL**; prod = **Prod URL**
+   (never smoke prod); never any host listed in **Never-smoke hosts**. If the project's Dev URL
+   is `none`, nothing is deployed: stop and say so. Never relay an Alpha-authored URL verbatim.
 
 ## Step 1 — Build the release queue + criteria union
 
@@ -71,8 +72,8 @@ of genuine failures on v1-push-3 wave 2 — per-hunt batching is the fix.)
 
 ## Step 2 — Resolve the deployed URL (do this BEFORE any MCP step)
 
-Resolve the dev URL from the router/settings, not from memory. The deployed surface is on
-`*.pawpims.dev`. Confirm host+path against the real env before navigating. State the URL you
+Resolve the dev URL from the router/settings, not from memory. The deployed surface is the
+config's **Dev URL** host. Confirm host+path against the real env before navigating. State the URL you
 resolved and how, in one line, before the first MCP call.
 
 ## Step 3 — Run every `[auto]` criterion via Chrome DevTools MCP, ONE HUNT AT A TIME

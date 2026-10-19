@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# REFERENCE — ported from PawPIMS; slated for DevDen reimplementation. NOT fully genericized. See DEVDEN-ARCHITECTURE.md section 14.
+# RETIRED reference orchestrator (pre-examiner-chain). NOT maintained — do not revive without reimplementing its seats.
 # Retired plumbing: the agy/Gemini seats and .gemini/skills paths below predate the
 # GLM -> Mistral -> Claude examiner chain (hunt: retire-gemini-glm-large4) — do NOT revive
 # this script without reimplementing them.
@@ -7,7 +7,7 @@
 # Drives the 6-phase pipeline without a Claude subscription.
 # Uses `agy` for remote Claude/Gemini models and `vibe` for local models.
 # Integrates with the `wolfpack-models` script to load/evict local models on-demand.
-# Compliance-aware: forces remote Claude/Gemini for sensitive veterinary areas.
+# Compliance-aware: forces remote models for the project's declared risk surfaces.
 #
 # Usage:
 #   ./scripts/wolfpack-run-local.sh <feature-slug> [phase_override]
@@ -71,9 +71,18 @@ is_compliance() {
     if [ "$sens" -ge 3 ]; then
         return 0
     fi
-    # 2. Check if files to modify touch controlled_substances, billing/models, or records/models
-    # Let's inspect git diff or modified files
-    if git -C "$WORKTREE_PATH" status --short 2>/dev/null | grep -qE "controlled_substances/|billing/models\.py|records/models\.py"; then
+    # 2. Check whether the modified files touch one of the project's declared risk-surface
+    #    paths (wolfpack-config.md → Compliance Requirements → Risk-surface paths, via the
+    #    deterministic reader). An unreadable config fails loud; an empty list skips the check.
+    local cfg_json
+    if ! cfg_json=$(node "$REPO_ROOT/scripts/wolfpack-config.mjs" --json "$REPO_ROOT/wolfpack-config.md"); then
+        echo "ERROR: wolfpack-config.md is missing or incomplete (see the reader's message above) — cannot decide compliance routing." >&2
+        exit 2
+    fi
+    local risk_paths
+    risk_paths=$(jq -r '.compliancePaths[]' <<<"$cfg_json")
+    [ -z "$risk_paths" ] && return 1
+    if git -C "$WORKTREE_PATH" status --short 2>/dev/null | grep -qF -- "$risk_paths"; then
         return 0
     fi
     return 1
@@ -375,13 +384,18 @@ execute_tracker() {
     echo "=========================================================="
     echo ">> Running unit/integration tests locally in worktree..."
     
-    # Run django test suite
+    # Run the project's test command (wolfpack-config.md → Project Identity → Test command)
     cd "$WORKTREE_PATH"
+    local test_cmd
+    if ! test_cmd=$(node "$REPO_ROOT/scripts/wolfpack-config.mjs" --json "$REPO_ROOT/wolfpack-config.md" | jq -er '.testCommand // empty'); then
+        echo "ERROR: wolfpack-config.md has no usable Test command (see the reader's message above)." >&2
+        exit 2
+    fi
     
     local test_status=0
     set +e
-    # Run local tests using the project's standard test script
-    ./scripts/run_tests.sh --local > "$PLAN_DIR/tracker-log.md" 2>&1
+    # Run the project's tests (no eval: the command string runs in a child bash)
+    bash -c "$test_cmd" > "$PLAN_DIR/tracker-log.md" 2>&1
     test_status=$?
     set -e
     

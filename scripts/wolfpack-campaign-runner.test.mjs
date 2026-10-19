@@ -31,11 +31,19 @@ const DEFERWEEK = { ...DEFER5H, reason: 'weekly cap: 7d 92% ≥ 90% — defer al
 // The degraded shape: ONLY the schema-required fields (no figures, no offload).
 const DEGRADED = { decision: 'proceed', exitCode: 0, source: 'transcript_estimate', degraded: true }
 
+// wolfpack-self-hosting (AC10): the runner's project-config probe relays the reader's JSON.
+// The default answer is a generic consumer WITH a deploy step; a scenario overrides it.
+const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/test-all.sh', worktreeLinks: [],
+  complianceAreas: null, compliancePaths: [], devDeployCommand: 'deploy-x', changelogFile: 'CHANGELOG.md',
+  tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [] }
+const configAnswer = (cfg = FIXTURE_CONFIG) => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2) })
+
 const hunt = (slug, extra = {}) => ({ slug, description: `do ${slug}`, tier: 'Yellow', mode: 'feature', dependsOn: [], status: 'ready_for_alpha', ...extra })
 const tick = () => new Promise(r => setImmediate(r))
 
 async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usageProtocol = 1, workflowDelayTicks = 3,
-  capability, gatePresent = true, gateProtocol = 1, depCheck = { allMerged: true }, workflowResult = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY' }) } = {}) {
+  capability, gatePresent = true, gateProtocol = 1, depCheck = { allMerged: true }, workflowResult = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY' }),
+  projectConfig = () => configAnswer() } = {}) {
   const events = []
   const logs = []
   const gateCalls = []
@@ -44,6 +52,7 @@ async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usagePr
   const agent = async (prompt, opts = {}) => {
     const label = opts.label || ''
     events.push({ type: 'agent', label })
+    if (label === 'project-config') { events[events.length - 1].prompt = prompt; events[events.length - 1].opts = opts; return projectConfig() }
     if (label === 'parse-campaign') return { waves: [{ number: 1, hunts }] }
     if (label === 'pipeline-capability') {
       events[events.length - 1].prompt = prompt
@@ -365,7 +374,7 @@ const CERT = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', statu
 
 // Generic runner: any runner source, a parse result, and per-label stubs.
 async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => PROCEED, workflowResult = CERT,
-  init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] } } = {}) {
+  init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] }, projectConfig = () => configAnswer() } = {}) {
   const events = []
   const logs = []
   const workflowCalls = []
@@ -375,6 +384,7 @@ async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => P
     const label = opts.label || ''
     agentCalls.push({ label, prompt, opts })
     events.push({ type: 'agent', label })
+    if (label === 'project-config') return projectConfig()
     if (label === 'parse-campaign') return JSON.parse(JSON.stringify(parse))
     if (label === 'pipeline-capability') return capability == null ? null : { ...capability }
     if (label.startsWith('usage-gate:') || label.startsWith('usage-gate-legacy:')) {
@@ -446,7 +456,11 @@ test('AC1: barrier mode (no chain) is identical to the pre-hunt runner — label
   const old = await runAny(base, opts)
   const now = await runAny(RUNNER, opts)
   noErr(old); noErr(now)
-  assert.deepEqual(now.labels, old.labels)
+  // wolfpack-self-hosting adds exactly ONE label (the project-config probe) the baseline predates;
+  // everything else must stay identical.
+  assert.equal(now.labels.filter(l => l === 'project-config').length, 1)
+  const sansProbe = (ls) => ls.filter(l => l !== 'project-config')
+  assert.deepEqual(sansProbe(now.labels), old.labels)
   assert.deepEqual(now.workflowCalls, old.workflowCalls)
   for (const w of now.workflowCalls) assert.equal('baseBranch' in w.args, false)
   assert.deepEqual(now.result, old.result)
@@ -454,7 +468,7 @@ test('AC1: barrier mode (no chain) is identical to the pre-hunt runner — label
   // also with the parse returning the new chain fields set to their barrier values
   const now2 = await runAny(RUNNER, { ...opts, parse: parseOf(waves.map(w => w.map(h => ({ ...h, migrationApps: [], revertedBecause: null, heldOn: [], baseBranch: '' }))), { chainMode: false, chainBranch: '' }) })
   noErr(now2)
-  assert.deepEqual(now2.labels, old.labels)
+  assert.deepEqual(sansProbe(now2.labels), old.labels)
   assert.deepEqual(now2.result, old.result)
 })
 
@@ -925,4 +939,75 @@ test('Pointer r1 F1 (round 3): a held certified_pending_compliance hunt keeps it
     { slug: 'red', status: 'certified_pending_compliance', heldOn: ['b'] },
     { slug: 'g', status: 'certified_held_overlap', heldOn: ['b'] },
   ])
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// wolfpack-self-hosting (AC10): the runner's project-config probe + config-driven release queue.
+// ════════════════════════════════════════════════════════════════════════════
+test('AC10 (a): a failing / garbled / empty project-config probe THROWS before any hunt is gated or launched', async () => {
+  const cases = [
+    [{ exitCode: 2, output: '{"missing":["testCommand"]}\n✗ wolfpack-config: missing testCommand' }, /the reader exited 2: ✗ wolfpack-config: missing testCommand/],
+    [{ exitCode: 0, output: 'not json' }, /no parseable JSON object/],
+    [{ exitCode: 0, output: JSON.stringify({ ...FIXTURE_CONFIG, compliancePaths: null }) }, /compliancePaths is not an array/],
+    [{ exitCode: 0, output: JSON.stringify({ ...FIXTURE_CONFIG, testCommand: 7 }) }, /testCommand is not a string/],
+    [null, /the project-config probe returned no result/],
+  ]
+  for (const [ans, why] of cases) {
+    const { error, events, gateCalls, workflowCalls } = await runRunner({ hunts: [hunt('a')], projectConfig: () => ans })
+    assert.ok(error, JSON.stringify(ans))
+    assert.match(error.message, /^campaign-runner: wolfpack-config\.md is missing or incomplete — no hunt may start\./)
+    assert.match(error.message, why)
+    assert.equal(gateCalls.length, 0)
+    assert.equal(workflowCalls.length, 0)
+    const labels = events.filter(e => e.type === 'agent').map(e => e.label)
+    assert.equal(labels[labels.length - 1], 'project-config', `${JSON.stringify(ans)}: nothing after the probe ran (${labels})`)
+    assert.equal(labels.some(l => /^(usage-gate|dep-check|chain-)/.test(l)), false, String(labels))
+  }
+})
+
+test('AC10: the runner probe is a read-only sonnet step in phase Parse running the exact reader command, before any hunt is gated or launched', async () => {
+  const { error, events, logs } = await runRunner({ hunts: [hunt('a')] })
+  assert.equal(error, undefined, error && error.stack)
+  const agents = events.filter(e => e.type === 'agent')
+  const i = agents.findIndex(e => e.label === 'project-config')
+  assert.ok(i > agents.findIndex(e => e.label === 'pipeline-capability'), 'after the capability preflight')
+  const pc = agents[i]
+  assert.ok(pc)
+  const firstGate = agents.findIndex(e => e.label.startsWith('usage-gate:'))
+  assert.ok(firstGate > i, 'before any hunt is gated')
+  assert.ok(events.findIndex(e => e.type === 'workflow-start') > events.indexOf(pc), 'before any hunt launches')
+  assert.equal(pc.opts.model, 'sonnet')
+  assert.equal(pc.opts.phase, 'Parse')
+  assert.match(pc.prompt, /node scripts\/wolfpack-config\.mjs --json wolfpack-config\.md 2>&1; echo "CONFIG_RC=\$\?"/)
+  assert.ok(logs.some(l => l === 'Project config: fixture-project — tests: bash scripts/test-all.sh; deploy: deploy-x'), logs.join('\n'))
+})
+
+const releaseBlock = (logs) => {
+  const i = logs.findIndex(l => /^Release this wave/.test(l))
+  return i < 0 ? null : logs.slice(i, i + 8)
+}
+
+test('AC10 (b): devDeployCommand null → the release queue says "no deploy step" and omits smoke-wave + redeploy lines', async () => {
+  const { error, logs } = await runRunner({ hunts: [hunt('a')], projectConfig: () => configAnswer({ ...FIXTURE_CONFIG, devDeployCommand: null }) })
+  assert.equal(error, undefined, error && error.stack)
+  const rel = releaseBlock(logs)
+  assert.ok(rel, logs.join('\n'))
+  assert.match(rel[1], /^ {2}1\. \/merge-wave \S+ 1 /)
+  assert.equal(rel[2], '  2. (no deploy step — wolfpack-config.md declares none)')
+  assert.equal(rel[3], '  3. (no smoke-wave — nothing is deployed)')
+  assert.equal(logs.some(l => /\/smoke-wave /.test(l)), false)
+  assert.equal(logs.some(l => /redeploy, re-smoke/.test(l)), false)
+  assert.equal(logs.some(l => /deploy-dev/.test(l)), false)
+  assert.ok(logs.some(l => /deploy: none$/.test(l)))
+})
+
+test('AC10 (c): devDeployCommand "deploy-x" → the release queue shows `2. deploy-x`, smoke-wave and the revert note', async () => {
+  const { error, logs } = await runRunner({ hunts: [hunt('a')] })
+  assert.equal(error, undefined, error && error.stack)
+  const rel = releaseBlock(logs)
+  assert.ok(rel, logs.join('\n'))
+  assert.match(rel[2], /^ {2}2\. deploy-x {3}\(ONE deploy for the whole wave — wolfpack-config\.md → Dev deploy command\)$/)
+  assert.match(rel[3], /^ {2}3\. \/smoke-wave \S+ 1 /)
+  assert.ok(logs.some(l => /redeploy, re-smoke that hunt only/.test(l)))
+  assert.equal(logs.some(l => /deploy-dev/.test(l)), false, 'no hard-coded consumer deploy function')
 })

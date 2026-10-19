@@ -1,5 +1,5 @@
 // Tests for wolfpack-usage.mjs (usage-limit-gate AC7/AC8/AC9) — run: node --test scripts/wolfpack-usage.test.mjs
-// Byte-identical in the pawpims and wolfpack repos.
+// Kept byte-identical with consuming-project copies until scripts-unfork reconciles them.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'

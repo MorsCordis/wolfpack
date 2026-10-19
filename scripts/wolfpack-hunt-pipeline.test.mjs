@@ -25,12 +25,21 @@ const WT = '/repo/.agents/worktrees/h'
 const PD = `${WT}/.wolfpack/plans/h`
 
 // Default happy-path answers; a scenario overrides by label prefix (value or fn(prompt, opts, n)).
+// wolfpack-self-hosting (AC10): the project-config probe relays the reader's JSON. The default
+// answer is a GENERIC consumer fixture WITH a deploy step, so the existing scenarios keep their
+// Verify path; the wolfpack-shaped scenarios below answer it by REALLY running the reader.
+const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/test-all.sh', worktreeLinks: [],
+  complianceAreas: null, compliancePaths: [], devDeployCommand: 'deploy-x', changelogFile: 'CHANGELOG.md',
+  tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [] }
+const configAnswer = (cfg = FIXTURE_CONFIG) => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2) })
+
 const BASE = {
+  'project-config': configAnswer(),
   'resume-probe': { fresh: true },
   // seat-profiles-into-pack: the toolcheck preflight passes by default (a missing answer
   // correctly parks toolcheck_failed — fail closed).
   'toolcheck-preflight': { ok: true, exitCode: 0, output: '✓' },
-  scaffold: { worktreePath: WT, planDir: PD, adcValid: true },
+  scaffold: { worktreePath: WT, planDir: PD },
   spec: { modeForBuild: 'autonomous', confidence: 'high', complianceCritical: false },
   alpha: { verdict: 'PLANNED', tier: 'Yellow', bloodhoundRounds: 1, pointerRounds: 1, trackerRounds: 1, bloodhoundModel: 'glm' },
   bloodhound: { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'glm', status: 'glm' },
@@ -331,6 +340,7 @@ async function runRunner({ env = {}, protocol }) {
   const calls = []
   const agent = async (_p, opts = {}) => {
     calls.push(opts.label)
+    if (opts.label === 'project-config') return configAnswer()
     if (opts.label === 'parse-campaign') return { waves: [] }
     if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol, gatePresent: true, gateProtocol: 1 }
     return {}
@@ -564,6 +574,7 @@ async function runRunnerLogged({ env = {}, protocol }) {
   const logs = []
   const agent = async (_p, opts = {}) => {
     calls.push(opts.label)
+    if (opts.label === 'project-config') return configAnswer()
     if (opts.label === 'parse-campaign') return { waves: [] }
     if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol, gatePresent: true, gateProtocol: 1 }
     return {}
@@ -1510,4 +1521,204 @@ test('AC6 (Bloodhound r1 MEDIUM): a claude last-resort certifier that omits tool
   assert.equal(result.status, 'parked:audit_only_certification', JSON.stringify(result))
   assert.match(find('park:h:audit_only_certification')[0].prompt, /certifier omitted the mandatory tool_access field/)
   assert.match(find('park:h:audit_only_certification')[0].prompt, /certifier: claude/)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// wolfpack-self-hosting (AC10): wolfpack as the CONSUMING repo. The project-config probe is
+// answered by REALLY running scripts/wolfpack-config.mjs on the real wolfpack-config.md, and
+// the worktree sits under wolfpack's own .agents/worktrees namespace.
+// ════════════════════════════════════════════════════════════════════════════
+const PACK_ROOT = join(here, '..')
+const WT_PACK = '/x/wolfpack/.agents/worktrees/h'
+const PD_PACK = `${WT_PACK}/.wolfpack/plans/h`
+// The probe answer: exit code + stdout/stderr verbatim, exactly as the probe agent relays it.
+const realConfig = (cfgPath = join(PACK_ROOT, 'wolfpack-config.md')) => () => {
+  try {
+    const out = execFileSync(process.execPath, [join(here, 'wolfpack-config.mjs'), '--json', cfgPath], { encoding: 'utf8', stdio: 'pipe' })
+    return { exitCode: 0, output: out }
+  } catch (e) {
+    return { exitCode: e.status, output: `${e.stdout || ''}${e.stderr || ''}` }
+  }
+}
+const PACK_ANSWERS = { 'project-config': realConfig(), scaffold: { worktreePath: WT_PACK, planDir: PD_PACK } }
+const FORBIDDEN_IN_PROMPTS = [/run_tests\.sh/, /manage\.py/, /gcloud/, /controlled_substances/, /billing\//]
+
+test('AC10 (a): wolfpack-hosted — Tracker/Shepherd/heartbeat carry `bash scripts/test-all.sh`; NO prompt carries a consumer-specific command or path', async () => {
+  // Red: exercises the single-pass review text and the full ceremony prompts.
+  for (const tier of ['Yellow', 'Red']) {
+    const { result, calls, find } = await runHunt({ answers: { ...PACK_ANSWERS, alpha: { ...BASE.alpha, tier } } })
+    assert.equal(result.status, 'certified', `${tier}: ${JSON.stringify(result)}`)
+    const tracker = find('tracker:')[0].prompt
+    assert.match(tracker, /- Run tests using: bash scripts\/test-all\.sh\n/)
+    assert.match(find('shepherd:')[0].prompt, /NEVER invoke the project's test command \(`bash scripts\/test-all\.sh`\)/)
+    assert.match(tracker, /Tests run ONLY via `bash scripts\/test-all\.sh` \(the project's test command/, 'heartbeat TOOLING POLICY')
+    // review seats (VERDICT_CONTRACT + DIFF_CATCH_NOTE) are included
+    assert.ok(find('bloodhound:').length && find('pointer:').length && find('watchdog:').length)
+    for (const c of calls) {
+      for (const re of FORBIDDEN_IN_PROMPTS) assert.doesNotMatch(c.prompt, re, `${tier} ${c.label} carries ${re}`)
+    }
+  }
+})
+
+test('AC10 (b): the scaffold uses .agents/worktrees/h; shim + toolcheck resolve under the pack root /x/wolfpack/scripts/', async () => {
+  const { find, logs } = await runHunt({ answers: PACK_ANSWERS })
+  const scaffold = find('scaffold:')[0].prompt
+  assert.match(scaffold, /git worktree add \.agents\/worktrees\/h|\.agents\/worktrees\/h/)
+  assert.doesNotMatch(scaffold, /\.claude\/worktrees/)
+  assert.match(scaffold, /7\. Convenience links \(wolfpack-config\.md → Worktree links\): for each of \(none configured — skip this step\)/)
+  assert.doesNotMatch(scaffold, /adcValid|application-default/)
+  assert.ok(logs.some(l => l === 'Shim root (always current): /x/wolfpack/scripts/'), logs.join('\n'))
+  assert.match(find('toolcheck-preflight:')[0].prompt, /'\/x\/wolfpack\/scripts\/wolfpack-toolcheck\.mjs' --shim '\/x\/wolfpack\/scripts\/podman-vibe\.sh'/)
+  assert.match(find('pointer:')[0].prompt, /'\/x\/wolfpack\/scripts\/podman-vibe\.sh' 'wolfpack-pointer-glm'/)
+  assert.ok(logs.some(l => /^Project config: wolfpack .* — tests: bash scripts\/test-all\.sh; deploy: none; risk surfaces: 0$/.test(l)), logs.join('\n'))
+})
+
+test('AC10 (b): the project-config probe runs FIRST — read-only sonnet, the exact reader command, before the resume probe', async () => {
+  const { calls } = await runHunt({ answers: PACK_ANSWERS })
+  assert.equal(calls[0].label, 'project-config:h')
+  assert.equal(calls[1].label, 'resume-probe:h')
+  assert.equal(calls[0].opts.model, 'sonnet')
+  assert.equal(calls[0].opts.phase, 'Scaffold')
+  assert.deepEqual(calls[0].opts.schema.required, ['exitCode', 'output'])
+  assert.match(calls[0].prompt, /node scripts\/wolfpack-config\.mjs --json wolfpack-config\.md 2>&1; echo "CONFIG_RC=\$\?"/)
+  assert.match(calls[0].prompt, /modify nothing/)
+})
+
+test('AC10 (c): no deploy step → Verify is never called; CERTIFIED_AWAITING_DEPLOY / certified; the log names /merge', async () => {
+  const { result, find, logs } = await runHunt({ answers: PACK_ANSWERS })
+  assert.equal(find('verify').length, 0)
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  assert.equal(result.status, 'certified')
+  assert.ok(logs.some(l => /No deploy step: .*Dev deploy command is none — h is certified; next: \/merge h\./.test(l)), logs.join('\n'))
+  assert.equal(logs.some(l => /Deploying feat\/h to dev/.test(l)), false)
+})
+
+test('AC10 (c): a project WITH a deploy step still reaches Verify, which surfaces the configured command (never runs it)', async () => {
+  const { find } = await runHunt()
+  const v = find('verify')
+  assert.equal(v.length, 1)
+  assert.match(v[0].prompt, /surface the Dev deploy\s+command \(`deploy-x`\)/i)
+  assert.match(v[0].prompt, /Feature-branch deploy \(Verify\)/)
+  assert.match(v[0].prompt, /Do NOT run any deploy command \(user-only\)/)
+  assert.doesNotMatch(v[0].prompt, /gcloud/)
+})
+
+test('AC10 (d): the compliance gate prompt says the project "declares no risk-surface paths"', async () => {
+  const { find } = await runHunt({ answers: PACK_ANSWERS })
+  const gate = find('compliance-gate')[0].prompt
+  assert.match(gate, /this project declares no risk-surface paths — nothing matches here; step 1b still applies/)
+  const spec = find('spec')[0].prompt
+  assert.match(spec, /Compliance areas: none — this project declares no compliance areas/)
+})
+
+test('consumer config: declared risk-surface paths, compliance areas and worktree links reach their prompts verbatim', async () => {
+  const consumer = { ...FIXTURE_CONFIG, complianceAreas: 'payments (card data)', compliancePaths: ['app/payments/', 'app/ledger.py'], worktreeLinks: ['.env', 'venv'] }
+  const { find } = await runHunt({ answers: { 'project-config': configAnswer(consumer), 'compliance-gate': { determined: true, complianceTouched: true, alreadySignedOff: false, touchedPaths: ['app/ledger.py'] } } })
+  const gate = find('compliance-gate')[0].prompt
+  assert.match(gate, /\n   - app\/payments\/\n   - app\/ledger\.py\n/)
+  assert.doesNotMatch(gate, /declares no risk-surface paths/)
+  assert.match(find('spec')[0].prompt, /Compliance areas: payments \(card data\)\)/)
+  assert.match(find('scaffold:')[0].prompt, /for each of `\.env`, `venv` that exists in the main repo/)
+  const park = find('park:h:compliance_review')
+  assert.equal(park.length, 1)
+  assert.match(park[0].prompt, /checking it against the project's Compliance Requirements \(wolfpack-config\.md\) — declared areas: payments \(card data\)/)
+  assert.doesNotMatch(park[0].prompt, /DEA|SAQ/)
+})
+
+test('AC10 (e): a failing / garbled / empty project-config probe THROWS naming wolfpack-config.md — nothing scaffolded', async () => {
+  const missingKeys = (() => {
+    const dir = mkdtempSync(join(tmpdir(), 'hp-cfg-'))
+    const p = join(dir, 'wolfpack-config.md')
+    writeFileSync(p, readFileSync(join(PACK_ROOT, 'wolfpack-config.md'), 'utf8').replace(/^- \*\*Test command:\*\*.*\n/m, ''))
+    const ans = realConfig(p)()
+    rmSync(dir, { recursive: true, force: true })
+    return ans
+  })()
+  assert.equal(missingKeys.exitCode, 2, 'the real reader exits 2 on a missing key')
+  const cases = [
+    [missingKeys, /the reader exited 2: ✗ wolfpack-config: missing testCommand/],
+    [{ exitCode: 2, output: '✗ wolfpack-config.md not found at /r/wolfpack-config.md' }, /not found at/],
+    [{ exitCode: 0, output: 'garbled, no json here' }, /no parseable JSON object/],
+    [{ exitCode: 0, output: '{ "testCommand": "x", ' }, /no parseable JSON object/],
+    [{ exitCode: 0, output: JSON.stringify({ ...FIXTURE_CONFIG, testCommand: null }) }, /testCommand is not a string/],
+    [{ exitCode: 0, output: JSON.stringify({ ...FIXTURE_CONFIG, testCommand: '' }) }, /testCommand is not a string/],
+    [{ exitCode: 0, output: JSON.stringify({ ...FIXTURE_CONFIG, compliancePaths: 'a/' }) }, /compliancePaths is not an array/],
+    [{ exitCode: '0', output: JSON.stringify(FIXTURE_CONFIG) }, /the reader exited 0/],
+    [null, /the project-config probe returned no result/],
+    [{}, /the reader exited undefined/],
+  ]
+  for (const [ans, why] of cases) {
+    const ran = []
+    const record = (label) => () => { ran.push(label); return {} }
+    await assert.rejects(runHunt({ answers: { 'project-config': () => ans, 'resume-probe': record('resume-probe'), scaffold: record('scaffold'), spec: record('spec') } }), (e) => {
+      assert.match(e.message, /^hunt-pipeline: h: wolfpack-config\.md is missing or incomplete — the pipeline will not guess project values\./, JSON.stringify(ans))
+      assert.match(e.message, why, JSON.stringify(ans))
+      assert.match(e.message, /node scripts\/wolfpack-config\.mjs --json$/)
+      return true
+    })
+    assert.deepEqual(ran, [], `${JSON.stringify(ans)}: nothing after the probe ran`)
+  }
+})
+
+test('AC10 (e): a relayed output with a leading banner and nested braces in strings still parses (brace-balanced, string-aware)', async () => {
+  const tricky = { ...FIXTURE_CONFIG, name: 'odd } name { "quoted"', testCommand: 'make test ARGS="{a}"' }
+  const { logs, find } = await runHunt({ answers: { 'project-config': { exitCode: 0, output: `note: relayed\n${JSON.stringify(tricky, null, 2)}\ntrailing {junk}` } } })
+  assert.ok(logs.some(l => l.startsWith('Project config: odd } name { "quoted" — tests: make test ARGS="{a}"')), logs.join('\n'))
+  assert.match(find('tracker:')[0].prompt, /Run tests using: make test ARGS="\{a\}"/)
+})
+
+// (f) / (g): the REAL toolcheck against a fixture root.
+function shimlessFixture() {
+  const fx = toolcheckFixture()
+  rmSync(fx.shim)
+  return fx
+}
+test('AC10 (f): a MISSING seat shim → parked:shim_missing naming the path; NO seat (and no Claude substitute) runs', async () => {
+  const fx = shimlessFixture()
+  try {
+    const { result, find, logs } = await runHunt({ answers: { ...PACK_ANSWERS, 'toolcheck-preflight': realToolcheck(fx) } })
+    assert.equal(result.status, 'parked:shim_missing', JSON.stringify(result))
+    assert.equal(result.verdict, 'PARKED')
+    assert.equal(result.reason, 'shim_missing')
+    for (const p of SEAT_CALLS) assert.equal(find(p).length, 0, `${p} never ran`)
+    assert.equal(find('spec').length, 0)
+    assert.equal(find('park:h:toolcheck_failed').length, 0, 'not the generic toolcheck park')
+    const park = find('park:h:shim_missing')
+    assert.equal(park.length, 1)
+    assert.ok(park[0].prompt.includes(`The seat shim ${fx.shim} does not exist.`), park[0].prompt)
+    assert.match(park[0].prompt, /resume_phase: Spec/)
+    assert.match(park[0].prompt, /resolution_type_expected: redirect/)
+    assert.match(park[0].prompt, /WOLFPACK_ENABLE_GLM=0 WOLFPACK_ENABLE_MISTRAL_AUTO=0/)
+    assert.ok(park[0].prompt.includes(`shim not found: ${fx.shim}`), 'the toolcheck output is the park context')
+    const stop = logs.find(l => /cross-family seat shim MISSING at/.test(l))
+    assert.ok(stop && stop.includes(fx.shim), logs.join('\n'))
+    assert.match(stop, /will NOT substitute Claude/)
+  } finally { fx.cleanup() }
+})
+
+test('AC10 (f): a missing shim on a resume at Code Review parks shim_missing with resume_phase Code Review', async () => {
+  const fx = shimlessFixture()
+  try {
+    const { result, find } = await runHunt({ answers: { ...PACK_ANSWERS, 'resume-probe': { ...RESUME_AT_CODE_REVIEW, worktreePath: WT_PACK, planDir: PD_PACK }, 'toolcheck-preflight': realToolcheck(fx) } })
+    assert.equal(result.status, 'parked:shim_missing')
+    assert.equal(find('pointer:').length, 0)
+    assert.match(find('park:h:shim_missing')[0].prompt, /resume_phase: Code Review/)
+  } finally { fx.cleanup() }
+})
+
+test('AC10 (g): a toolcheck profile MISMATCH (shim present) still parks toolcheck_failed, not shim_missing', async () => {
+  const fx = toolcheckFixture({ 'wolfpack-pointer-glm': bashNever })
+  try {
+    const { result, find } = await runHunt({ answers: { ...PACK_ANSWERS, 'toolcheck-preflight': realToolcheck(fx) } })
+    assert.equal(result.status, 'parked:toolcheck_failed')
+    assert.equal(find('park:h:shim_missing').length, 0)
+  } finally { fx.cleanup() }
+})
+
+test('the shim_missing park reason is registered in the parked skill reason table', () => {
+  const skill = readFileSync(join(PACK_ROOT, '.agents', 'skills', 'parked', 'SKILL.md'), 'utf8')
+  const row = skill.split('\n').find(l => /^\|.*`shim_missing`/.test(l))
+  assert.ok(row, 'a shim_missing row')
+  assert.match(row, /WOLFPACK_ENABLE_GLM=0 WOLFPACK_ENABLE_MISTRAL_AUTO=0/)
+  assert.match(row, /redirect/)
 })

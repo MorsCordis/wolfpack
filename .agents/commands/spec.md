@@ -20,7 +20,7 @@ The skill specifies:
 ## Hard rails
 - Do NOT write outside `.wolfpack/plans/$ARGUMENTS/` except `metadata.json` (and a best-effort repro test inside the worktree).
 - Do NOT plan, implement, or review — those are `/alpha`, `/shepherd`, and the reviewer commands.
-- Do NOT mark a `controlled_substances` / `billing` hunt `autonomous` without `compliance_review_required: true`.
+- Do NOT mark a hunt that touches one of the project's Compliance Requirements areas (wolfpack-config.md → Compliance Requirements → Compliance areas) `autonomous` without `compliance_review_required: true`.
 - Do NOT commit.
 
 Feature slug: `$ARGUMENTS`

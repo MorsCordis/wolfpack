@@ -84,8 +84,9 @@ When the task notification arrives, relay the verdict.
 
 ## Step 4 — After the workflow completes
 - **Certified** → the Verify phase does NOT deploy: it surfaces the feature-branch dev deploy
-  commands (user-run — the hook blocks `gcloud run deploy pawpims-*` for agents; `deploy-dev`
-  itself would silently ship MAIN from a worktree) and lists the smoke steps. Relay those, then
+  commands (user-run — from wolfpack-config.md → Deployment Notes; a project's main-repo deploy
+  function may ship MAIN, not the branch, from a worktree) and lists the smoke steps. If the
+  project declares no deploy step, Verify reports "certified" and the next step is `/merge <slug>`. Relay those, then
   hand off: user deploys feat branch to dev → `/smoke <slug>` → `/merge <slug>` (tags
   `proposed_version.tag`) → push. Prod deploy is USER-ONLY.
 - **Parked** → show `parked.md`'s reason + the `/resolve <slug>` handoff; re-run

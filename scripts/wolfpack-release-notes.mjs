@@ -117,10 +117,10 @@ export const DEFAULT_SUPPRESS_CATEGORIES = ['Security', 'Tooling', 'Docs', 'Docu
 
 // Regulatory/compliance markers. A real compliance CHANGE is surfaced in its own bucket —
 // never silently dropped. WHERE it's surfaced is a project policy (see wolfpack-config
-// `compliance_visibility`): to the END USER when they are the regulated party (PawPIMS — the
-// vet holds the DEA registration, is the SAQ merchant, owns the TCPA numbers), or to an
-// internal compliance owner otherwise. Generic defaults; the project adds its own (DEA, NM
-// Board, SAQ, controlled substance, …). Non-issue for projects with no regulated domain (chispa).
+// `compliance_visibility`): to the END USER when they are the regulated party (e.g. a
+// clinic that holds its own registration and is the payment merchant), or to an internal
+// compliance owner otherwise. Generic defaults; the project adds its own (its regulator's
+// terms). Non-issue for a project with no regulated domain.
 export const DEFAULT_COMPLIANCE_TERMS = ['compliance', 'regulatory', 'HIPAA', 'PCI', 'GDPR', 'SOC 2', 'audit trail', 'retention'];
 
 export function classifyEntry(entry, {
