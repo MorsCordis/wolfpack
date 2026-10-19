@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest   # GitHub-hosted ONLY — public repo: fork PRs must never reach operator hardware
+    timeout-minutes: 20
+    env:
+      WOLFPACK_TEST_NO_PODMAN: '1'   # podman tests run locally + in acceptance (A3); they SKIP here, visibly
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Git identity for temp-repo tests
+        run: |
+          git config --global user.name "wolfpack-ci"
+          git config --global user.email "wolfpack-ci@users.noreply.github.com"
+      - name: Test suite + leak grep
+        run: bash scripts/test-all.sh

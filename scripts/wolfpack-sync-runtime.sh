@@ -4,7 +4,7 @@
 #
 # WHY THIS EXISTS
 #   The reference workflow `hunt-pipeline.js` lives canonically in this repo at
-#   .agents/workflows/. A consuming project (e.g. PawPIMS) runs hunts from its OWN
+#   .agents/workflows/. A consuming project runs hunts from its OWN
 #   copy under .claude/workflows/. The ONLY legitimate difference between the two is
 #   a deterministic path-namespace swap: canonical uses `.agents/worktrees` and
 #   `.agents/skills`; the consumer uses `.claude/worktrees` and `.claude/skills`.
@@ -14,14 +14,16 @@
 #   drift class is impossible: edit canonical, run this, done.
 #
 # USAGE
-#   scripts/wolfpack-sync-runtime.sh [TARGET_FILE] [--check]
-#     TARGET_FILE  consumer runtime copy to (re)generate
-#                  default: $HOME/Projects/pawpims/.claude/workflows/hunt-pipeline.js
+#   scripts/wolfpack-sync-runtime.sh <TARGET_FILE> [--check]
+#     TARGET_FILE  consumer runtime copy to (re)generate. REQUIRED — there is no default:
+#                  a default once overwrote a consumer's main runtime copy with unmerged
+#                  canonical. With no target (or a flag first) it prints usage, exits 2
+#                  and writes nothing.
 #                  The canonical SOURCE is chosen by the target's basename:
 #                  .agents/workflows/<basename> — so hunt-pipeline.js AND
 #                  campaign-runner.js (and any future workflow) sync the same way.
 #                  Point it at a worktree to regenerate a branch's copy, e.g.
-#                  …/pawpims/.claude/worktrees/<slug>/.claude/workflows/campaign-runner.js
+#                  <consumer>/.claude/worktrees/<slug>/.claude/workflows/campaign-runner.js
 #     --check      dry-run: print the diff that WOULD be applied; write nothing.
 #                  Exit 0 = already in sync, 1 = drift, 2 = error.
 #
@@ -35,10 +37,27 @@ DST_NS='.claude'
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-TARGET="${1:-$HOME/Projects/pawpims/.claude/workflows/hunt-pipeline.js}"
+usage() {
+  {
+    echo "usage: $0 <TARGET_FILE> [--check]"
+    echo "  TARGET_FILE is required (no default) — the consumer runtime copy to (re)generate,"
+    echo "  e.g. <consumer>/.claude/workflows/<workflow>.js. Canonical workflows:"
+    for f in "$REPO_ROOT"/.agents/workflows/*.js; do
+      echo "    $(basename "$f")"
+    done
+  } >&2
+}
+
+# Validate the arguments BEFORE touching anything.
+if [ "$#" -eq 0 ] || [ "$#" -gt 2 ] || [[ "$1" == -* ]]; then
+  usage
+  exit 2
+fi
+TARGET="$1"
 CHECK=0
-[ "${1:-}" = "--check" ] && { CHECK=1; TARGET="$HOME/Projects/pawpims/.claude/workflows/hunt-pipeline.js"; }
-[ "${2:-}" = "--check" ] && CHECK=1
+if [ "$#" -eq 2 ]; then
+  if [ "$2" = "--check" ]; then CHECK=1; else usage; exit 2; fi
+fi
 
 # A directory is the common mistake (passing the consumer repo): name the real targets.
 if [ -d "$TARGET" ]; then

@@ -1,5 +1,5 @@
 // Tests for wolfpack-statusline.mjs (usage-limit-gate AC1) — run: node --test scripts/wolfpack-statusline.test.mjs
-// Byte-identical in the pawpims and wolfpack repos.
+// Kept byte-identical with consuming-project copies until scripts-unfork reconciles them.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
@@ -16,7 +16,7 @@ const FAKE_SRC = "const c=[];process.stdin.on('data',d=>c.push(d));process.stdin
 const FAKE = [NODE, '-e', FAKE_SRC]
 
 const fixture = (extra = {}) => ({
-  session_id: 'sess-123', transcript_path: '/home/x/.claude/projects/p/t.jsonl', cwd: '/home/x/proj',
+  session_id: 'sess-123', transcript_path: '/tmp/u/.claude/projects/p/t.jsonl', cwd: '/tmp/u/proj',
   model: { id: 'claude-opus', display_name: 'Opus' }, prompt: 'secret prompt text',
   rate_limits: {
     five_hour: { used_percentage: 42.4, resets_at: 1760620000, extra_field: 'drop me' },
@@ -51,7 +51,7 @@ test('AC1(a): both windows ⇒ snapshot holds EXACTLY {rate_limits, captured_at}
     })
     assert.ok(Math.abs(Date.parse(snap.captured_at) - Date.now()) < 60 * 1000)
     const raw = readFileSync(snapPath, 'utf8')
-    for (const leak of ['sess-123', 'transcript', '/home/x/proj', 'Opus', 'secret prompt', 'drop me']) {
+    for (const leak of ['sess-123', 'transcript', '/tmp/u/proj', 'Opus', 'secret prompt', 'drop me']) {
       assert.equal(raw.includes(leak), false, `snapshot leaked ${leak}`)
     }
     // private file, no tmp leftovers
@@ -65,7 +65,7 @@ test('AC1(b): stdout is byte-identical to the inner command run directly (ASCII,
   try {
     const inputs = [
       Buffer.from(JSON.stringify(fixture()) + '\n'),
-      Buffer.from(JSON.stringify(fixture({ cwd: '/home/x/Café ☕ 日本語 🐾' }))),     // multi-byte, no newline
+      Buffer.from(JSON.stringify(fixture({ cwd: '/tmp/u/Café ☕ 日本語 🐾' }))),     // multi-byte, no newline
       Buffer.from('plain text, not JSON, no newline'),
       Buffer.from([0xe2, 0x9c, 0x93, 0x0a, 0xf0, 0x9f, 0x90, 0xbe]),                      // raw UTF-8 bytes
     ]

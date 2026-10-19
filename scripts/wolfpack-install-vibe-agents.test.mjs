@@ -57,11 +57,11 @@ test('AC1: vibe-agents/ holds exactly the ten Wolfpack seat profiles, and git tr
 })
 
 test('AC1: no template leaks a project path, ID, domain or name', () => {
-  const leak = /pawpims\.(dev|vet)|pawprints-|\/home\/[a-z]+|logcabincoding/
+  const leak = /pawpims\.(dev|vet)|pawprints-|\/home\/[a-z]+|logcabincoding/   // leak-grep:allow
   for (const n of NAMES) {
     const text = readFileSync(join(TPL, n), 'utf8')
     assert.doesNotMatch(text, leak, n)
-    assert.doesNotMatch(text, /pawpims/i, n)
+    assert.doesNotMatch(text, /pawpims/i, n)   // leak-grep:allow
     assert.match(text.split('\n')[0], /^# Tracked template — install with scripts\/wolfpack-install-vibe-agents\.mjs; do not hand-edit the installed copy\.$/, `${n}: header`)
   }
 })

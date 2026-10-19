@@ -1,5 +1,5 @@
 export const meta = {
-// REFERENCE — ported from PawPIMS; NOT de-PawPIMS-genericized. This IS the durable orchestrator: the DevDen Python reimplementation is stale (last commit 2026-07-06; its repomap/memory/RAG were superseded by dev-cortex, its local-model runtime has no consumer). Invest here, not in a successor. See memory project_devden_architecture.
+// Wolfpack hunt pipeline — the canonical, durable orchestrator. Consuming projects run a GENERATED copy (scripts/wolfpack-sync-runtime.sh <target>); wolfpack itself runs this file via .claude/workflows. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here.
   name: 'hunt-pipeline',
   description: 'Run a full Wolfpack hunt pipeline: scaffold through certification',
   phases: [
@@ -220,7 +220,7 @@ const SPEC_SCHEMA = {
     // value — belt-and-suspenders, never a fall-through to a build.
     modeForBuild: { type: 'string', enum: ['autonomous', 'flagged', 'parked'] },
     ambiguityOpen: { type: 'boolean' },     // a load-bearing question is unanswered
-    complianceCritical: { type: 'boolean' },// touches controlled_substances / billing
+    complianceCritical: { type: 'boolean' },// touches a declared compliance area (wolfpack-config.md)
     complianceReviewRequired: { type: 'boolean' }, // pre-merge compliance checkpoint flag
     acceptanceWritten: { type: 'boolean' }, // acceptance.md exists at the plan dir
     questionCount: { type: 'number' },      // ranked load-bearing ambiguity questions raised
@@ -658,6 +658,15 @@ const campaignContext = [
 // ABSOLUTE main-repo path right after repoRoot is computed, so a stale worktree lacking the
 // script still stamps. (repoRoot is a later const — never reference it in heartbeat(): TDZ.)
 let usageCli = 'scripts/wolfpack-usage.mjs'
+// wolfpack-self-hosting (AC10): the consuming project's resolved wolfpack-config.md
+// (scripts/wolfpack-config.mjs --json), loaded by the project-config probe right after
+// phase('Scaffold'). Every project-specific value (test command, compliance surfaces,
+// deploy step, worktree links) reads through cfg() — use-before-load throws.
+let projectConfig = null
+const cfg = () => {
+  if (!projectConfig) throw new Error('hunt-pipeline: project config used before the project-config probe')
+  return projectConfig
+}
 const heartbeat = (phaseName, detail) => {
   const timed = phaseName !== 'Scaffold'
   const startMarker = timed ? `
@@ -691,7 +700,7 @@ TOOLING POLICY (every phase): Do NOT use the chrome-devtools MCP or any browser 
 (new_page / navigate_page / take_snapshot / etc.). This is a headless BUILD pipeline — there
 is no local server to drive, and the deployed dev environment runs the OLD code (this hunt is
 unmerged), so browsing it verifies nothing and just spawns a browser on the operator's screen.
-Tests run ONLY via \`./scripts/run_tests.sh\` (the Django suite). Browser/UI smoke is a SEPARATE,
+Tests run ONLY via \`${cfg().testCommand}\` (the project's test command — wolfpack-config.md → Project Identity → Test command). Browser/UI smoke is a SEPARATE,
 post-deploy, user-driven \`/smoke-wave\` step — never part of a build phase.`
 }
 
@@ -737,6 +746,65 @@ const BACKWARD_AUTHORITATIVE = new Set([
 ])
 
 phase('Scaffold')
+
+// wolfpack-self-hosting (AC10) — PROJECT-CONFIG PROBE. The Workflow script has no
+// filesystem access, so one read-only agent runs the deterministic reader and relays its
+// JSON verbatim. Fail closed: a missing/incomplete config, a garbled relay or a dead seat
+// THROWS (the hunt may not be scaffolded yet — nothing to park into). The pipeline never
+// guesses a project value.
+const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+// The first brace-balanced {…} block of a text (string-aware, so braces inside JSON strings
+// never end it early; a non-greedy first-} match would truncate inside nested objects).
+const firstJsonObject = (text) => {
+  const t = String(text || '')
+  const start = t.indexOf('{')
+  if (start < 0) return null
+  let depth = 0, inStr = false, esc = false
+  for (let i = start; i < t.length; i++) {
+    const c = t[i]
+    if (inStr) {
+      if (esc) esc = false
+      else if (c === '\\') esc = true
+      else if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') inStr = true
+    else if (c === '{') depth++
+    else if (c === '}') { depth--; if (depth === 0) return t.slice(start, i + 1) }
+  }
+  return null
+}
+const loadProjectConfig = async (who, consequence, label, phaseName) => {
+  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. From the repo root (your starting directory), run exactly:
+  node scripts/wolfpack-config.mjs --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"
+Return exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the CONFIG_RC line.
+If the command could not run at all, return exitCode 2 and the error text as output. Never create, fix or edit anything.`,
+    { label, phase: phaseName, model: 'sonnet', schema: PROJECT_CONFIG_SCHEMA })
+  const out = (pc && typeof pc.output === 'string') ? pc.output : ''
+  // The reader's ✗ line names the missing keys; surface it first, then the head of the output.
+  const outLines = out.split('\n')
+  const flagged = outLines.filter(l => /^\s*✗/.test(l))
+  const detail = out ? [...flagged, ...outLines.slice(0, 20).filter(l => !flagged.includes(l))].join('\n') : '(no output — the probe seat returned nothing)'
+  let parsed = null
+  let why = ''
+  if (!pc) why = 'the project-config probe returned no result'
+  else if (pc.exitCode !== 0) why = `the reader exited ${pc.exitCode}`
+  else {
+    const block = firstJsonObject(out)
+    try { parsed = block ? JSON.parse(block) : null } catch { parsed = null }
+    if (!parsed) why = 'the reader output held no parseable JSON object'
+    else if (typeof parsed.testCommand !== 'string' || !parsed.testCommand) why = 'testCommand is not a string'
+    else if (!Array.isArray(parsed.compliancePaths)) why = 'compliancePaths is not an array'
+  }
+  if (why) {
+    throw new Error(`${who}: wolfpack-config.md is missing or incomplete — ${consequence}. ${why}: ${detail}. Fix: copy wolfpack-config.example.md to wolfpack-config.md and fill the required keys (Name, Test command, Compliance areas, Risk-surface paths, Model Pool judgment + reviewer-a); check with node scripts/wolfpack-config.mjs --json`)
+  }
+  if (!Array.isArray(parsed.worktreeLinks)) parsed.worktreeLinks = []
+  return parsed
+}
+projectConfig = await loadProjectConfig(`hunt-pipeline: ${slug}`, 'the pipeline will not guess project values', `project-config:${slug}`, 'Scaffold')
+log(`Project config: ${projectConfig.name} — tests: ${projectConfig.testCommand}; deploy: ${projectConfig.devDeployCommand || 'none'}; risk surfaces: ${projectConfig.compliancePaths.length}`)
+
 const resumeProbe = await agent(`
 Read-only resume probe. Report the durable state of this hunt so the pipeline
 can resume where a prior (crashed or limited-out) run left off. Do NOT modify,
@@ -937,7 +1005,7 @@ const at = (p) => PHASE_ORDER.indexOf(p) >= PHASE_ORDER.indexOf(resumeFrom)
 trackerFamily = familyOf(resumeProbe && resumeProbe.trackerModel) || trackerFamily
 
 // ─── Phase 0: Scaffold (skipped on resume) ─────────────────────
-let worktreePath, planDir, adcValid = true
+let worktreePath, planDir
 let tier, bloodhoundRounds, pointerRounds, trackerRounds
 if (at('Scaffold')) {
 if (!descriptionPassed) {
@@ -984,20 +1052,16 @@ Steps:
    mkdir -p .agents/worktrees/${slug}/.wolfpack/plans/${slug}/
    cp .wolfpack/plans/${slug}/metadata.json .agents/worktrees/${slug}/.wolfpack/plans/${slug}/
 6. Update metadata.json worktree_path to the absolute path of the worktree ${META_PRESERVE_NOTE}
-7. Create convenience symlinks in the worktree if paw_env and .env exist in main repo
+7. Convenience links (wolfpack-config.md → Worktree links): for each of ${cfg().worktreeLinks.length ? cfg().worktreeLinks.map(l => `\`${l}\``).join(', ') : '(none configured — skip this step)'} that exists in the main repo, symlink it into the worktree at the same relative path (skip any that already exist).
 
-8. GCP preflight (non-blocking): run gcloud auth application-default print-access-token
-   If it succeeds, return adcValid: true
-   If it fails, return adcValid: false — do NOT stop, just report
-
-9. SAFETY TAG — Create a rollback point on ${BASE} BEFORE any work begins:
+8. SAFETY TAG — Create a rollback point on ${BASE} BEFORE any work begins:
    git tag -f pre-hunt-${slug} ${BASE}   # -f so a resumed hunt re-tags cleanly
    This tag marks the exact state of ${BASE} before the hunt. If anything goes wrong:
    - git worktree remove --force .agents/worktrees/${slug}
    - git branch -D feat/${slug}
    - ${BASE} is unchanged (the tag proves it)
 
-Return the worktree absolute path, tier (null at this stage), and adcValid boolean.
+Return the worktree absolute path and tier (null at this stage).
 Do NOT ask questions. Do NOT run Alpha or any planning.
 ${heartbeat('Scaffold', 'creating worktree and metadata')}
 `, { label: `scaffold:${slug}`, phase: 'Scaffold', schema: {
@@ -1005,14 +1069,12 @@ ${heartbeat('Scaffold', 'creating worktree and metadata')}
   properties: {
     worktreePath: { type: 'string' },
     planDir: { type: 'string' },
-    adcValid: { type: 'boolean' },
   },
   required: ['worktreePath'],
 }})
 
   worktreePath = scaffold.worktreePath
   planDir = scaffold.planDir || `${worktreePath}/.wolfpack/plans/${slug}`
-  adcValid = scaffold.adcValid !== false
 } else {
   worktreePath = resumeProbe.worktreePath
   planDir = resumeProbe.planDir || `${worktreePath}/.wolfpack/plans/${slug}`
@@ -1074,8 +1136,20 @@ exitCode 2 and the error text as output. Never fix, install or edit anything.`,
     { label: `toolcheck-preflight:${slug}`, phase: 'Scaffold', model: 'sonnet', schema: TOOLCHECK_SCHEMA })
   if (!(tc && tc.exitCode === 0)) {
     const tcOut = (tc && tc.output) || '(no output)'
-    log(`⛔ ${slug}: seat toolcheck FAILED (exit ${tc && tc.exitCode}) — review/certify seats would run boxed or audit-only. Stopping.\n${tcOut}`)
     const tcResume = PHASE_ORDER[Math.max(PHASE_ORDER.indexOf(resumeFrom), PHASE_ORDER.indexOf('Spec'))]
+    // wolfpack-self-hosting (AC10): a MISSING seat shim gets its own loud park naming the
+    // path — the pipeline never skips the cross-family seats or substitutes Claude for them.
+    const shimMissing = /shim not found: (\S+)/.exec(tcOut)
+    if (shimMissing) {
+      log(`⛔ ${slug}: cross-family seat shim MISSING at ${shimMissing[1]} — non-Claude seats cannot run, and the pipeline will NOT substitute Claude. Stopping.`)
+      await parkHunt({
+        reason: 'shim_missing', resumePhase: tcResume, resolutionTypeExpected: 'redirect', phaseLabel: 'Scaffold',
+        needFromUser: `The seat shim ${shimMissing[1]} does not exist. Provide it (the pack's execution layer: podman-vibe.sh + its lib), or disable the Vibe families (WOLFPACK_ENABLE_GLM=0 WOLFPACK_ENABLE_MISTRAL_AUTO=0 — reviews of Claude-written work then park no_cross_family_reviewer). Then resume.`,
+        context: tcOut,
+      })
+      return { slug, verdict: 'PARKED', status: 'parked:shim_missing', reason: 'shim_missing', tier, worktreePath }
+    }
+    log(`⛔ ${slug}: seat toolcheck FAILED (exit ${tc && tc.exitCode}) — review/certify seats would run boxed or audit-only. Stopping.\n${tcOut}`)
     await parkHunt({
       reason: 'toolcheck_failed', resumePhase: tcResume, resolutionTypeExpected: 'redirect', phaseLabel: 'Scaffold',
       needFromUser: 'The seat profiles and the shim disagree (or a profile is missing). Fix them — usually `node <wolfpack>/scripts/wolfpack-install-vibe-agents.mjs` — re-run the toolcheck until it exits 0, then resume.',
@@ -1259,9 +1333,6 @@ const CLAUDE_FINAL_SELF_REVIEW_STEP = (promptFile) => `   [1] CLAUDE FINAL REVIE
        WOLFPACK_CLAUDE_FALLBACK and do NOT write a claude_fallback_reviews row — record it only
        in claude_final_reviews (step 8).`
 
-// (ADC no longer gates anything — Tracker tests run against a local PostgreSQL.)
-void adcValid
-
 // [03] Part A — the verdict contract appended to every reviewer prompt
 // (Bloodhound + Pointer). The non-Claude reviewer MUST end with this hard,
 // machine-parseable block; the shim's job shrinks from interpret → extract +
@@ -1276,7 +1347,7 @@ MANDATORY VERDICT CONTRACT — your response MUST end with exactly ONE machine-p
   "verdict": "APPROVED" | "ISSUES_FOUND",
   "findings": [
     { "id": 1, "severity": "CRITICAL|HIGH|MEDIUM|LOW", "title": "short title",
-      "file": "billing/services/payments.py", "line": 142,
+      "file": "src/app/module.py", "line": 142,
       "claim": "one-sentence defect statement",
       "evidence": "what in the diff or file shows it" }
   ],
@@ -1285,7 +1356,7 @@ MANDATORY VERDICT CONTRACT — your response MUST end with exactly ONE machine-p
 </verdict>
 Rules:
 - verdict APPROVED ⇒ findings MAY be [] (empty). verdict ISSUES_FOUND ⇒ findings MUST be non-empty (an ISSUES_FOUND with no findings is a contradiction and will be discarded).
-- Every "file" MUST be repo-root-relative (e.g. billing/models.py) — never absolute, never a container mount path like /workspace/... — so the pipeline can ground it with test -f against the worktree.
+- Every "file" MUST be repo-root-relative (e.g. src/app/module.py) — never absolute, never a container mount path like /workspace/... — so the pipeline can ground it with test -f against the worktree.
 - Put "file" and "line" on every finding that points at code; "claim" and "evidence" are required on each finding.
 - Emitting NO <verdict> block, malformed JSON, or paths the grounding check cannot find means your review is DISCARDED (counts as no review at all).
 - "tool_access" is MANDATORY: report honestly whether your shell ran (\`git diff\`, the project's test command). "ok" = it ran; "denied" = a shell call was refused/unavailable; "unused" = you never tried. Put every tool call that was denied or reported as an unknown tool in "denied_tools" (e.g. ["bash"]). Never present a file-reading audit as a review that ran the diff.`
@@ -1363,8 +1434,8 @@ const DIFF_CATCH_NOTE = `
 DIFF-CATCH (mandatory, run AFTER capturing the review): a reviewer must touch ONLY its own
 review artifact + metadata.json, never app source. Run \`git -C <worktree> status --porcelain\`
 (or \`git -C <worktree> diff --name-only\`). If ANY changed path is OUTSIDE the plan dir
-(.wolfpack/plans/<slug>/) — i.e. it touches app source (billing/, records/,
-controlled_substances/, scheduler/, templates, JS, etc.) — the reviewer VIOLATED its
+(.wolfpack/plans/<slug>/) — i.e. it touches app source (any source, test, template, script
+or config file of the project) — the reviewer VIOLATED its
 read-only role: print a LOUD log line "WOLFPACK_REVIEWER_DIFF_VIOLATION: <files>" and append
 { "round": <n>, "role": "<role>", "files": [<paths>] } to metadata.json's
 "reviewer_diff_violations" array. Do NOT silently ignore it. (Clean tree = nothing to do.)`
@@ -1469,25 +1540,14 @@ ISSUES_FOUND verdict MUST carry a non-empty findings array.`
 
 // [02] Compliance-review risk-surface allowlist. The post-PASS compliance gate
 // (AC5) parks any hunt whose diff touches one of these surfaces for human
-// sign-off BEFORE the release queue. This is a NARROW allowlist of genuinely
-// risk-bearing modules, NOT a top-level `billing/` glob — billing is pervasive
-// (it touches a large fraction of the app), so a directory match would park most
-// hunts and turn the checkpoint into noise (docs/wolfpack-autonomy/02
-// § compliance-review caveat). A UI tweak that merely imports from billing/ must
-// NOT trip it. Maintain this as a REVIEWED list: a new money/tax/CS/retention
-// surface is added deliberately, the same way a new migration is.
-//   • controlled_substances/  — DEA receipt→disposition + retention (whole app is risk-bearing)
-//   • billing/services/payments.py — Trinity/PayJunction PCI SAQ A-EP card flow
-//   • billing/services/tax_engine.py — NM GRT / tax computation
-//   • billing/models.py — invoice/tax-field + TaxBracket/PracticeSettings money models
-//   • records/models.py — medical-record retention / soft-delete (NM 4-year rule)
-const COMPLIANCE_PATHS = [
-  'controlled_substances/',
-  'billing/services/payments.py',
-  'billing/services/tax_engine.py',
-  'billing/models.py',
-  'records/models.py',
-]
+// sign-off BEFORE the release queue. It is the NARROW risk-surface allowlist from
+// wolfpack-config.md → Compliance Requirements → Risk-surface paths (prefix match for
+// entries ending in /, exact match otherwise) — genuinely risk-bearing modules, not a
+// pervasive top-level directory glob that would park most hunts and turn the
+// checkpoint into noise. The project maintains it as a REVIEWED list in its config. A
+// project that declares none gets an empty list: the gate then fires only on the Spec
+// flag (step 1b).
+const compliancePaths = () => cfg().compliancePaths
 
 // Agent-config paths the Claude Code permission classifier refuses to let an agent edit
 // ("Self-Modification"): guard hooks and settings. A plan item that changes one of these
@@ -1814,8 +1874,8 @@ Steps:
    confidence:low. Otherwise "med"; if the ticket is too vague to produce sharp
    questions or a load-bearing assumption is low → "low". Compliance-criticality
    does NOT lower the rating — it is a ROUTING modifier applied in step 8, not a
-   confidence penalty (a clear, well-specified CS/billing ticket can still be high).
-7. Determine compliance_critical = the hunt touches controlled_substances OR billing.
+   confidence penalty (a clear, well-specified compliance-area ticket can still be high).
+7. Determine compliance_critical = the hunt touches any compliance area this project declares (wolfpack-config.md → Compliance Requirements → Compliance areas: ${cfg().complianceAreas || 'none — this project declares no compliance areas, so compliance_critical is false unless the ticket itself names a regulatory obligation'}).
 8. Compute mode_for_build from the routing table:
    - high + non-compliance → autonomous
    - high + compliance     → autonomous, AND set compliance_review_required = true
@@ -2341,7 +2401,7 @@ Steps:
 
 2. Write the review prompt to a temp file (avoids shell escaping issues):
    Write to ${tmpFile}:
-   "You are reviewing Wolfpack hunt '${slug}', round ${round}, tier ${tier}. Read the plan at ${planDir}/${planFile}. Also read TODO.md, CLAUDE.md, and .wolfpack/pedigree/index.md for context. Read metadata.json at ${planDir}/metadata.json for tier and scope. Read .agents/skills/bloodhound/SKILL.md and follow it. Produce your adversarial review following your system prompt instructions. PLAN-REVIEW SCOPE (mandatory): you are reviewing the PLAN DOCUMENT's design — NOT whether it has been implemented. The code is NOT written yet (Shepherd implements in a LATER phase). Findings of the form 'not implemented / missing from the codebase / absent from the file / helper missing / code remains unchanged / pre-implementation state' are INVALID and MUST NOT be reported — that state is EXPECTED at plan-review time and reporting it is a misfire that falsely trips non-convergence. Use the code ONLY to verify the plan's factual claims about the CURRENT codebase are accurate; judge the plan's correctness, completeness, and compliance, never its implementation status.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): do NOT read whole large files — grep for the relevant symbols/lines first, then read only those ranges with a line offset/limit. Scope every grep to the relevant app directory (e.g. billing/, records/, controlled_substances/), never the repo root, or it times out. Reading entire 1000+ line files (models.py, views.py) bloats context and can crash the request mid-review.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive adversarial review covering every lens (correctness, compliance/DEA, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. The headless cross-model roster fan-out is disabled — the pipeline handles orchestration, not you.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
+   "You are reviewing Wolfpack hunt '${slug}', round ${round}, tier ${tier}. Read the plan at ${planDir}/${planFile}. Also read TODO.md, CLAUDE.md, and .wolfpack/pedigree/index.md for context. Read metadata.json at ${planDir}/metadata.json for tier and scope. Read .agents/skills/bloodhound/SKILL.md and follow it. Produce your adversarial review following your system prompt instructions. PLAN-REVIEW SCOPE (mandatory): you are reviewing the PLAN DOCUMENT's design — NOT whether it has been implemented. The code is NOT written yet (Shepherd implements in a LATER phase). Findings of the form 'not implemented / missing from the codebase / absent from the file / helper missing / code remains unchanged / pre-implementation state' are INVALID and MUST NOT be reported — that state is EXPECTED at plan-review time and reporting it is a misfire that falsely trips non-convergence. Use the code ONLY to verify the plan's factual claims about the CURRENT codebase are accurate; judge the plan's correctness, completeness, and compliance, never its implementation status.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): do NOT read whole large files — grep for the relevant symbols/lines first, then read only those ranges with a line offset/limit. Scope every grep to the relevant app directory (e.g. src/app/, lib/module/), never the repo root, or it times out. Reading entire 1000+ line files (models.py, views.py) bloats context and can crash the request mid-review.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive adversarial review covering every lens (correctness, compliance/DEA, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. The headless cross-model roster fan-out is disabled — the pipeline handles orchestration, not you.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
 
 3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
 ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound')}
@@ -2783,7 +2843,7 @@ Only if rebase succeeds, execute ALL Shepherd instructions:${BASE_META_LINE ? `
 SAFETY RULES:
 - Do NOT git push
 - Do NOT deploy
-- Do NOT run the test suite. Running tests is the TRACKER phase's job, not yours (your SKILL.md says this too). To confirm your code loads, the MOST you may do is a fast syntax/import check or "python manage.py check <app>" / "showmigrations <app>". NEVER invoke scripts/run_tests.sh — the full suite (especially against Cloud SQL via the proxy) can hang 30+ minutes and livelock the whole pipeline. Tracker runs the suite, scoped, in its own phase.
+- Do NOT run the test suite. Running tests is the TRACKER phase's job, not yours (your SKILL.md says this too). To confirm your code loads, the MOST you may do is a fast syntax/import check (e.g. \`node --check <file>\`, a compile, or the project's quick check if wolfpack-config.md names one). NEVER invoke the project's test command (\`${cfg().testCommand}\`) — the full suite can hang for a long time and livelock the whole pipeline. Tracker runs the suite, scoped, in its own phase.
 - Do NOT modify files outside the worktree
 - Do NOT run git add . or git add -A
 ${PROTECTED_PATCH_RULE}
@@ -3271,9 +3331,8 @@ cd to ${worktreePath} before doing any work.
 Execute ALL Tracker instructions:
 - Read plan-final.md, shepherd-log.md, pointer reviews, code diff
 - Write tests per the tier strategy
-- Run tests using: ./scripts/run_tests.sh --local
-  (--local runs against the sandbox's baked-in local PostgreSQL — the script
-  auto-bootstraps the cluster on first use. NO Cloud SQL, gcloud, or ADC needed.)
+- Run tests using: ${cfg().testCommand}
+  (wolfpack-config.md → Project Identity → Test command — follow its notes on narrowing and on which test backend the sandbox uses)
 - Classify failures (baseline/transient/pre-existing/legitimate)
 - Write ${planDir}/tracker-log.md and ${planDir}/tracker-report-1.md if needed
 - Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}
@@ -3577,8 +3636,8 @@ if (watchdogResult.verdict !== 'PASS') {
 // [02] A NARROW, policy-driven park — not triggered by a finding, but by WHAT the
 // hunt touched. Runs on the path INTO Verify (whether Certify just PASSed this run
 // or we resumed straight to Verify). If the diff touches a compliance risk surface
-// (COMPLIANCE_PATHS) the hunt parks `compliance_review` for human sign-off BEFORE
-// the release queue — honoring "PawPIMS must be RIGHT" without taxing cosmetic
+// (compliancePaths(), from wolfpack-config.md) the hunt parks `compliance_review` for human
+// sign-off BEFORE the release queue — honoring the project's compliance bar without taxing cosmetic
 // hunts. Fail-closed: if path detection is uncertain, park anyway. A prior /resolve
 // sign-off (park.compliance_signed_off) short-circuits the gate so resume proceeds.
 if (at('Verify')) {
@@ -3599,34 +3658,34 @@ cd to ${worktreePath}.
 
 1b. Spec-flag override (authoritative): in that same metadata.json, read
    \`spec.compliance_review_required\`. If it is true, the Spec phase ALREADY
-   classified this hunt compliance-critical (e.g. it touches billing or
-   controlled_substances broadly, beyond the narrow path allowlist below).
+   classified this hunt compliance-critical (e.g. it touches a declared compliance
+   area broadly, beyond the narrow path allowlist below).
    FIRST write ${planDir}/compliance-summary.md — this hunt WILL park for sign-off and
    the park payload references this file by path, so it MUST exist (a missing summary
    here is the recurring bug this branch fixes: the spec-flag path used to STOP before
    the step-4 write). The whole diff is the compliance surface (no narrow path match), so:
    run \`git diff --stat ${BASE}..HEAD\` for the file list, then \`git diff ${BASE}..HEAD\` and
-   quote the risk-bearing hunks (controlled_substances; billing money/tax/PCI; records
-   retention / soft-delete), noting each against the [compliance] criteria in
+   quote the risk-bearing hunks (the hunks that touch a declared compliance area), noting each against the [compliance] criteria in
    ${planDir}/acceptance.md (if present). Keep it readable in under a minute. Do NOT
    commit it. THEN return
    { complianceTouched:true, determined:true, alreadySignedOff:false,
    touchedPaths:["spec.compliance_review_required"], summary:"Spec flagged
    compliance_review_required" } — STOP. The path allowlist in step 3 only ADDS
    to this signal; it never overrides a Spec compliance flag. (This closes the gap
-   where a Spec-flagged hunt whose diff misses the narrow allowlist — e.g. an
-   invoice-email feature touching billing/views.py — certified without sign-off.)
+   where a Spec-flagged hunt whose diff misses the narrow allowlist — e.g. a feature
+   in a compliance area touching a file outside the listed risk-surface paths — certified
+   without sign-off.)
 
 2. Compute the touched files: \`git diff --name-only ${BASE}..HEAD\` (run from the
    worktree). If that fails for any reason, return determined:false (the pipeline
    fails closed and parks). Otherwise determined:true.
 
 3. A path is COMPLIANCE-TOUCHED if it matches ANY entry of this risk-surface
-   allowlist (prefix match for the directory entry, exact match for files):
-${COMPLIANCE_PATHS.map(p => `   - ${p}`).join('\n')}
-   This is intentionally NARROW: a file merely UNDER billing/ that is NOT one of the
-   listed files does NOT count (billing is pervasive; only the listed money/tax/PCI
-   surfaces are risk-bearing). controlled_substances/ counts as a whole (prefix).
+   allowlist (wolfpack-config.md → Compliance Requirements → Risk-surface paths):
+${compliancePaths().length ? compliancePaths().map(p => `   - ${p}`).join('\n') : '   (this project declares no risk-surface paths — nothing matches here; step 1b still applies)'}
+   This is intentionally NARROW: an entry ending in / matches the whole directory
+   (prefix); a file entry matches only that file. A file near a listed one that is not
+   itself listed does NOT count.
 
 4. If any touched file matches, set complianceTouched:true and write a tight
    ${planDir}/compliance-summary.md: list the matched files, quote the relevant diff
@@ -3687,7 +3746,7 @@ ${heartbeat('Certify', 'chain mode: recording compliance hold (merge-and-await)'
       resumePhase: 'Verify',          // sign-off resumes straight into deploy/verify
       resolutionTypeExpected: 'clarify',
       phaseLabel: 'Certify',
-      needFromUser: `This certified hunt's diff ${why}. Read the compliance summary and sign off (or send it back). DEA: CS records ≥2yr, exact unit flow. NM: medical records ≥4yr, no hard-delete. PCI: card flow is SAQ A-EP.`,
+      needFromUser: `This certified hunt's diff ${why}. Read the compliance summary and sign off (or send it back), checking it against the project's Compliance Requirements (wolfpack-config.md)${cfg().complianceAreas ? ` — declared areas: ${cfg().complianceAreas}` : ''}.`,
       context: `Compliance summary: ${planDir}/compliance-summary.md\nMatched surfaces: ${(complianceGate.touchedPaths || []).join(', ') || '(detection inconclusive — failing closed)'}\nFull diff: \`git -C ${worktreePath} diff ${BASE}..HEAD\``,
       options: `- A (clarify): compliant — sign off, proceed to deploy + smoke.\n- B (redirect): a compliance defect — send back to re-plan/rework.`,
     })
@@ -3706,6 +3765,13 @@ phase('Verify')
 // ONCE for the whole campaign (AC14). The certified hunt goes back to the runner, which merges it.
 if (baseBranch) {
   log(`Chain mode: per-hunt dev deploy skipped — /release-campaign deploys ${baseBranch} once.`)
+  return { slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', tier, findings: watchdogResult?.findings, worktreePath, status: 'certified' }
+}
+// wolfpack-self-hosting (AC10): a project with no deploy step (wolfpack-config.md → Deployment
+// Notes → Dev deploy command: none) has nothing to verify on dev. The verdict token stays
+// CERTIFIED_AWAITING_DEPLOY — campaign-runner and wolfpack-release.mjs key on it.
+if (!cfg().devDeployCommand) {
+  log(`No deploy step: wolfpack-config.md → Deployment Notes → Dev deploy command is none — ${slug} is certified; next: /merge ${slug}.`)
   return { slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', tier, findings: watchdogResult?.findings, worktreePath, status: 'certified' }
 }
 log(`Deploying feat/${slug} to dev for pre-merge verification`)
@@ -3730,24 +3796,12 @@ Steps:
    If no smoke-tests.md exists, note that no smoke tests were defined.
    Summarize the smoke test steps that need to be run after deploy.
 
-2. SURFACE THE DEPLOY COMMAND:
-   The user needs to deploy the feature branch from the worktree. The deploy-dev shell
-   function is hard-coded to deploy from the main repo, so for feature-branch verification
-   the user should run these commands manually:
-
-   cd ${worktreePath}
-   VERSION=$(git describe --tags --always 2>/dev/null || echo "dev-${slug}")
-   timeout 600s gcloud run deploy pawpims-dev --source . --region us-central1 --update-env-vars "APP_VERSION=$VERSION,APP_ENVIRONMENT=dev"
-   IMAGE=$(gcloud run services describe pawpims-dev --region us-central1 --format="value(spec.template.spec.containers[0].image)")
-   [ -n "$IMAGE" ] || { echo "ERROR: could not read the deployed image SHA — stop, do NOT pin jobs" >&2; false; }
-   gcloud run jobs update migrate-dev --image "$IMAGE" --region us-central1
-   gcloud run jobs update worker-dev --image "$IMAGE" --region us-central1
-   gcloud run jobs execute migrate-dev --region us-central1 --wait
-   scripts/ops/check_image_invariant.sh dev   # service + migrate + worker must share one SHA
-
-   NOTE: These deploy commands are INTENTIONALLY user-only. The PreToolUse hook
-   blocks 'gcloud run deploy pawpims-*' to enforce the image-invariant rule.
-   Do NOT attempt to run these — surface them for the user to copy-paste.
+2. SURFACE THE DEPLOY COMMANDS (user-run, never by you):
+   Read wolfpack-config.md → Deployment Notes. If it has a "Feature-branch deploy (Verify)" block, surface those
+   commands verbatim with {worktree} → ${worktreePath} and {slug} → ${slug}. Otherwise surface the Dev deploy
+   command (\`${cfg().devDeployCommand}\`) and WARN that it may deploy the main checkout, not this branch — the
+   user must confirm how to deploy a feature branch. These commands are user-only (project hooks may block them).
+   Do NOT attempt to run them.
 
 3. PREPARE SMOKE TEST EXECUTION:
    If Chrome DevTools MCP tools are available, prepare to run smoke tests automatically
@@ -3770,7 +3824,7 @@ The pipeline PAUSES here. The user will:
 5. If smoke tests fail → fix in worktree, redeploy, retest
 
 SAFETY:
-- Do NOT run gcloud deploy commands (hook-blocked, user-only)
+- Do NOT run any deploy command (user-only)
 - Do NOT merge to main
 - Do NOT git push
 ${heartbeat('Verify', 'preparing deploy commands and smoke steps')}

@@ -207,7 +207,7 @@ Opt-in campaign mode with **no wave barriers**. Barrier mode stays the default a
   `node scripts/wolfpack-release.mjs revert --campaign <c> --hunt <slug> --reason "<why>"`.
 - **End states:** `CAMPAIGN_READY_FOR_RELEASE`, `CAMPAIGN_AWAITING_HUMAN` (each blocked hunt + its `/resolve` + who
   waits on it), `WAVE_PAUSED_QUOTA` / `WAVE_PAUSED_BUDGET` (resume mid-chain).
-- **Release** is a project-provided command (PawPIMS: `/release-campaign <slug> [--checkpoint]`): one dev deploy of the
+- **Release** is a project-provided command (e.g. `/release-campaign <slug> [--checkpoint]`): one dev deploy of the
   branch, Red sign-offs (fail closed), one aggregated version, one CHANGELOG stamp, then one `--no-ff` merge into
   `main` + one tag after the human approves. `/merge-wave` and `/merge` refuse chain campaigns.
 

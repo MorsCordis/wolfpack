@@ -20,3 +20,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Claude Code's synced skills store — the HARNESS owns it (~/.claude/skills symlinks to
+# this repo's .agents/skills, so synced anthropic-skills land here). Never delete or track it.
+.agents/skills/synced/

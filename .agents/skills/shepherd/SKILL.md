@@ -94,7 +94,7 @@ The user decides whether to include or defer. Your default is to include.
 
 Shepherd does NOT write or run tests — that is Tracker's job. However, verify that the code compiles/imports cleanly:
 - Run a quick syntax check if you've written Python that imports new modules or defines new classes.
-- If the plan includes migrations, run `python manage.py showmigrations <app>` to verify the migration chain is intact.
+- If the plan includes migrations, verify the migration chain with the project's migration tooling (wolfpack-config.md → Deployment Notes; e.g. a framework's show-migrations command) — check only, never apply.
 - If build/lint errors appear, fix them before handing off — Pointer reviews code, not broken builds.
 
 ### Implementation Decision Cap

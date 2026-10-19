@@ -35,10 +35,11 @@ merged                terminal
 | icon | reason | meaning | typical resolution |
 |---|---|---|---|
 | ⛔ | `open_critical` | a CRITICAL survived its review budget | clarify (out of scope) or redirect (re-plan) |
-| 🔒 | `compliance_review` | diff touched a CS/billing/records risk surface | clarify (sign off) or redirect (defect) |
+| 🔒 | `compliance_review` | diff touched a declared risk surface (wolfpack-config.md → Risk-surface paths) | clarify (sign off) or redirect (defect) |
 | 🔁 | `non_convergence` | a review loop never converged | clarify (proceed) or redirect (rework) |
 | 🐛 | `repro_failed` | bug not reproducible [01] | clarify (more repro detail) or redirect |
 | 🩹 | `human_patch` | the plan changes a protected agent-config file (`.claude/hooks/`, `.claude/settings*.json`) that agents cannot edit; the Shepherd staged it in `human-patches/` | apply + commit the patches (commands in parked.md), then clarify → resume at **Code Review** (`implementing_done`) |
+| 🧩 | `shim_missing` | a cross-family seat shim (e.g. `podman-vibe.sh`) does not exist at the resolved path; no non-Claude seat can run, and Claude is never substituted | provide the shim (the pack's execution layer), or disable the Vibe families (`WOLFPACK_ENABLE_GLM=0 WOLFPACK_ENABLE_MISTRAL_AUTO=0`), then `/resolve` (redirect, as the park expects) → resumes at the parked phase |
 | ⏳ | `model_quota` | both cross-model CLIs rate-limited [05] | usually just re-run later |
 | 🚧 | `smoke_pending_human` | wave smoke has un-runnable criteria [04] | run the manual criteria |
 | ⚠ | `rebase_conflict` | Shepherd rebase failed | resolve the conflict, then resume |

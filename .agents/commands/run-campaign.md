@@ -102,8 +102,8 @@ Parse `$ARGUMENTS` as: `<campaign-slug> [max-parallel]`. Default max-parallel is
    `WAVE_AWAITING_HUMAN`, `WAVE_PAUSED_QUOTA/BUDGET`). It prints the release queue itself; the
    wave-release sequence is the two wave commands, not a per-hunt loop:
    - `/merge-wave $SLUG <wave>` — sequential `--no-ff` merges → ONE wave tag → push
-   - `deploy-dev` (+ `migrate-dev` if it flags migrations) — ONE deploy for the wave
-   - `/smoke-wave $SLUG <wave>` — consolidated per-hunt smoke
+   - the configured Dev deploy command (+ the Migration command if `/merge-wave` flags migrations) — ONE deploy for the wave; skip this and `/smoke-wave` when wolfpack-config.md declares no deploy step
+   - `/smoke-wave $SLUG <wave>` — consolidated per-hunt smoke (only when something was deployed)
    - Any hunt parked for a human → `/resolve <slug>` first (compliance holds included).
    - Re-run `/run-campaign $SLUG` to resume — Step 2's RESUME PLAN will show the next wave.
 

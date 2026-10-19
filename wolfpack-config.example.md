@@ -2,6 +2,8 @@
 
 Copy this file to your project root as `wolfpack-config.md` and fill in your project-specific details. Every Wolfpack role reads this file to adapt the pipeline to your codebase.
 
+The pipeline itself (router, `hunt-pipeline`, `campaign-runner`) reads the machine-consumed keys through ONE deterministic reader, `scripts/wolfpack-config.mjs`. A key is a `- **Name:** value` (or `- Name: value`) bullet inside its `## Section`; the first backticked span is the value for command/file keys, and `none` means "not applicable". Validate the file with `node scripts/wolfpack-config.mjs --json` — it exits 0 when complete and names every missing key otherwise (the pipeline refuses to start on an incomplete config rather than guess). REQUIRED keys: Project Identity → **Name** and **Test command**; Compliance Requirements → **Compliance areas** and **Risk-surface paths** (either may be `none`); Model Pool → the `judgment` and `reviewer-a` lines.
+
 ---
 
 ## Project Identity
@@ -9,7 +11,8 @@ Copy this file to your project root as `wolfpack-config.md` and fill in your pro
 - **Name:** My Project
 - **Language/Framework:** Python/Django, TypeScript/Next.js, Go, etc.
 - **Repo root:** (auto-detected from git)
-- **Test command:** `./scripts/run_tests.sh` or `npm test` or `go test ./...`
+- **Test command:** `./scripts/run_tests.sh` or `npm test` or `go test ./...` — REQUIRED; the first backticked span is the command the pipeline runs (Tracker) and forbids Shepherd from running. Follow it with any notes on narrowing.
+- **Worktree links:** (optional; backticked main-repo paths symlinked into each worktree, e.g. `.env`, or none)
 - **Deploy command (dev):** `deploy-dev` or `npm run deploy:staging` or `kubectl apply -f ...`
 - **Deploy command (prod):** USER ONLY — describe the process here so agents know not to run it
 - **Vault root:** `~/Vault` — absolute path to the Obsidian vault that holds `project-notes/<project>/` (session notes, `/memory` project/lesson/reference notes, `/recall` search). Must NOT be inside the code repo or its parent workspace.
@@ -26,7 +29,12 @@ List your project's non-negotiable rules. These are enforced by every pipeline p
 
 ## Compliance Requirements (if any)
 
-Describe regulatory or compliance constraints that affect code review and testing. Leave empty if none apply.
+Describe regulatory or compliance constraints that affect code review and testing. The two keys below are read by the pipeline (Spec's compliance_critical call and the post-certify compliance-review gate); write `none` for each if no regulated area applies.
+
+- **Compliance areas:** (REQUIRED — plain-language list, or `none`)
+- **Risk-surface paths:** (REQUIRED — backticked paths; a trailing / = whole directory; or `none`)
+
+Keep **Risk-surface paths** NARROW — genuinely risk-bearing modules only. A certified hunt whose diff touches one parks for human sign-off before release; a pervasive directory glob would park most hunts and turn the checkpoint into noise.
 
 ```markdown
 - (e.g., HIPAA: medical records must be encrypted at rest and in transit)
@@ -143,6 +151,24 @@ simply omits that step from the finishing message.
 - Deploy-before-migrate: (yes/no — yes if the migration runner must use the image built by the deploy)
 - Changelog file: (e.g., `CHANGELOG.md`, or blank if the project keeps no changelog)
 - Backlog file: (e.g., `TODO.md`, or blank)
+- Tag pattern: (e.g. `v[0-9]*`)
+- Dev URL / Prod URL / Never-smoke hosts: (e.g. `staging.myapp.example` / `myapp.example` / `myapp-marketing.example`; `/smoke-wave` smokes only the Dev URL, never Prod or a never-smoke host; `none` when nothing is deployed)
+```
+
+`Dev deploy command: none` tells the pipeline there is no deploy step: Verify reports the hunt
+certified (next step `/merge`) and the wave-close commands skip deploy and `/smoke-wave`.
+
+### Feature-branch deploy (Verify)
+
+Optional. When present, the Verify phase surfaces these commands (user-run, never by an agent)
+to deploy a certified FEATURE BRANCH for pre-merge smoke, with `{worktree}` → the hunt's
+worktree path and `{slug}` → the hunt slug. Without it, Verify surfaces the Dev deploy command
+and warns that it may deploy the main checkout instead of the branch.
+
+```bash
+cd {worktree}
+VERSION=$(git describe --tags --always 2>/dev/null || echo "dev-{slug}")
+./deploy.sh staging --version "$VERSION"     # your project's branch-deploy command(s)
 ```
 
 **Deploy-before-migrate** exists because some deployment models pin the migration

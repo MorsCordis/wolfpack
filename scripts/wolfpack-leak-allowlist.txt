@@ -1,0 +1,5 @@
+# scripts/wolfpack-leak-allowlist.txt — deliberate leak-pattern literals, read by scripts/wolfpack-leak-grep.sh.
+# Format: <path><TAB><justification>. Each permitted hit line must ALSO carry the inline marker.
+# Keep this list short: reword a hit before allow-listing it. An entry with no marked hit fails as stale.
+scripts/wolfpack-leak-grep.sh	holds the leak pattern itself
+scripts/wolfpack-install-vibe-agents.test.mjs	leak-assertion regexes proving the installed seat templates carry no private identifiers

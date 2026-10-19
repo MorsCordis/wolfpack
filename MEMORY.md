@@ -138,6 +138,6 @@ Procedure:
 
 - [x] schema + this spec
 - [x] `/memory`, `/recall` skills (`.agents/skills/`)
-- [x] `/summary` upgraded to call the primitive (consumer-side, e.g. PawPIMS)
+- [x] `/summary` upgraded to call the primitive (consumer-side)
 - [ ] `kb_search` — repo-map PageRank over the wikilink graph (Spark-side retrieval)
 - [ ] DevDen orchestrator forced-recall gate wiring

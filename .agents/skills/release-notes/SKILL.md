@@ -23,14 +23,14 @@ extract+filter (code)  →  translate to voice (model)  →  post-check (code, f
 ## Inputs from the project's `wolfpack-config.md` → `## Release Notes`
 - **Audience** — who reads it (e.g. "veterinary clinic staff").
 - **Denylist** — terms that must never reach the audience (security/domain-sensitive).
-- **Compliance terms** — regulatory markers (e.g. DEA, NM Board, PCI, SAQ). A real compliance
+- **Compliance terms** — regulatory markers (e.g. HIPAA, PCI, SAQ, a licensing board's record rules). A real compliance
   *change* matching these is surfaced (never silently dropped); a behavior-preserving refactor
   that merely touches compliance code stays internal noise.
 - **`compliance_visibility`** — `customer` or `digest`:
-  - `customer` (when the END USER is the regulated party — PawPIMS: the vet holds the DEA
-    registration, is the SAQ merchant, owns the TCPA numbers): compliance changes go INTO the
+  - `customer` (when the END USER is the regulated party — e.g. a clinic that holds its own
+    regulatory registration and is the payment merchant): compliance changes go INTO the
     customer note, in their own "Compliance & regulatory updates" section. The user must know.
-  - `digest` (default; chispa and non-regulated projects): compliance changes go to an internal
+  - `digest` (default; projects with no regulated end user): compliance changes go to an internal
     digest only, not the customer note.
 - **Template** — the email/announcement skeleton.
 - **Exemplars** — 2–3 engineering→audience rewrite examples (how a small model learns the voice).
@@ -74,9 +74,9 @@ node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <denylist>
 Exit 1 = a forbidden term leaked → fix and re-check. Do **not** present a draft that hasn't passed.
 
 ### 5. Present (depends on `compliance_visibility`)
-- **`customer` mode (PawPIMS):** ONE note with two sections — "What's new" (`included`), and a
+- **`customer` mode:** ONE note with two sections — "What's new" (`included`), and a
   **"Compliance & regulatory updates"** section built from `compliance`, rewritten in plain
-  language for the regulated user (e.g. "We tightened who can export DEA Form 222 reports —
+  language for the regulated user (e.g. "We tightened who can export regulated controlled-item reports —
   only staff with reporting + inventory permissions can download them now"). These are changes
   the vet must know to stay compliant. Run the **customer-mode** post-check.
 - **`digest` mode (default):** the note is `included` only; render `compliance` as a separate

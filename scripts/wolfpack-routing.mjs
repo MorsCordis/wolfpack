@@ -40,8 +40,9 @@
 // `reviewer-b` are the REVIEWER families. A real project maps these neutral roles
 // onto concrete models via wolfpack-config.md → "Model Pool" (e.g. judgment=Opus,
 // work-horse=Sonnet, reviewer-a=Gemini, reviewer-b=Mistral). The DEFAULT_POOL below
-// is a neutral example only — override it by passing `pool` to recommendModels()
-// (or by editing wolfpack-config.md and threading it through the caller).
+// is a neutral example only — library callers pass `pool` to recommendModels(); the
+// CLI reads the consuming project's wolfpack-config.md → Model Pool through
+// scripts/wolfpack-config.mjs and threads it in (DEFAULT_POOL only when no config exists).
 //
 // HARD CONSTRAINTS (never relax — enforced + asserted, fail-loud):
 //   * Alpha is ALWAYS the judgment family (planner). Never explore the planner seat.
@@ -61,18 +62,25 @@
 // exploit the best), never random, so a workflow could call this and resume cleanly.
 //
 // Usage (CLI, for inspection/dry-run):
-//   node scripts/wolfpack-routing.mjs <planDir>
-//     reads <planDir>/metadata.json (tier + predicted_dimensions) and
-//     .wolfpack/pedigree/model-stats.json, prints the recommendation as JSON.
+//   node scripts/wolfpack-routing.mjs <planDir> [--config <path>]
+//     reads <planDir>/metadata.json (tier + predicted_dimensions),
+//     .wolfpack/pedigree/model-stats.json, and the Model Pool from wolfpack-config.md
+//     (default <planDir>/../../../wolfpack-config.md, i.e. <root>/wolfpack-config.md;
+//     --config may only follow <planDir>). Prints the recommendation as JSON with
+//     pool_source 'config' (+ config: <path>) or 'default' (no config: stderr warning +
+//     the same line in warnings). An unusable Model Pool exits 2. With an empty pedigree
+//     every seat is the tier default over the config pool's order.
 
 import { readFileSync, existsSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ucbSelect } from './wolfpack-bandit.mjs'
+import { loadConfig } from './wolfpack-config.mjs'
 
 // ─── The neutral model pool ──────────────────────────────────────
 // DEFAULT_POOL is a provider-agnostic EXAMPLE. Real projects supply their own
-// mapping via wolfpack-config.md → "Model Pool" and thread it in as `pool`.
+// mapping via wolfpack-config.md → "Model Pool"; the CLI reads it (scripts/wolfpack-config.mjs)
+// and threads it in as `pool`.
 //   * implementer families may NOT review (cross-family adversarial rule).
 //   * reviewer families are the only legal reviewer/verify picks.
 export const DEFAULT_POOL = {
@@ -467,23 +475,61 @@ export function complianceCriticalFromMeta(meta = {}) {
 }
 
 // ─── CLI ────────────────────────────────────────────────────────
+const CLI_USAGE = 'usage: node scripts/wolfpack-routing.mjs <planDir> [--config <path to wolfpack-config.md>]'
+
 function main(argv) {
-  const planDir = argv[2]
-  if (!planDir) { console.error('usage: node wolfpack-routing.mjs <planDir>'); process.exit(2) }
+  const args = argv.slice(2)
+  const planDir = args[0]
+  if (!planDir || planDir.startsWith('-')) { console.error(CLI_USAGE); process.exit(2) }
+  let configPath = null
+  const rest = args.slice(1)
+  if (rest.length) {
+    if (rest.length !== 2 || rest[0] !== '--config' || !rest[1] || rest[1].startsWith('-')) {
+      console.error(CLI_USAGE); process.exit(2)
+    }
+    configPath = rest[1]
+  }
   const metaPath = join(planDir, 'metadata.json')
   if (!existsSync(metaPath)) { console.error(`metadata.json not found in ${planDir}`); process.exit(2) }
   const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
   const here = dirname(fileURLToPath(import.meta.url))
   const statsPath = join(here, '..', '.wolfpack', 'pedigree', 'model-stats.json')
   const stats = existsSync(statsPath) ? JSON.parse(readFileSync(statsPath, 'utf8')) : {}
+
+  // The Model Pool comes from the consuming project's wolfpack-config.md (planDir =
+  // <root>/.wolfpack/plans/<slug>). An unusable pool fails loud; an ABSENT config is a
+  // disclosed degrade to the neutral DEFAULT_POOL (stderr + pool_source + warnings).
+  const cfgPath = resolve(configPath ?? join(planDir, '..', '..', '..', 'wolfpack-config.md'))
+  let pool = DEFAULT_POOL
+  let poolSource = 'default'
+  let degradeWarning = null
+  if (existsSync(cfgPath)) {
+    const cfg = loadConfig(cfgPath)
+    const poolProblems = cfg.problems.filter((x) => x.startsWith('Model Pool:'))
+    if (poolProblems.length || !cfg.pool || !cfg.pool.judgment || !cfg.pool.reviewerA) {
+      const why = poolProblems.length ? poolProblems.join('; ') : 'missing required role(s) judgment/reviewer-a'
+      console.error(`✗ wolfpack-routing: ${cfgPath}: Model Pool unusable — ${why}`)
+      process.exit(2)
+    }
+    pool = cfg.pool
+    poolSource = 'config'
+  } else {
+    degradeWarning = `no wolfpack-config.md at ${cfgPath} — using the neutral DEFAULT_POOL (role names, not runnable models)`
+    console.error(`⚠ wolfpack-routing: ${degradeWarning}`)
+  }
+
   const rec = recommendModels({
     tier: meta.tier,
     dimensions: meta.predicted_dimensions || {},
     stats: stats.model_stats || stats,
     pins: pinsFromMeta(meta),
+    pool,
     offload: !!meta.usage_offload,
     complianceCritical: complianceCriticalFromMeta(meta),
   })
+  rec.pool_source = poolSource
+  if (poolSource === 'config') rec.config = cfgPath
+  if (degradeWarning) rec.warnings = [...(rec.warnings || []), degradeWarning]
   console.log(JSON.stringify(rec, null, 2))
 }
 

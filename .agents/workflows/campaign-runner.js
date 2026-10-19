@@ -1,5 +1,5 @@
 export const meta = {
-// REFERENCE — ported from PawPIMS; NOT de-PawPIMS-genericized. This IS the durable orchestrator: the DevDen Python reimplementation is stale (last commit 2026-07-06; its repomap/memory/RAG were superseded by dev-cortex, its local-model runtime has no consumer). Invest here, not in a successor. See memory project_devden_architecture.
+// Wolfpack campaign runner — the canonical, durable orchestrator. Consuming projects run a GENERATED copy (scripts/wolfpack-sync-runtime.sh <target>); wolfpack itself runs this file via .claude/workflows. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here.
   name: 'campaign-runner',
   description: 'Run all hunts in a Wolfpack campaign wave by wave',
   phases: [
@@ -317,7 +317,7 @@ normalize it:
   so this git inference should not normally be needed.
 
 Chain-mode fields — ALWAYS return them for every hunt (barrier campaigns too):
-- migrationApps (ALWAYS return it; from the "Migration app(s)" field — a JSON-ish list like ["billing"]; [] if absent or "[]")
+- migrationApps (ALWAYS return it; from the "Migration app(s)" field — a JSON-ish list like ["app_a"]; [] if absent or "[]")
 - revertedBecause: metadata.reverted_because if set, else null;  heldOn: slugs in metadata.held_on, else []
 - baseBranch: metadata.base_branch if a non-empty string, else ""
 Top level (ALWAYS return both): chainMode = true iff .wolfpack/campaigns/${campaignSlug}/metadata.json has chain.mode === "chain",
@@ -382,12 +382,12 @@ and chainScriptPresent (true only if scripts/wolfpack-chain.mjs exists).
   chainCapability = cap
   const proto = Number(cap.protocol) || 0
   if (proto < REQUIRED_EXAMINER_PROTOCOL) {
-    throw new Error(`campaign-runner: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) is STALE — examiner protocol ${proto} < ${REQUIRED_EXAMINER_PROTOCOL}; it cannot honor the ${EXAMINER_ROTATION.join('/')} examiner hints. Re-run ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh (hunt-pipeline.js + campaign-runner.js), then relaunch.`)
+    throw new Error(`campaign-runner: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) is STALE — examiner protocol ${proto} < ${REQUIRED_EXAMINER_PROTOCOL}; it cannot honor the ${EXAMINER_ROTATION.join('/')} examiner hints. Re-run wolfpack-sync-runtime.sh <that runtime file> (from the pack's scripts/; once for hunt-pipeline.js and once for campaign-runner.js), then relaunch.`)
   }
   if (proto < LATEST_EXAMINER_PROTOCOL) {
     // Disclosed degrade (CLAUDE.md § Fail Loud): logged at WARNING level AND visible in the
     // campaign output, every pass, naming the exact fix.
-    log(`⚠ STALE PIPELINE: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) reports examiner protocol ${proto}, this campaign-runner is ${LATEST_EXAMINER_PROTOCOL}. Reviews will run on the OLD (gemini-first) chain until you re-run: ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh <repo>/.claude/workflows/hunt-pipeline.js`)
+    log(`⚠ STALE PIPELINE: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) reports examiner protocol ${proto}, this campaign-runner is ${LATEST_EXAMINER_PROTOCOL}. Reviews will run on the OLD (gemini-first) chain until you re-run: wolfpack-sync-runtime.sh <repo>/.claude/workflows/hunt-pipeline.js (from the pack's scripts/)`)
   } else {
     log(`Pipeline capability OK: examiner protocol ${proto} (${cap.path}) — hint rotation ${EXAMINER_ROTATION.join(' / ')}`)
   }
@@ -401,7 +401,7 @@ and chainScriptPresent (true only if scripts/wolfpack-chain.mjs exists).
   // gate at all is not a degrade we can label). PRESENT but pre-protocol ⇒ WARN and run the
   // labelled legacy mode (see legacyGate) instead of letting the schema reject every claim.
   if (!(cap && cap.gatePresent)) {
-    throw new Error(`campaign-runner: scripts/wolfpack-window-gate.mjs is MISSING — the usage gate cannot run, so no hunt may start. Re-run ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh, then relaunch.`)
+    throw new Error(`campaign-runner: scripts/wolfpack-window-gate.mjs is MISSING — the usage gate cannot run, so no hunt may start. Re-run wolfpack-sync-runtime.sh <that runtime file> (from the pack's scripts/), then relaunch.`)
   }
   if ((Number(cap.gateProtocol) || 0) < 1) {
     legacyGate = true
@@ -409,6 +409,64 @@ and chainScriptPresent (true only if scripts/wolfpack-chain.mjs exists).
   } else {
     log(`Usage gate capability OK: gate protocol ${cap.gateProtocol}`)
   }
+}
+
+// ─── Preflight: the consuming project's wolfpack-config.md (wolfpack-self-hosting, AC10) ───
+// The runner surfaces the project's deploy step in the release queue, and every hunt it
+// launches reads the same config. The Workflow script has no filesystem access, so one
+// read-only agent runs the deterministic reader (scripts/wolfpack-config.mjs) and relays its
+// JSON. Fail closed: a missing/incomplete config, a garbled relay or a dead seat THROWS
+// before any hunt launches — the runner never guesses a project value.
+const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+// The first brace-balanced {…} block of a text (string-aware, so braces inside JSON strings
+// never end it early; a non-greedy first-} match would truncate inside nested objects).
+const firstJsonObject = (text) => {
+  const t = String(text || '')
+  const start = t.indexOf('{')
+  if (start < 0) return null
+  let depth = 0, inStr = false, esc = false
+  for (let i = start; i < t.length; i++) {
+    const c = t[i]
+    if (inStr) {
+      if (esc) esc = false
+      else if (c === '\\') esc = true
+      else if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') inStr = true
+    else if (c === '{') depth++
+    else if (c === '}') { depth--; if (depth === 0) return t.slice(start, i + 1) }
+  }
+  return null
+}
+let projectConfig = null
+{
+  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. From the repo root (your starting directory), run exactly:
+  node scripts/wolfpack-config.mjs --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"
+Return exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the CONFIG_RC line.
+If the command could not run at all, return exitCode 2 and the error text as output. Never create, fix or edit anything.`,
+    { label: 'project-config', phase: 'Parse', model: 'sonnet', schema: PROJECT_CONFIG_SCHEMA })
+  const out = (pc && typeof pc.output === 'string') ? pc.output : ''
+  // The reader's ✗ line names the missing keys; surface it first, then the head of the output.
+  const outLines = out.split('\n')
+  const flagged = outLines.filter(l => /^\s*✗/.test(l))
+  const detail = out ? [...flagged, ...outLines.slice(0, 20).filter(l => !flagged.includes(l))].join('\n') : '(no output — the probe seat returned nothing)'
+  let parsed = null
+  let why = ''
+  if (!pc) why = 'the project-config probe returned no result'
+  else if (pc.exitCode !== 0) why = `the reader exited ${pc.exitCode}`
+  else {
+    const block = firstJsonObject(out)
+    try { parsed = block ? JSON.parse(block) : null } catch { parsed = null }
+    if (!parsed) why = 'the reader output held no parseable JSON object'
+    else if (typeof parsed.testCommand !== 'string' || !parsed.testCommand) why = 'testCommand is not a string'
+    else if (!Array.isArray(parsed.compliancePaths)) why = 'compliancePaths is not an array'
+  }
+  if (why) {
+    throw new Error(`campaign-runner: wolfpack-config.md is missing or incomplete — no hunt may start. ${why}: ${detail}. Fix: copy wolfpack-config.example.md to wolfpack-config.md and fill the required keys (Name, Test command, Compliance areas, Risk-surface paths, Model Pool judgment + reviewer-a); check with node scripts/wolfpack-config.mjs --json`)
+  }
+  projectConfig = parsed
+  log(`Project config: ${projectConfig.name} — tests: ${projectConfig.testCommand}; deploy: ${projectConfig.devDeployCommand || 'none'}`)
 }
 
 // ─── Chain mode (`--chain`, campaign-chain-mode) ───────────────
@@ -963,7 +1021,7 @@ if (chainMode) {
   // and rebase them onto origin/main — silently wrong for a chain campaign.
   const ccap = chainCapability || {}
   if (!(Number(ccap.chainProtocol) >= 1)) {
-    throw new Error(`campaign-runner: STALE PIPELINE for chain mode — the runtime hunt-pipeline (${ccap.path || 'not found'}) reports chain protocol ${Number(ccap.chainProtocol) || 0} < 1 (no WOLFPACK_CHAIN_PROTOCOL marker), so its hunts would fork from main and rebase onto origin/main. Re-run ~/Projects/wolfpack/scripts/wolfpack-sync-runtime.sh <repo>/.claude/workflows/hunt-pipeline.js, then relaunch.`)
+    throw new Error(`campaign-runner: STALE PIPELINE for chain mode — the runtime hunt-pipeline (${ccap.path || 'not found'}) reports chain protocol ${Number(ccap.chainProtocol) || 0} < 1 (no WOLFPACK_CHAIN_PROTOCOL marker), so its hunts would fork from main and rebase onto origin/main. Re-run wolfpack-sync-runtime.sh <repo>/.claude/workflows/hunt-pipeline.js (from the pack's scripts/), then relaunch.`)
   }
   if (ccap.chainScriptPresent !== true) {
     throw new Error(`campaign-runner: scripts/wolfpack-chain.mjs is MISSING (or the probe could not confirm it) — chain mode cannot run its git steps. Copy it from wolfpack canonical scripts/, then relaunch.`)
@@ -1342,7 +1400,7 @@ Return { allMerged: true/false, notMerged: ["slug1", ...], certified: ["slug1", 
 
   if (complianceReviewThisWave.length > 0) {
     log(``)
-    log(`These hunts CERTIFIED but are held for COMPLIANCE SIGN-OFF (DEA/NM/PCI risk surface) — they are EXCLUDED from the release queue until you sign off with /resolve:`)
+    log(`These hunts CERTIFIED but are held for COMPLIANCE SIGN-OFF (a declared risk surface — wolfpack-config.md → Compliance Requirements) — they are EXCLUDED from the release queue until you sign off with /resolve:`)
     for (const r of complianceReviewThisWave) {
       log(`  ⏸ ${r.slug}: ${r.status || r.verdict}  →  /resolve ${r.slug}`)
     }
@@ -1382,11 +1440,16 @@ Return { allMerged: true/false, notMerged: ["slug1", ...], certified: ["slug1", 
     log(``)
     log(`Release this wave (single tag, single deploy, one consolidated smoke):`)
     log(`  1. /merge-wave ${campaignSlug} ${wave.number}   (sequential --no-ff merges → ONE wave tag → push)`)
-    log(`  2. deploy-dev                                    (ONE deploy for the whole wave)`)
-    log(`  3. /smoke-wave ${campaignSlug} ${wave.number}    (consolidated [auto] smoke + [manual] checklist)`)
-    log(``)
-    log(`If one hunt fails smoke: git revert <that hunt's merge commit> (--no-ff merges are cleanly revertible),`)
-    log(`re-lay the wave tag on the post-revert commit, redeploy, re-smoke that hunt only.`)
+    if (projectConfig.devDeployCommand) {
+      log(`  2. ${projectConfig.devDeployCommand}   (ONE deploy for the whole wave — wolfpack-config.md → Dev deploy command)`)
+      log(`  3. /smoke-wave ${campaignSlug} ${wave.number}    (consolidated [auto] smoke + [manual] checklist)`)
+      log(``)
+      log(`If one hunt fails smoke: git revert <that hunt's merge commit> (--no-ff merges are cleanly revertible),`)
+      log(`re-lay the wave tag on the post-revert commit, redeploy, re-smoke that hunt only.`)
+    } else {
+      log(`  2. (no deploy step — wolfpack-config.md declares none)`)
+      log(`  3. (no smoke-wave — nothing is deployed)`)
+    }
   }
 
   log(``)

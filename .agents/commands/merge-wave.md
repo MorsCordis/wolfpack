@@ -126,31 +126,35 @@ abort leaves them recoverable.
    on-disk log carries `status: merged` + `merge_commit` + `released_version` — the full
    authoritative done-record the kickoff reads without touching git.
 4. **Migration detection + graph-collision gate (do NOT run migrations).**
+   Skip this step entirely if wolfpack-config.md → Deployment Notes → **Migration file pattern**
+   is `none` (the project has no migrations; `HAS_MIGRATIONS` stays false).
    ```bash
-   MIGS=$(git diff <wave-base>..HEAD --name-only | grep -E '/migrations/[0-9]')
+   MIGS=$(git diff <wave-base>..HEAD --name-only | grep -E '<Migration file pattern>')
    ```
-   where `<wave-base>` is the commit before the first hunt's merge. If any, set
-   `HAS_MIGRATIONS=true`, list them, and note they run AFTER `deploy-dev` (image invariant).
+   where `<wave-base>` is the commit before the first hunt's merge and `<Migration file pattern>`
+   is the config's Migration file pattern (e.g. `/migrations/[0-9]`). If any, set
+   `HAS_MIGRATIONS=true`, list them, and note they run AFTER the configured Dev deploy command
+   (when Deploy-before-migrate is `yes`).
 
    **Collision check — parallel hunts that forked from the same base can EACH add a migration
-   with the same number in the same app → two leaf nodes → `migrate-dev` dies with "Conflicting
-   migrations / multiple leaf nodes."** `/merge-wave` only lists files today; detect the
+   with the same number in the same app → two leaf nodes → the migration command fails with
+   "Conflicting migrations / multiple leaf nodes."** `/merge-wave` only lists files today; detect the
    collision so it can't reach the migrate job silently:
    ```bash
    echo "$MIGS" | sed -E 's#^(.+)/migrations/([0-9]+)_.*#\1 \2#' | sort | uniq -d
    ```
    - **If any `<app> <NNNN>` row prints (duplicate leaf number in one app):** STOP — do NOT tag,
-     do NOT hand off. This wave will break `migrate-dev`. Emit the fix and wait:
+     do NOT hand off. This wave will break the migration command. Emit the fix and wait:
      ```
      ⚠ MIGRATION GRAPH COLLISION — <app> has two leaf migrations at <NNNN>:
        <fileA>
        <fileB>
-     Resolve BEFORE deploy/migrate (needs the Cloud SQL proxy / Django env — merge-wave can't):
-       python manage.py makemigrations <app> --merge
-     Commit the 00NN_merge_*.py on fix/migration-merge-<app> → --no-ff main, then re-run /merge-wave.
+     Resolve BEFORE deploy/migrate (needs the project's database/runtime env — merge-wave can't):
+       the project's migration-merge procedure (e.g. a framework's `makemigrations --merge`)
+     Commit the merge migration on fix/migration-merge-<app> → --no-ff main, then re-run /merge-wave.
      ```
-     merge-wave **detects only** — it does not run `makemigrations` (no DB/Django env here).
-     (`makemigrations --merge` is a no-op if the leaves turn out linear, so a false positive is harmless.)
+     merge-wave **detects only** — it does not run the migration-merge procedure (no database/runtime env here).
+     (A migration merge is typically a no-op if the leaves turn out linear, so a false positive is harmless.)
    - **If nothing prints:** no collision — continue to Step 4 worktree cleanup.
 
 ## Step 4 — Worktree cleanup
@@ -170,25 +174,36 @@ post-revert commit so it always points at exactly-what-shipped:
 - Do NOT merge a hunt that is not `certified` (rework/parked/compliance_review).
 - Do NOT lay a per-hunt tag or stamp a per-hunt version heading — the wave owns ONE tag.
 - Do NOT fast-forward (always `--no-ff`), force-push main, or delete feature branches.
-- Do NOT deploy — that's the user's single `deploy-dev` after this command.
+- Do NOT deploy — that is the user's single configured Dev deploy command after this command (if the project has one).
 - Do NOT push to any remote other than `origin`.
 
 ## Finishing message (mandatory last line)
 
-If `HAS_MIGRATIONS` is true:
+Pick the variant from wolfpack-config.md → Deployment Notes. `<Dev deploy command>` and
+`<Migration command>` are filled verbatim from the config.
+
+If the Dev deploy command is present and `HAS_MIGRATIONS` is true:
 ```
 ✓ Wave released: <N> hunts merged --no-ff → main, tagged <VERSION>
   origin (GitHub)
 
-Next: deploy-dev → gcloud run jobs execute migrate-dev --region us-central1 --wait → /smoke-wave <campaign> <wave>
+Next: <Dev deploy command> → <Migration command> → /smoke-wave <campaign> <wave>
 ```
 
-Otherwise:
+If the Dev deploy command is present and there are no migrations:
 ```
 ✓ Wave released: <N> hunts merged --no-ff → main, tagged <VERSION>
   origin (GitHub)
 
-Next: deploy-dev → /smoke-wave <campaign> <wave>
+Next: <Dev deploy command> → /smoke-wave <campaign> <wave>
+```
+
+If the Dev deploy command is `none`:
+```
+✓ Wave released: <N> hunts merged --no-ff → main, tagged <VERSION>
+  origin (GitHub)
+
+Next: nothing to deploy — the wave is released at the tag; /smoke-wave does not apply.
 ```
 
 (If tooling-only — no tag — replace "tagged <VERSION>" with "no version tag (tooling-only wave)".)
