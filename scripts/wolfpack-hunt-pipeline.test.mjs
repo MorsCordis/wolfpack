@@ -1397,6 +1397,34 @@ test('AC6b: Orange + a self-reported denied shell (no denial lines) also parks',
   assert.equal(result.status, 'parked:audit_only_certification')
 })
 
+test('Orange + a shell-ok PASS that lists only read-only-by-role tools as denied certifies (not audit-only)', async () => {
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange' },
+    watchdog: { verdict: 'PASS', provider: 'glm', deniedTools: [], toolAccess: { shell: 'ok', denied_tools: ['write_file', 'edit', 'skill', 'task'] } },
+  } })
+  assert.notEqual(result.status, 'parked:audit_only_certification', JSON.stringify(result))
+  assert.equal(find('park:h:audit_only_certification').length, 0)
+  assert.equal(auditRecords(find, 'watchdog').length, 0)
+})
+
+test('Orange + a shell-ok PASS that also lists a non-role tool (bash) as denied still parks', async () => {
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, tier: 'Orange' },
+    watchdog: { verdict: 'PASS', provider: 'glm', deniedTools: [], toolAccess: { shell: 'ok', denied_tools: ['write_file', 'bash'] } },
+  } })
+  assert.equal(result.status, 'parked:audit_only_certification', JSON.stringify(result))
+  const ev = find('park:h:audit_only_certification')[0].prompt
+  assert.match(ev, /seat reported denied tool: bash/)
+  assert.doesNotMatch(ev, /seat reported denied tool: write_file/)
+})
+
+test('a review seat that lists only write_file as denied is not recorded audit_only', async () => {
+  const { find } = await runHunt({ answers: {
+    bloodhound: { ...BASE.bloodhound, deniedTools: [], toolAccess: { shell: 'ok', denied_tools: ['write_file'] } },
+  } })
+  assert.equal(auditRecords(find, 'bloodhound').length, 0)
+})
+
 test('AC6c: Yellow + an audit-only PASS → allowed (Verify runs) but recorded against certification.md', async () => {
   const { result, find } = await runHunt({ answers: { watchdog: AUDIT_PASS } })
   assert.notEqual(String(result.status).startsWith('parked'), true, JSON.stringify(result))
@@ -1433,7 +1461,7 @@ test('AC6 (Bloodhound r1 MEDIUM): an Orange/Red/unknown PASS that OMITS tool_acc
 test('AC6: the missing-tool_access rule is provider-agnostic (a claude-attributed certification is held to it too)', () => {
   // Exercise the deployed helpers directly: certAuditEvidence never looks at the provider.
   const body = SRC.match(/const SINGLE_LENS = .*\n/)[0] + SRC.match(/const TIER_CONFIG = \{[\s\S]*?\n\}\n/)[0]
-  const helpers = SRC.match(/const auditEvidence = [\s\S]*?\nconst certAuditEvidence = [\s\S]*?\n\}\n/)[0]
+  const helpers = SRC.match(/const ROLE_DENIED_TOOLS = [\s\S]*?\nconst certAuditEvidence = [\s\S]*?\n\}\n/)[0]
   const mk = new Function(`${body}\n${helpers}\nreturn { auditEvidence, isAuditOnly, HEAVY, certAuditEvidence, mergeToolAccess }`)
   const { auditEvidence, isAuditOnly, HEAVY, certAuditEvidence, mergeToolAccess } = mk()
   // Pointer r1 #1: on Orange/Red/unknown, any shell state other than "ok" is evidence ("unused" =

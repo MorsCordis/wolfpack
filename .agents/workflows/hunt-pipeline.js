@@ -1454,13 +1454,19 @@ const isQuotaStatus = (s) => /model_quota|quota|rate[_\s-]?limit|both.*(rate|thr
 // harness test asserts it; this workflow body cannot import).
 const TOOL_DENIAL_PATTERN =
   "Tool '[^']+' is permanently disabled|Unknown tool '[^']+'|Tool execution denied by (the )?approval policy|Tool '[^']+' was denied by hook|fatal: not a git repository"
+// Tools every review/certify seat profile denies BY ROLE (vibe-agents/*.toml: read-only seats,
+// no self-orchestration). A seat that self-reports one of these as denied is describing its
+// profile, not a missing shell, so it is not audit-only evidence.
+const ROLE_DENIED_TOOLS = ['edit', 'write_file', 'task', 'skill']
 const auditEvidence = (r) => {
   const ev = []
   for (const l of (Array.isArray(r && r.deniedTools) ? r.deniedTools : [])) if (String(l).trim()) ev.push(String(l).trim())
   const ta = r && r.toolAccess
   if (ta && typeof ta === 'object') {
     if (String(ta.shell || '').toLowerCase() === 'denied') ev.push('seat reported tool_access.shell = denied')
-    for (const t of (Array.isArray(ta.denied_tools) ? ta.denied_tools : [])) ev.push(`seat reported denied tool: ${t}`)
+    for (const t of (Array.isArray(ta.denied_tools) ? ta.denied_tools : [])) {
+      if (!ROLE_DENIED_TOOLS.includes(String(t).trim().toLowerCase())) ev.push(`seat reported denied tool: ${t}`)
+    }
   }
   if (r && r.auditOnly === true && !ev.length) ev.push('shim agent reported auditOnly')
   return ev
@@ -3519,7 +3525,8 @@ ${certifySteps}
 
 4.5 AUDIT-ONLY GATE (tier ${tier}): ${HEAVY(tier)
   ? `this tier cannot certify on audit alone. If the TOOL-DENIAL CHECK found ANY line, OR the verdict's
-   tool_access shows shell as anything other than "ok" ("denied" or "unused") or lists any denied tool,
+   tool_access shows shell as anything other than "ok" ("denied" or "unused") or lists any denied tool
+   other than the read-only-by-role ${ROLE_DENIED_TOOLS.join('/')},
    OR the verdict has NO tool_access you can copy — do NOT perform the PASS-only actions: do not stamp status "certified" (step 7), do not run
    step 8/8b, do not append to .wolfpack/pedigree/index.md, do not commit. Still write
    certification.md, and return the verdict with \`deniedTools\` / \`toolAccess\` — the pipeline parks it.`

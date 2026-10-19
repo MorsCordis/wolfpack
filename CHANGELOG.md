@@ -5,6 +5,7 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 ## [Unreleased]
 
 ### Fixed
+- A review or certify seat that lists only its read-only-by-role tools (`edit`, `write_file`, `task`, `skill`) as denied is no longer recorded audit-only, so a shell-verified Orange/Red PASS certifies instead of parking `audit_only_certification`. <!-- hunt:audit-only-role-denied-tools -->
 - The self-hosting changelog test checks the hunt's entries exist under `[Unreleased]` or a version heading, so it no longer fails once a wave stamps them. <!-- hunt:wolfpack-self-hosting -->
 
 ## [v0.1.0] - 2026-10-19
