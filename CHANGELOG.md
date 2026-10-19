@@ -4,6 +4,8 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+## [v0.1.0] - 2026-10-19
+
 ### Added
 - Wolfpack hosts its own hunts: its own `wolfpack-config.md`, a deterministic config reader (`scripts/wolfpack-config.mjs`) used by the router and both workflows, `.claude/workflows` wiring, and an empty public pedigree whose router falls back to the Model Pool order. <!-- hunt:wolfpack-self-hosting -->
 - One test entry point, `scripts/test-all.sh` (every node and shell test plus the leak grep; podman tests print `SKIP: needs podman`). <!-- hunt:wolfpack-self-hosting -->
