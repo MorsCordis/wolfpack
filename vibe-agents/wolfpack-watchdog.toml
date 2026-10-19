@@ -1,5 +1,5 @@
 # Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
-# Wolfpack Mistral seat (watchdog). Run ONLY via the project's podman-vibe.sh shim, which passes
+# Wolfpack Mistral seat (watchdog). Run ONLY via the pack's podman-vibe.sh shim, which passes
 # one --enabled-tools flag per tool from VIBE_TOOLS_DEFAULT (read grep edit write_file bash)
 # and NO --auto-approve, so every tool the seat uses must be granted "always" here (an
 # ungranted tool falls to "ask", and a headless vibe -p run denies every ask).

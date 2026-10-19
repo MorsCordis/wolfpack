@@ -68,7 +68,8 @@ set -uo pipefail
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "$(cd "$(dirname "$0")/.." && pwd)")
 GATE="${REPO_ROOT}/scripts/wolfpack-window-gate.mjs"
-SANDBOX="${REPO_ROOT}/scripts/run-pipeline-sandbox.sh"
+# The sandbox launcher is the PACK's (beside this script), never a copy in the consuming repo.
+SANDBOX="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run-pipeline-sandbox.sh"
 
 MAX_CYCLES="${WOLFPACK_OVERNIGHT_MAX_CYCLES:-12}"
 MAX_SLEEP="${WOLFPACK_OVERNIGHT_MAX_SLEEP:-21600}"

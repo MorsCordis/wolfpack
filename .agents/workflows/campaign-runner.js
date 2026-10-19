@@ -468,6 +468,25 @@ If the command could not run at all, return exitCode 2 and the error text as out
   projectConfig = parsed
   log(`Project config: ${projectConfig.name} — tests: ${projectConfig.testCommand}; deploy: ${projectConfig.devDeployCommand || 'none'}`)
 }
+// exec-layer-into-pack: the pack's execution layer resolves from WOLFPACK_HOME — env, else
+// wolfpack-config.md → Project Identity → Wolfpack home, else STOP with the fix (before any
+// hunt launches). Never the consuming repo. TRUST BOUNDARY: the key leg reads ONLY the
+// projectConfig probed above from the main checkout's root, never a worktree. Nothing is
+// passed to the hunts: each hunt-pipeline resolves for itself from the same env and key.
+// Body identical to hunt-pipeline.js's resolveWolfpackHome (apart from the env accessor).
+const resolveWolfpackHome = (who) => {
+  const env = _envRunner('WOLFPACK_HOME'); const key = projectConfig && projectConfig.wolfpackHome
+  const fix = 'Fix: export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add "- **Wolfpack home:** `<path>`" under ## Project Identity in wolfpack-config.md (check: node <pack>/scripts/wolfpack-config.mjs)'
+  const raw = (typeof env === 'string' && env.trim()) ? env.trim() : (typeof key === 'string' && key.trim()) ? key.trim() : ''
+  const source = (typeof env === 'string' && env.trim()) ? 'env WOLFPACK_HOME' : 'wolfpack-config.md → Project Identity → Wolfpack home'
+  if (!raw) throw new Error(`${who}: WOLFPACK_HOME is not set and wolfpack-config.md has no Wolfpack home — the pack's execution shims are never looked up in the consuming repo. ${fix}`)
+  if (!raw.startsWith('/')) throw new Error(`${who}: ${source} is not an absolute path ('${raw}'). ${fix}`)
+  return { home: raw.replace(/\/+$/, '') || '/', source }
+}
+{
+  const wolfpackHome = resolveWolfpackHome('campaign-runner')
+  log(`Pack home (WOLFPACK_HOME): ${wolfpackHome.home} — from ${wolfpackHome.source}`)
+}
 
 // ─── Chain mode (`--chain`, campaign-chain-mode) ───────────────
 // Chain mode moves the integration target from `main` to a LOCAL `campaign/<slug>` branch:

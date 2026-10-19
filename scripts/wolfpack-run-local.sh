@@ -22,6 +22,8 @@ SLUG="${1:?Usage: wolfpack-run-local.sh <feature-slug> [phase_override]}"
 PHASE_OVERRIDE="${2:-}"
 
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+# The seat shim is the PACK's (beside this script), never a copy in the consuming repo.
+SHIM="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/podman-vibe.sh"
 WM_BIN="$HOME/Projects/local-llm/bin/wolfpack-models"
 
 # ─── 1. Locate Metadata and Worktree ───────────────────────────
@@ -156,7 +158,7 @@ run_agent() {
             fi
             # Run local model via vibe
             echo "[local] running vibe with $model..."
-            VIBE_ACTIVE_MODEL="$model" "$REPO_ROOT/scripts/podman-vibe.sh" "wolfpack-$role" "$WORKTREE_PATH" <(echo "$prompt") 80 > "$output_file" 2>&1 || true
+            VIBE_ACTIVE_MODEL="$model" "$SHIM" "wolfpack-$role" "$WORKTREE_PATH" <(echo "$prompt") 80 > "$output_file" 2>&1 || true
             ;;
         *)
             # Run remote model via agy

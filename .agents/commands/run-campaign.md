@@ -90,10 +90,21 @@ Parse `$ARGUMENTS` as: `<campaign-slug> [max-parallel]`. Default max-parallel is
    watcher** so the user can paste it into a separate terminal — print the label and the command
    on its OWN line (no prefix on the command line, so it copies cleanly), then exec. Do NOT
    auto-run the watcher (an in-process `--loop` just creates an endless scroll):
+
+   **Resolve the pack home first** (the launcher is the PACK's, never a copy in this repo):
+   `PACK="$WOLFPACK_HOME"`; if that is empty, use the `Wolfpack home` value from
+   `node <any pack checkout>/scripts/wolfpack-config.mjs --json` (its `wolfpackHome`
+   field), or read it by eye from `wolfpack-config.md` → Project Identity →
+   Wolfpack home if the reader is not at hand (expand a leading `~`). If neither is set, or
+   `"$PACK/scripts/run-pipeline-sandbox.sh"` does not exist, STOP and give the user the fix:
+   "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add
+   a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md".
+   Never run a `./scripts/run-pipeline-sandbox.sh` from the consuming repo.
+
    ```bash
    echo "Live progress — paste into a separate terminal:"
    echo "./scripts/wolfpack-watch.sh --loop 5"
-   exec ./scripts/run-pipeline-sandbox.sh --campaign $SLUG $MAX_PARALLEL
+   exec "$PACK/scripts/run-pipeline-sandbox.sh" --campaign $SLUG $MAX_PARALLEL
    ```
 
    The `exec` replaces this Claude process with the containerized one — no double billing. The container runs Claude in `--permission-mode auto` with sandboxed filesystem access.

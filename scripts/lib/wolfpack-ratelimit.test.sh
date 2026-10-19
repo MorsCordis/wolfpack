@@ -193,7 +193,7 @@ export WOLFPACK_CB_FAILS=2 WOLFPACK_CB_WINDOW=600 WOLFPACK_MAX_RETRIES=2 WOLFPAC
 EVF="$TMPDIR/events.jsonl"
 # [Errno 28] on stderr, EMPTY stdout, rc 1 (Vibe crashes before printing anything).
 echo 0 > "$CNT"
-emit_enospc() { echo $(( $(cat "$CNT") + 1 )) > "$CNT"; echo "OSError: [Errno 28] No space left on device: '/home/u/.vibe/logs/vibe.log'" >&2; return 1; }
+emit_enospc() { echo $(( $(cat "$CNT") + 1 )) > "$CNT"; echo "OSError: [Errno 28] No space left on device: '/tmp/x/.vibe/logs/vibe.log'" >&2; return 1; }
 rl_reset rb-enospc
 WOLFPACK_RL_EVENTS_FILE="$EVF" retry_with_backoff rb-enospc emit_enospc >"$TMPDIR/en.out" 2>"$TMPDIR/en.err"; r=$?
 check "$r" 77 "ENOSPC (empty stdout, rc 1) → exit 77"

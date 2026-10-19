@@ -6,10 +6,20 @@
 # worktree + sandbox are the guardrail; reviewer-writes-to-source are caught by
 # diff-catch, not a tool fence. See VIBE_TOOLS_DEFAULT below + wolfpack-toolcheck.mjs.
 #
-# Usage: ./scripts/podman-vibe.sh <agent-name> <worktree-path> <prompt-file> [max-turns]
-#        ./scripts/podman-vibe.sh --implement <agent-name> <worktree-path> <prompt-file> [max-turns]
+# Usage: $WOLFPACK_HOME/scripts/podman-vibe.sh <agent-name> <worktree-path> <prompt-file> [max-turns]
+#        $WOLFPACK_HOME/scripts/podman-vibe.sh --implement <agent-name> <worktree-path> <prompt-file> [max-turns]
 #
 # Output goes to stdout (capture in calling script).
+#
+# Config: the shim is the PACK's (WOLFPACK_HOME); every project specific comes from the
+# consuming project's wolfpack-config.md → `## Execution Layer` (Sandbox image, GLM image,
+# Sandbox project layer, Seat extra mounts, Secrets paths, Vibe agent dir, Seat test env),
+# read through scripts/wolfpack-config.mjs --exec (scripts/lib/wolfpack-sandbox.sh). Which
+# config: WOLFPACK_CONFIG (absolute path, operator override), else
+# <git toplevel of the CALLER's CWD>/wolfpack-config.md, else exit 2. The pipeline calls the
+# shim from the main checkout's root, so a hunt branch that edits its own config cannot widen
+# its reviewer's sandbox. A missing or invalid key is exit 2 naming the key. With
+# WOLFPACK_SANDBOX=1 (already inside the unified sandbox) no config is read.
 #
 # Exit codes (beyond the model's own):
 #   75  rate-limited / circuit open — WOLFPACK_RATE_LIMITED:<family> on stderr (fall back)
@@ -58,10 +68,12 @@
 # read-only when it lives outside the worktree (a `git worktree` checkout's .git is a FILE
 # pointing at <repo>/.git/worktrees/<slug>), so `git diff` works in the container, and
 # sets GIT_OPTIONAL_LOCKS=0 so git never tries to write index.lock on the ro mount. It
-# also sets WOLFPACK_SANDBOX=1 and a test-only SECRET_KEY in the container, so the test
-# command runs on the image's Python + a /tmp PG (never the host venv or the host .env).
+# also sets WOLFPACK_SANDBOX=1 plus the configured Seat test env in the container, so the
+# test command runs on the image's runtime (never the host's tooling or the host .env), and
+# mounts each configured Seat extra mount read-only. Every bind source is checked against the
+# configured Secrets paths BEFORE any podman build or run.
 #
-# The seat profiles (~/.vibe/agents-headless/, installed from the tracked wolfpack
+# The seat profiles (the configured Vibe agent dir, installed from the tracked wolfpack
 # vibe-agents/ templates) must agree with the tool lists below; scripts/wolfpack-toolcheck.mjs
 # asserts it and hunt-pipeline.js runs it as a preflight.
 
@@ -135,6 +147,10 @@ if [ "$VIBE_MODE" = "implement" ] && [ -z "${WOLFPACK_MAX_RETRIES:-}" ]; then
 fi
 # shellcheck source=lib/wolfpack-ratelimit.sh
 source "$RL_LIB"
+SHIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WP_CALLER="podman-vibe"
+# shellcheck source=lib/wolfpack-sandbox.sh
+source "${SHIM_DIR}/lib/wolfpack-sandbox.sh"
 # Per-family breaker/cooldown key: "mistral" (unchanged default) or "glm".
 VIBE_FAMILY=$(rl_vibe_family "$AGENT") || exit 2
 RL_MODEL="$VIBE_FAMILY"
@@ -143,7 +159,6 @@ if [ "$VIBE_MODE" = "implement" ] && [ "$VIBE_FAMILY" != "glm" ]; then
     exit 2
 fi
 
-IMAGE="wolfpack-sandbox:latest"
 WORKTREE_ABS=$(realpath "$WORKTREE")
 
 # ─── tmpfs sizes (AC10) ────────────────────────────────────────
@@ -174,17 +189,27 @@ if [ -z "${WOLFPACK_RL_EVENTS_FILE:-}" ]; then
     esac
 fi
 PROMPT_ABS=$(realpath "$PROMPT_FILE")
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "/home/cecil/Projects/pawpims")
+# The CALLER's checkout (no fallback: outside a git checkout, set WOLFPACK_CONFIG).
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
 
 # When WOLFPACK_SANDBOX=1 we are ALREADY inside the unified sandbox container
 # (launched by run-pipeline-sandbox.sh). podman is not installed in that image
 # and nesting containers is neither possible nor wanted — the container itself
-# is the sandbox. Skip every podman operation and call Vibe directly below.
+# is the sandbox. Skip every podman operation (and the config read: the container owns its
+# mounts) and call Vibe directly below.
+WP_SEAT_MOUNTS=() WP_SEAT_ENV=() WP_SECRETS_PATHS=()
 if [ -z "${WOLFPACK_SANDBOX:-}" ]; then
-    if ! podman image exists "$IMAGE" 2>/dev/null; then
-        echo "Building wolfpack-sandbox container..." >&2
-        podman build -t "$IMAGE" -f "${REPO_ROOT}/.claude/containers/Containerfile.wolfpack" "$REPO_ROOT" >&2
+    wp_load_exec_config "$REPO_ROOT" || exit 2
+    if [ ! -d "$WP_VIBE_AGENT_DIR" ]; then
+        echo "✗ podman-vibe: the configured Vibe agent dir does not exist: ${WP_VIBE_AGENT_DIR} (wolfpack-config.md → Execution Layer → Vibe agent dir) — install the seat profiles (scripts/wolfpack-install-vibe-agents.mjs) or fix the key" >&2
+        exit 2
     fi
+    IMAGE="$WP_SANDBOX_IMAGE"
+else
+    # Never mounted in this mode (run_vibe calls Vibe directly); no existence check.
+    WP_VIBE_AGENT_DIR="${HOME}/.vibe/agents-headless"
+    IMAGE="(in-sandbox)"
+    WP_CFG_PATH=""
 fi
 
 # GLM seats need a CURRENT Vibe (--auto-approve + read_file/edit tool names). The base
@@ -194,12 +219,9 @@ fi
 # limit) if the in-container Vibe can't auto-approve, rather than hang or be misgraded.
 if [ "$VIBE_FAMILY" = "glm" ]; then
     if [ -z "${WOLFPACK_SANDBOX:-}" ]; then
-        IMAGE="${WOLFPACK_GLM_IMAGE:-wolfpack-sandbox-glm:latest}"
-        if ! podman image exists "$IMAGE" 2>/dev/null; then
-            echo "Building ${IMAGE} (GLM Vibe layer)..." >&2
-            podman build -t "$IMAGE" -f "${REPO_ROOT}/.claude/containers/Containerfile.wolfpack-glm" \
-                "${REPO_ROOT}/.claude/containers" >&2
-        fi
+        # Operator env override wins over the configured GLM image. Built (when absent)
+        # only after the secrets guard below.
+        IMAGE="${WOLFPACK_GLM_IMAGE:-$WP_GLM_IMAGE}"
     elif ! vibe --help 2>/dev/null | grep -q -- '--auto-approve'; then
         echo "ERROR: the in-sandbox vibe ($(vibe --version 2>/dev/null)) has no --auto-approve — GLM seats cannot run headless (vibe -p would hang on approval). Rebuild the sandbox image with a current mistral-vibe." >&2
         exit 2
@@ -231,14 +253,16 @@ else
 fi
 
 # Review/certify seats run the project's test command inside the container. Tell it that
-# it IS inside the sandbox image (WOLFPACK_SANDBOX=1 → the image's system Python, never the
-# host venv, and an on-demand PG under /tmp), and give Django a TEST-ONLY, non-secret
-# SECRET_KEY. The host .env is never mounted: it holds real credentials, and the seat gets
-# none. --implement has no shell, so it gets neither. These are container-side only: on the
-# host this script still reads WOLFPACK_SANDBOX from its own environment.
+# it IS inside the sandbox image (WOLFPACK_SANDBOX=1 → the image's own runtime, never the
+# host's), plus the project's configured Seat test env (TEST-ONLY, non-secret values, e.g. a
+# framework key the test command needs). The host .env is never mounted: it holds real
+# credentials, and the seat gets none. --implement has no shell, so it gets neither. These
+# are container-side only: on the host this script still reads WOLFPACK_SANDBOX from its own
+# environment.
 REVIEW_ENV=()
 if [ "$VIBE_MODE" != "implement" ]; then
-    REVIEW_ENV=(-e WOLFPACK_SANDBOX=1 -e SECRET_KEY=wolfpack-review-sandbox-test-only)
+    REVIEW_ENV=(-e WOLFPACK_SANDBOX=1)
+    for _kv in ${WP_SEAT_ENV[@]+"${WP_SEAT_ENV[@]}"}; do REVIEW_ENV+=(-e "$_kv"); done
 fi
 
 MOUNT_ARGS=(
@@ -250,9 +274,9 @@ MOUNT_ARGS=(
     -v "${HOME}/.vibe/.env:${HOME}/.vibe/.env:ro,z"
     -v "${HOME}/.vibe/config.toml:${HOME}/.vibe/config.toml:ro,z"
     # Vibe custom agents + prompts (read-only).
-    # agents-headless holds the pipeline seats / headless profiles; the interactive
-    # Shift+Tab cycle only sees ~/.vibe/agents (task() subagents).
-    -v "${HOME}/.vibe/agents-headless:${HOME}/.vibe/agents:ro,z"
+    # The configured Vibe agent dir holds the pipeline seats / headless profiles; the
+    # interactive Shift+Tab cycle only sees ~/.vibe/agents (task() subagents).
+    -v "${WP_VIBE_AGENT_DIR}:${HOME}/.vibe/agents:ro,z"
     -v "${HOME}/.vibe/prompts:${HOME}/.vibe/prompts:ro,z"
     # Vibe needs writable scratch dirs — tmpfs so nothing persists or escapes.
     # mode=1777 is REQUIRED: podman 5.8+ mounts a tmpfs root-owned 0755 when any
@@ -286,48 +310,13 @@ if [ "$VIBE_MODE" != "implement" ]; then
         MOUNT_ARGS+=(-v "${REPO_ROOT}/.wolfpack:${CWORK}/.wolfpack:ro,z")
     fi
 
-    # The CANONICAL wolfpack repo, read-only, at its own host path.
-    #
-    # WHY: the orchestration layer (.agents/workflows/hunt-pipeline.js, campaign-runner.js)
-    # is canonical in a SEPARATE repo; pawpims runs GENERATED copies of it. A hunt that
-    # changes pipeline behaviour therefore has half its diff outside this repo, and a
-    # reviewer with only the pawpims worktree mounted cannot verify that half. GLM said so
-    # itself on retire-gemini-glm-large4 round 4: "the wolfpack repo is not mounted in this
-    # sandbox, so wolfpack-repo line cites could not be independently verified."
-    #
-    # Mounted at the SAME host path inside the container so `git -C <path>` and any
-    # absolute cite in a prompt resolve identically for both families (GLM already uses the
-    # host path as CWORK; Mistral's /workspace does not collide with it). The .git dir
-    # comes along, so a reviewer can diff main..HEAD on the wolfpack side.
-    #
-    # READ-ONLY, and review/certify only. A GLM Shepherd in --implement mode is NOT given
-    # write access to canonical here: that would let an implementer edit a repo whose diff
-    # this project's /merge does not manage. Two-repo implementation stays a host-side
-    # (Claude-shepherd) job until the hunt scope question is settled.
-    WOLFPACK_CANONICAL_REPO="${WOLFPACK_CANONICAL_REPO:-${HOME}/Projects/wolfpack}"
-    # Set ONLY where the -v below is actually appended: the git common-dir block treats a
-    # path under it as already mounted, so it must never name a mount that was skipped.
-    _canon_mounted=""
-    if [ -d "${WOLFPACK_CANONICAL_REPO}/.git" ] && [ "${WOLFPACK_CANONICAL_REPO}" != "${REPO_ROOT}" ]; then
-        case "$WOLFPACK_CANONICAL_REPO" in
-            *:*|*$'\n'*)
-                echo "wolfpack: WOLFPACK_CANONICAL_REPO contains ':' or a newline — not mounting: $WOLFPACK_CANONICAL_REPO" >&2 ;;
-            "${WORKTREE_ABS}"|"${WORKTREE_ABS}"/*|"${CWORK}"|"${CWORK}"/*)
-                echo "wolfpack: WOLFPACK_CANONICAL_REPO overlaps the worktree mount — not mounting: $WOLFPACK_CANONICAL_REPO" >&2 ;;
-            *)
-                MOUNT_ARGS+=(-v "${WOLFPACK_CANONICAL_REPO}:${WOLFPACK_CANONICAL_REPO}:ro,z")
-                _canon_mounted="$WOLFPACK_CANONICAL_REPO" ;;
-        esac
-    fi
-
     # Git visibility for review/certify seats. A hunt worktree's .git is a FILE
     # ("gitdir: <repo>/.git/worktrees/<slug>"); with only the worktree mounted, git in the
     # container sees a dangling gitdir and every `git diff` fails "not a git repository" —
     # the seat silently degrades to a file-reading audit. Mount the git COMMON dir
     # read-only at its host path so that absolute gitdir resolves. Skipped when it is
-    # already inside the worktree (a plain checkout's own .git dir) or inside the
-    # canonical-wolfpack mount above. podman path only: in WOLFPACK_SANDBOX mode the
-    # unified container owns its mounts.
+    # already inside the worktree (a plain checkout's own .git dir). podman path only: in
+    # WOLFPACK_SANDBOX mode the unified container owns its mounts.
     if [ -z "${WOLFPACK_SANDBOX:-}" ]; then
         if GIT_COMMON_DIR=$(git -C "$WORKTREE_ABS" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) && [ -n "$GIT_COMMON_DIR" ]; then
             case "$GIT_COMMON_DIR" in
@@ -336,16 +325,50 @@ if [ "$VIBE_MODE" != "implement" ]; then
                 "${WORKTREE_ABS}"|"${WORKTREE_ABS}"/*)
                     : ;;   # inside the worktree mount already
                 *)
-                    case "$GIT_COMMON_DIR" in
-                        "${_canon_mounted:-/nonexistent-wolfpack-canonical}"/*) : ;;   # covered by the canonical mount
-                        *) MOUNT_ARGS+=(-v "${GIT_COMMON_DIR}:${GIT_COMMON_DIR}:ro,z") ;;
-                    esac ;;
+                    MOUNT_ARGS+=(-v "${GIT_COMMON_DIR}:${GIT_COMMON_DIR}:ro,z") ;;
             esac
         else
             echo "wolfpack: WARNING: ${WORKTREE_ABS} is not a git checkout — the reviewer cannot run git diff" >&2
         fi
+
+        # Project-configured extra mounts (wolfpack-config.md → Execution Layer → Seat extra
+        # mounts): review/certify seats only, ALWAYS read-only. The host path must exist —
+        # podman would otherwise auto-create it as a directory.
+        for _m in ${WP_SEAT_MOUNTS[@]+"${WP_SEAT_MOUNTS[@]}"}; do
+            _mh="${_m%%:*}"; _mc="${_m#*:}"
+            case "$_mh$_mc" in
+                *:*|*$'\n'*)
+                    echo "✗ podman-vibe: Seat extra mounts entry contains ':' or a newline: ${_m} (wolfpack-config.md → Execution Layer → Seat extra mounts)" >&2
+                    exit 2 ;;
+            esac
+            if [ ! -e "$_mh" ]; then
+                echo "✗ podman-vibe: Seat extra mounts host path does not exist: ${_mh} (wolfpack-config.md → Execution Layer → Seat extra mounts) — refusing to let podman create it" >&2
+                exit 2
+            fi
+            MOUNT_ARGS+=(-v "${_mh}:${_mc}:ro,z")
+        done
     fi
 fi
+
+# ─── Secrets guard, then images (podman path only) ─────────────
+# Order is load-bearing: the full mount list is built above, EVERY bind source is checked
+# against the configured Secrets paths, and only then may an image build or a run happen —
+# a refusal therefore runs no podman build and no podman run.
+if [ -z "${WOLFPACK_SANDBOX:-}" ]; then
+    _srcs=()
+    _next=""
+    for _a in "${MOUNT_ARGS[@]}"; do
+        if [ "$_next" = 1 ]; then _srcs+=("${_a%%:*}"); _next=""; continue; fi
+        [ "$_a" = "-v" ] && _next=1
+    done
+    wp_secrets_guard "Secrets paths" "${_srcs[@]}" || exit 2
+    if [ "$VIBE_FAMILY" = "glm" ]; then
+        wp_ensure_glm_image "$IMAGE" || exit 2
+    else
+        wp_ensure_sandbox_image || exit 2
+    fi
+fi
+echo "wolfpack: podman-vibe ${AGENT} family=${VIBE_FAMILY} mode=${VIBE_MODE} worktree=${WORKTREE_ABS} shim=${SHIM_DIR} config=${WP_CFG_PATH:-<sandbox>} image=${IMAGE}" >&2
 
 # ─── Concurrency guard: cap concurrent Mistral calls at 1 ──────
 # Multiple hunts (and review rounds) hit Mistral at once; uncapped fan-out
@@ -399,7 +422,7 @@ sem_run() {
 # diff` to SEE the change). Per docs/wolfpack-autonomy/06 § "Give models their tools
 # — don't box them": give each model its CAPABLE default toolset and make it safe by
 # LAYERING, not boxing —
-#   * the sandbox + Bash denylist is the REAL guardrail (no prod, no gcloud run, no
+#   * the sandbox + Bash denylist is the REAL guardrail (no prod credentials, no
 #     escape); tool-freedom lives INSIDE it.
 #   * the worktree mounts READ-ONLY (`/workspace:ro` above), so even with write tools
 #     enabled the reviewer physically cannot mutate app source — defense in depth.

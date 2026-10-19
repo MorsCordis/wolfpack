@@ -53,7 +53,8 @@
 //
 // Usage:
 //   node scripts/wolfpack-toolcheck.mjs [<shim> | --shim <path>] [--profiles <dir>]
-//     shim default:     <this dir>/podman-vibe.sh
+//     shim default:     $WOLFPACK_HOME/scripts/podman-vibe.sh (the pack's shim) when
+//                       WOLFPACK_HOME is set, else <this dir>/podman-vibe.sh
 //     profiles default: $WOLFPACK_VIBE_AGENTS_DIR, else $HOME/.vibe/agents when
 //                       WOLFPACK_SANDBOX is set (the unified-sandbox mount), else
 //                       $HOME/.vibe/agents-headless
@@ -407,13 +408,15 @@ function main(argv) {
     console.error('usage: node wolfpack-toolcheck.mjs [<shim> | --shim <path>] [--profiles <dir>]')
     process.exit(2)
   }
-  const vibePath = args.shim || join(here, 'podman-vibe.sh')
+  const vibePath = args.shim || (process.env.WOLFPACK_HOME
+    ? join(process.env.WOLFPACK_HOME, 'scripts', 'podman-vibe.sh')
+    : join(here, 'podman-vibe.sh'))
   const profilesDir = args.profiles || defaultProfilesDir(process.env)
 
   let failed = false
 
   if (!existsSync(vibePath)) {
-    console.error(`✗ toolcheck: shim not found: ${vibePath}`)
+    console.error(`✗ toolcheck: shim not found: ${vibePath} — pass --shim <path> or set WOLFPACK_HOME to the pack checkout`)
     process.exit(2)
   }
   let isDir = false

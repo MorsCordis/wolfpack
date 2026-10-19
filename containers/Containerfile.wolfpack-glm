@@ -1,16 +1,20 @@
-# GLM layer on top of the unified Wolfpack sandbox (Containerfile.wolfpack).
+# GLM layer on top of a Wolfpack sandbox image (the configured Sandbox image: the pack base
+# from Containerfile.wolfpack, plus the project's layer when one is configured).
 #
-# WHY A SEPARATE TAG: the base image pins whatever mistral-vibe was current when it was
-# built (2.13.0 as of 2026-05-30), which predates `--auto-approve` and uses the old
-# `read` tool name. GLM seats REQUIRE --auto-approve (vibe -p hangs forever on any tool
-# call needing approval) and the current tool names (read_file / grep / write_file /
-# edit). Layering the upgrade on a separate tag gives GLM a current Vibe WITHOUT
-# changing the Vibe that the Mistral path (and any live hunt) runs on in the base tag.
+# WHY A SEPARATE TAG: a sandbox image pins whatever mistral-vibe was current when it was
+# built, which may predate `--auto-approve` and use the old `read` tool name. GLM seats
+# REQUIRE --auto-approve (vibe -p hangs forever on any tool call needing approval) and the
+# current tool names (read_file / grep / write_file / edit). Layering the upgrade on a
+# separate tag gives GLM a current Vibe WITHOUT changing the Vibe that the Mistral path
+# (and any live hunt) runs on in the base tag.
 #
-# Build (podman-vibe.sh auto-builds it on first GLM use; the base must exist):
-#   podman build -t wolfpack-sandbox-glm:latest -f .claude/containers/Containerfile.wolfpack-glm .claude/containers
-FROM wolfpack-sandbox:latest
+# Build (podman-vibe.sh / wolfpack-build-images.sh build it on demand; BASE_IMAGE is
+# REQUIRED — without it the FROM is empty and the build fails):
+#   podman build --build-arg BASE_IMAGE=<sandbox image> -t <glm image> \
+#     -f "$WOLFPACK_HOME/containers/Containerfile.wolfpack-glm" "$WOLFPACK_HOME/containers"
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 USER root
-RUN pip install --no-cache-dir --upgrade "mistral-vibe>=2.24.1"
-USER cecil
+RUN /opt/vibe/bin/pip install --no-cache-dir --upgrade "mistral-vibe>=2.24.1"
+USER ${WOLFPACK_USER}
