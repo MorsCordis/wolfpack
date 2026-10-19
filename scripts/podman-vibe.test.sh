@@ -5,17 +5,53 @@
 # HOME + TMPDIR. Asserts the per-family command line (mistral unchanged, glm gets
 # --auto-approve + the strict allow-list), --implement gating, and the per-family
 # rate-limit exit contract (exit 75 + WOLFPACK_RATE_LIMITED:<family>).
+# The podman path (a FAKE podman on PATH) reads a fixture wolfpack-config.md → Execution Layer
+# through WOLFPACK_CONFIG: image names, the image build chain, seat extra mounts, the secrets
+# guard, the Vibe agent dir, the seat test env and the fail-loud missing-key cases.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SHIM="${HERE}/podman-vibe.sh"
+PACK=$(cd "$HERE/.." && pwd)
 
 SCRATCH=$(mktemp -d)
 trap 'rm -rf "$SCRATCH"' EXIT
+SCRATCH=$(realpath "$SCRATCH")
 export TMPDIR="$SCRATCH/tmp"; mkdir -p "$TMPDIR"
 export HOME="$SCRATCH/home"; mkdir -p "$HOME/.vibe" "$SCRATCH/bin" "$SCRATCH/wt"
 touch "$HOME/.vibe/.env" "$HOME/.vibe/config.toml"
+mkdir -p "$HOME/.vibe/agents-headless" "$SCRATCH/secrets"
 echo "review this" > "$SCRATCH/prompt.txt"
+
+# mkcfg <dir>: writes <dir>/wolfpack-config.md = the pack's example config with its
+# Execution Layer replaced by a fixture one. CFG_<KEY> overrides a value (the whole text after
+# the key, backticks included); CFG_OMIT="<written key>[|<key>…]" drops lines entirely.
+mkcfg() {
+  local dir="$1" f
+  mkdir -p "$dir"; f="$dir/wolfpack-config.md"
+  awk '/^## Execution Layer/{skip=1; next} /^## /{skip=0} !skip' "$PACK/wolfpack-config.example.md" > "$f"
+  {
+    echo; echo "## Execution Layer"
+    echo "- **Sandbox image:** ${CFG_SANDBOX-\`fx-sandbox:latest\`}"
+    echo "- **GLM image:** ${CFG_GLM-\`fx-sandbox-glm:latest\`}"
+    echo "- **Sandbox project layer:** ${CFG_LAYER-none}"
+    echo "- **Seat extra mounts:** ${CFG_SEAT_MOUNTS-none}"
+    echo "- **Sandbox extra mounts:** ${CFG_SANDBOX_MOUNTS-none}"
+    echo "- **Secrets paths:** ${CFG_SECRETS-\`$SCRATCH/secrets\`}"
+    echo "- **Vibe agent dir:** ${CFG_AGENTS-\`$HOME/.vibe/agents-headless\`}"
+    echo "- **Seat test env:** ${CFG_SEAT_ENV-\`SECRET_KEY=wolfpack-review-sandbox-test-only\`}"
+  } > "$f.exec"
+  if [ -n "${CFG_OMIT:-}" ]; then
+    grep -vE "^- \*\*(${CFG_OMIT}):\*\*" "$f.exec" >> "$f"
+  else
+    cat "$f.exec" >> "$f"
+  fi
+  rm -f "$f.exec"
+  echo "$f"
+}
+export WOLFPACK_CONFIG; WOLFPACK_CONFIG=$(mkcfg "$SCRATCH/cfg")
+node "$PACK/scripts/wolfpack-config.mjs" --exec "$WOLFPACK_CONFIG" >/dev/null \
+  || { echo "FAIL - fixture config does not read clean"; exit 1; }
 
 # Fake vibe: print argv (one per line) to stdout; behaviour steered by env.
 cat > "$SCRATCH/bin/vibe" <<'FAKE'
@@ -133,10 +169,10 @@ chmod +x "$SCRATCH/bin/podman"
 WT=$(realpath "$SCRATCH/wt")
 out=$(WOLFPACK_SANDBOX= run wolfpack-pointer "$SCRATCH/wt" "$SCRATCH/prompt.txt")
 has "$out" "${WT}:/workspace:ro,z" "podman mistral: worktree ro at /workspace (unchanged)"
-has "$out" "wolfpack-sandbox:latest" "podman mistral: base image (unchanged)"
+has "$out" "fx-sandbox:latest" "podman mistral: the configured Sandbox image"
 out=$(WOLFPACK_SANDBOX= run wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt")
 has "$out" "${WT}:${WT}:ro,z" "podman glm review: worktree ro at its HOST path (dev-cortex mirror)"
-has "$out" "wolfpack-sandbox-glm:latest" "podman glm: layered GLM image (current Vibe)"
+has "$out" "fx-sandbox-glm:latest" "podman glm: the configured GLM image (current Vibe)"
 has "$out" 'exec vibe -p "$(cat /tmp/prompt.txt)" "$@" </dev/null' "podman glm: constant in-container script (no string-built command)"
 has "$out" "--auto-approve" "podman glm: --auto-approve passed as its own argv element"
 grep -A1 -xF -- "--workdir" <<<"$out" | tail -1 | grep -qxF -- "$WT" && ok "podman glm: host-path workdir passed as one argv element" || no "podman glm workdir argv"
@@ -182,8 +218,9 @@ grep -q "is not a git checkout — the reviewer cannot run git diff" "$SCRATCH/e
 out=$(WOLFPACK_SANDBOX= run --implement wolfpack-shepherd-glm "$GWT" "$SCRATCH/prompt.txt")
 grep -qF -- "${GCOMMON}:${GCOMMON}" <<<"$out" && no "podman glm implement: git common dir mounted" || ok "podman glm implement: no git common-dir mount"
 has "$out" "GIT_OPTIONAL_LOCKS=0" "podman glm implement: GIT_OPTIONAL_LOCKS=0 too (both podman run calls)"
-# Review seats run the test command in the container: WOLFPACK_SANDBOX=1 (image Python + /tmp
-# PG) and a test-only SECRET_KEY on BOTH podman run calls; never the host .env; never on --implement.
+# Review seats run the test command in the container: WOLFPACK_SANDBOX=1 (the image runtime) and
+# the configured Seat test env (here a test-only SECRET_KEY) on BOTH podman run calls; never the
+# host .env; never on --implement.
 for agent in wolfpack-pointer-glm wolfpack-pointer; do
   out=$(WOLFPACK_SANDBOX= run "$agent" "$GWT" "$SCRATCH/prompt.txt")
   grep -A1 -xF -- "-e" <<<"$out" | grep -qxF "WOLFPACK_SANDBOX=1" && ok "podman $agent: -e WOLFPACK_SANDBOX=1 (tests use the image Python)" || no "podman $agent: WOLFPACK_SANDBOX=1 missing"
@@ -263,14 +300,15 @@ for a in "$@"; do printf '%s\n' "$a"; done
 FAKE
 chmod +x "$SCRATCH/bin/podman"
 export PODMAN_LOG="$SCRATCH/podman.log"; : > "$PODMAN_LOG"
-( cd "$SCRATCH/wt" && WOLFPACK_SANDBOX= FAKE_MISSING_IMAGE=wolfpack-sandbox-glm bash "$SHIM" wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null 2>&1 ); rc=$?
+( cd "$SCRATCH/wt" && WOLFPACK_SANDBOX= FAKE_MISSING_IMAGE=fx-sandbox-glm bash "$SHIM" wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null 2>&1 ); rc=$?
 check "$rc" 0 "missing GLM image → built, then run"
-grep -q "^build -t wolfpack-sandbox-glm:latest -f .*/.claude/containers/Containerfile.wolfpack-glm .*/.claude/containers$" "$PODMAN_LOG" \
-  && ok "GLM image built from Containerfile.wolfpack-glm with the small .claude/containers context" || no "GLM image build command ($(grep ^build "$PODMAN_LOG"))"
-grep -q "wolfpack-sandbox-glm:latest bash -c" "$PODMAN_LOG" && ok "…and the run uses the freshly built GLM image" || no "GLM run image"
+grep -qxF "build --build-arg BASE_IMAGE=fx-sandbox:latest -t fx-sandbox-glm:latest -f ${PACK}/containers/Containerfile.wolfpack-glm ${PACK}/containers" "$PODMAN_LOG" \
+  && ok "GLM image built from the PACK's containers/Containerfile.wolfpack-glm FROM the configured Sandbox image" || no "GLM image build command ($(grep ^build "$PODMAN_LOG"))"
+check "$(grep -c '^build' "$PODMAN_LOG")" 1 "…only the GLM layer is built (the Sandbox image exists)"
+grep -q "fx-sandbox-glm:latest bash -c" "$PODMAN_LOG" && ok "…and the run uses the freshly built GLM image" || no "GLM run image"
 : > "$PODMAN_LOG"
-( cd "$SCRATCH/wt" && WOLFPACK_SANDBOX= FAKE_MISSING_IMAGE=wolfpack-sandbox-glm bash "$SHIM" wolfpack-pointer "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null 2>&1 )
-grep -q "wolfpack-sandbox-glm" "$PODMAN_LOG" && no "mistral path touched the GLM image" || ok "mistral path never builds/uses the GLM image"
+( cd "$SCRATCH/wt" && WOLFPACK_SANDBOX= FAKE_MISSING_IMAGE=fx-sandbox-glm bash "$SHIM" wolfpack-pointer "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null 2>&1 )
+grep -q "fx-sandbox-glm" "$PODMAN_LOG" && no "mistral path touched the GLM image" || ok "mistral path never builds/uses the GLM image"
 ( cd "$SCRATCH/wt" && WOLFPACK_SANDBOX= WOLFPACK_GLM_IMAGE=my-glm:dev bash "$SHIM" wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null 2>&1 )
 grep -q "my-glm:dev bash -c" "$PODMAN_LOG" && ok "WOLFPACK_GLM_IMAGE override honoured" || no "GLM image override"
 
@@ -299,7 +337,7 @@ done
 check "$rc" 2 "invalid scratch tmpfs size → exit 2 (sandbox mode too)"
 
 # ─── usage-limit-gate AC10: ENOSPC from Vibe → exit 77, no breaker, never 75 ───
-ENOSPC="OSError: [Errno 28] No space left on device: '/home/u/.vibe/logs/vibe.log'"
+ENOSPC="OSError: [Errno 28] No space left on device: '$SCRATCH/h/.vibe/logs/vibe.log'"
 for agent in wolfpack-pointer wolfpack-pointer-glm; do
   fam=mistral; case "$agent" in *glm*) fam=glm ;; esac
   rm -f "$TMPDIR/wolfpack-sem/$fam".{cooldown,fails}
@@ -350,8 +388,281 @@ OPF="$SCRATCH/operator-events.jsonl"
 check "$(grep -c '"family":"mistral"' "$EVF" 2>/dev/null)" 0 "operator value wins → derived file not written"
 rm -f "$TMPDIR/wolfpack-sem/mistral".{cooldown,fails}
 
-# ─── shims stay executable (hunt-pipeline runs "<repo>/scripts/podman-vibe.sh" directly;
-#     /run-hunt and /run-campaign `exec ./scripts/run-pipeline-sandbox.sh`) ───
+# ═══ exec-layer-into-pack: the Execution Layer config on the podman path ═══════════════════
+# Fake podman: every call is logged (one line, "$*") to PODMAN_LOG; `image exists <name>` says
+# ABSENT when <name> matches the ERE in FAKE_ABSENT (unset = everything present); `build`
+# exits FAKE_BUILD_RC (default 0); `run` echoes its argv one per line.
+cat > "$SCRATCH/bin/podman" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >> "$PODMAN_LOG"
+if [ "${1:-}" = "image" ]; then
+  if [ -n "${FAKE_ABSENT:-}" ] && [[ "$3" =~ $FAKE_ABSENT ]]; then exit 1; fi
+  exit 0
+fi
+[ "${1:-}" = "build" ] && exit "${FAKE_BUILD_RC:-0}"
+for a in "$@"; do printf '%s\n' "$a"; done
+FAKE
+chmod +x "$SCRATCH/bin/podman"
+# pvrun <shim args…>: the podman path from a non-git CWD (the config comes from WOLFPACK_CONFIG).
+pvrun() { : > "$PODMAN_LOG"; ( cd "$SCRATCH/wt" && WOLFPACK_SANDBOX= bash "$SHIM" "$@" 2>"$SCRATCH/err" ); }
+no_podman() { if [ -s "$PODMAN_LOG" ]; then no "$1 (podman was called: $(tr '\n' '|' < "$PODMAN_LOG"))"; else ok "$1"; fi; }
+err_has() { if grep -qF -- "$1" "$SCRATCH/err"; then ok "$2"; else no "$2 (stderr: $(tr '\n' '|' < "$SCRATCH/err"))"; fi; }
+# vmount <argv> <spec> <label>: <spec> is present AND is the value of a -v flag.
+vmount() { if grep -B1 -xF -- "$2" <<<"$1" | head -1 | grep -qxF -- "-v"; then ok "$3"; else no "$3 (no '-v $2')"; fi; }
+buildline() { grep -n '^build ' "$PODMAN_LOG" | grep -F -- "$1" | head -1 | cut -d: -f1; }
+UNAME=$(id -un); UUID=$(id -u); UGID=$(id -g)
+USER_ARGS="--build-arg USER_NAME=${UNAME} --build-arg USER_UID=${UUID} --build-arg USER_GID=${UGID} --build-arg USER_HOME=${HOME}"
+
+# (a) Seat extra mounts → -v host:container:ro,z on review seats (both families), never on --implement.
+mkdir -p "$SCRATCH/extra" "$SCRATCH/extra2" "$HOME/tilde-extra"
+CFG_A=$(CFG_SEAT_MOUNTS="\`$SCRATCH/extra\` \`$SCRATCH/extra2:/opt/extra2\` \`~/tilde-extra\`" mkcfg "$SCRATCH/cfg-a")
+for agent in wolfpack-pointer-glm wolfpack-pointer; do
+  out=$(WOLFPACK_CONFIG="$CFG_A" pvrun "$agent" "$SCRATCH/wt" "$SCRATCH/prompt.txt"); rc=$?
+  check "$rc" 0 "(a) $agent with Seat extra mounts → rc 0"
+  vmount "$out" "$SCRATCH/extra:$SCRATCH/extra:ro,z" "(a) $agent: a host-only entry mounts read-only at its host path"
+  vmount "$out" "$SCRATCH/extra2:/opt/extra2:ro,z" "(a) $agent: a host:container entry mounts read-only at the container path"
+  vmount "$out" "$HOME/tilde-extra:$HOME/tilde-extra:ro,z" "(a) $agent: ~ expands on both sides"
+done
+grep -qE "extra(2)?:[^ ]*:rw" <<<"$out" && no "(a) an extra mount was rw" || ok "(a) extra mounts are never rw"
+out=$(WOLFPACK_CONFIG="$CFG_A" pvrun --implement wolfpack-shepherd-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt"); rc=$?
+check "$rc" 0 "(a) --implement with Seat extra mounts → rc 0"
+grep -qF -- "$SCRATCH/extra" <<<"$out" && no "(a) --implement got a seat extra mount" || ok "(a) --implement gets NO seat extra mount"
+# A host path that does not exist is refused (podman would auto-create it) — no podman call.
+CFG=$(CFG_SEAT_MOUNTS="\`$SCRATCH/nope\`" mkcfg "$SCRATCH/cfg-a2")
+WOLFPACK_CONFIG="$CFG" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(a) a missing Seat extra mounts host path → exit 2"
+err_has "Seat extra mounts host path does not exist: $SCRATCH/nope" "(a) …naming the key and the path"
+no_podman "(a) …and podman is never called"
+[ -e "$SCRATCH/nope" ] && no "(a) the missing host path was created" || ok "(a) …and the host path is not created"
+# An entry with its own options (a third ':' field) is a reader problem → exit 2, no podman.
+CFG=$(CFG_SEAT_MOUNTS="\`$SCRATCH/extra:/x:rw\`" mkcfg "$SCRATCH/cfg-a3")
+WOLFPACK_CONFIG="$CFG" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(a) a mount with options (rw) → exit 2"
+err_has "Seat extra mounts entry '$SCRATCH/extra:/x:rw' has a third ':' field" "(a) …the reader names the key and the entry"
+no_podman "(a) …and podman is never called"
+
+# (b) The secrets guard: a mount that equals / lies under / contains a Secrets path → exit 2
+# naming the key, BEFORE any podman call — with BOTH images absent, so an early ensure would
+# have shown up as a build line.
+mkdir -p "$SCRATCH/secrets/sub" "$SCRATCH/secrets-not"
+ln -s "$SCRATCH/secrets" "$SCRATCH/sec-link"
+for c in "under|$SCRATCH/secrets/sub" "equal|$SCRATCH/secrets" "contains|$SCRATCH" "symlink-to|$SCRATCH/sec-link"; do
+  name=${c%%|*}; path=${c#*|}
+  CFG=$(CFG_SEAT_MOUNTS="\`$path\`" mkcfg "$SCRATCH/cfg-b-$name")
+  for agent in wolfpack-pointer-glm wolfpack-pointer; do
+    WOLFPACK_CONFIG="$CFG" FAKE_ABSENT='.' pvrun "$agent" "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+    check "$rc" 2 "(b) $agent: a seat mount that $name the secrets path → exit 2"
+    err_has "(wolfpack-config.md → Execution Layer → Secrets paths) — refusing to start the container" "(b) $agent ($name): stderr names the Secrets paths key"
+    no_podman "(b) $agent ($name): no podman build, no podman run (no podman call at all)"
+  done
+done
+err_has "overlaps a configured secret path $SCRATCH/secrets" "(b) the message names the resolved secret path"
+# A sibling whose name merely STARTS with the secret path is not refused.
+CFG=$(CFG_SEAT_MOUNTS="\`$SCRATCH/secrets-not\`" mkcfg "$SCRATCH/cfg-b-sib")
+out=$(WOLFPACK_CONFIG="$CFG" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt"); rc=$?
+check "$rc" 0 "(b) a sibling path (secrets-not) is NOT refused"
+vmount "$out" "$SCRATCH/secrets-not:$SCRATCH/secrets-not:ro,z" "(b) …and is mounted"
+# The guard covers EVERY bind source, not only configured mounts: a worktree under the secrets
+# path is refused too (review and --implement).
+mkdir -p "$SCRATCH/secrets/wt"
+WOLFPACK_CONFIG="$CFG" FAKE_ABSENT='.' pvrun wolfpack-pointer-glm "$SCRATCH/secrets/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(b) a worktree under the secrets path → exit 2 (review)"
+no_podman "(b) …no podman call"
+WOLFPACK_CONFIG="$CFG" FAKE_ABSENT='.' pvrun --implement wolfpack-shepherd-glm "$SCRATCH/secrets/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(b) a worktree under the secrets path → exit 2 (--implement)"
+no_podman "(b) …no podman call"
+# Secrets paths: none disables the guard (a legal value).
+CFG=$(CFG_SECRETS=none CFG_SEAT_MOUNTS="\`$SCRATCH/secrets/sub\`" mkcfg "$SCRATCH/cfg-b-none")
+out=$(WOLFPACK_CONFIG="$CFG" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt"); rc=$?
+check "$rc" 0 "(b) Secrets paths: none → the guard is off (rc 0)"
+
+# (c) Every shim-required key, when absent (or none where none is illegal), stops the shim
+# with exit 2 naming the key — no hard-coded project default, no podman call.
+for key in "Sandbox image" "GLM image" "Sandbox project layer" "Seat extra mounts" "Secrets paths" "Vibe agent dir"; do
+  CFG=$(CFG_OMIT="$key" mkcfg "$SCRATCH/cfg-c-${key// /_}")
+  for agent in wolfpack-pointer-glm wolfpack-pointer; do
+    WOLFPACK_CONFIG="$CFG" pvrun "$agent" "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+    check "$rc" 2 "(c) $agent: '$key' absent → exit 2"
+    err_has "Execution Layer: missing $key" "(c) $agent: stderr names '$key' as written"
+    no_podman "(c) $agent: '$key' absent → no podman call"
+  done
+done
+for key in SANDBOX GLM AGENTS; do
+  CFG=$(env "CFG_${key}=none" bash -c "$(declare -f mkcfg); PACK='$PACK' SCRATCH='$SCRATCH' HOME='$HOME' mkcfg '$SCRATCH/cfg-c-none-$key'")
+  WOLFPACK_CONFIG="$CFG" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+  check "$rc" 2 "(c) a required key set to none ($key) → exit 2"
+  no_podman "(c) none ($key) → no podman call"
+done
+# Seat test env is optional: absent → the run proceeds.
+CFG=$(CFG_OMIT="Seat test env" mkcfg "$SCRATCH/cfg-c-noenv")
+WOLFPACK_CONFIG="$CFG" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 0 "(c) Seat test env absent → rc 0 (optional key)"
+# The whole section absent → exit 2 naming every shim-required key.
+NOSEC="$SCRATCH/cfg-c-nosec/wolfpack-config.md"; mkdir -p "${NOSEC%/*}"
+awk '/^## Execution Layer/{skip=1; next} /^## /{skip=0} !skip' "$PACK/wolfpack-config.example.md" > "$NOSEC"
+WOLFPACK_CONFIG="$NOSEC" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(c) no Execution Layer section → exit 2"
+err_has "Execution Layer: missing Sandbox image, GLM image, Sandbox project layer, Seat extra mounts, Secrets paths, Vibe agent dir" "(c) …naming every shim-required key"
+no_podman "(c) …no podman call"
+
+# (d) Which config: no WOLFPACK_CONFIG and a non-git CWD → exit 2 with the fix; no podman call.
+: > "$PODMAN_LOG"
+( cd "$SCRATCH/wt" && env -u WOLFPACK_CONFIG WOLFPACK_SANDBOX= bash "$SHIM" wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null 2>"$SCRATCH/err" ); rc=$?
+check "$rc" 2 "(d) no WOLFPACK_CONFIG + non-git CWD → exit 2"
+err_has "no wolfpack-config.md — run from the consuming repo's root or set WOLFPACK_CONFIG" "(d) …with the fix"
+no_podman "(d) …no podman call"
+# A relative or nonexistent WOLFPACK_CONFIG is refused.
+WOLFPACK_CONFIG="cfg/wolfpack-config.md" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(d) a relative WOLFPACK_CONFIG → exit 2"
+err_has "WOLFPACK_CONFIG must be an absolute path" "(d) …saying so"
+WOLFPACK_CONFIG="$SCRATCH/absent/wolfpack-config.md" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(d) a WOLFPACK_CONFIG that does not exist → exit 2"
+no_podman "(d) …no podman call"
+# No WOLFPACK_CONFIG: the config comes from the CALLER's git toplevel — never from the worktree
+# under review (a hunt branch cannot widen its own reviewer's sandbox, H7).
+CALLER="$SCRATCH/caller"; mkdir -p "$CALLER"; git -C "$CALLER" init -q
+mkcfg "$CALLER" >/dev/null
+UNDER="$SCRATCH/under-review"; mkdir -p "$UNDER" "$SCRATCH/branch-widened"; git -C "$UNDER" init -q
+CFG_SEAT_MOUNTS="\`$SCRATCH/branch-widened\`" mkcfg "$UNDER" >/dev/null
+: > "$PODMAN_LOG"
+out=$( cd "$CALLER" && env -u WOLFPACK_CONFIG WOLFPACK_SANDBOX= bash "$SHIM" wolfpack-pointer-glm "$UNDER" "$SCRATCH/prompt.txt" 2>"$SCRATCH/err" ); rc=$?
+check "$rc" 0 "(d) no WOLFPACK_CONFIG + caller CWD in a git checkout → rc 0"
+err_has "config=$CALLER/wolfpack-config.md" "(d) …the log names the CALLER's config"
+grep -qF -- "$SCRATCH/branch-widened" <<<"$out" && no "(d) the worktree's own config widened the mounts" || ok "(d) …the worktree-under-review's config is never read"
+
+# (e) The configured Vibe agent dir is the source of the seat's ~/.vibe/agents mount.
+mkdir -p "$SCRATCH/agents-x"
+CFG=$(CFG_AGENTS="\`$SCRATCH/agents-x\`" mkcfg "$SCRATCH/cfg-e")
+for agent in wolfpack-pointer-glm wolfpack-pointer; do
+  out=$(WOLFPACK_CONFIG="$CFG" pvrun "$agent" "$SCRATCH/wt" "$SCRATCH/prompt.txt")
+  vmount "$out" "$SCRATCH/agents-x:$HOME/.vibe/agents:ro,z" "(e) $agent: Vibe agent dir → the read-only ~/.vibe/agents mount"
+  grep -qF -- "$HOME/.vibe/agents-headless:" <<<"$out" && no "(e) $agent: the default agents dir is still mounted" || ok "(e) $agent: no hard-coded agents-headless mount"
+done
+
+# (f) Seat test env → -e NAME=value on review seats only; none → no SECRET_KEY at all.
+CFG=$(CFG_SEAT_ENV="\`FOO=bar\` \`FX_EMPTY=\`" mkcfg "$SCRATCH/cfg-f")
+for agent in wolfpack-pointer-glm wolfpack-pointer; do
+  out=$(WOLFPACK_CONFIG="$CFG" pvrun "$agent" "$SCRATCH/wt" "$SCRATCH/prompt.txt")
+  grep -A1 -xF -- "-e" <<<"$out" | grep -qxF "FOO=bar" && ok "(f) $agent: -e FOO=bar" || no "(f) $agent: FOO=bar missing"
+  grep -A1 -xF -- "-e" <<<"$out" | grep -qxF "FX_EMPTY=" && ok "(f) $agent: -e FX_EMPTY= (empty value kept)" || no "(f) $agent: FX_EMPTY= missing"
+  grep -A1 -xF -- "-e" <<<"$out" | grep -qxF "WOLFPACK_SANDBOX=1" && ok "(f) $agent: WOLFPACK_SANDBOX=1 kept" || no "(f) $agent: WOLFPACK_SANDBOX=1 missing"
+  grep -q "^SECRET_KEY=" <<<"$out" && no "(f) $agent: a SECRET_KEY not in the config" || ok "(f) $agent: no SECRET_KEY unless configured"
+done
+out=$(WOLFPACK_CONFIG="$CFG" pvrun --implement wolfpack-shepherd-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt")
+grep -q "^FOO=bar$" <<<"$out" && no "(f) --implement got the seat test env" || ok "(f) --implement gets no seat test env"
+CFG=$(CFG_SEAT_ENV=none mkcfg "$SCRATCH/cfg-f2")
+out=$(WOLFPACK_CONFIG="$CFG" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt"); rc=$?
+check "$rc" 0 "(f) Seat test env: none → rc 0"
+grep -q "SECRET_KEY" <<<"$out" && no "(f) none: SECRET_KEY still passed" || ok "(f) none: no SECRET_KEY (it is config, not a shim constant)"
+for bad in "\`HOME=/x\`" "\`WOLFPACK_SANDBOX=0\`" "\`GIT_DIR=/x\`" "\`PATH=/x\`" "\`not-a-pair\`"; do
+  CFG=$(CFG_SEAT_ENV="$bad" mkcfg "$SCRATCH/cfg-f3")
+  WOLFPACK_CONFIG="$CFG" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+  check "$rc" 2 "(f) Seat test env $bad → exit 2"
+  err_has "Seat test env entry" "(f) $bad: stderr names the key"
+  no_podman "(f) $bad: no podman call"
+done
+
+# (g) AC7: no second wolfpack checkout is mounted, whatever the env says; the git-common-dir
+# ro mount is kept. (The retired variable's name is assembled so this file never spells it.)
+SIB="$SCRATCH/sibling-pack"; mkdir -p "$SIB"; git -C "$SIB" init -q
+OLD_DEFAULT="$HOME/Projects"/wolfpack; mkdir -p "$OLD_DEFAULT"; git -C "$OLD_DEFAULT" init -q
+RETIRED_VAR="WOLFPACK_CANONICAL""_REPO"
+for agent in wolfpack-pointer-glm wolfpack-pointer; do
+  : > "$PODMAN_LOG"
+  out=$( cd "$SCRATCH/wt" && env "${RETIRED_VAR}=${SIB}" WOLFPACK_SANDBOX= bash "$SHIM" "$agent" "$GWT" "$SCRATCH/prompt.txt" 2>"$SCRATCH/err" ); rc=$?
+  check "$rc" 0 "(g) $agent with the retired canonical-repo env set → rc 0"
+  grep -qF -- "$SIB" <<<"$out" && no "(g) $agent: the sibling checkout was mounted" || ok "(g) $agent: a sibling wolfpack checkout is never mounted"
+  grep -qF -- "$OLD_DEFAULT" <<<"$out" && no "(g) $agent: the old default checkout was mounted" || ok "(g) $agent: nor the old default path"
+  vmount "$out" "${GCOMMON}:${GCOMMON}:ro,z" "(g) $agent: the git common dir ro mount is kept"
+done
+
+# (h) The image build chain (all images absent).
+# With a project layer: pack base (+ the four USER_* build args) tagged <sandbox>-pack-base:<tag>,
+# then the layer FROM it with the CONFIG's dir as context, then GLM FROM the sandbox image.
+mkdir -p "$SCRATCH/cfg-h/layer"; echo "FROM scratch" > "$SCRATCH/cfg-h/layer/Containerfile.fx"
+CFG_H=$(CFG_LAYER="\`layer/Containerfile.fx\`" mkcfg "$SCRATCH/cfg-h")
+out=$(WOLFPACK_CONFIG="$CFG_H" FAKE_ABSENT='.' pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt"); rc=$?
+check "$rc" 0 "(h) layered build chain → rc 0"
+check "$(grep -c '^build ' "$PODMAN_LOG")" 3 "(h) three builds: base, project layer, GLM"
+B1=$(buildline "-t fx-sandbox-pack-base:latest"); B2=$(buildline "-t fx-sandbox:latest"); B3=$(buildline "-t fx-sandbox-glm:latest")
+grep -qxF "build ${USER_ARGS} -t fx-sandbox-pack-base:latest -f ${PACK}/containers/Containerfile.wolfpack ${PACK}/containers" "$PODMAN_LOG" \
+  && ok "(h) base: the pack's containers/Containerfile.wolfpack + all four USER_* args, tagged fx-sandbox-pack-base:latest" || no "(h) base build line ($(grep '^build' "$PODMAN_LOG" | head -1))"
+grep -qxF "build --build-arg BASE_IMAGE=fx-sandbox-pack-base:latest -t fx-sandbox:latest -f $SCRATCH/cfg-h/layer/Containerfile.fx $SCRATCH/cfg-h" "$PODMAN_LOG" \
+  && ok "(h) layer: BASE_IMAGE=fx-sandbox-pack-base:latest, the layer resolved against the config dir, config dir as context" || no "(h) layer build line ($(grep '^build' "$PODMAN_LOG" | sed -n 2p))"
+grep -qxF "build --build-arg BASE_IMAGE=fx-sandbox:latest -t fx-sandbox-glm:latest -f ${PACK}/containers/Containerfile.wolfpack-glm ${PACK}/containers" "$PODMAN_LOG" \
+  && ok "(h) GLM: BASE_IMAGE=<the Sandbox image>, the pack's Containerfile.wolfpack-glm" || no "(h) GLM build line ($(grep '^build' "$PODMAN_LOG" | sed -n 3p))"
+[ -n "$B1" ] && [ -n "$B2" ] && [ -n "$B3" ] && [ "$B1" -lt "$B2" ] && [ "$B2" -lt "$B3" ] && ok "(h) order: base → layer → GLM" || no "(h) build order ($B1 $B2 $B3)"
+R=$(grep -n '^run ' "$PODMAN_LOG" | head -1 | cut -d: -f1)
+[ -n "$R" ] && [ "$R" -gt "${B3:-999}" ] && ok "(h) the run comes after every build" || no "(h) run before builds"
+grep -q "^run .* fx-sandbox-glm:latest bash -c" "$PODMAN_LOG" && ok "(h) the run uses the GLM image" || no "(h) run image"
+# Without a layer: the pack base IS the sandbox image (one build for a Mistral seat; no -pack-base tag).
+out=$(FAKE_ABSENT='.' pvrun wolfpack-pointer "$SCRATCH/wt" "$SCRATCH/prompt.txt"); rc=$?
+check "$rc" 0 "(h) no layer → rc 0"
+grep -qxF "build ${USER_ARGS} -t fx-sandbox:latest -f ${PACK}/containers/Containerfile.wolfpack ${PACK}/containers" "$PODMAN_LOG" \
+  && ok "(h) no layer: the pack base is built straight to the Sandbox tag" || no "(h) no-layer build ($(grep '^build' "$PODMAN_LOG"))"
+check "$(grep -c '^build ' "$PODMAN_LOG")" 1 "(h) no layer, Mistral seat: exactly one build"
+grep -q "pack-base" "$PODMAN_LOG" && no "(h) no layer: a -pack-base tag appeared" || ok "(h) no layer: no -pack-base tag"
+# Everything present → no build at all.
+out=$(pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt")
+check "$(grep -c '^build ' "$PODMAN_LOG")" 0 "(h) images present → nothing is built"
+# A registry-port image name splits at the LAST ':' (the tag), never the port.
+mkdir -p "$SCRATCH/cfg-h3/layer"; echo "FROM scratch" > "$SCRATCH/cfg-h3/layer/Containerfile.fx"
+CFG=$(CFG_SANDBOX="\`localhost:5000/fx/sb:v2\`" CFG_LAYER="\`layer/Containerfile.fx\`" mkcfg "$SCRATCH/cfg-h3")
+WOLFPACK_CONFIG="$CFG" FAKE_ABSENT='.' pvrun wolfpack-pointer "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 0 "(h) registry-port sandbox image → rc 0"
+grep -qF -- "-t localhost:5000/fx/sb-pack-base:v2 " "$PODMAN_LOG" && ok "(h) registry port: base tag localhost:5000/fx/sb-pack-base:v2" || no "(h) registry-port base tag ($(grep '^build' "$PODMAN_LOG" | head -1))"
+# WOLFPACK_GLM_IMAGE still overrides the configured GLM image.
+out=$(WOLFPACK_GLM_IMAGE=my-glm:dev FAKE_ABSENT='^my-glm' pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt"); rc=$?
+check "$rc" 0 "(h) WOLFPACK_GLM_IMAGE override → rc 0"
+grep -qxF "build --build-arg BASE_IMAGE=fx-sandbox:latest -t my-glm:dev -f ${PACK}/containers/Containerfile.wolfpack-glm ${PACK}/containers" "$PODMAN_LOG" \
+  && ok "(h) the override is built FROM the configured Sandbox image" || no "(h) override build ($(grep '^build' "$PODMAN_LOG"))"
+grep -q "^run .* my-glm:dev bash -c" "$PODMAN_LOG" && ok "(h) …and run" || no "(h) override run"
+# A configured layer that does not exist → exit 2 naming the key; no build, no run.
+CFG=$(CFG_LAYER="\`layer/absent.Containerfile\`" mkcfg "$SCRATCH/cfg-h2")
+WOLFPACK_CONFIG="$CFG" FAKE_ABSENT='.' pvrun wolfpack-pointer "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(h) a missing project layer file → exit 2"
+err_has "Sandbox project layer" "(h) …naming the key"
+grep -qE '^(build|run) ' "$PODMAN_LOG" && no "(h) missing layer: podman build/run happened" || ok "(h) missing layer: no build, no run"
+# A failing build stops loud (exit 2), never runs a container.
+WOLFPACK_CONFIG="$CFG_H" FAKE_ABSENT='.' FAKE_BUILD_RC=1 pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(h) a failing podman build → exit 2"
+err_has "podman build of the pack base image fx-sandbox-pack-base:latest failed" "(h) …naming the failed build"
+grep -q '^run ' "$PODMAN_LOG" && no "(h) a container ran after a failed build" || ok "(h) …and no container runs"
+
+# (i) The dispatch log line names the worktree, the shim dir, the config and the image.
+out=$(pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt")
+grep -qxF "wolfpack: podman-vibe wolfpack-pointer-glm family=glm mode=review worktree=$SCRATCH/wt shim=$HERE config=$WOLFPACK_CONFIG image=fx-sandbox-glm:latest" "$SCRATCH/err" \
+  && ok "(i) log line: worktree, shim dir, config path, image" || no "(i) log line ($(grep 'podman-vibe ' "$SCRATCH/err"))"
+out=$(pvrun --implement wolfpack-shepherd-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt")
+grep -qF "family=glm mode=implement worktree=$SCRATCH/wt" "$SCRATCH/err" && ok "(i) …mode=implement on --implement" || no "(i) implement log line"
+
+# (j) WOLFPACK_SANDBOX=1 never needs a config, a node or an agents dir.
+HOME2="$SCRATCH/home2"; mkdir -p "$HOME2/.vibe"; touch "$HOME2/.vibe/.env" "$HOME2/.vibe/config.toml"   # Vibe's own files, but NO agents-headless
+: > "$PODMAN_LOG"
+out=$( cd "$SCRATCH/wt" && env -u WOLFPACK_CONFIG HOME="$HOME2" WOLFPACK_SANDBOX=1 bash "$SHIM" wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" 2>"$SCRATCH/err" ); rc=$?
+check "$rc" 0 "(j) sandbox mode, no config, no agents dir → rc 0"
+has "$out" "--auto-approve" "(j) …and Vibe is invoked directly"
+no_podman "(j) …podman is never called"
+# …while on the podman path a configured Vibe agent dir that does not exist → exit 2, no podman.
+CFG=$(CFG_AGENTS="\`$SCRATCH/no-agents\`" mkcfg "$SCRATCH/cfg-j")
+WOLFPACK_CONFIG="$CFG" pvrun wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null; rc=$?
+check "$rc" 2 "(j) podman path: a missing Vibe agent dir → exit 2"
+err_has "the configured Vibe agent dir does not exist: $SCRATCH/no-agents (wolfpack-config.md → Execution Layer → Vibe agent dir)" "(j) …naming the key and the path"
+no_podman "(j) …no podman call"
+# …and the podman path without node on PATH stops loud (it cannot read the config).
+NONODE="$SCRATCH/nonode"; mkdir -p "$NONODE"
+for d in /usr/local/bin /usr/bin /bin; do
+  [ -d "$d" ] || continue
+  for f in "$d"/*; do b=${f##*/}; [ "$b" = node ] && continue; [ -e "$NONODE/$b" ] || ln -s "$f" "$NONODE/$b" 2>/dev/null; done
+done
+: > "$PODMAN_LOG"
+( cd "$SCRATCH/wt" && PATH="$SCRATCH/bin:$NONODE" WOLFPACK_SANDBOX= bash "$SHIM" wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt" >/dev/null 2>"$SCRATCH/err" ); rc=$?
+check "$rc" 2 "(j) podman path without node → exit 2"
+err_has "needs node to read wolfpack-config.md" "(j) …saying node is needed"
+no_podman "(j) …no podman call"
+
+# ─── shims stay executable (hunt-pipeline runs "$WOLFPACK_HOME/scripts/podman-vibe.sh" directly;
+#     /run-hunt and /run-campaign `exec "$PACK/scripts/run-pipeline-sandbox.sh"`) ───
 REPO_TOP=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null)
 if [ -n "$REPO_TOP" ]; then
   for f in scripts/podman-vibe.sh scripts/run-pipeline-sandbox.sh scripts/wolfpack-usage; do

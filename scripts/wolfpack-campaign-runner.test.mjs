@@ -35,7 +35,8 @@ const DEGRADED = { decision: 'proceed', exitCode: 0, source: 'transcript_estimat
 // The default answer is a generic consumer WITH a deploy step; a scenario overrides it.
 const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/test-all.sh', worktreeLinks: [],
   complianceAreas: null, compliancePaths: [], devDeployCommand: 'deploy-x', changelogFile: 'CHANGELOG.md',
-  tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [] }
+  tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [],
+  wolfpackHome: '/pack' }   // exec-layer-into-pack: Project Identity → Wolfpack home
 const configAnswer = (cfg = FIXTURE_CONFIG) => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2) })
 
 const hunt = (slug, extra = {}) => ({ slug, description: `do ${slug}`, tier: 'Yellow', mode: 'feature', dependsOn: [], status: 'ready_for_alpha', ...extra })
@@ -43,7 +44,7 @@ const tick = () => new Promise(r => setImmediate(r))
 
 async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usageProtocol = 1, workflowDelayTicks = 3,
   capability, gatePresent = true, gateProtocol = 1, depCheck = { allMerged: true }, workflowResult = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY' }),
-  projectConfig = () => configAnswer() } = {}) {
+  projectConfig = () => configAnswer(), env = {} } = {}) {
   const events = []
   const logs = []
   const gateCalls = []
@@ -84,7 +85,7 @@ async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usagePr
   let result, error
   try {
     result = await fn({ campaign: 'c', maxParallel }, agent, async (f) => Promise.all(f.map(x => x())),
-      (m) => logs.push(String(m)), () => {}, { total: 0, remaining: () => 1e12 }, { env: {} }, workflow)
+      (m) => logs.push(String(m)), () => {}, { total: 0, remaining: () => 1e12 }, { env }, workflow)
   } catch (e) { error = e }
   events.push({ type: 'return' })
   return { result, error, events, logs, gateCalls, workflowCalls }
@@ -1010,4 +1011,54 @@ test('AC10 (c): devDeployCommand "deploy-x" → the release queue shows `2. depl
   assert.match(rel[3], /^ {2}3\. \/smoke-wave \S+ 1 /)
   assert.ok(logs.some(l => /redeploy, re-smoke that hunt only/.test(l)))
   assert.equal(logs.some(l => /deploy-dev/.test(l)), false, 'no hard-coded consumer deploy function')
+})
+
+// ─── exec-layer-into-pack: the runner resolves WOLFPACK_HOME before any hunt (AC3) ─────────
+test('AC3 (a): env WOLFPACK_HOME wins over the key — logged with its source; nothing is passed to the hunts', async () => {
+  const { error, logs, workflowCalls } = await runRunner({ hunts: [hunt('a')], env: { WOLFPACK_HOME: '/envpack/' } })
+  assert.equal(error, undefined, error && error.stack)
+  assert.ok(logs.includes('Pack home (WOLFPACK_HOME): /envpack — from env WOLFPACK_HOME'), logs.join('\n'))
+  assert.equal(workflowCalls.length, 1)
+  assert.equal(JSON.stringify(workflowCalls[0].args).includes('envpack'), false, 'each hunt resolves for itself')
+  assert.equal('wolfpackHome' in workflowCalls[0].args, false)
+})
+
+test('AC3 (b): env unset or blank → the config key is used', async () => {
+  for (const env of [{}, { WOLFPACK_HOME: '' }, { WOLFPACK_HOME: ' ' }]) {
+    const { error, logs, workflowCalls } = await runRunner({ hunts: [hunt('a')], env })
+    assert.equal(error, undefined, error && error.stack)
+    assert.ok(logs.includes('Pack home (WOLFPACK_HOME): /pack — from wolfpack-config.md → Project Identity → Wolfpack home'), logs.join('\n'))
+    assert.equal(workflowCalls.length, 1)
+  }
+})
+
+test('AC3 (c): neither env nor key → throws naming WOLFPACK_HOME and the key, BEFORE any hunt is gated, parsed or launched', async () => {
+  for (const cfg of [{ ...FIXTURE_CONFIG, wolfpackHome: null }, (({ wolfpackHome, ...rest }) => rest)(FIXTURE_CONFIG)]) {
+    const { error, events, workflowCalls, gateCalls } = await runRunner({ hunts: [hunt('a')], env: {}, projectConfig: () => configAnswer(cfg) })
+    assert.ok(error, 'throws')
+    assert.match(error.message, /^campaign-runner: WOLFPACK_HOME is not set and wolfpack-config\.md has no Wolfpack home — the pack's execution shims are never looked up in the consuming repo\. Fix: export WOLFPACK_HOME=/)
+    assert.match(error.message, /"- \*\*Wolfpack home:\*\* `<path>`" under ## Project Identity in wolfpack-config\.md/)
+    assert.equal(workflowCalls.length, 0)
+    assert.equal(gateCalls.length, 0)
+    const agents = events.filter(e => e.type === 'agent').map(e => e.label)
+    assert.deepEqual(agents.slice(agents.indexOf('project-config') + 1), [], `nothing after the config probe (${agents})`)
+  }
+  // a relative value is refused too
+  const rel = await runRunner({ hunts: [hunt('a')], env: { WOLFPACK_HOME: 'pack' } })
+  assert.match(rel.error && rel.error.message, /campaign-runner: env WOLFPACK_HOME is not an absolute path \('pack'\)/)
+  assert.equal(rel.workflowCalls.length, 0)
+})
+
+test('AC3 parity: resolveWolfpackHome is identical in both workflows apart from the env accessor', () => {
+  const pipeline = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8')
+  const body = (src) => {
+    const m = /const resolveWolfpackHome = \(who\) => \{\n[\s\S]*?\n\}\n/.exec(src)
+    assert.ok(m, 'resolveWolfpackHome found')
+    return m[0]
+  }
+  const a = body(RUNNER).replace(/_envRunner\(/g, 'ENV(')
+  const b = body(pipeline).replace(/_env\(/g, 'ENV(')
+  assert.equal(a, b)
+  assert.match(a, /ENV\('WOLFPACK_HOME'\)/)
+  assert.doesNotMatch(RUNNER, /repoRoot\}?\/scripts\/(podman-vibe|run-pipeline-sandbox)\.sh/, 'AC4 grep (runner)')
 })
