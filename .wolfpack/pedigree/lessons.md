@@ -2,7 +2,7 @@
 
 Aggregated patterns from the last 1 hunts (window: 10).
 Updated by `scripts/wolfpack-lessons.sh`, called at end of every Watchdog cert.
-Last regenerated: 2026-10-20T06:25:32Z
+Last regenerated: 2026-10-20T08:22:51Z
 
 ## Patterns That Work (count >= 3)
 
@@ -23,7 +23,7 @@ _(none yet)_
 - Average sub-agents per hunt: 0
 - Average redundancy rate: 0%
 - Hunts where parallelism was high-value: _(none yet)_
-- Hunts where parallelism was low-value or none: pack-commands-canonical
+- Hunts where parallelism was low-value or none: scripts-unfork
 
 ## Recommendations for Next Plan
 
@@ -34,4 +34,4 @@ _(none yet — keep tagging hunts and patterns will emerge)_
 ---
 
 _Vocabulary defined in `.agents/skills/watchdog/SKILL.md`. To re-tune thresholds:_
-_`WOLFPACK_LESSONS_WINDOW=20 WOLFPACK_MIN_RECURRING=3 ./scripts/wolfpack-lessons.sh`_
+_`WOLFPACK_LESSONS_WINDOW=20 WOLFPACK_MIN_RECURRING=3 "$WOLFPACK_HOME/scripts/wolfpack-lessons.sh"`_
