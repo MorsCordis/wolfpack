@@ -1271,6 +1271,10 @@ HANDOFF SIGNAL: a Vibe shim run with --out-dir delivers its artifact ITSELF. Exi
 the file is in the plan dir, byte-identical to what the seat wrote — NEVER write, rewrite,
 prepend to or re-create it from stdout. Exit 78 or any "WOLFPACK_ARTIFACT_ERROR:" line means the
 seat broke its write contract (missing artifact, extra file, source touched): that link FAILED.
+A failed link can still have delivered a file (a two-file delivery whose second move fails,
+or a "move-failed <name>" whose file landed): move every file named by a DELIVERED or
+"move-failed" line of that link aside per the step's REJECTED delivered link rule (above) BEFORE the
+next link, so no artifact of a failed link stays in the plan dir.
 Print "WOLFPACK_HANDOFF_VIOLATION: <role> r<round> <provider> <the ARTIFACT_ERROR lines>",
 append {role, round, provider, link, errors: [<lines>]} to metadata.json's
 "handoff_violations" array (create it if absent; preserve every other field), log the
@@ -1399,7 +1403,7 @@ const logSeatArtifacts = (role, n, result) => {
   const arts = (result && Array.isArray(result.artifacts)) ? result.artifacts.filter(a => a && a.file) : []
   log(`✓ ${slug}: ${role} r${n || 0} artifacts delivered by the shim: ${arts.length
     ? arts.map(a => `${a.file} ${String(a.sha256 || '?').slice(0, 12)}`).join(', ')
-    : '(claude link wrote them)'}`)
+    : (result && result.provider === 'claude' ? '(claude link wrote them)' : '(artifacts not reported by the shim agent)')}`)
 }
 
 // usage-limit-gate (AC6): metadata step for the Claude FINAL review round (usage offload on a
@@ -2523,7 +2527,9 @@ ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound', handoff)}
 5. THE ARTIFACT. Vibe link: the shim delivered ${planDir}/${rawFile} itself (HANDOFF SIGNAL) —
    do not write or modify it. claude link: save your review to ${planDir}/${rawFile}. (The
    SANDBOXED SEAT HANDOFF note in the review prompt applies only to Vibe links.)
-   REJECTED delivered link (exit 0 but step 6/7 fails it): before the next link run exactly
+   REJECTED delivered link (exit 0 but step 6/7 fails it, OR a FAILED handoff — exit 78 / any
+   WOLFPACK_ARTIFACT_ERROR line — whose .err names ${rawFile} in a WOLFPACK_ARTIFACT_DELIVERED or
+   "move-failed" line and the file exists): before the next link run exactly
      mkdir -p ${planDir}/seat-notes && mv -f ${planDir}/${rawFile} ${planDir}/seat-notes/${rawFile}.rejected-l<N>
 6. EXTRACT THE VERDICT from ${planDir}/${rawFile} (the delivered artifact) for a Vibe link, or
    from your own review for the claude link — strict extract-and-validate, NO prose-rescue. The
@@ -3119,7 +3125,9 @@ ${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChai
 5. THE ARTIFACT. Vibe link: the shim delivered ${planDir}/${rawFile} itself (HANDOFF SIGNAL) —
    do not write or modify it. claude link: save your review to ${planDir}/${rawFile}. (The
    SANDBOXED SEAT HANDOFF note in the review prompt applies only to Vibe links.)
-   REJECTED delivered link (exit 0 but step 6/7 fails it): before the next link run exactly
+   REJECTED delivered link (exit 0 but step 6/7 fails it, OR a FAILED handoff — exit 78 / any
+   WOLFPACK_ARTIFACT_ERROR line — whose .err names ${rawFile} in a WOLFPACK_ARTIFACT_DELIVERED or
+   "move-failed" line and the file exists): before the next link run exactly
      mkdir -p ${planDir}/seat-notes && mv -f ${planDir}/${rawFile} ${planDir}/seat-notes/${rawFile}.rejected-l<N>
 6. EXTRACT THE VERDICT from ${planDir}/${rawFile} (the delivered artifact) for a Vibe link, or
    from your own review for the claude link — strict extract-and-validate, NO prose-rescue. The
@@ -3649,8 +3657,12 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
    - Else if stdout has a <verdict> block, parse it
    - Else if stdout has a "## Status: <VERDICT>" line or a clear PASS / REWORK / FLAWED_PLAN statement, use that
    - If none of these are present, that link failed — go to step 5
-   REJECTED delivered link (exit 0 but this step or 4.5 fails it): before the next link run exactly
-     mkdir -p ${planDir}/seat-notes && mv -f ${planDir}/certification.md ${planDir}/seat-notes/certification.md.rejected-l<N> && mv -f ${planDir}/pedigree.json ${planDir}/seat-notes/pedigree.json.rejected-l<N>
+   REJECTED delivered link (exit 0 but this step or 4.5 fails it, OR a FAILED handoff — exit 78 /
+   any WOLFPACK_ARTIFACT_ERROR line — after a partial delivery: the .err has a
+   WOLFPACK_ARTIFACT_DELIVERED or "move-failed" line): before the next link, move EVERY one of
+   the two files that exists in ${planDir} aside, so no artifact of a failed link survives
+   there (step 4's file-first read and the resume probe would take it as this round's verdict):
+     mkdir -p ${planDir}/seat-notes; for f in certification.md pedigree.json; do [ ! -e ${planDir}/$f ] || mv -f ${planDir}/$f ${planDir}/seat-notes/$f.rejected-l<N>; done
 
 4a. ${toolDenialCheck(`/tmp/watchdog-${slug}-l<N>, N = that link's number in step 3`)}
 
