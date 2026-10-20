@@ -2,7 +2,7 @@
 // scripts/pack-docs.test.mjs — the pack's own design docs (docs/autonomy/ + docs/user-guide.md):
 // the eight autonomy files exist (AC1), no frontmatter project tag and 01/02 defer compliance to
 // wolfpack-config.md (AC3), the retired doc-set path is gone from tracked files (AC4), every
-// docs/autonomy/ citation resolves — directly or by numeric prefix (AC5), any docs/wolfpack.md
+// docs/autonomy/ citation resolves — directly or by numeric prefix (AC5), any retired consumer-guide
 // citation names a real file (AC6), and README/SETUP link the docs.
 // The name sits OUTSIDE scripts/wolfpack-* on purpose (AC7's pathspec). Old/fake paths are
 // assembled at runtime so the real-repo scans never match this file's own text.
@@ -19,6 +19,7 @@ import { spawnSync } from 'node:child_process'
 const here = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(here, '..')
 const AUTO = 'docs/' + 'autonomy'
+const RETIRED_GUIDE = 'docs/wolf' + 'pack.md'
 const OLD = 'wolfpack-' + 'autonomy'
 const AUTO_FILES = [
   'README.md',
@@ -97,8 +98,8 @@ test('AC5 negative: the resolver flags a dangling numeric citation and a bare RE
   }
 })
 
-test('AC6: any docs/wolfpack.md citation in tracked files names an existing file', () => {
-  const r = gitIn(ROOT, 'grep', '-ohE', 'docs/wolfpack\\.md')
+test('AC6: any retired consumer-guide citation in tracked files names an existing file', () => {
+  const r = gitIn(ROOT, 'grep', '-ohE', RETIRED_GUIDE.replace('.', '\\.'))
   assert.ok(r.status === 0 || r.status === 1)
   for (const p of new Set(r.stdout.split('\n').filter(Boolean))) {
     assert.ok(existsSync(join(ROOT, p)), `dangling ${p}`)
