@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Byte-identical copy of the pack's scripts/wolfpack-config.mjs — retired by pack-install-model / scripts-unfork.
+// Byte-identical copy of the pack's scripts/wolfpack-config.mjs — retired by scripts-unfork.
 //
 // scripts/wolfpack-config.mjs — the ONE deterministic reader of a consuming project's
 // wolfpack-config.md. The router CLI, both workflows (through a one-command probe
@@ -34,6 +34,9 @@
 //                    the home dir; a present, non-NONE, non-absolute value is a problem.
 //                    The WOLFPACK_HOME env var overrides it (the workflows + pack-home resolve
 //                    env → this key → fail loud; never the consuming repo).
+//   worktreeRoot     Project Identity → Worktree root (code)     optional; null when absent; the
+//                    workflows require it. Repo-relative (e.g. `.agents/worktrees`), trailing `/`
+//                    stripped; a malformed value is a problem (see validWorktreeRoot).
 //   exec             ## Execution Layer (see execLayer below) — the execution-layer keys the
 //                    seat shim / sandbox launcher need. NOT part of the top-level `missing`
 //                    (a project with no Vibe seats needs none of them): exec.missing lists the
@@ -271,6 +274,17 @@ export function execLayer(body, configDir = process.cwd()) {
   return { ...out, missing, problems }
 }
 
+// A repo-relative directory for hunt worktrees: non-empty, not absolute, no leading `~`, every
+// `/`-segment an optional leading dot + [A-Za-z0-9_] + [A-Za-z0-9_.-]* (so `.agents`, `.claude`,
+// `.wt` pass; `.`, `..`, `..x`, empty, whitespace, quotes, `$`, `*`, backticks fail), and a first
+// segment other than `.git`. The workflows' requireWorktreeRoot inlines this identical rule.
+export function validWorktreeRoot(p) {
+  if (typeof p !== 'string' || p === '' || p.startsWith('/') || p.startsWith('~')) return false
+  const segs = p.split('/')
+  if (segs[0] === '.git') return false
+  return segs.every((seg) => /^\.?[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(seg))
+}
+
 export function readConfig(text, { configDir = process.cwd() } = {}) {
   const secs = parseSections(text)
   const byKey = {}
@@ -309,6 +323,16 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
       wolfpackHome = null
     }
   }
+  // pack-install-model: where hunt worktrees live, repo-relative (e.g. `.agents/worktrees`).
+  // Absent/none → null (the workflows fail loud); malformed → a problem.
+  let worktreeRoot = optionalCode('Project Identity', 'Worktree root')
+  if (worktreeRoot !== null) {
+    worktreeRoot = worktreeRoot.trim().replace(/\/+$/, '')
+    if (!validWorktreeRoot(worktreeRoot)) {
+      problems.push('Project Identity → Worktree root must be a repo-relative path like `.agents/worktrees` (no leading / or ~, no . or .. segments, no spaces or shell characters)')
+      worktreeRoot = null
+    }
+  }
   const exec = execLayer(sec('Execution Layer'), configDir)
   if (sec('Execution Layer') !== undefined) problems.push(...exec.problems)
 
@@ -323,6 +347,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     tagPattern: optionalCode('Deployment Notes', 'Tag pattern'),
     backlogFile: optionalCode('Deployment Notes', 'Backlog file'),
     wolfpackHome,
+    worktreeRoot,
     exec,
     pool,
     models,
@@ -354,6 +379,7 @@ function summary(cfg) {
     `testCommand: ${cfg.testCommand ?? '(missing)'}`,
     `devDeployCommand: ${cfg.devDeployCommand ?? 'none'}`,
     `wolfpackHome: ${cfg.wolfpackHome ?? 'none'}`,
+    `worktreeRoot: ${cfg.worktreeRoot ?? 'none'}`,
     cfg.exec && cfg.exec.missing.length
       ? `exec: missing ${cfg.exec.missing.join(', ')}`
       : `exec: sandbox ${cfg.exec?.sandboxImage} · glm ${cfg.exec?.glmImage} · layer ${cfg.exec?.projectLayer ?? 'none'}`,

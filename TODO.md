@@ -21,12 +21,7 @@ keep their original filing dates.
 
 - [ ] **Track the Vibe seat system prompts in the pack** — `~/.vibe/prompts/wolfpack-{bloodhound,pointer,watchdog}.md` are untracked, still say "You are read-only" and name stale output files (`bloodhound-review-N.md`, `watchdog-certification.md`); seat-handoff-writes overrides them from the pipeline prompt. Move them into `vibe-agents/prompts/` and install them with the seat profiles (installer work).
 
-- [ ] **Role prompts name a skill path consumers don't have** (Low, 2026-10-17; from prespec-sweep AC10):
-  `hunt-pipeline.js` tells each headless role to "read `.agents/skills/<role>/SKILL.md`". The runtime sync
-  rewrites that to `.claude/skills/<role>/SKILL.md`, and that path is absent in a consumer that loads the
-  Wolfpack skills user-level (`~/.claude/skills` → this repo's `.agents/skills`). Agents fall back to the
-  user-level skill, but each phase starts with a dead read. **Fix:** name the skill ("the `spec` skill") or
-  `~/.claude/skills/<role>/SKILL.md` in the prompts, then re-sync consumers.
+- [ ] **Container seats can't read the pack's role skills in a non-pack consumer** (Low, 2026-10-19; from pack-install-model): host-side seats now read `$WOLFPACK_HOME/.agents/skills`, but a Vibe seat container sees only the worktree. Fix: a read-only pack-skills mount in `scripts/podman-vibe.sh` (after seat-handoff-writes settles the mount code), then point the container prompts at it.
 
 - [ ] **Heartbeat: write to an absolute mount path so the host can observe post-Scaffold phases**
   (Low, 2026-05-29; from a consumer): the per-hunt heartbeat in `hunt-pipeline.js` writes a *relative*
@@ -49,9 +44,8 @@ keep their original filing dates.
   input and re-triggers upstream) **STILL OPEN** → build as a focused follow-up.
   Deferral LIFTED: it was a sequencing wait for the other session's in-flight hunt, not a benchmark
   gate. Applies to `hunt-pipeline.js` (1+2 done) AND the DevDen Python orchestrator (pending).
-  NOTE: a consumer's runtime copy is now GENERATED from canonical via
-  `scripts/wolfpack-sync-runtime.sh` (deterministic `.agents`→`.claude` path transform) — this
-  ends the hand-sync drift (~47 line-groups) between canonical and a consumer's runtime copy.
+  NOTE: a consumer's runtime copy is GENERATED and stamped by `install.sh` (run-start checked) —
+  this ends the hand-sync drift (~47 line-groups) between canonical and a consumer's runtime copy.
 
 - [ ] **Make router output BINDING, not advisory — close the model-attribution gap**
   (Medium, 2026-06-11; from a consumer): `scripts/wolfpack-routing.mjs` assigns roles per tier/pedigree,

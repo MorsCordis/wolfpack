@@ -4,8 +4,9 @@
 #
 # Usage: bash scripts/wolfpack-leak-grep.sh [<repo-root>]   (default: this script's repo)
 #
-# Campaign pattern: pawpims\.(dev|vet)|pawprints-|/home/[a-z]+|logcabincoding   # leak-grep:allow
-# plus case-insensitive bare pawpims (which subsumes the dev/vet domains). Scanned with   # leak-grep:allow
+# Campaign pattern: the first consuming project's name (assembled at runtime below, so this
+# script never spells it) | pawprints- | /home/[a-z]+ | logcabincoding   # leak-grep:allow
+# — the bare, case-insensitive name subsumes its dev/vet domains. Scanned with
 # grep -IiE, so binaries are skipped; symlinks (mode 120000) are skipped too.
 #
 # Allow-list: scripts/wolfpack-leak-allowlist.txt — `#` comments and blank lines ignored;
@@ -17,7 +18,8 @@
 # Exit: 0 clean · 1 leak(s) or stale allow-list entry · 2 not a git repo / malformed allow-list.
 set -uo pipefail
 
-PATTERN='pawpims|pawprints-|/home/[a-z]+|logcabincoding'   # leak-grep:allow
+NAME='paw'; NAME+='pims'   # the first consuming project's name, assembled so no tracked script spells it
+PATTERN="${NAME}|pawprints-|/home/[a-z]+|logcabincoding"   # leak-grep:allow
 MARKER='leak-grep:allow'
 
 if [ "$#" -gt 1 ]; then

@@ -24,3 +24,9 @@ Thumbs.db
 # Claude Code's synced skills store — the HARNESS owns it (~/.claude/skills symlinks to
 # this repo's .agents/skills, so synced anthropic-skills land here). Never delete or track it.
 .agents/skills/synced/
+
+# Wolfpack — generated workflow copies are never tracked, in any repo (install.sh writes them and
+# the run start refuses a stale one). In the pack itself .claude/workflows is the tracked link to
+# the canonical .agents/workflows, so nothing is generated here; the lines keep the rule identical.
+.claude/workflows/hunt-pipeline.js
+.claude/workflows/campaign-runner.js

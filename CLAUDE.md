@@ -11,3 +11,4 @@ Everything tracked here is world-readable. For pipeline runs, `wolfpack-config.m
 6. Fail loud: a missing config key, shim, script or seat is a visible error or park, never a silent default or a Claude substitution.
 
 Tests: `bash scripts/test-all.sh` (every node and shell test plus the leak grep).
+Install/upgrade: `bash install.sh` (`--check` is read-only).

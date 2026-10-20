@@ -1,5 +1,5 @@
 export const meta = {
-// Wolfpack campaign runner — the canonical, durable orchestrator. Consuming projects run a GENERATED copy (scripts/wolfpack-sync-runtime.sh <target>); wolfpack itself runs this file via .claude/workflows. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here.
+// Wolfpack campaign runner — the canonical, durable orchestrator. Consuming projects run a GENERATED, stamped copy (`bash <pack>/install.sh --consumer <repo>`), checked at run start; wolfpack itself runs this file via its .claude/workflows link. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here.
   name: 'campaign-runner',
   description: 'Run all hunts in a Wolfpack campaign wave by wave',
   phases: [
@@ -7,6 +7,10 @@ export const meta = {
     { title: 'Execute', detail: 'Run hunts wave by wave with parallel tracks' },
   ],
 }
+// pack-install-model: THIS script's own stamp. The canonical carries the null form; the pack's
+// generator (scripts/wolfpack-workflows.mjs, run by install.sh) replaces exactly this one line in
+// a consumer's copy with {workflow, commit, version, source}. Keep it unique and on one line.
+const WOLFPACK_STAMP = null // wolfpack-stamp — generated copies carry {workflow, commit, version, source}; see scripts/wolfpack-workflows.mjs
 
 const CAMPAIGN_SCHEMA = {
   type: 'object',
@@ -227,7 +231,7 @@ Never invent a proceed/defer.
   const out = legacyGate ? {
     decision: g.decision, reason: g.reason || '', reset_at: g.reset_at ?? null,
     source: 'legacy_gate', degraded: true,
-    degraded_reason: 'STALE gate script (pre-usage-limit-gate, no WOLFPACK_GATE_PROTOCOL) — transcript estimate only; re-run wolfpack-sync-runtime.sh',
+    degraded_reason: `STALE gate script (pre-usage-limit-gate, no WOLFPACK_GATE_PROTOCOL) — transcript estimate only; update the project's scripts/wolfpack-window-gate.mjs from the pack (${wolfpackHome.home}/scripts/)`,
     offload: false, offload_reason: null, five_hour_pct: null, seven_day_pct: null, weekly_pace: null,
   } : {
     decision: g.decision, reason: g.reason || '', reset_at: g.reset_at ?? null,
@@ -274,144 +278,10 @@ const usagePausedReturn = (pause, waveResults, deferred, waveNumber) => {
 phase('Parse')
 log(`Parsing campaign: ${campaignSlug}`)
 
-const campaign = await agent(`
-Read the campaign file at .wolfpack/campaigns/${campaignSlug}/campaign.md.
-Also read .wolfpack/campaigns/${campaignSlug}/metadata.json.
-
-Extract the wave structure from the "## Proposed Hunts" section and the "### Wave diagram" section.
-
-For each hunt, extract ALL of these fields — Alpha needs them for scoping:
-- slug (from the ### N. <slug> heading)
-- description (from the Trigger line, inside the quotes after the slug — this is the FULL description, not a summary)
-- tier (from the Tier field — Alpha MUST respect this, not downgrade)
-- mode (from the Mode field — update or feature)
-- blocked (true if Wave is "BLOCKED")
-- dependsOn (array of slugs from the "Depends on" field; empty array if None)
-- ticketRefs (from "Ticket refs" field — e.g. "[dev #26 Urgent, #61 Urgent]")
-- todoItemsCleared (from "TODO items cleared" field — what gets removed from TODO.md)
-- migrationRisk (from "Migration risk" field — none, additive, or destructive)
-- rationale (from "Rationale" field — why this hunt is scoped/bundled this way)
-
-Group hunts by their Wave number.
-
-Also read each hunt's CURRENT status so the runner can skip work that's already done. The
-status field is the AUTHORITATIVE on-disk log — return it VERBATIM, do NOT re-derive or
-normalize it:
-- Read the hunt's metadata.json — the worktree copy
-  .agents/worktrees/<slug>/.wolfpack/plans/<slug>/metadata.json FIRST if it exists (it's the
-  live one during a run), else the main-repo copy .wolfpack/plans/<slug>/metadata.json — and
-  return its \`status\` as-is. Meanings:
-  - "merged" — stamped by /merge + /merge-wave at copy-back; the hunt shipped.
-  - "certified" / "certified_not_merged" — Watchdog PASS, NOT yet merged (await /merge-wave).
-  - "needs_spec" or "parked:<reason>" (parked:open_critical, parked:compliance_review,
-    parked:non_convergence, parked:model_quota, …) — await a human via /resolve (except
-    parked:model_quota, which auto-resumes). Pass through verbatim; do NOT drop them.
-  - CHAIN MODE statuses (pass through verbatim, never normalize): "merged_to_campaign",
-    "merged_to_campaign_pending_compliance" (merged into the campaign branch, awaiting the
-    campaign release), "certified_pending_compliance", "certified_held_overlap" (certified,
-    not yet merged into the campaign branch), "parked:campaign_merge_conflict",
-    "parked:reverted_from_campaign", "reverted_with_dependency".
-  - anything else (ready_for_alpha, reviewing, reviewed, implementing, …) — mid-pipeline, resumable.
-- LEGACY FALLBACK ONLY: if an OLD hunt's status is still "certified" but feat/<slug> is gone AND
-  its merge commit is on main, you MAY return "merged". New hunts are stamped "merged" directly,
-  so this git inference should not normally be needed.
-
-Chain-mode fields — ALWAYS return them for every hunt (barrier campaigns too):
-- migrationApps (ALWAYS return it; from the "Migration app(s)" field — a JSON-ish list like ["app_a"]; [] if absent or "[]")
-- revertedBecause: metadata.reverted_because if set, else null;  heldOn: slugs in metadata.held_on, else []
-- baseBranch: metadata.base_branch if a non-empty string, else ""
-Top level (ALWAYS return both): chainMode = true iff .wolfpack/campaigns/${campaignSlug}/metadata.json has chain.mode === "chain",
-else false; chainBranch = chain.branch whenever the metadata has a chain block with a non-empty branch, WHATEVER chain.mode reads (else "").
-
-Return the structured wave data. Exclude BLOCKED hunts. Include done, certified, and
-parked/needs_spec hunts with their verbatim status.
-`, { label: 'parse-campaign', phase: 'Parse', schema: CAMPAIGN_SCHEMA })
-
-log(`Campaign parsed: ${campaign.waves.length} waves, ${campaign.waves.reduce((n, w) => n + w.hunts.length, 0)} hunts`)
-
-// ─── Preflight: runtime hunt-pipeline supports the hinted examiner families ────
-// The runtime hunt-pipeline.js in a consuming project is a GENERATED, often gitignored
-// copy (scripts/wolfpack-sync-runtime.sh). A stale copy predates the examiner chain: it
-// would silently misread a "glm" hint (as mistral, or drop it). The preflight now runs
-// UNCONDITIONALLY — there is no "gemini-only, nothing to check" case any more, so the old
-// `some(f => f !== 'gemini')` wrapper was trivially true and therefore meaningless.
-//
-// FLOOR vs LATEST (AC25). REQUIRED is the FLOOR: below it the runtime cannot honor an
-// examiner-chain hint at all, so we throw. LATEST is what the current canonical
-// hunt-pipeline emits; at-or-above the floor but below LATEST we WARN and CONTINUE, because
-// this file is tracked and merges with the hunt while the consumer's hunt-pipeline.js stays
-// gitignored and un-regenerated until the operator runs wolfpack-sync-runtime.sh. Throwing
-// there would abort every campaign launch AND every cron auto-resume at the Parse phase for
-// the whole merge→sync window — converting a known, temporary, documented drift into an
-// outage. The degrade is bounded and LOUD: an old protocol-2 pipeline honors a glm hint and
-// falls back to its own gemini-first chain otherwise.
-const REQUIRED_EXAMINER_PROTOCOL = 2   // FLOOR: understands the examiner chain / crossExaminer hint at all
-const LATEST_EXAMINER_PROTOCOL   = 3   // what the current canonical hunt-pipeline emits
-let chainCapability = null   // the probe result, read by the chain-mode checks below
-{
-  const cap = await agent(`
-READ-ONLY check — modify nothing. From the current repo root, pick the runtime workflow file:
-.claude/workflows/hunt-pipeline.js if it exists, else .agents/workflows/hunt-pipeline.js.
-Run: grep -o 'WOLFPACK_EXAMINER_PROTOCOL=[0-9]*' <that file> | head -1
-Also run: grep -o 'WOLFPACK_USAGE_PROTOCOL=[0-9]*' <that file> | head -1
-Then, for the usage gate script, run: test -f scripts/wolfpack-window-gate.mjs && echo present
-and: grep -o 'WOLFPACK_GATE_PROTOCOL=[0-9]*' scripts/wolfpack-window-gate.mjs | head -1
-Chain mode: grep -o 'WOLFPACK_CHAIN_PROTOCOL=[0-9]*' <the runtime workflow file> | head -1
-and: test -f scripts/wolfpack-chain.mjs && echo present
-Return path (the file you checked, or "" if neither exists), protocol (the integer after
-the first marker's "=", or 0 if the marker is absent / the file is missing),
-usageProtocol (the integer after the second marker's "=", or 0 if absent), gatePresent
-(true only if scripts/wolfpack-window-gate.mjs exists) and gateProtocol (the integer after
-the WOLFPACK_GATE_PROTOCOL marker's "=", or 0 if absent / the file is missing),
-chainProtocol (the integer after the WOLFPACK_CHAIN_PROTOCOL marker's "=", or 0 if absent)
-and chainScriptPresent (true only if scripts/wolfpack-chain.mjs exists).
-`, { label: 'pipeline-capability', phase: 'Parse', model: 'sonnet', schema: {
-    type: 'object',
-    properties: {
-      path: { type: 'string' }, protocol: { type: 'number' }, usageProtocol: { type: 'number' },
-      gatePresent: { type: 'boolean' }, gateProtocol: { type: 'number' },
-      chainProtocol: { type: 'number' }, chainScriptPresent: { type: 'boolean' },
-    },
-    required: ['protocol', 'gatePresent', 'gateProtocol'],
-  } })
-  // Pointer r2 F3: a null result is a PROBE failure (agent error / schema exhaustion), not
-  // evidence of a stale pipeline — say so instead of sending the operator to re-sync.
-  if (cap == null) {
-    throw new Error(`campaign-runner: the pipeline-capability probe returned no result (agent failure) — capability is UNKNOWN, so no hunt may start. This is not a stale-pipeline diagnosis; relaunch to re-run the probe, and check the agent/model availability if it repeats.`)
-  }
-  chainCapability = cap
-  const proto = Number(cap.protocol) || 0
-  if (proto < REQUIRED_EXAMINER_PROTOCOL) {
-    throw new Error(`campaign-runner: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) is STALE — examiner protocol ${proto} < ${REQUIRED_EXAMINER_PROTOCOL}; it cannot honor the ${EXAMINER_ROTATION.join('/')} examiner hints. Re-run wolfpack-sync-runtime.sh <that runtime file> (from the pack's scripts/; once for hunt-pipeline.js and once for campaign-runner.js), then relaunch.`)
-  }
-  if (proto < LATEST_EXAMINER_PROTOCOL) {
-    // Disclosed degrade (CLAUDE.md § Fail Loud): logged at WARNING level AND visible in the
-    // campaign output, every pass, naming the exact fix.
-    log(`⚠ STALE PIPELINE: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) reports examiner protocol ${proto}, this campaign-runner is ${LATEST_EXAMINER_PROTOCOL}. Reviews will run on the OLD (gemini-first) chain until you re-run: wolfpack-sync-runtime.sh <repo>/.claude/workflows/hunt-pipeline.js (from the pack's scripts/)`)
-  } else {
-    log(`Pipeline capability OK: examiner protocol ${proto} (${cap.path}) — hint rotation ${EXAMINER_ROTATION.join(' / ')}`)
-  }
-  // usage-limit-gate: a WARNING, not a throw — same merge→sync reasoning as AC25 above. The
-  // gate itself still works (it runs here, in the runner); only the hunt-side offload record
-  // and usage_delta/heartbeat stamping are missing until the runtime copy is regenerated.
-  if ((Number(cap && cap.usageProtocol) || 0) < 1) {
-    log(`⚠ STALE PIPELINE: runtime hunt-pipeline predates the usage gate — usage offload and usage_delta will NOT be recorded until you re-run wolfpack-sync-runtime.sh`)
-  }
-  // Pointer r1 F2 — gate-script capability. MISSING ⇒ throw here, once, naming the fix (no
-  // gate at all is not a degrade we can label). PRESENT but pre-protocol ⇒ WARN and run the
-  // labelled legacy mode (see legacyGate) instead of letting the schema reject every claim.
-  if (!(cap && cap.gatePresent)) {
-    throw new Error(`campaign-runner: scripts/wolfpack-window-gate.mjs is MISSING — the usage gate cannot run, so no hunt may start. Re-run wolfpack-sync-runtime.sh <that runtime file> (from the pack's scripts/), then relaunch.`)
-  }
-  if ((Number(cap.gateProtocol) || 0) < 1) {
-    legacyGate = true
-    log(`⚠ STALE USAGE GATE: scripts/wolfpack-window-gate.mjs predates usage-limit-gate (no WOLFPACK_GATE_PROTOCOL marker). Gating on its TRANSCRIPT ESTIMATE only (source legacy_gate, degraded) — live 5h/weekly figures and usage offload are INACTIVE until you re-run wolfpack-sync-runtime.sh`)
-  } else {
-    log(`Usage gate capability OK: gate protocol ${cap.gateProtocol}`)
-  }
-}
-
 // ─── Preflight: the consuming project's wolfpack-config.md (wolfpack-self-hosting, AC10) ───
+// pack-install-model (D9): this block runs FIRST in the Parse phase — before the parse-campaign
+// agent — so a stale runner stops before any campaign work and the parse prompt can use
+// worktreeRoot. Order: config probe (read-only) → pack home → stamp check.
 // The runner surfaces the project's deploy step in the release queue, and every hunt it
 // launches reads the same config. The Workflow script has no filesystem access, so one
 // read-only agent runs the deterministic reader (scripts/wolfpack-config.mjs) and relays its
@@ -483,10 +353,214 @@ const resolveWolfpackHome = (who) => {
   if (!raw.startsWith('/')) throw new Error(`${who}: ${source} is not an absolute path ('${raw}'). ${fix}`)
   return { home: raw.replace(/\/+$/, '') || '/', source }
 }
-{
-  const wolfpackHome = resolveWolfpackHome('campaign-runner')
-  log(`Pack home (WOLFPACK_HOME): ${wolfpackHome.home} — from ${wolfpackHome.source}`)
+// Top-level (pack-install-model): the stamp check and the Execute-phase fix texts need it.
+const wolfpackHome = resolveWolfpackHome('campaign-runner')
+log(`Pack home (WOLFPACK_HOME): ${wolfpackHome.home} — from ${wolfpackHome.source}`)
+// pack-install-model: where hunt worktrees live (wolfpack-config.md → Project Identity →
+// Worktree root, repo-relative). Required — the pipeline never guesses it. Re-validated here
+// with the reader's validWorktreeRoot rule (fail closed on a garbled relay). Body identical in
+// hunt-pipeline.js and campaign-runner.js.
+const requireWorktreeRoot = (who, value) => {
+  const fix = 'Fix: add "- **Worktree root:** `<dir>`" under ## Project Identity, where <dir> is the repo-relative, gitignored directory this project\'s hunt worktrees live in (e.g. `.agents/worktrees` or `.claude/worktrees`); check: node scripts/wolfpack-config.mjs --json'
+  if (typeof value !== 'string' || !value) throw new Error(`${who}: wolfpack-config.md has no Worktree root — the pipeline will not guess where hunt worktrees live. ${fix}`)
+  const segs = value.split('/')
+  const ok = !value.startsWith('/') && !value.startsWith('~') && segs[0] !== '.git' &&
+    segs.every(seg => /^\.?[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(seg))
+  if (!ok) throw new Error(`${who}: wolfpack-config.md → Worktree root '${value}' is not a repo-relative path (no leading / or ~, no . or .. segments, no spaces or shell characters, not under .git). ${fix}`)
+  return value
 }
+const worktreeRoot = requireWorktreeRoot('campaign-runner', projectConfig.worktreeRoot)
+log(`Worktree root: ${worktreeRoot} (wolfpack-config.md → Project Identity)`)
+// pack-install-model (AC5): the run-start stamp check. WOLFPACK_STAMP is THIS script's own
+// stamp (null in the canonical). A read-only probe runs the pack's checker against the main
+// checkout; fail closed on any malformed/absent result. Throws BEFORE any state is mutated.
+// Body identical in hunt-pipeline.js and campaign-runner.js (apart from the call's args).
+const STAMP_PROBE_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+const checkWorkflowStamp = async (who, label, phaseName) => {
+  const self = `${meta.name}.js`
+  const home = wolfpackHome.home
+  if (home.includes("'")) throw new Error(`${who}: WOLFPACK_HOME contains a single quote — refusing to build the stamp probe`)
+  const p = await agent(`READ-ONLY workflow stamp probe — modify nothing. From the repo root (your starting directory), run exactly:
+  node '${home}/scripts/wolfpack-workflows.mjs' check --pack '${home}' --consumer "$(pwd)" --json 2>&1; echo "STAMP_RC=$?"
+Return exitCode = the number after STAMP_RC= and output = the command's stdout+stderr VERBATIM, minus the STAMP_RC line.
+If the command could not run at all, return exitCode 2 and the error text as output. Never create, fix, regenerate or edit anything.`,
+    { label, phase: phaseName, model: 'sonnet', schema: STAMP_PROBE_SCHEMA })
+  if (!p) throw new Error(`${who}: the workflow stamp probe returned no result — workflow freshness UNKNOWN; relaunch`)
+  const out = typeof p.output === 'string' ? p.output : ''
+  const head = out.split('\n').slice(0, 20).join('\n') || '(no output)'
+  if (p.exitCode !== 0 && p.exitCode !== 1) throw new Error(`${who}: the workflow stamp check failed (exit ${p.exitCode}) — workflow freshness UNKNOWN: ${head}. Fix: run node '${home}/scripts/wolfpack-workflows.mjs' check --consumer <this repo> and resolve what it names (bash '${home}/install.sh' --check lists every problem)`)
+  let parsed = null
+  try { const block = firstJsonObject(out); parsed = block ? JSON.parse(block) : null } catch { parsed = null }
+  if (!parsed || !Array.isArray(parsed.workflows)) throw new Error(`${who}: the workflow stamp probe output held no checker result (no workflows[] array) — workflow freshness UNKNOWN: ${head}`)
+  const entry = parsed.workflows.find(w => w && w.name === self)
+  if (!entry || typeof entry.state !== 'string') throw new Error(`${who}: the workflow stamp check did not report ${self} — workflow freshness UNKNOWN: ${head}`)
+  const S = WOLFPACK_STAMP
+  const packVersion = parsed.packVersion
+  const packCommit = String(parsed.packCommit || '')
+  if (S === null) {
+    if (entry.state === 'canonical') {
+      log(`Workflow version: ${self} canonical — pack ${packVersion} @ ${packCommit.slice(0, 12)} (${entry.file})`)
+      return parsed
+    }
+    throw new Error(`${who}: this run is the UNSTAMPED canonical ${self} but ${entry.file} is ${entry.state} — fix: ${entry.fix || `bash '${home}/install.sh' --consumer <this repo>`}, then restart Claude Code (named workflows are cached per session) and relaunch`)
+  }
+  if (S.source === entry.canonicalSource) {
+    if (entry.state === 'current') {
+      log(`Workflow version: ${self} ${S.version} @ ${String(S.commit).slice(0, 12)} (source ${String(S.source).slice(0, 19)}…) — current against the pack at ${home}`)
+      return parsed
+    }
+    throw new Error(`${who}: ${entry.file} is ${entry.state} — its stamp matches the pack but the copy on disk is not the generated bytes. ` +
+      `Fix: ${entry.fix || 'regenerate it'}, then restart Claude Code (named workflows are cached per session) and relaunch.`)
+  }
+  throw new Error(`${who}: STALE WORKFLOW — this run is ${self} ${S.version} @ ${String(S.commit).slice(0, 12)}, but the pack's canonical ${self} has changed. ` +
+    (entry.state === 'current'
+      ? `${entry.file} is already regenerated: this session is running a CACHED older copy — restart Claude Code (named workflows are cached per session) and relaunch.`
+      : `${entry.file} is ${entry.state}. Fix: ${entry.fix || `bash '${home}/install.sh' --consumer <this repo>`}, then restart Claude Code and relaunch.`))
+}
+const stampState = await checkWorkflowStamp('campaign-runner', 'workflow-stamp', 'Parse')
+// The runner launches workflow('hunt-pipeline') by name: refuse to start a wave when that copy
+// is not current (each hunt would stop at its own run start anyway — fail once, early).
+const hp = stampState.workflows.find(w => w.name === 'hunt-pipeline.js')
+if (!hp || !['current', 'canonical'].includes(hp.state)) throw new Error(`campaign-runner: the runtime hunt-pipeline.js is ${hp ? hp.state : 'not reported'} — no hunt may start. Fix: ${hp && hp.fix ? hp.fix : `bash '${wolfpackHome.home}/install.sh' --consumer <this repo>`}, then restart Claude Code and relaunch.`)
+
+
+const campaign = await agent(`
+Read the campaign file at .wolfpack/campaigns/${campaignSlug}/campaign.md.
+Also read .wolfpack/campaigns/${campaignSlug}/metadata.json.
+
+Extract the wave structure from the "## Proposed Hunts" section and the "### Wave diagram" section.
+
+For each hunt, extract ALL of these fields — Alpha needs them for scoping:
+- slug (from the ### N. <slug> heading)
+- description (from the Trigger line, inside the quotes after the slug — this is the FULL description, not a summary)
+- tier (from the Tier field — Alpha MUST respect this, not downgrade)
+- mode (from the Mode field — update or feature)
+- blocked (true if Wave is "BLOCKED")
+- dependsOn (array of slugs from the "Depends on" field; empty array if None)
+- ticketRefs (from "Ticket refs" field — e.g. "[dev #26 Urgent, #61 Urgent]")
+- todoItemsCleared (from "TODO items cleared" field — what gets removed from TODO.md)
+- migrationRisk (from "Migration risk" field — none, additive, or destructive)
+- rationale (from "Rationale" field — why this hunt is scoped/bundled this way)
+
+Group hunts by their Wave number.
+
+Also read each hunt's CURRENT status so the runner can skip work that's already done. The
+status field is the AUTHORITATIVE on-disk log — return it VERBATIM, do NOT re-derive or
+normalize it:
+- Read the hunt's metadata.json — the worktree copy
+  ${worktreeRoot}/<slug>/.wolfpack/plans/<slug>/metadata.json FIRST if it exists (it's the
+  live one during a run), else the main-repo copy .wolfpack/plans/<slug>/metadata.json — and
+  return its \`status\` as-is. Meanings:
+  - "merged" — stamped by /merge + /merge-wave at copy-back; the hunt shipped.
+  - "certified" / "certified_not_merged" — Watchdog PASS, NOT yet merged (await /merge-wave).
+  - "needs_spec" or "parked:<reason>" (parked:open_critical, parked:compliance_review,
+    parked:non_convergence, parked:model_quota, …) — await a human via /resolve (except
+    parked:model_quota, which auto-resumes). Pass through verbatim; do NOT drop them.
+  - CHAIN MODE statuses (pass through verbatim, never normalize): "merged_to_campaign",
+    "merged_to_campaign_pending_compliance" (merged into the campaign branch, awaiting the
+    campaign release), "certified_pending_compliance", "certified_held_overlap" (certified,
+    not yet merged into the campaign branch), "parked:campaign_merge_conflict",
+    "parked:reverted_from_campaign", "reverted_with_dependency".
+  - anything else (ready_for_alpha, reviewing, reviewed, implementing, …) — mid-pipeline, resumable.
+- LEGACY FALLBACK ONLY: if an OLD hunt's status is still "certified" but feat/<slug> is gone AND
+  its merge commit is on main, you MAY return "merged". New hunts are stamped "merged" directly,
+  so this git inference should not normally be needed.
+
+Chain-mode fields — ALWAYS return them for every hunt (barrier campaigns too):
+- migrationApps (ALWAYS return it; from the "Migration app(s)" field — a JSON-ish list like ["app_a"]; [] if absent or "[]")
+- revertedBecause: metadata.reverted_because if set, else null;  heldOn: slugs in metadata.held_on, else []
+- baseBranch: metadata.base_branch if a non-empty string, else ""
+Top level (ALWAYS return both): chainMode = true iff .wolfpack/campaigns/${campaignSlug}/metadata.json has chain.mode === "chain",
+else false; chainBranch = chain.branch whenever the metadata has a chain block with a non-empty branch, WHATEVER chain.mode reads (else "").
+
+Return the structured wave data. Exclude BLOCKED hunts. Include done, certified, and
+parked/needs_spec hunts with their verbatim status.
+`, { label: 'parse-campaign', phase: 'Parse', schema: CAMPAIGN_SCHEMA })
+
+log(`Campaign parsed: ${campaign.waves.length} waves, ${campaign.waves.reduce((n, w) => n + w.hunts.length, 0)} hunts`)
+
+// ─── Preflight: runtime hunt-pipeline supports the hinted examiner families ────
+// The runtime hunt-pipeline.js in a consuming project is a GENERATED, often gitignored
+// copy — a GENERATED, stamped copy (install.sh). A stale copy predates the examiner chain: it
+// would silently misread a "glm" hint (as mistral, or drop it). The preflight now runs
+// UNCONDITIONALLY — there is no "gemini-only, nothing to check" case any more, so the old
+// `some(f => f !== 'gemini')` wrapper was trivially true and therefore meaningless.
+//
+// FLOOR vs LATEST (AC25). REQUIRED is the FLOOR: below it the runtime cannot honor an
+// examiner-chain hint at all, so we throw. LATEST is what the current canonical
+// hunt-pipeline emits; at-or-above the floor but below LATEST we WARN and CONTINUE, because
+// this file is tracked and merges with the hunt while the consumer's hunt-pipeline.js stays
+// gitignored and un-regenerated until the operator re-runs install.sh — a GENERATED, stamped copy (install.sh). Throwing
+// there would abort every campaign launch AND every cron auto-resume at the Parse phase for
+// the whole merge→sync window — converting a known, temporary, documented drift into an
+// outage. The degrade is bounded and LOUD: an old protocol-2 pipeline honors a glm hint and
+// falls back to its own gemini-first chain otherwise.
+const REQUIRED_EXAMINER_PROTOCOL = 2   // FLOOR: understands the examiner chain / crossExaminer hint at all
+const LATEST_EXAMINER_PROTOCOL   = 3   // what the current canonical hunt-pipeline emits
+let chainCapability = null   // the probe result, read by the chain-mode checks below
+{
+  const cap = await agent(`
+READ-ONLY check — modify nothing. From the current repo root, pick the runtime workflow file:
+.claude/workflows/hunt-pipeline.js if it exists, else .agents/workflows/hunt-pipeline.js.
+Run: grep -o 'WOLFPACK_EXAMINER_PROTOCOL=[0-9]*' <that file> | head -1
+Also run: grep -o 'WOLFPACK_USAGE_PROTOCOL=[0-9]*' <that file> | head -1
+Then, for the usage gate script, run: test -f scripts/wolfpack-window-gate.mjs && echo present
+and: grep -o 'WOLFPACK_GATE_PROTOCOL=[0-9]*' scripts/wolfpack-window-gate.mjs | head -1
+Chain mode: grep -o 'WOLFPACK_CHAIN_PROTOCOL=[0-9]*' <the runtime workflow file> | head -1
+and: test -f scripts/wolfpack-chain.mjs && echo present
+Return path (the file you checked, or "" if neither exists), protocol (the integer after
+the first marker's "=", or 0 if the marker is absent / the file is missing),
+usageProtocol (the integer after the second marker's "=", or 0 if absent), gatePresent
+(true only if scripts/wolfpack-window-gate.mjs exists) and gateProtocol (the integer after
+the WOLFPACK_GATE_PROTOCOL marker's "=", or 0 if absent / the file is missing),
+chainProtocol (the integer after the WOLFPACK_CHAIN_PROTOCOL marker's "=", or 0 if absent)
+and chainScriptPresent (true only if scripts/wolfpack-chain.mjs exists).
+`, { label: 'pipeline-capability', phase: 'Parse', model: 'sonnet', schema: {
+    type: 'object',
+    properties: {
+      path: { type: 'string' }, protocol: { type: 'number' }, usageProtocol: { type: 'number' },
+      gatePresent: { type: 'boolean' }, gateProtocol: { type: 'number' },
+      chainProtocol: { type: 'number' }, chainScriptPresent: { type: 'boolean' },
+    },
+    required: ['protocol', 'gatePresent', 'gateProtocol'],
+  } })
+  // Pointer r2 F3: a null result is a PROBE failure (agent error / schema exhaustion), not
+  // evidence of a stale pipeline — say so instead of sending the operator to re-sync.
+  if (cap == null) {
+    throw new Error(`campaign-runner: the pipeline-capability probe returned no result (agent failure) — capability is UNKNOWN, so no hunt may start. This is not a stale-pipeline diagnosis; relaunch to re-run the probe, and check the agent/model availability if it repeats.`)
+  }
+  chainCapability = cap
+  const proto = Number(cap.protocol) || 0
+  if (proto < REQUIRED_EXAMINER_PROTOCOL) {
+    throw new Error(`campaign-runner: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) is STALE — examiner protocol ${proto} < ${REQUIRED_EXAMINER_PROTOCOL}; it cannot honor the ${EXAMINER_ROTATION.join('/')} examiner hints. Regenerate it: bash '${wolfpackHome.home}/install.sh' --consumer <this repo> (then restart Claude Code), then relaunch.`)
+  }
+  if (proto < LATEST_EXAMINER_PROTOCOL) {
+    // Disclosed degrade (CLAUDE.md § Fail Loud): logged at WARNING level AND visible in the
+    // campaign output, every pass, naming the exact fix.
+    log(`⚠ STALE PIPELINE: the runtime hunt-pipeline (${(cap && cap.path) || 'not found'}) reports examiner protocol ${proto}, this campaign-runner is ${LATEST_EXAMINER_PROTOCOL}. Reviews will run on the OLD (gemini-first) chain until you regenerate it: bash '${wolfpackHome.home}/install.sh' --consumer <this repo> (then restart Claude Code)`)
+  } else {
+    log(`Pipeline capability OK: examiner protocol ${proto} (${cap.path}) — hint rotation ${EXAMINER_ROTATION.join(' / ')}`)
+  }
+  // usage-limit-gate: a WARNING, not a throw — same merge→sync reasoning as AC25 above. The
+  // gate itself still works (it runs here, in the runner); only the hunt-side offload record
+  // and usage_delta/heartbeat stamping are missing until the runtime copy is regenerated.
+  if ((Number(cap && cap.usageProtocol) || 0) < 1) {
+    log(`⚠ STALE PIPELINE: runtime hunt-pipeline predates the usage gate — usage offload and usage_delta will NOT be recorded until you regenerate it: bash '${wolfpackHome.home}/install.sh' --consumer <this repo> (then restart Claude Code)`)
+  }
+  // Pointer r1 F2 — gate-script capability. MISSING ⇒ throw here, once, naming the fix (no
+  // gate at all is not a degrade we can label). PRESENT but pre-protocol ⇒ WARN and run the
+  // labelled legacy mode (see legacyGate) instead of letting the schema reject every claim.
+  if (!(cap && cap.gatePresent)) {
+    throw new Error(`campaign-runner: scripts/wolfpack-window-gate.mjs is MISSING — the usage gate cannot run, so no hunt may start. Fix: update the project's scripts/wolfpack-window-gate.mjs from the pack (${wolfpackHome.home}/scripts/), then relaunch.`)
+  }
+  if ((Number(cap.gateProtocol) || 0) < 1) {
+    legacyGate = true
+    log(`⚠ STALE USAGE GATE: scripts/wolfpack-window-gate.mjs predates usage-limit-gate (no WOLFPACK_GATE_PROTOCOL marker). Gating on its TRANSCRIPT ESTIMATE only (source legacy_gate, degraded) — live 5h/weekly figures and usage offload are INACTIVE until you update the project's scripts/wolfpack-window-gate.mjs from the pack (${wolfpackHome.home}/scripts/)`)
+  } else {
+    log(`Usage gate capability OK: gate protocol ${cap.gateProtocol}`)
+  }
+}
+
 
 // ─── Chain mode (`--chain`, campaign-chain-mode) ───────────────
 // Chain mode moves the integration target from `main` to a LOCAL `campaign/<slug>` branch:
@@ -1040,7 +1114,7 @@ if (chainMode) {
   // and rebase them onto origin/main — silently wrong for a chain campaign.
   const ccap = chainCapability || {}
   if (!(Number(ccap.chainProtocol) >= 1)) {
-    throw new Error(`campaign-runner: STALE PIPELINE for chain mode — the runtime hunt-pipeline (${ccap.path || 'not found'}) reports chain protocol ${Number(ccap.chainProtocol) || 0} < 1 (no WOLFPACK_CHAIN_PROTOCOL marker), so its hunts would fork from main and rebase onto origin/main. Re-run wolfpack-sync-runtime.sh <repo>/.claude/workflows/hunt-pipeline.js (from the pack's scripts/), then relaunch.`)
+    throw new Error(`campaign-runner: STALE PIPELINE for chain mode — the runtime hunt-pipeline (${ccap.path || 'not found'}) reports chain protocol ${Number(ccap.chainProtocol) || 0} < 1 (no WOLFPACK_CHAIN_PROTOCOL marker), so its hunts would fork from main and rebase onto origin/main. Regenerate it: bash '${wolfpackHome.home}/install.sh' --consumer <this repo> (then restart Claude Code), then relaunch.`)
   }
   if (ccap.chainScriptPresent !== true) {
     throw new Error(`campaign-runner: scripts/wolfpack-chain.mjs is MISSING (or the probe could not confirm it) — chain mode cannot run its git steps. Copy it from wolfpack canonical scripts/, then relaunch.`)

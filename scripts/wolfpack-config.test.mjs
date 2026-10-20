@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import {
   parseSections, field, code, list, isNone, modelPool, readConfig, loadConfig, problemLine,
-  expandHome, execLayer, execLines, imageHasTag, EXEC_KEYS,
+  expandHome, execLayer, execLines, imageHasTag, EXEC_KEYS, validWorktreeRoot,
 } from './wolfpack-config.mjs'
 import { homedir } from 'node:os'
 
@@ -570,4 +570,70 @@ test('the REAL wolfpack-config.md and the example both read clean under --exec a
   const ex = readFileSync(join(ROOT, 'wolfpack-config.example.md'), 'utf8')
   for (const [k] of EXEC_KEYS) assert.match(ex, new RegExp(`^- \\*\\*${k}:\\*\\*`, 'm'), k)
   assert.match(ex, /^- \*\*Wolfpack home:\*\*/m)
+})
+
+// ─── pack-install-model (AC8): Project Identity → Worktree root ──────────
+const withRoot = (line) => FULL.replace('- **Worktree links:**', `${line}\n- **Worktree links:**`)
+
+test('AC8: Worktree root present → the value (trailing / stripped); absent → null with NO problem', () => {
+  assert.equal(readConfig(withRoot('- **Worktree root:** `.agents/worktrees`')).worktreeRoot, '.agents/worktrees')
+  assert.equal(readConfig(withRoot('- **Worktree root:** `.agents/worktrees/`')).worktreeRoot, '.agents/worktrees')
+  assert.equal(readConfig(withRoot('- **Worktree root:** `.claude/worktrees//` — prose after')).worktreeRoot, '.claude/worktrees')
+  const c = readConfig(withRoot('- **Worktree root:** `.wt/hunts`'))
+  assert.equal(c.worktreeRoot, '.wt/hunts')
+  assert.deepEqual(c.problems, [])
+  const absent = readConfig(FULL)
+  assert.equal(absent.worktreeRoot, null)
+  assert.deepEqual(absent.problems, [])
+  assert.deepEqual(absent.missing, [], 'optional for the reader; the workflows require it')
+})
+
+test('AC8: validWorktreeRoot accepts the dot-dir roots and plain names; rejects every malformed shape', () => {
+  for (const ok of ['.agents/worktrees', '.claude/worktrees', '.wt/hunts', 'worktrees', 'a_b/c-d.e', '_x']) {
+    assert.equal(validWorktreeRoot(ok), true, ok)
+  }
+  for (const bad of ['', '/abs', '~/x', '~', '../x', 'a/../b', './x', '..x/y', '.', '..', 'a b', '.git/x', '.git', '`$x`', '$x', 'a/*', "it's", 'a//b', 'a/', '-x', null, undefined, 7]) {
+    assert.equal(validWorktreeRoot(bad), false, String(bad))
+  }
+})
+
+test('AC8: a malformed Worktree root → a problems entry + null (reader exit 2)', () => {
+  for (const v of ['/abs', '~/x', '../x', 'a/../b', './x', '..x/y', 'a b', '.git/x', '$x']) {
+    const c = readConfig(withRoot(`- **Worktree root:** \`${v}\``))
+    assert.equal(c.worktreeRoot, null, v)
+    assert.ok(c.problems.some(p => /^Project Identity → Worktree root must be a repo-relative path like `\.agents\/worktrees`/.test(p)), `${v}: ${c.problems}`)
+  }
+  withTemp((dir) => {
+    const p = writeCfg(dir, withRoot('- **Worktree root:** `../escape`'))
+    const r = runCli(['--json', p])
+    assert.equal(r.status, 2, r.stdout + r.stderr)
+  })
+})
+
+test('AC8: the REAL wolfpack-config.md resolves Worktree root `.agents/worktrees` with no problem; the CLI carries it in --json and the summary', () => {
+  const c = loadConfig(REAL)
+  assert.equal(c.worktreeRoot, '.agents/worktrees')
+  assert.deepEqual(c.problems, [])
+  const j = runCli(['--json', REAL])
+  assert.equal(j.status, 0, j.stderr)
+  assert.equal(JSON.parse(j.stdout).worktreeRoot, '.agents/worktrees')
+  const s = runCli([REAL])
+  assert.equal(s.status, 0)
+  assert.match(s.stdout, /^worktreeRoot: \.agents\/worktrees$/m)
+  // the example carries the REQUIRED key too, and reads clean
+  const ex = loadConfig(join(ROOT, 'wolfpack-config.example.md'))
+  assert.equal(typeof ex.worktreeRoot, 'string')
+  assert.ok(validWorktreeRoot(ex.worktreeRoot), ex.worktreeRoot)
+})
+
+test('AC8 parity: both workflows inline the reader\'s validWorktreeRoot rule (same segment regex, .git and ~ guards)', () => {
+  const src = readFileSync(join(here, 'wolfpack-config.mjs'), 'utf8')
+  const seg = '/^\\.?[A-Za-z0-9_][A-Za-z0-9_.-]*$/'
+  assert.ok(src.includes(seg))
+  for (const n of ['hunt-pipeline.js', 'campaign-runner.js']) {
+    const w = readFileSync(join(ROOT, '.agents', 'workflows', n), 'utf8')
+    assert.ok(w.includes(`segs.every(seg => ${seg}.test(seg))`), n)
+    assert.ok(w.includes("segs[0] !== '.git'"), n)
+    assert.ok(w.includes("!value.startsWith('~')"), n)
+  }
 })

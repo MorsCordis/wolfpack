@@ -13,6 +13,7 @@ import { spawnSync, execFileSync } from 'node:child_process'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(here, '..')
+const RETIRED_SYNC = ['wolfpack', 'sync', 'runtime'].join('-')   // built, so AC7's literal git grep stays empty
 const git = (...a) => spawnSync('git', ['-C', ROOT, ...a], { encoding: 'utf8' })
 
 test('AC9: .agents/skills/synced/ is git-ignored (harness-owned, never tracked)', () => {
@@ -108,4 +109,88 @@ test('the config\'s Test command is exactly what CI runs (one entry point)', () 
   const out = execFileSync(process.execPath, [join(here, 'wolfpack-config.mjs'), '--json', join(ROOT, 'wolfpack-config.md')], { encoding: 'utf8' })
   const ci = readFileSync(join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8')
   assert.ok(ci.includes(`run: ${JSON.parse(out).testCommand}`))
+})
+
+// ─── pack-install-model ──────────────────────────────────────────────────
+test('AC6: both generated workflow copies are git-ignored (one rule); wolfpack\'s own .claude/workflows link is still tracked', () => {
+  const ignore = readFileSync(join(ROOT, '.gitignore'), 'utf8').split('\n')
+  for (const f of ['.claude/workflows/hunt-pipeline.js', '.claude/workflows/campaign-runner.js']) {
+    assert.ok(ignore.includes(f), `.gitignore line ${f}`)
+  }
+  // through the tracked .claude/workflows LINK git sees a symlinked dir, so check-ignore on the
+  // path behind it reports the same (consistent) value for BOTH files
+  const rc = ['hunt-pipeline.js', 'campaign-runner.js'].map(f => git('check-ignore', '-q', '--no-index', `.claude/workflows/${f}`).status)
+  assert.equal(rc[0], rc[1], 'the same track-or-ignore value for both files')
+  assert.equal(git('ls-files', '-s', '.claude/workflows').stdout.split(' ')[0], '120000')
+})
+
+test('install.sh is tracked with mode 100755; the retired sync-runtime script and its test are gone', () => {
+  assert.equal(git('ls-files', '-s', 'install.sh').stdout.split(' ')[0], '100755')
+  assert.equal(git('ls-files', `scripts/${RETIRED_SYNC}.sh`, `scripts/${RETIRED_SYNC}.test.sh`).stdout.trim(), '')
+  assert.equal(existsSync(join(ROOT, 'scripts', `${RETIRED_SYNC}.sh`)), false)
+  assert.equal(git('ls-files', '-s', 'scripts/wolfpack-workflows.mjs').stdout.split(' ')[0], '100755')
+})
+
+test('AC7: no tracked file outside CHANGELOG.md names the retired sync-runtime script', () => {
+  const r = git('grep', '-n', RETIRED_SYNC, '--', ':!CHANGELOG.md')
+  assert.equal(r.stdout.trim(), '', r.stdout)
+  assert.match(readFileSync(join(ROOT, 'CHANGELOG.md'), 'utf8'), new RegExp(`${RETIRED_SYNC}[\\s\\S]*<!-- hunt:pack-install-model -->`))
+})
+
+test('AC9: no canonical command/skill/workflow instructs re-making the alias links; no tracked .agents alias links', () => {
+  assert.doesNotMatch(readFileSync(join(ROOT, '.agents', 'commands', 'hunt.md'), 'utf8'), new RegExp(`${'Re'}${'create'} alias-namespace sym${'links'}`))
+  assert.equal(git('grep', '-n', '-i', `${'re'}${'create'}.*sym${'link'}`, '--', ':!CHANGELOG.md').stdout.trim(), '')
+  const links = git('ls-files', '-s', '.agents').stdout.split('\n').filter(l => l.startsWith('120000'))
+  assert.deepEqual(links, [], 'no tracked symlinks under .agents/')
+})
+
+test('AC8: neither workflow hard-codes the .agents/worktrees root in logic', () => {
+  for (const n of ['hunt-pipeline.js', 'campaign-runner.js']) {
+    const lines = readFileSync(join(ROOT, '.agents', 'workflows', n), 'utf8').split('\n')
+    const hits = lines.filter(l => /'\.agents\/worktrees|\/\.agents\/worktrees\/'/.test(l))
+    assert.deepEqual(hits, [], n)
+    // remaining mentions are value-neutral fix-text examples only
+    for (const l of lines.filter(l => l.includes('.agents/worktrees'))) {
+      assert.match(l, /e\.g\. `\.agents\/worktrees` or `\.claude\/worktrees`|^\s*\/\//, `${n}: ${l.trim().slice(0, 120)}`)
+    }
+  }
+})
+
+test('AC14: SETUP.md / README.md carry the install mechanics (track-or-ignore rule once, STALE WORKFLOW fix, Step 3b with --check)', () => {
+  const setup = readFileSync(join(ROOT, 'SETUP.md'), 'utf8')
+  const readme = readFileSync(join(ROOT, 'README.md'), 'utf8')
+  assert.equal(setup.split('A generated workflow copy is never tracked').length - 1, 1, 'the rule is stated exactly once')
+  assert.match(setup, /STALE WORKFLOW/)
+  assert.match(setup, /install\.sh --consumer/)
+  assert.match(setup, /restart Claude Code/)
+  const m = /^## Step 3b[^\n]*\n([\s\S]*?)(?=^## )/m.exec(setup)
+  assert.ok(m, 'a Step 3b section')
+  assert.match(m[1], /install\.sh --check/)
+  for (const [n, t] of [['SETUP.md', setup], ['README.md', readme]]) assert.ok(t.includes('bash ~/wolfpack/install.sh'), n)
+})
+
+test('wolfpack-config.md + the example declare Worktree root; the Module Map no longer routes on sync-runtime', () => {
+  for (const f of ['wolfpack-config.md', 'wolfpack-config.example.md']) {
+    assert.match(readFileSync(join(ROOT, f), 'utf8'), /^- \*\*Worktree root:\*\* `[^`]+`/m, f)
+  }
+  assert.doesNotMatch(readFileSync(join(ROOT, 'wolfpack-config.md'), 'utf8'), /sync-runtime/)
+})
+
+test('CHANGELOG: every release section lists each ### category at most once (merged hunts share headings, no duplicates)', () => {
+  const cl = readFileSync(join(ROOT, 'CHANGELOG.md'), 'utf8')
+  const sections = cl.split(/^## /m).filter(s => /^\[(Unreleased|v[0-9][^\]]*)\]/.test(s))
+  assert.ok(sections.length >= 1)
+  for (const s of sections) {
+    const name = s.slice(0, s.indexOf('\n'))
+    const cats = [...s.matchAll(/^### (.+)$/gm)].map(m => m[1].trim())
+    assert.deepEqual(cats, [...new Set(cats)], `${name}: duplicate category heading`)
+  }
+  assert.ok(sections.some(s => s.includes('<!-- hunt:pack-install-model -->')), 'pack-install-model entries present')
+})
+
+test('CHANGELOG / TODO carry no merge-conflict markers; TODO drops the item pack-install-model fixed', () => {
+  for (const f of ['CHANGELOG.md', 'TODO.md']) {
+    assert.doesNotMatch(readFileSync(join(ROOT, f), 'utf8'), /^(<{7}|={7}|>{7})( |$)/m, f)
+  }
+  assert.ok(!readFileSync(join(ROOT, 'TODO.md'), 'utf8').includes("Role prompts name a skill path consumers don't have"))
 })

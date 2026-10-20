@@ -8,6 +8,7 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 - **Repo root:** auto-detected from git
 - **Test command:** `bash scripts/test-all.sh` — the single entry point: every `scripts/**/*.test.mjs`, every `scripts/**/*.test.sh`, and the leak grep. Narrow while iterating with `node --test scripts/<file>.test.mjs`. Podman-dependent tests print `SKIP: needs podman` when podman is absent or `WOLFPACK_TEST_NO_PODMAN=1`.
 - **Worktree links:** none
+- **Worktree root:** `.agents/worktrees` — where /hunt and the pipeline create hunt worktrees (repo-relative).
 - **Deploy command (dev):** none — the pack is not deployed; consumers install it.
 - **Deploy command (prod):** none.
 - **Vault root:** `~/Vault`
@@ -30,12 +31,12 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 - Every behaviour change ships with a test in `scripts/*.test.mjs` / `*.test.sh`, runnable from `scripts/test-all.sh`.
 - Workflow scripts (`.agents/workflows/*.js`) have no filesystem access: any file-derived value comes through a probe agent and is validated (fail closed).
 - No new hard-coded consuming-project value (paths, commands, domains, compliance surfaces) — it becomes a `wolfpack-config.md` key read via `scripts/wolfpack-config.mjs`.
-- Generated consumer copies are never hand-edited (`scripts/wolfpack-sync-runtime.sh <explicit target>`).
+- Generated consumer workflow copies are never hand-edited: `bash install.sh --consumer <repo>` regenerates them, and the run start refuses a stale or edited copy.
 - Leak grep clean (`bash scripts/wolfpack-leak-grep.sh`).
 
 ## Plan Review Checklist (Bloodhound uses this)
 - Cross-repo effects named: which consumer copies regenerate, which consumer config keys a change requires.
-- The running session caches named workflows: a workflow change takes effect only for the NEXT run.
+- The running session caches named workflows: a workflow change takes effect only for the NEXT run. The run start logs the running script's stamped version; a mismatch stops the run with "restart Claude Code".
 - Review seats may lack `node` in their sandbox image: plans must not depend on a review seat running node suites.
 
 ## Multi-Tenancy
@@ -63,7 +64,7 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 - `.agents/workflows` ← "hunt-pipeline", "campaign-runner", "workflow", "orchestrator"
 - `.agents/commands` ← "command", "slash command", "/hunt", "/merge", "/smoke"
 - `.agents/skills` ← "skill", "role skill", "alpha", "bloodhound", "shepherd", "pointer", "tracker", "watchdog", "spec"
-- `scripts` ← "router", "routing", "toolcheck", "usage gate", "window gate", "pedigree", "chain", "release", "sync-runtime", "leak grep", "test-all", "config reader"
+- `scripts` ← "router", "routing", "toolcheck", "usage gate", "window gate", "pedigree", "chain", "release", "leak grep", "test-all", "config reader"
 - `vibe-agents` ← "seat profile", "Vibe agent"
 - `hooks` ← "hook", "guard"
 - `.github/workflows` ← "CI"
