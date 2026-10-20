@@ -2,7 +2,7 @@
 
 Aggregated patterns from the last 1 hunts (window: 10).
 Updated by `scripts/wolfpack-lessons.sh`, called at end of every Watchdog cert.
-Last regenerated: 2026-10-20T04:47:20Z
+Last regenerated: 2026-10-20T06:12:24Z
 
 ## Patterns That Work (count >= 3)
 
@@ -23,7 +23,7 @@ _(none yet)_
 - Average sub-agents per hunt: 0
 - Average redundancy rate: 0%
 - Hunts where parallelism was high-value: _(none yet)_
-- Hunts where parallelism was low-value or none: workflow-meta-runtime
+- Hunts where parallelism was low-value or none: autonomy-docs-into-pack
 
 ## Recommendations for Next Plan
 
