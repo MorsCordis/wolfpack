@@ -2263,6 +2263,20 @@ test('workflow-meta-runtime (3): a matching (or omitted) reported plan dir logs 
   }
 })
 
+test('workflow-meta-runtime (3): a trailing-slash reported worktreePath is normalized — no seat-handoff park, computed plan dir reaches the seat', async () => {
+  const { find, logs, result } = await runHunt({ answers: { scaffold: { worktreePath: WT + '/', planDir: PD } } })
+  assert.ok(find('bloodhound:').length > 0, 'reaches the Bloodhound seat')
+  for (const c of find('bloodhound:')) assert.ok(c.prompt.includes(`--deliver-to '${PD}'`), c.label)
+  assert.equal(logs.some(l => /not inside the worktree/.test(l)), false, logs.join('\n'))
+  assert.notEqual(result?.verdict, 'PARKED_REVIEW_ERROR')
+})
+
+test('workflow-meta-runtime AC5: runtimeMetaRefs keeps a meta ref after a // inside a string/template literal', () => {
+  assert.ok(runtimeMetaRefs('const a = `x // y ${meta.name}`').length > 0)
+  assert.ok(runtimeMetaRefs("const a = 'x // y'; const b = meta.name").length > 0)
+  assert.equal(runtimeMetaRefs('// meta\nconst a = 1 /* meta */').length, 0)
+})
+
 test('workflow-meta-runtime (3): the source never adopts an agent-reported plan dir', () => {
   assert.doesNotMatch(SRC, /scaffold\.planDir \|\|/)
   assert.doesNotMatch(SRC, /resumeProbe\.planDir \|\|/)

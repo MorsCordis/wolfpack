@@ -35,8 +35,41 @@ export function stripMeta(src) { return splitMeta(src).body }
 // Hits of the bare identifier `meta` in runtime code (comments blanked, strings/templates kept:
 // the bug lived inside a template literal).
 export function runtimeMetaRefs(body) {
-  const noComments = body
-    .replace(/\/\*[\s\S]*?\*\//g, m => m.replace(/[^\n]/g, ' '))
-    .replace(/(^|[^:\\'"`])\/\/.*$/gm, (m, p) => p)
-  return [...noComments.matchAll(/\bmeta\b/g)].map(m => ({ index: m.index }))
+  // String-aware scan: comments are blanked only OUTSIDE string/template literals. Template
+  // `${ ... }` interpolations are code again (and may nest further templates), tracked on a stack.
+  let out = ''
+  let str = null            // current literal quote when inside ' " or ` text
+  const stack = []          // saved {depth} for each open `${` interpolation
+  let depth = 0             // brace depth inside the current interpolation
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i], n = body[i + 1]
+    if (str) {
+      if (c === '\\') { out += c + (n ?? ''); i++; continue }
+      if (str === '`' && c === '$' && n === '{') { stack.push({ depth }); depth = 0; str = null; out += '${'; i++; continue }
+      if (c === str) str = null
+      else if (c === '\n' && str !== '`') str = null // ' and " literals cannot span lines
+      out += c
+      continue
+    }
+    if (c === '/' && n === '/') {
+      while (i < body.length && body[i] !== '\n') { out += ' '; i++ }
+      i--
+      continue
+    }
+    if (c === '/' && n === '*') {
+      const e = body.indexOf('*/', i + 2)
+      const stop = e < 0 ? body.length : e + 2
+      out += body.slice(i, stop).replace(/[^\n]/g, ' ')
+      i = stop - 1
+      continue
+    }
+    if (c === "'" || c === '"' || c === '`') { str = c; out += c; continue }
+    if (c === '{') depth++
+    else if (c === '}') {
+      if (depth === 0 && stack.length) { depth = stack.pop().depth; str = '`'; out += c; continue }
+      depth--
+    }
+    out += c
+  }
+  return [...out.matchAll(/\bmeta\b/g)].map(m => ({ index: m.index }))
 }

@@ -1199,7 +1199,9 @@ ${heartbeat('Scaffold', 'creating worktree and metadata')}
 }
 // workflow-meta-runtime (3): the plan dir is COMPUTED, never agent-reported — a scaffold agent
 // once reported the MAIN-checkout plan dir, and every seat then failed the handoff guard.
-planDir = `${String(worktreePath).replace(/\/+$/, '')}/.wolfpack/plans/${slug}`
+// Normalize once (trailing slashes) so every `${worktreePath}/...` join and relToWorktree's prefix test agree.
+worktreePath = String(worktreePath).replace(/\/+$/, '') || worktreePath
+planDir = `${worktreePath}/.wolfpack/plans/${slug}`
 if (typeof reportedPlanDir === 'string' && reportedPlanDir.trim() && reportedPlanDir.trim().replace(/\/+$/, '') !== planDir) {
   log(`⚠ WARNING: the ${at('Scaffold') ? 'scaffold' : 'resume probe'} agent reported plan dir ${reportedPlanDir}, which differs from the computed ${planDir} — IGNORING the reported value and using the computed one.`)
 }
