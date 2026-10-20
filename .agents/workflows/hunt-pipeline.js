@@ -19,6 +19,10 @@ export const meta = {
 // generator (scripts/wolfpack-workflows.mjs, run by install.sh) replaces exactly this one line in
 // a consumer's copy with {workflow, commit, version, source}. Keep it unique and on one line.
 const WOLFPACK_STAMP = null // wolfpack-stamp — generated copies carry {workflow, commit, version, source}; see scripts/wolfpack-workflows.mjs
+// workflow-meta-runtime: the runtime STRIPS the `export const meta` block before executing this
+// script, so runtime code must never reference `meta`. This constant MUST equal the name field
+// declared in the meta block (guarded by scripts/wolfpack-hunt-pipeline.test.mjs).
+const WORKFLOW_NAME = 'hunt-pipeline'
 
 const VERDICT_SCHEMA = {
   type: 'object',
@@ -762,7 +766,15 @@ phase('Scaffold')
 // JSON verbatim. Fail closed: a missing/incomplete config, a garbled relay or a dead seat
 // THROWS (the hunt may not be scaffolded yet — nothing to park into). The pipeline never
 // guesses a project value.
-const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+// workflow-meta-runtime: the two run-start probes (project-config, workflow-stamp) must run in
+// the SAME host repo. Each prints its pwd in the same command line and returns it as `cwd`; the
+// stamp check fails closed unless both agree with the checker's consumer.
+const PROBE_NO_CD = 'Run in your STARTING directory exactly as launched — do NOT cd anywhere first (not to a repo root, not into any project, repo or path named in your context or memory). Run the command below as ONE command line.'
+// Trailing-slash/whitespace normalized only (no realpath — a symlink-vs-logical difference fails
+// closed). '' when absent, empty or not absolute; callers treat '' as a mismatch.
+const probeRoot = (v) => (typeof v === 'string' && v.trim().startsWith('/')) ? (v.trim().replace(/\/+$/, '') || '/') : ''
+let hostRepoRoot = ''
+const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' }, cwd: { type: 'string' } }, required: ['exitCode', 'output', 'cwd'] }
 // The first brace-balanced {…} block of a text (string-aware, so braces inside JSON strings
 // never end it early; a non-greedy first-} match would truncate inside nested objects).
 const firstJsonObject = (text) => {
@@ -785,10 +797,10 @@ const firstJsonObject = (text) => {
   return null
 }
 const loadProjectConfig = async (who, consequence, label, phaseName) => {
-  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. From the repo root (your starting directory), run exactly:
-  node scripts/wolfpack-config.mjs --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"
-Return exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the CONFIG_RC line.
-If the command could not run at all, return exitCode 2 and the error text as output. Never create, fix or edit anything.`,
+  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. ${PROBE_NO_CD} Run exactly:
+  echo "PROBE_PWD=$(pwd)"; node scripts/wolfpack-config.mjs --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"
+Return cwd = the path after PROBE_PWD= VERBATIM, exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the PROBE_PWD and CONFIG_RC lines.
+If the command could not run at all, return exitCode 2, the error text as output, and cwd = the output of pwd. Never create, fix or edit anything.`,
     { label, phase: phaseName, model: 'sonnet', schema: PROJECT_CONFIG_SCHEMA })
   const out = (pc && typeof pc.output === 'string') ? pc.output : ''
   // The reader's ✗ line names the missing keys; surface it first, then the head of the output.
@@ -809,6 +821,9 @@ If the command could not run at all, return exitCode 2 and the error text as out
   if (why) {
     throw new Error(`${who}: wolfpack-config.md is missing or incomplete — ${consequence}. ${why}: ${detail}. Fix: copy wolfpack-config.example.md to wolfpack-config.md and fill the required keys (Name, Test command, Compliance areas, Risk-surface paths, Model Pool judgment + reviewer-a); check with node scripts/wolfpack-config.mjs --json`)
   }
+  const root = probeRoot(pc.cwd)
+  if (!root) throw new Error(`${who}: the project-config probe did not report the directory it ran in (cwd ${JSON.stringify(pc.cwd ?? null)}) — the host repo is UNKNOWN, so the stamp check cannot confirm both probes read the same repo. Relaunch from the consuming repo's root.`)
+  hostRepoRoot = root
   if (!Array.isArray(parsed.worktreeLinks)) parsed.worktreeLinks = []
   return parsed
 }
@@ -854,16 +869,16 @@ const PACK_SKILLS = `${wolfpackHome.home}/.agents/skills`
 // pack-install-model (AC5): the run-start stamp check. WOLFPACK_STAMP is THIS script's own
 // stamp (null in the canonical). A read-only probe runs the pack's checker against the main
 // checkout; fail closed on any malformed/absent result. Throws BEFORE any state is mutated.
-// Body identical in hunt-pipeline.js and campaign-runner.js (apart from the call's args).
-const STAMP_PROBE_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+// Body identical in hunt-pipeline.js and campaign-runner.js (byte-identical; the per-file value is WORKFLOW_NAME).
+const STAMP_PROBE_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' }, cwd: { type: 'string' } }, required: ['exitCode', 'output', 'cwd'] }
 const checkWorkflowStamp = async (who, label, phaseName) => {
-  const self = `${meta.name}.js`
+  const self = `${WORKFLOW_NAME}.js`
   const home = wolfpackHome.home
   if (home.includes("'")) throw new Error(`${who}: WOLFPACK_HOME contains a single quote — refusing to build the stamp probe`)
-  const p = await agent(`READ-ONLY workflow stamp probe — modify nothing. From the repo root (your starting directory), run exactly:
-  node '${home}/scripts/wolfpack-workflows.mjs' check --pack '${home}' --consumer "$(pwd)" --json 2>&1; echo "STAMP_RC=$?"
-Return exitCode = the number after STAMP_RC= and output = the command's stdout+stderr VERBATIM, minus the STAMP_RC line.
-If the command could not run at all, return exitCode 2 and the error text as output. Never create, fix, regenerate or edit anything.`,
+  const p = await agent(`READ-ONLY workflow stamp probe — modify nothing. ${PROBE_NO_CD} Run exactly:
+  echo "PROBE_PWD=$(pwd)"; node '${home}/scripts/wolfpack-workflows.mjs' check --pack '${home}' --consumer "$(pwd)" --json 2>&1; echo "STAMP_RC=$?"
+Return cwd = the path after PROBE_PWD= VERBATIM, exitCode = the number after STAMP_RC= and output = the command's stdout+stderr VERBATIM, minus the PROBE_PWD and STAMP_RC lines.
+If the command could not run at all, return exitCode 2, the error text as output, and cwd = the output of pwd. Never create, fix, regenerate or edit anything.`,
     { label, phase: phaseName, model: 'sonnet', schema: STAMP_PROBE_SCHEMA })
   if (!p) throw new Error(`${who}: the workflow stamp probe returned no result — workflow freshness UNKNOWN; relaunch`)
   const out = typeof p.output === 'string' ? p.output : ''
@@ -874,6 +889,14 @@ If the command could not run at all, return exitCode 2 and the error text as out
   if (!parsed || !Array.isArray(parsed.workflows)) throw new Error(`${who}: the workflow stamp probe output held no checker result (no workflows[] array) — workflow freshness UNKNOWN: ${head}`)
   const entry = parsed.workflows.find(w => w && w.name === self)
   if (!entry || typeof entry.state !== 'string') throw new Error(`${who}: the workflow stamp check did not report ${self} — workflow freshness UNKNOWN: ${head}`)
+  // workflow-meta-runtime: fail closed unless the config probe, this probe and the checker all
+  // name the SAME host repo (a probe that cd'd elsewhere would compare the wrong consumer).
+  const probePwd = probeRoot(p.cwd)
+  const checkedConsumer = probeRoot(parsed.consumer)
+  if (!hostRepoRoot || probePwd !== hostRepoRoot || checkedConsumer !== hostRepoRoot) {
+    const show = (v) => v || '(not reported)'
+    throw new Error(`${who}: HOST REPO DRIFTED between probes — the project-config probe ran in ${show(hostRepoRoot)}, but the workflow stamp probe ran in ${show(probePwd)} and checked consumer ${show(checkedConsumer)}. Refusing to run: ${self}'s freshness would be judged against a different repo than the config was read from. Fix: relaunch from the consuming repo's root (the probes must not cd).`)
+  }
   const S = WOLFPACK_STAMP
   const packVersion = parsed.packVersion
   const packCommit = String(parsed.packCommit || '')
@@ -1099,7 +1122,7 @@ const at = (p) => PHASE_ORDER.indexOf(p) >= PHASE_ORDER.indexOf(resumeFrom)
 trackerFamily = familyOf(resumeProbe && resumeProbe.trackerModel) || trackerFamily
 
 // ─── Phase 0: Scaffold (skipped on resume) ─────────────────────
-let worktreePath, planDir
+let worktreePath, planDir, reportedPlanDir
 let tier, bloodhoundRounds, pointerRounds, trackerRounds
 if (at('Scaffold')) {
 if (!descriptionPassed) {
@@ -1168,11 +1191,19 @@ ${heartbeat('Scaffold', 'creating worktree and metadata')}
 }})
 
   worktreePath = scaffold.worktreePath
-  planDir = scaffold.planDir || `${worktreePath}/.wolfpack/plans/${slug}`
+  reportedPlanDir = scaffold.planDir
 } else {
   worktreePath = resumeProbe.worktreePath
-  planDir = resumeProbe.planDir || `${worktreePath}/.wolfpack/plans/${slug}`
+  reportedPlanDir = resumeProbe.planDir
   log(`Adopted existing worktree (resume): ${worktreePath}`)
+}
+// workflow-meta-runtime (3): the plan dir is COMPUTED, never agent-reported — a scaffold agent
+// once reported the MAIN-checkout plan dir, and every seat then failed the handoff guard.
+// Normalize once (trailing slashes) so every `${worktreePath}/...` join and relToWorktree's prefix test agree.
+worktreePath = String(worktreePath).replace(/\/+$/, '') || worktreePath
+planDir = `${worktreePath}/.wolfpack/plans/${slug}`
+if (typeof reportedPlanDir === 'string' && reportedPlanDir.trim() && reportedPlanDir.trim().replace(/\/+$/, '') !== planDir) {
+  log(`⚠ WARNING: the ${at('Scaffold') ? 'scaffold' : 'resume probe'} agent reported plan dir ${reportedPlanDir}, which differs from the computed ${planDir} — IGNORING the reported value and using the computed one.`)
 }
 log(`Worktree: ${worktreePath}`)
 log(`Examiner chain for this hunt (reviews of Claude-written work): ${chainLabel(examinerChain(PLAN_WRITER_FAMILIES))} — enabled: ${EXAMINER_ORDER.join(', ')} (WOLFPACK_ENABLE_GLM ${GLM_ENABLED ? 'on' : 'off'}, WOLFPACK_ENABLE_MISTRAL_AUTO ${MISTRAL_AUTO ? 'on' : 'off'})`)
@@ -1768,7 +1799,7 @@ fresh run), ignore this and proceed; do NOT invent direction that was not given.
 // barrier reports it. The agent ONLY writes park artifacts — it does not plan,
 // fix, review, or commit. `resolutionTypeExpected` is the agent's best guess
 // (clarify|redirect); /resolve can override it from the human's actual answer.
-async function parkHunt({ reason, resumePhase, resolutionTypeExpected, needFromUser, context, options, phaseLabel, extraMeta }) {
+async function parkHunt({ reason, resumePhase, resolutionTypeExpected, needFromUser, context, options, phaseLabel, extraMeta, error }) {
   return await agent(`
 You are writing a PARK record for a halted Wolfpack hunt. You ONLY write the two
 park artifacts below — do NOT plan, implement, review, fix, or commit anything.
@@ -1788,7 +1819,7 @@ cd to ${worktreePath}. Use ABSOLUTE paths for every write.
 
 # PARKED — ${slug}
 
-- reason: ${reason}
+- reason: ${reason}${error ? `\n- error: ${JSON.stringify(String(error))}` : ''}
 - parked_at: <NOW>
 - resume_phase: ${resumePhase}
 - resolution_type_expected: ${resolutionTypeExpected}
@@ -1799,14 +1830,14 @@ ${needFromUser}
 
 ## Context (enough to decide without opening the worktree)
 ${context}
-${options ? `\n## Options (feeds AskUserQuestion)\n${options}\n` : ''}
+${options ? `\n## Options (feeds AskUserQuestion)\n${options}\n` : ''}${error ? '\nCopy the "- error:" line above VERBATIM — do not paraphrase, shorten or re-explain it.\n' : ''}
 3. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}:
    - set top-level "status" = "parked:${reason}"
    - add (or overwrite) a "park" block (initialize ALL fields so /resolve and the
      compliance gate never read undefined):
      { "reason": "${reason}", "parked_at": "<NOW>", "resume_phase": "${resumePhase}",
        "resolution_type": "${resolutionTypeExpected}", "tier": "${tier || 'Red'}",
-       "human_notes_seen": false, "redirect_count": 0, "compliance_signed_off": false }
+       "human_notes_seen": false, "redirect_count": 0, "compliance_signed_off": false${error ? `, "error": ${JSON.stringify(String(error))}` : ''} }
      EXCEPTION: if a "park" block already exists (a re-park), PRESERVE its existing
      "redirect_count" rather than resetting it to 0 — the redirect-loop guard counts
      across cycles. Preserve every other top-level field too.
@@ -1913,11 +1944,27 @@ async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
   let lastFailedStatuses = []   // statuses from the most recent failing iteration
   while (pending.length) {
     const results = []
+    // workflow-meta-runtime (4): build every prompt BEFORE parallel(). A throw here is a PIPELINE /
+    // CONFIG error (no seat ran) — the runtime's parallel() would turn it into a bare null and the
+    // park would guess "model outage". Surface it verbatim instead; no concurrency degradation
+    // (a deterministic config error is not contention).
+    const prompts = []
+    for (const unit of pending) {
+      try { prompts.push(buildPrompt(unit, unit.nudge ? verdictCorrectiveNudge(unit.lastStatus) : '')) }
+      catch (e) {
+        const pipelineError = String((e && e.message) || e)
+        degradeLog.push(`lens "${unit.key}" pipeline error before any seat ran: ${pipelineError}`)
+        log(`⛔ review fan-out could not start (pipeline_error, no seat ran): ${pipelineError}`)
+        return { verdict: 'ERROR', status: 'pipeline_error', pipelineError,
+                 findings: 0, findingsList: mergeFindings(done), grounded: 0, dropped: [],
+                 provider: null, degradeLog, unitsOk: done.length, unitsTotal: lenses.length }
+      }
+    }
     // chunk into groups of `cap` so at most `cap` units run concurrently
     for (let i = 0; i < pending.length; i += cap) {
       const chunk = pending.slice(i, i + cap)
-      const res = await parallel(chunk.map(unit => () =>
-        agent(buildPrompt(unit, unit.nudge ? verdictCorrectiveNudge(unit.lastStatus) : ''),
+      const res = await parallel(chunk.map((unit, j) => () =>
+        agent(prompts[i + j],
               { label: `${label}:${unit.key}${unit.nudge ? `:nudge${unit.nudge}` : ''}`, phase: phaseLabel, schema: REVIEW_SCHEMA })))
       results.push(...res)
     }
@@ -2714,6 +2761,17 @@ ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + un
       break
     }
     if (reviewResult.verdict === 'ERROR') {
+      if (reviewResult.status === 'pipeline_error') {
+        log(`⏸ ${slug}: the plan review could not start — pipeline/config error before any seat ran. Parking review_error with the error verbatim.`)
+        await parkHunt({
+          reason: 'review_error', resumePhase: 'Review', resolutionTypeExpected: 'redirect', phaseLabel: 'Review',
+          error: reviewResult.pipelineError,
+          needFromUser: `The plan review could not start: the pipeline threw a configuration error BEFORE any examiner seat ran, so no model was called. This is NOT a model outage or quota problem. The error, verbatim:\n\n${reviewResult.pipelineError}\n\nFix the cause it names, then resume the review.`,
+          context: `Pipeline error (verbatim, no seat ran): ${reviewResult.pipelineError}\nReview fan-out log:\n${(reviewResult.degradeLog || []).map(l => `- ${l}`).join('\n')}\nFinal status: pipeline_error`,
+          options: `- A (redirect): fix the configuration the error names, then resume the review.\n- B (clarify): the cause is already fixed outside the hunt — resume the review as-is.`,
+        })
+        return { slug, verdict: 'PARKED', status: 'parked:review_error', reason: 'review_error', tier, worktreePath, pipelineError: reviewResult.pipelineError, degradeLog: reviewResult.degradeLog }
+      }
       // [03] Part B — review fan-out floored at concurrency 1 and STILL failing → PARK.
       // [05] AC3 — distinguish a QUOTA outage (every chain examiner rate-limited; status
       // "model_quota") from broken PLUMBING (review_error). Quota is transient: the host
@@ -3329,6 +3387,17 @@ ${META_PRESERVE_NOTE}. Do NOT alter any other file. Do NOT commit. Return record
     const wasClaudeFinalRound = claudeFinalRound
     claudeFinalRound = false
     if (pointerResult.verdict === 'ERROR') {
+      if (pointerResult.status === 'pipeline_error') {
+        log(`⏸ ${slug}: the code review could not start — pipeline/config error before any seat ran. Parking review_error with the error verbatim.`)
+        await parkHunt({
+          reason: 'review_error', resumePhase: 'Code Review', resolutionTypeExpected: 'redirect', phaseLabel: 'Code Review',
+          error: pointerResult.pipelineError,
+          needFromUser: `The code review could not start: the pipeline threw a configuration error BEFORE any examiner seat ran, so no model was called. This is NOT a model outage or quota problem. The error, verbatim:\n\n${pointerResult.pipelineError}\n\nFix the cause it names, then resume the code review.`,
+          context: `Pipeline error (verbatim, no seat ran): ${pointerResult.pipelineError}\nCode-review fan-out log:\n${(pointerResult.degradeLog || []).map(l => `- ${l}`).join('\n')}\nFinal status: pipeline_error`,
+          options: `- A (redirect): fix the configuration the error names, then resume the code review.\n- B (clarify): the cause is already fixed outside the hunt — resume the code review as-is.`,
+        })
+        return { slug, verdict: 'PARKED', status: 'parked:review_error', reason: 'review_error', tier, worktreePath, pipelineError: pointerResult.pipelineError, degradeLog: pointerResult.degradeLog }
+      }
       // [03] Part B — code-review fan-out floored at cap 1 and STILL failing → PARK.
       // [05] AC3 — quota outage (every chain examiner throttled) parks model_quota (host
       // driver reschedules past reset); broken plumbing parks review_error.

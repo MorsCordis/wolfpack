@@ -11,6 +11,10 @@ export const meta = {
 // generator (scripts/wolfpack-workflows.mjs, run by install.sh) replaces exactly this one line in
 // a consumer's copy with {workflow, commit, version, source}. Keep it unique and on one line.
 const WOLFPACK_STAMP = null // wolfpack-stamp — generated copies carry {workflow, commit, version, source}; see scripts/wolfpack-workflows.mjs
+// workflow-meta-runtime: the runtime STRIPS the `export const meta` block before executing this
+// script, so runtime code must never reference `meta`. This constant MUST equal the name field
+// declared in the meta block (guarded by scripts/wolfpack-campaign-runner.test.mjs).
+const WORKFLOW_NAME = 'campaign-runner'
 
 const CAMPAIGN_SCHEMA = {
   type: 'object',
@@ -287,7 +291,15 @@ log(`Parsing campaign: ${campaignSlug}`)
 // read-only agent runs the deterministic reader (scripts/wolfpack-config.mjs) and relays its
 // JSON. Fail closed: a missing/incomplete config, a garbled relay or a dead seat THROWS
 // before any hunt launches — the runner never guesses a project value.
-const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+// workflow-meta-runtime: the two run-start probes (project-config, workflow-stamp) must run in
+// the SAME host repo. Each prints its pwd in the same command line and returns it as `cwd`; the
+// stamp check fails closed unless both agree with the checker's consumer.
+const PROBE_NO_CD = 'Run in your STARTING directory exactly as launched — do NOT cd anywhere first (not to a repo root, not into any project, repo or path named in your context or memory). Run the command below as ONE command line.'
+// Trailing-slash/whitespace normalized only (no realpath — a symlink-vs-logical difference fails
+// closed). '' when absent, empty or not absolute; callers treat '' as a mismatch.
+const probeRoot = (v) => (typeof v === 'string' && v.trim().startsWith('/')) ? (v.trim().replace(/\/+$/, '') || '/') : ''
+let hostRepoRoot = ''
+const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' }, cwd: { type: 'string' } }, required: ['exitCode', 'output', 'cwd'] }
 // The first brace-balanced {…} block of a text (string-aware, so braces inside JSON strings
 // never end it early; a non-greedy first-} match would truncate inside nested objects).
 const firstJsonObject = (text) => {
@@ -311,10 +323,10 @@ const firstJsonObject = (text) => {
 }
 let projectConfig = null
 {
-  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. From the repo root (your starting directory), run exactly:
-  node scripts/wolfpack-config.mjs --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"
-Return exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the CONFIG_RC line.
-If the command could not run at all, return exitCode 2 and the error text as output. Never create, fix or edit anything.`,
+  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. ${PROBE_NO_CD} Run exactly:
+  echo "PROBE_PWD=$(pwd)"; node scripts/wolfpack-config.mjs --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"
+Return cwd = the path after PROBE_PWD= VERBATIM, exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the PROBE_PWD and CONFIG_RC lines.
+If the command could not run at all, return exitCode 2, the error text as output, and cwd = the output of pwd. Never create, fix or edit anything.`,
     { label: 'project-config', phase: 'Parse', model: 'sonnet', schema: PROJECT_CONFIG_SCHEMA })
   const out = (pc && typeof pc.output === 'string') ? pc.output : ''
   // The reader's ✗ line names the missing keys; surface it first, then the head of the output.
@@ -335,6 +347,9 @@ If the command could not run at all, return exitCode 2 and the error text as out
   if (why) {
     throw new Error(`campaign-runner: wolfpack-config.md is missing or incomplete — no hunt may start. ${why}: ${detail}. Fix: copy wolfpack-config.example.md to wolfpack-config.md and fill the required keys (Name, Test command, Compliance areas, Risk-surface paths, Model Pool judgment + reviewer-a); check with node scripts/wolfpack-config.mjs --json`)
   }
+  const root = probeRoot(pc.cwd)
+  if (!root) throw new Error(`campaign-runner: the project-config probe did not report the directory it ran in (cwd ${JSON.stringify(pc.cwd ?? null)}) — the host repo is UNKNOWN, so the stamp check cannot confirm both probes read the same repo. Relaunch from the consuming repo's root.`)
+  hostRepoRoot = root
   projectConfig = parsed
   log(`Project config: ${projectConfig.name} — tests: ${projectConfig.testCommand}; deploy: ${projectConfig.devDeployCommand || 'none'}`)
 }
@@ -374,16 +389,16 @@ log(`Worktree root: ${worktreeRoot} (wolfpack-config.md → Project Identity)`)
 // pack-install-model (AC5): the run-start stamp check. WOLFPACK_STAMP is THIS script's own
 // stamp (null in the canonical). A read-only probe runs the pack's checker against the main
 // checkout; fail closed on any malformed/absent result. Throws BEFORE any state is mutated.
-// Body identical in hunt-pipeline.js and campaign-runner.js (apart from the call's args).
-const STAMP_PROBE_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+// Body identical in hunt-pipeline.js and campaign-runner.js (byte-identical; the per-file value is WORKFLOW_NAME).
+const STAMP_PROBE_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' }, cwd: { type: 'string' } }, required: ['exitCode', 'output', 'cwd'] }
 const checkWorkflowStamp = async (who, label, phaseName) => {
-  const self = `${meta.name}.js`
+  const self = `${WORKFLOW_NAME}.js`
   const home = wolfpackHome.home
   if (home.includes("'")) throw new Error(`${who}: WOLFPACK_HOME contains a single quote — refusing to build the stamp probe`)
-  const p = await agent(`READ-ONLY workflow stamp probe — modify nothing. From the repo root (your starting directory), run exactly:
-  node '${home}/scripts/wolfpack-workflows.mjs' check --pack '${home}' --consumer "$(pwd)" --json 2>&1; echo "STAMP_RC=$?"
-Return exitCode = the number after STAMP_RC= and output = the command's stdout+stderr VERBATIM, minus the STAMP_RC line.
-If the command could not run at all, return exitCode 2 and the error text as output. Never create, fix, regenerate or edit anything.`,
+  const p = await agent(`READ-ONLY workflow stamp probe — modify nothing. ${PROBE_NO_CD} Run exactly:
+  echo "PROBE_PWD=$(pwd)"; node '${home}/scripts/wolfpack-workflows.mjs' check --pack '${home}' --consumer "$(pwd)" --json 2>&1; echo "STAMP_RC=$?"
+Return cwd = the path after PROBE_PWD= VERBATIM, exitCode = the number after STAMP_RC= and output = the command's stdout+stderr VERBATIM, minus the PROBE_PWD and STAMP_RC lines.
+If the command could not run at all, return exitCode 2, the error text as output, and cwd = the output of pwd. Never create, fix, regenerate or edit anything.`,
     { label, phase: phaseName, model: 'sonnet', schema: STAMP_PROBE_SCHEMA })
   if (!p) throw new Error(`${who}: the workflow stamp probe returned no result — workflow freshness UNKNOWN; relaunch`)
   const out = typeof p.output === 'string' ? p.output : ''
@@ -394,6 +409,14 @@ If the command could not run at all, return exitCode 2 and the error text as out
   if (!parsed || !Array.isArray(parsed.workflows)) throw new Error(`${who}: the workflow stamp probe output held no checker result (no workflows[] array) — workflow freshness UNKNOWN: ${head}`)
   const entry = parsed.workflows.find(w => w && w.name === self)
   if (!entry || typeof entry.state !== 'string') throw new Error(`${who}: the workflow stamp check did not report ${self} — workflow freshness UNKNOWN: ${head}`)
+  // workflow-meta-runtime: fail closed unless the config probe, this probe and the checker all
+  // name the SAME host repo (a probe that cd'd elsewhere would compare the wrong consumer).
+  const probePwd = probeRoot(p.cwd)
+  const checkedConsumer = probeRoot(parsed.consumer)
+  if (!hostRepoRoot || probePwd !== hostRepoRoot || checkedConsumer !== hostRepoRoot) {
+    const show = (v) => v || '(not reported)'
+    throw new Error(`${who}: HOST REPO DRIFTED between probes — the project-config probe ran in ${show(hostRepoRoot)}, but the workflow stamp probe ran in ${show(probePwd)} and checked consumer ${show(checkedConsumer)}. Refusing to run: ${self}'s freshness would be judged against a different repo than the config was read from. Fix: relaunch from the consuming repo's root (the probes must not cd).`)
+  }
   const S = WOLFPACK_STAMP
   const packVersion = parsed.packVersion
   const packCommit = String(parsed.packCommit || '')

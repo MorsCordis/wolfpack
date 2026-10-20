@@ -324,7 +324,8 @@ Opt-in campaign mode with **no wave barriers**. Barrier mode stays the default a
     "tier": "carried so resume never guesses a downgraded tier",
     "human_notes_seen": false,
     "redirect_count": 0,
-    "compliance_signed_off": false
+    "compliance_signed_off": false,
+    "error": "optional — verbatim pipeline/config error text when the hunt parked before any seat ran (e.g. review_error from a prompt-build throw); absent otherwise"
   }
 }
 ```

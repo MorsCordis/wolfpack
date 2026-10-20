@@ -4,6 +4,12 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+### Fixed
+- `hunt-pipeline.js` and `campaign-runner.js` no longer die at launch with `ReferenceError: meta is not defined`: the Workflow runtime strips the `export const meta` block, so the run-start stamp check now names its own file from a plain `WORKFLOW_NAME` constant (kept equal to `meta.name`, guarded by a test). The test harnesses now REMOVE the meta block the way the runtime does instead of rewriting it to `const meta`, which hid the bug. <!-- hunt:workflow-meta-runtime -->
+- The run-start project-config and workflow-stamp probes run in their starting directory with no `cd`, and each reports the `pwd` it ran in. The run stops with a "host repo drifted between probes" error naming both paths when the stamp probe's directory or the checker's consumer differs from the config probe's directory, or when either probe omits it. A probe can no longer wander into another repo and check the wrong consumer. <!-- hunt:workflow-meta-runtime -->
+- `hunt-pipeline.js` always computes the hunt's plan dir as `<worktree>/.wolfpack/plans/<slug>`. It no longer adopts a plan dir reported by the scaffold or resume agent, which once pointed every review seat at the main checkout. A differing reported value is logged as a WARNING and ignored. <!-- hunt:workflow-meta-runtime -->
+- When a review or code review cannot start because the pipeline itself threw (a configuration error, no seat ran), the hunt now parks with that error text verbatim in `parked.md` and in the metadata `park.error` field. It used to say "likely a model outage or quota exhaustion". The test harness's `parallel()` now nulls a throwing unit the way the runtime does, so a thrown error can no longer hide behind it. <!-- hunt:workflow-meta-runtime -->
+
 ## [v0.3.0] - 2026-10-20
 
 ### Added
