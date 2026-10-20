@@ -1,5 +1,4 @@
 // Tests for wolfpack-statusline.mjs (usage-limit-gate AC1) — run: node --test scripts/wolfpack-statusline.test.mjs
-// Kept byte-identical with consuming-project copies until scripts-unfork reconciles them.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'

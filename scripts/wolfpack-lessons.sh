@@ -266,7 +266,7 @@ done
   echo "---"
   echo
   echo "_Vocabulary defined in \`.agents/skills/watchdog/SKILL.md\`. To re-tune thresholds:_"
-  echo "_\`WOLFPACK_LESSONS_WINDOW=20 WOLFPACK_MIN_RECURRING=3 ./scripts/wolfpack-lessons.sh\`_"
+  echo "_\`WOLFPACK_LESSONS_WINDOW=20 WOLFPACK_MIN_RECURRING=3 \"\$WOLFPACK_HOME/scripts/wolfpack-lessons.sh\"\`_"
 } > "$LESSONS"
 
 echo "Wrote $LESSONS — ${#pedigree_files[@]} hunts aggregated"

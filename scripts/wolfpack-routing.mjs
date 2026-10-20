@@ -61,21 +61,39 @@
 // DETERMINISTIC (thin-data → explore the work horse to accrue data; rich-data →
 // exploit the best), never random, so a workflow could call this and resume cleanly.
 //
-// Usage (CLI, for inspection/dry-run):
-//   node scripts/wolfpack-routing.mjs <planDir> [--config <path>]
-//     reads <planDir>/metadata.json (tier + predicted_dimensions),
-//     .wolfpack/pedigree/model-stats.json, and the Model Pool from wolfpack-config.md
-//     (default <planDir>/../../../wolfpack-config.md, i.e. <root>/wolfpack-config.md;
-//     --config may only follow <planDir>). Prints the recommendation as JSON with
-//     pool_source 'config' (+ config: <path>) or 'default' (no config: stderr warning +
-//     the same line in warnings). An unusable Model Pool exits 2. With an empty pedigree
-//     every seat is the tier default over the config pool's order.
+// Usage (CLI, for inspection/dry-run) — run it from the pack, never from a copy:
+//   node "$WOLFPACK_HOME/scripts/wolfpack-routing.mjs" <planDir> [--config <path>] [--stats <path>]
+//     (each flag at most once, any order after <planDir>; anything else → usage, exit 2)
+//     reads <planDir>/metadata.json (tier + predicted_dimensions), the model-stats
+//     meter, and the Model Pool from wolfpack-config.md (default
+//     <planDir>/../../../wolfpack-config.md, i.e. <root>/wolfpack-config.md). Prints the
+//     recommendation as JSON with pool_source 'config' (+ config: <path>) or 'default'
+//     (no config: stderr warning + the same line in warnings). An unusable Model Pool
+//     exits 2. With an empty pedigree every seat is the tier default over the pool's order.
+//
+//   DATA ROOT. The stats default is the INVOKING repo's meter, never the script's own
+//     location: <main worktree of planDir's repo>/.wolfpack/pedigree/model-stats.json
+//     (a planDir inside a hunt worktree reads the main checkout's meter — the same file
+//     Watchdog's model-stats step writes). When planDir is not inside a git repo the
+//     default is <planDir>/../../../.wolfpack/pedigree/model-stats.json — derived from the
+//     caller's argument, not the script's location. --stats overrides both. The JSON names
+//     the resolved path (`stats`) and whether it existed (`stats_source`: file | absent).
+//
+//   GATES. A Model Pool line may carry `gate=<ENV>` (wolfpack-config.mjs → `gates`). The CLI
+//     turns them into the enabled reviewer set with the workflows' gate shape (unset / "" /
+//     "1" / "true" → on, anything else → off) and reports them as `gates`. A review seat
+//     whose chain is empty (every pool reviewer is the writer's family or gated off) is a
+//     constraint violation: exit 3 with the fix (the pipeline parks no_cross_family_reviewer).
+//
+//   LAST RESORT. The last-resort examiner link (the judgment family) is appended by
+//     hunt-pipeline, never routed here. A Model Pool role the router does not use (e.g. a
+//     documented `reviewer-z` last-resort line) is ignored with a stderr warning.
 
 import { readFileSync, existsSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ucbSelect } from './wolfpack-bandit.mjs'
-import { loadConfig } from './wolfpack-config.mjs'
+import { loadConfig, mainWorktree } from './wolfpack-config.mjs'
 
 // ─── The neutral model pool ──────────────────────────────────────
 // DEFAULT_POOL is a provider-agnostic EXAMPLE. Real projects supply their own
@@ -286,7 +304,7 @@ export function recommendModels({ tier, dimensions = {}, stats = {}, pins = {}, 
   A.tracker = pickWithPin('tracker', pins, def.tracker, stats, domain, explore, warnings, pool)
 
   // Final hard-constraint assertions (fail-loud).
-  assertConstraints(A, warnings, pool)
+  assertConstraints(A, warnings, pool, enabled)
 
   // Usage offload on Red OR compliance-critical ⇒ a judgment-family final review follows
   // the cross-family Pointer review (A-5). "Compliance-critical" is the hunt-pipeline seat
@@ -425,14 +443,20 @@ export function providerFamily(m, pool = DEFAULT_POOL) {
   return null
 }
 
-// Fail-loud invariant check on the final assignment set.
-export function assertConstraints(A, warnings, pool = DEFAULT_POOL) {
+// Fail-loud invariant check on the final assignment set. `enabled` (Set, optional) is the
+// gate-filtered family set: a review seat whose model is gated off, or whose examiner chain
+// is empty, is a breach (the advisory twin of the pipeline's no_cross_family_reviewer park).
+export function assertConstraints(A, warnings, pool = DEFAULT_POOL, enabled = null) {
   const { IMPLEMENTER } = familySets(pool)
   const problems = []
   if (providerFamily(A.alpha.model, pool) !== pool.judgment) problems.push('Alpha is not the judgment family')
   for (const role of ['bloodhound', 'pointer', 'watchdog']) {
     const fam = providerFamily(A[role].model, pool)
     if (IMPLEMENTER.has(fam)) problems.push(`${role} is an implementer family (${A[role].model}) — reviewers must be a reviewer family`)
+    if (Array.isArray(A[role].chain) && A[role].chain.length === 0) {
+      problems.push(`${role} has no eligible examiner (every pool reviewer is the writer's family or gated off)`)
+    }
+    if (enabled && !enabled.has(fam)) problems.push(`${role} model ${A[role].model} is disabled by its env gate`)
   }
   if (providerFamily(A.pointer.model, pool) === providerFamily(A.shepherd.model, pool)) problems.push('Pointer shares Shepherd family (not cross-model)')
   if (providerFamily(A.watchdog.model, pool) === providerFamily(A.shepherd.model, pool)) problems.push('Watchdog shares Shepherd family (not cross-model)')
@@ -474,27 +498,54 @@ export function complianceCriticalFromMeta(meta = {}) {
     Number(meta.predicted_dimensions?.domain_sensitivity || 0) >= 3)
 }
 
+// ─── Env gates (Model Pool `gate=<ENV>`) ─────────────────────────
+// gate value shape shared with hunt-pipeline/campaign-runner: unset/""/"1"/"true" → on, else off.
+export function gateOn(v) {
+  if (v === undefined || v === null) return true
+  const s = String(v).trim().toLowerCase()
+  return s === '' || s === '1' || s === 'true'
+}
+
+// enabled = every family in the pool, minus each gated family whose env gate is off.
+export function enabledFromGates(pool = DEFAULT_POOL, gates = {}, env = {}) {
+  const enabled = new Set(Object.values(pool || {}).filter(Boolean))
+  for (const [fam, name] of Object.entries(gates || {})) {
+    if (!gateOn(env[name])) enabled.delete(fam)
+  }
+  return enabled
+}
+
 // ─── CLI ────────────────────────────────────────────────────────
-const CLI_USAGE = 'usage: node scripts/wolfpack-routing.mjs <planDir> [--config <path to wolfpack-config.md>]'
+const CLI_USAGE = 'usage: node "$WOLFPACK_HOME/scripts/wolfpack-routing.mjs" <planDir> [--config <path to wolfpack-config.md>] [--stats <path to model-stats.json>]'
+
+// The model-stats meter a planDir routes on: --stats, else the main worktree of planDir's
+// repo, else (not a git repo) the root implied by planDir = <root>/.wolfpack/plans/<slug>.
+export function defaultStatsPath(planDir) {
+  const root = mainWorktree(resolve(planDir)) ?? resolve(planDir, '..', '..', '..')
+  return join(root, '.wolfpack', 'pedigree', 'model-stats.json')
+}
 
 function main(argv) {
   const args = argv.slice(2)
   const planDir = args[0]
   if (!planDir || planDir.startsWith('-')) { console.error(CLI_USAGE); process.exit(2) }
-  let configPath = null
+  const flags = { '--config': null, '--stats': null }
   const rest = args.slice(1)
-  if (rest.length) {
-    if (rest.length !== 2 || rest[0] !== '--config' || !rest[1] || rest[1].startsWith('-')) {
+  for (let i = 0; i < rest.length; i += 2) {
+    const flag = rest[i]
+    const val = rest[i + 1]
+    if (!(flag in flags) || flags[flag] !== null || !val || val.startsWith('-')) {
       console.error(CLI_USAGE); process.exit(2)
     }
-    configPath = rest[1]
+    flags[flag] = val
   }
+  const configPath = flags['--config']
   const metaPath = join(planDir, 'metadata.json')
   if (!existsSync(metaPath)) { console.error(`metadata.json not found in ${planDir}`); process.exit(2) }
   const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
-  const here = dirname(fileURLToPath(import.meta.url))
-  const statsPath = join(here, '..', '.wolfpack', 'pedigree', 'model-stats.json')
-  const stats = existsSync(statsPath) ? JSON.parse(readFileSync(statsPath, 'utf8')) : {}
+  const statsPath = resolve(flags['--stats'] ?? defaultStatsPath(planDir))
+  const statsSource = existsSync(statsPath) ? 'file' : 'absent'
+  const stats = statsSource === 'file' ? JSON.parse(readFileSync(statsPath, 'utf8')) : {}
 
   // The Model Pool comes from the consuming project's wolfpack-config.md (planDir =
   // <root>/.wolfpack/plans/<slug>). An unusable pool fails loud; an ABSENT config is a
@@ -503,6 +554,9 @@ function main(argv) {
   let pool = DEFAULT_POOL
   let poolSource = 'default'
   let degradeWarning = null
+  let enabled = null
+  let gateReport = null
+  let unknownWarning = null
   if (existsSync(cfgPath)) {
     const cfg = loadConfig(cfgPath)
     const poolProblems = cfg.problems.filter((x) => x.startsWith('Model Pool:'))
@@ -513,23 +567,42 @@ function main(argv) {
     }
     pool = cfg.pool
     poolSource = 'config'
+    enabled = enabledFromGates(pool, cfg.gates || {}, process.env)
+    gateReport = {}
+    for (const [fam, name] of Object.entries(cfg.gates || {})) gateReport[fam] = { env: name, on: enabled.has(fam) }
+    if (cfg.unknownRoles?.length) {
+      unknownWarning = `Model Pool role(s) ${cfg.unknownRoles.join(', ')} not used by the router — ignored (the last-resort examiner link is appended by hunt-pipeline, not routed)`
+      console.error(`⚠ wolfpack-routing: ${unknownWarning}`)
+    }
   } else {
     degradeWarning = `no wolfpack-config.md at ${cfgPath} — using the neutral DEFAULT_POOL (role names, not runnable models)`
     console.error(`⚠ wolfpack-routing: ${degradeWarning}`)
   }
 
-  const rec = recommendModels({
-    tier: meta.tier,
-    dimensions: meta.predicted_dimensions || {},
-    stats: stats.model_stats || stats,
-    pins: pinsFromMeta(meta),
-    pool,
-    offload: !!meta.usage_offload,
-    complianceCritical: complianceCriticalFromMeta(meta),
-  })
+  let rec
+  try {
+    rec = recommendModels({
+      tier: meta.tier,
+      dimensions: meta.predicted_dimensions || {},
+      stats: stats.model_stats || stats,
+      pins: pinsFromMeta(meta),
+      pool,
+      enabled,
+      offload: !!meta.usage_offload,
+      complianceCritical: complianceCriticalFromMeta(meta),
+    })
+  } catch (e) {
+    if (!/routing constraint violation/.test(String(e?.message))) throw e
+    console.error(`✗ wolfpack-routing: ${e.message} — enable a reviewer family (its gate env) or change the Shepherd; the pipeline parks no_cross_family_reviewer`)
+    process.exit(3)
+  }
   rec.pool_source = poolSource
   if (poolSource === 'config') rec.config = cfgPath
+  rec.stats = statsPath
+  rec.stats_source = statsSource
+  if (gateReport) rec.gates = gateReport
   if (degradeWarning) rec.warnings = [...(rec.warnings || []), degradeWarning]
+  if (unknownWarning) rec.warnings = [...(rec.warnings || []), unknownWarning]
   console.log(JSON.stringify(rec, null, 2))
 }
 

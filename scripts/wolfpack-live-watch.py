@@ -3,11 +3,19 @@
 # Combines heartbeats, active sandbox containers, agent-harness session logs, and local model servers.
 # Supports continuous loop monitoring with colors and unicode progress icons.
 #
-# Usage:
-#   python3 scripts/wolfpack-live-watch.py [--loop [interval_sec]]
+# Run it from the pack (never a copy) with cwd inside the repo to watch:
+#   python3 "$WOLFPACK_HOME/scripts/wolfpack-live-watch.py" [--loop [interval_sec]]
 #
 # Example:
-#   python3 scripts/wolfpack-live-watch.py --loop 2
+#   python3 "$WOLFPACK_HOME/scripts/wolfpack-live-watch.py" --loop 2
+#
+# DATA ROOT = the MAIN worktree of the cwd's git repo (git rev-parse --git-common-dir), never
+# this script's location; not a git repo → exit 2 with the fix. Both harness worktree layouts
+# (.agents/worktrees, .claude/worktrees) are scanned.
+#
+# Env:
+#   WOLFPACK_WATCH_CONTAINER_MATCH  comma-separated extra container-name substrings to list
+#                                   (default empty), ORed with "wolfpack".
 
 import os
 import sys
@@ -43,7 +51,35 @@ if not sys.stdout.isatty() or os.environ.get("WOLFPACK_WATCH_COLOR") == "0":
     Colors.DIM = ""
     Colors.ENDC = ""
 
-REPO_ROOT = Path(__file__).parent.parent.resolve()
+def _invoking_repo_root():
+    """Main worktree of the cwd's git repo, or None outside git."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except Exception:
+        return None
+    return Path(out).parent if out else None
+
+REPO_ROOT = _invoking_repo_root()
+if REPO_ROOT is None:
+    sys.stderr.write(f"✗ wolfpack-live-watch: run it from inside the consuming repo (not a git repo: {os.getcwd()})\n")
+    sys.exit(2)
+
+# Both harness worktree layouts; a layout that is a symlink to the other is scanned once.
+WT_ROOTS = []
+_seen_wt = set()
+for _r in (REPO_ROOT / ".agents" / "worktrees", REPO_ROOT / ".claude" / "worktrees"):
+    if _r.is_dir() and os.path.realpath(_r) not in _seen_wt:
+        _seen_wt.add(os.path.realpath(_r))
+        WT_ROOTS.append(str(_r))
+
+def wt_glob(pattern):
+    out = []
+    for r in WT_ROOTS:
+        out += glob.glob(f"{r}/{pattern}")
+    return out
 WM_BIN = Path.home() / "Projects" / "local-llm" / "bin" / "wolfpack-models"
 
 # ─── 1. Active Hunt Heartbeats ─────────────────────────────────
@@ -60,7 +96,7 @@ PHASE_ROLE = {
 
 def read_meta(slug):
     # Scan worktrees first, then main repo
-    candidates = sorted(glob.glob(f"{REPO_ROOT}/.agents/worktrees/{slug}/.wolfpack/plans/{slug}/metadata.json")) \
+    candidates = sorted(wt_glob(f"{slug}/.wolfpack/plans/{slug}/metadata.json")) \
                  + [f"{REPO_ROOT}/.wolfpack/plans/{slug}/metadata.json"]
     for cand in candidates:
         try:
@@ -72,7 +108,7 @@ def read_meta(slug):
 
 def get_hunts_status():
     paths = glob.glob(f"{REPO_ROOT}/.wolfpack/heartbeats/*.json") \
-            + glob.glob(f"{REPO_ROOT}/.agents/worktrees/*/.wolfpack/heartbeats/*.json")
+            + wt_glob("*/.wolfpack/heartbeats/*.json")
     
     best = {}  # slug -> (mtime, path)
     for p in paths:
@@ -110,7 +146,7 @@ def get_hunts_status():
             role = "alpha"
         model = ma.get(role) or meta.get("models", {}).get(role) or "-"
         
-        loc = "wt" if ".agents/worktrees" in p else "main"
+        loc = "wt" if "/worktrees/" in os.path.relpath(p, REPO_ROOT) else "main"
         rows.append({
             "slug": slug,
             "tier": tier,
@@ -126,6 +162,8 @@ def get_hunts_status():
     return rows
 
 # ─── 2. Running Sandbox Containers ─────────────────────────────
+CONTAINER_MATCH = ["wolfpack"] + [t.strip() for t in os.environ.get("WOLFPACK_WATCH_CONTAINER_MATCH", "").split(",") if t.strip()]
+
 def get_running_containers():
     try:
         out = subprocess.run(
@@ -139,9 +177,8 @@ def get_running_containers():
         for c in data:
             names = c.get("Names", c.get("Name", ""))
             name = names[0] if isinstance(names, list) and names else names
-            # TODO(de-fracture): the extra sandbox container-name token is project-specific.
-            # Parameterize additional container name filters via wolfpack-config.md.
-            if "wolfpack" in name:
+            # "wolfpack" plus any project tokens from WOLFPACK_WATCH_CONTAINER_MATCH.
+            if any(tok in name for tok in CONTAINER_MATCH):
                 containers.append(c)
         return containers
     except Exception:

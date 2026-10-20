@@ -19,11 +19,13 @@
 //               is a pack skill, plus alias links at those dirs. Project skills (other names) pass.
 //   workflows — consumer: every tracked path under .claude/workflows/ other than
 //               .claude/workflows/README.md, and everything under .agents/workflows/.
-// scripts-unfork (4B) adds the script class by appending to CLASSES.
+//   scripts   — consumer: every tracked scripts/wolfpack-* or scripts/lib/wolfpack-* path (the
+//               wolfpack- prefix under scripts/ is the pack's; pack scripts run from the Wolfpack
+//               home). Nested paths and un-prefixed project scripts pass. Pack mode: no-op.
 //
 // CLI: node <pack>/scripts/wolfpack-no-copies.mjs [--pack <dir>] [<repo>]
 //   <repo> defaults to the cwd's git toplevel; --pack defaults to this script's own repo root.
-//   exit 0 — clean: `✓ no-copies: clean (<mode>: commands, skills, workflows)`
+//   exit 0 — clean: `✓ no-copies: clean (<mode>: commands, skills, workflows, scripts)`
 //   exit 1 — offending paths: one `✗ <path> — <fix>` line each (sorted by path), then
 //            `✗ no-copies: <N> offending path(s) (<mode>)`
 //   exit 2 — usage or setup error: not a git repo, a consumer without wolfpack-config.md, a config
@@ -137,10 +139,23 @@ function workflowsCheck(ctx) {
     .map((t) => ({ path: t.path, fix }))
 }
 
+// scripts (scripts-unfork) — consumer: every tracked scripts/wolfpack-* or scripts/lib/wolfpack-* path (the wolfpack- prefix
+// under scripts/ is the pack's); pack mode: no-op (the pack IS where they live).
+function scriptsCheck(ctx) {
+  if (ctx.mode === 'pack') return []
+  const packScripts = new Set(git(ctx.pack, ['ls-files', '-z', 'scripts']).split('\0').filter(Boolean))
+  return ctx.tracked
+    .filter((t) => /^scripts\/(lib\/)?wolfpack-[^/]*$/.test(t.path))
+    .map((t) => ({ path: t.path, fix: packScripts.has(t.path)
+      ? `delete the copy — the pack's ${t.path} runs from the Wolfpack home ("$WOLFPACK_HOME/${t.path}", else wolfpack-config.md → Wolfpack home)`
+      : `rename it — the wolfpack- prefix under scripts/ is reserved for pack scripts (they run from the Wolfpack home), or move it into the pack` }))
+}
+
 export const CLASSES = [
   { name: 'commands', check: commandsCheck },
   { name: 'skills', check: skillsCheck },
   { name: 'workflows', check: workflowsCheck },
+  { name: 'scripts', check: scriptsCheck },
 ]
 
 const real = (p) => realpathSync(p)

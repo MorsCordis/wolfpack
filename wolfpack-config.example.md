@@ -2,7 +2,7 @@
 
 Copy this file to your project root as `wolfpack-config.md` and fill in your project-specific details. Every Wolfpack role reads this file to adapt the pipeline to your codebase.
 
-The pipeline itself (router, `hunt-pipeline`, `campaign-runner`) reads the machine-consumed keys through ONE deterministic reader, `scripts/wolfpack-config.mjs`. A key is a `- **Name:** value` (or `- Name: value`) bullet inside its `## Section`; the first backticked span is the value for command/file keys, and `none` means "not applicable". Validate the file with `node scripts/wolfpack-config.mjs --json` — it exits 0 when complete and names every missing key otherwise (the pipeline refuses to start on an incomplete config rather than guess). REQUIRED keys: Project Identity → **Name** and **Test command**; Compliance Requirements → **Compliance areas** and **Risk-surface paths** (either may be `none`); Model Pool → the `judgment` and `reviewer-a` lines.
+The pipeline itself (router, `hunt-pipeline`, `campaign-runner`) reads the machine-consumed keys through ONE deterministic reader, `scripts/wolfpack-config.mjs`. A key is a `- **Name:** value` (or `- Name: value`) bullet inside its `## Section`; the first backticked span is the value for command/file keys, and `none` means "not applicable". Validate the file with `node "$WOLFPACK_HOME/scripts/wolfpack-config.mjs" --json` (the pack's reader — a consuming project keeps no copy of any pack script) — it exits 0 when complete and names every missing key otherwise (the pipeline refuses to start on an incomplete config rather than guess). REQUIRED keys: Project Identity → **Name** and **Test command**; Compliance Requirements → **Compliance areas** and **Risk-surface paths** (either may be `none`); Model Pool → the `judgment` and `reviewer-a` lines.
 
 ---
 
@@ -101,16 +101,16 @@ Wolfpack is model-agnostic. The pipeline reasons about model **families** by rol
 - **reviewer-c** — optional third reviewer family; slots into the examiner chain between reviewer-a and reviewer-b.
 - **coder-alt** — optional non-default implementer for NON-heavy tiers (often the same family as reviewer-c — a model that can both code and review). Heavy/compliance tiers still force judgment.
 
-Map each family onto a concrete model you have. The router (`scripts/wolfpack-routing.mjs`) reads this mapping and the pedigree history to pick a model per role per hunt. The brand names below are fill-in EXAMPLES — replace them with whatever models your harness can reach.
+Map each family onto a concrete model you have. The router (`"$WOLFPACK_HOME/scripts/wolfpack-routing.mjs"`) reads this mapping and the pedigree history to pick a model per role per hunt. The brand names below are fill-in EXAMPLES — replace them with whatever models your harness can reach.
 
 ```markdown
 ### Family → model mapping (EXAMPLES — fill in your own)
 - judgment    → claude:opus:high          # e.g. Opus, GPT-5, Gemini Pro
 - work-horse  → claude:sonnet             # e.g. Sonnet, GPT-5-mini, a local 70B
 - reviewer-a  → gemini:flash              # any family ≠ your implementers
-- reviewer-b  → mistral:large             # optional second cross-family reviewer
-- reviewer-c  → glm:5.3                   # optional third reviewer (chain: a → c → b)
-- coder-alt   → glm:5.3                   # optional non-Claude implementer; fallback = work-horse
+- reviewer-b  → mistral:large gate=WOLFPACK_ENABLE_MISTRAL_AUTO  # optional second cross-family reviewer
+- reviewer-c  → glm:5.3 gate=WOLFPACK_ENABLE_GLM                # optional third reviewer (chain: a → c → b)
+- coder-alt   → glm:5.3 gate=WOLFPACK_ENABLE_GLM                # optional non-Claude implementer; fallback = work-horse
 
 ### Hard constraints (enforced by the router — never relax)
 - Alpha is ALWAYS the judgment family (load-bearing planner).
@@ -131,6 +131,8 @@ Map each family onto a concrete model you have. The router (`scripts/wolfpack-ro
   coder-alt family removed.)
 - (e.g., UI-heavy hunts: pin reviewer-a as the visual-review specialist)
 ```
+
+**Env gates (`gate=<ENV>`, optional).** A reviewer-a/b/c or coder-alt line may carry one `gate=<ENV>` word after the model token (before any `#` comment), e.g. `- reviewer-b → mistral:large gate=WOLFPACK_ENABLE_MISTRAL_AUTO`. `<ENV>` must match `WOLFPACK_[A-Z0-9_]+`; the router turns each gate into the enabled reviewer set — unset, empty, `1` or `true` keeps the family on, anything else (`0`, `false`) turns it off. Ungated families are always on; judgment/work-horse can never be gated; two lines of one family must name the same gate. Use the names the pipeline itself reads (`WOLFPACK_ENABLE_GLM`, `WOLFPACK_ENABLE_MISTRAL_AUTO`) so router advice and the runtime chain agree. `wolfpack-config.mjs --json` shows them as `gates`. A role the router does not know (e.g. a documentation line for the last-resort link the pipeline appends) is ignored with a warning.
 
 ## Deployment Notes
 
@@ -185,7 +187,7 @@ the value `` `./scripts/smoke-login --host {host} --account {account}` accounts 
 - `none` (or absent): both smoke commands say visibly "No smoke login hook configured — using
   your own browser session" and continue in the operator's session.
 
-`node scripts/wolfpack-config.mjs --json` exposes it as `smokeLoginHook` (the template, or `null`)
+`node "$WOLFPACK_HOME/scripts/wolfpack-config.mjs" --json` exposes it as `smokeLoginHook` (the template, or `null`)
 and `smokeLoginAccounts` (the names, `[]` when none).
 
 ### Feature-branch deploy (Verify)
@@ -208,7 +210,7 @@ hand-off deploy-then-migrate and refuse to offer migrations earlier.
 
 ## Execution Layer
 
-Read by the pack's seat shim (`$WOLFPACK_HOME/scripts/podman-vibe.sh`), sandbox launcher (`run-pipeline-sandbox.sh`) and image builder (`wolfpack-build-images.sh`) through `node scripts/wolfpack-config.mjs --exec`. Needed only when the project runs Vibe seats (GLM / Mistral) or the sandboxed pipeline; the shim refuses to start (exit 2, naming the key) while a key it needs is absent. `none` is legal where the line says so.
+Read by the pack's seat shim (`$WOLFPACK_HOME/scripts/podman-vibe.sh`), sandbox launcher (`run-pipeline-sandbox.sh`) and image builder (`wolfpack-build-images.sh`) through `node "$WOLFPACK_HOME/scripts/wolfpack-config.mjs" --exec`. Needed only when the project runs Vibe seats (GLM / Mistral) or the sandboxed pipeline; the shim refuses to start (exit 2, naming the key) while a key it needs is absent. `none` is legal where the line says so.
 
 - **Sandbox image:** `myproject-wolfpack-sandbox:latest` — the image the seats and the sandboxed pipeline run in (REQUIRED; never `none`; must carry a `:tag`). Podman tags are HOST-GLOBAL: give each project that builds a different layer its OWN name, or two projects overwrite each other's image.
 - **GLM image:** `myproject-wolfpack-sandbox-glm:latest` — the GLM layer built `FROM` the Sandbox image (REQUIRED; never `none`; unique per project, same rule). The `WOLFPACK_GLM_IMAGE` env var overrides it per run.

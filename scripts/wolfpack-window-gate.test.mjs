@@ -136,7 +136,6 @@ test('collectEvents: file older than the window is SKIPPED but still counts as r
 
 // ════════════════════════════════════════════════════════════════════════════
 // usage-limit-gate — live snapshot decision core (AC2/AC3/AC4, A-6, A-7, A-11).
-// This block is kept byte-identical with consuming-project copies until scripts-unfork reconciles them.
 // ════════════════════════════════════════════════════════════════════════════
 import {
   computeUsageDecision, thresholdsFromEnv, readSnapshot, normTier, isValidWindow,

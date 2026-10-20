@@ -34,8 +34,14 @@
 # the gate's reset_at, set ScheduleWakeup delaySeconds = (reset_at - now). This script is
 # the host-side equivalent for cron/systemd/terminal runs; `sleep` is its ScheduleWakeup.
 #
-# Usage:
-#   ./scripts/wolfpack-overnight.sh --campaign <slug> [max-parallel]
+# Usage (run it from the pack, with cwd = the consuming repo checkout to launch from):
+#   "$WOLFPACK_HOME/scripts/wolfpack-overnight.sh" --campaign <slug> [max-parallel]
+#   "$WOLFPACK_HOME/scripts/wolfpack-overnight.sh" --dry-run [--campaign <slug> …]
+#       resolve and print REPO_ROOT=, GATE=, SANDBOX= and exit 0 — no gate call, no launch.
+# REPO_ROOT is the cwd's checkout (git rev-parse --show-toplevel, deliberately NOT the main
+# worktree: the sandbox launcher detects its repo from its own cwd's toplevel, so this driver
+# cd's into exactly the checkout the operator launched from). Not a git repo → exit 2. The
+# gate and the sandbox launcher are the PACK's, beside this script — never a consumer copy.
 # Options (env):
 #   (usage-limit-gate) The gate is LIVE-SNAPSHOT-FIRST: it decides on Claude Code's real
 #   5-hour / 7-day usage, snapshotted by the status-line wrapper
@@ -66,10 +72,15 @@
 #   WOLFPACK_OVERNIGHT_FAIL_BACKOFF  seconds to wait after a crashed launch (default 60).
 set -uo pipefail
 
-REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "$(cd "$(dirname "$0")/.." && pwd)")
-GATE="${REPO_ROOT}/scripts/wolfpack-window-gate.mjs"
-# The sandbox launcher is the PACK's (beside this script), never a copy in the consuming repo.
-SANDBOX="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/run-pipeline-sandbox.sh"
+# The pack's scripts dir (this script's own location) — where the gate and the sandbox launcher
+# live. The DATA/launch root is the invoking checkout, never this location.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+[ -n "$REPO_ROOT" ] || { echo "✗ wolfpack-overnight: run it from the consuming repo (not a git repo: $PWD)" >&2; exit 2; }
+GATE="$HERE/wolfpack-window-gate.mjs"
+SANDBOX="$HERE/run-pipeline-sandbox.sh"
+[ -f "$GATE" ] || { echo "✗ wolfpack-overnight: the pack has no $GATE — point WOLFPACK_HOME at an up-to-date wolfpack checkout" >&2; exit 2; }
+[ -f "$SANDBOX" ] || { echo "✗ wolfpack-overnight: the pack has no $SANDBOX — point WOLFPACK_HOME at an up-to-date wolfpack checkout" >&2; exit 2; }
 
 MAX_CYCLES="${WOLFPACK_OVERNIGHT_MAX_CYCLES:-12}"
 MAX_SLEEP="${WOLFPACK_OVERNIGHT_MAX_SLEEP:-21600}"
@@ -77,6 +88,14 @@ FAIL_BACKOFF="${WOLFPACK_OVERNIGHT_FAIL_BACKOFF:-60}"
 EXIT_ON_DEFER="${WOLFPACK_OVERNIGHT_EXIT_ON_DEFER:-0}"
 
 # ─── Parse mode ────────────────────────────────────────────────
+DRY_RUN=0; if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; shift; fi
+if [ "$DRY_RUN" = 1 ]; then
+    echo "REPO_ROOT=$REPO_ROOT"
+    echo "GATE=$GATE"
+    echo "SANDBOX=$SANDBOX"
+    exit 0
+fi
+cd "$REPO_ROOT" || exit 2
 MODE="${1:-}"
 if [ "$MODE" != "--campaign" ]; then
     echo "Usage: $0 --campaign <slug> [max-parallel]" >&2

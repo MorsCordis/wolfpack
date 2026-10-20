@@ -2,7 +2,7 @@
 # wolfpack-watch.sh — live Wolfpack hunt/campaign progress, free of Claude.
 #
 # The pipeline runs agents INSIDE worktrees, so heartbeats land in
-#   .agents/worktrees/<slug>/.wolfpack/heartbeats/<slug>.json
+#   .agents/worktrees/<slug>/.wolfpack/heartbeats/<slug>.json   (or .claude/worktrees/<slug>/…)
 # NOT just the main repo's .wolfpack/heartbeats/. Watching only main makes a
 # busy run look dead (this is what bit us). This script DUAL-SCANS both, takes
 # the newest heartbeat per hunt, and shows how long since it last advanced.
@@ -15,13 +15,19 @@
 # derived from the campaign.md wave layout + each hunt's metadata status. Below
 # it, live per-hunt heartbeats with slugs tinted by tier.
 #
+# Run it from the pack (never a copy) with cwd inside the repo to watch, or pass --repo <dir>:
+#   "$WOLFPACK_HOME/scripts/wolfpack-watch.sh" [--repo <dir>] [--loop 5]
+# DATA ROOT = the MAIN worktree of that repo (git rev-parse --git-common-dir), never this
+# script's location — run from a hunt worktree it still watches the whole repo. Not a repo → exit 2.
+# Both harness worktree layouts are scanned: .agents/worktrees/* and .claude/worktrees/*.
+#
 # Modes:
-#   ./scripts/wolfpack-watch.sh              one-shot snapshot
-#   ./scripts/wolfpack-watch.sh --loop [N]   ← USE THIS. Self-redrawing every N sec (default 5).
+#   "$WOLFPACK_HOME/scripts/wolfpack-watch.sh" [--repo <dir>]              one-shot snapshot
+#   "$WOLFPACK_HOME/scripts/wolfpack-watch.sh" [--repo <dir>] --loop [N]   ← USE THIS. Self-redrawing every N sec (default 5).
 #                                            Plain ANSI: clear + reprint, so the terminal does its
 #                                            own glyph handling and a resize is absorbed by the
 #                                            next redraw. Nothing to corrupt.
-#   ./scripts/wolfpack-watch.sh --scroll [N] scrollable curses UI — j/k or ↑/↓ scroll, PgUp/PgDn,
+#   "$WOLFPACK_HOME/scripts/wolfpack-watch.sh" [--repo <dir>] --scroll [N] scrollable curses UI — j/k or ↑/↓ scroll, PgUp/PgDn,
 #                                            g/G, r refresh, q quit. Only worth it when the hunt
 #                                            list outgrows the screen and you need scrollback; it
 #                                            does manual cursor placement, which is inherently
@@ -48,7 +54,23 @@
 #                                          this itself; set it by hand to test narrow layouts.
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+# Absolute path of this script, taken BEFORE the cd below (the --scroll mode re-invokes it).
+_wp_self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+# Data root: --repo <dir>, else the main worktree of the cwd's repo — never the script's own
+# location (the pack), so a consumer watches its own .wolfpack/.
+if [ "${1:-}" = "--repo" ]; then
+  [ -n "${2:-}" ] || { echo "✗ wolfpack-watch: --repo needs a directory" >&2; exit 2; }
+  _wp_repo_arg="$2"; shift 2
+  REPO="$(cd "$_wp_repo_arg" 2>/dev/null && git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+else
+  REPO="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+fi
+[ -n "$REPO" ] && REPO="$(dirname "$REPO")"
+if [ -z "$REPO" ] || [ ! -d "$REPO" ]; then
+  echo "✗ wolfpack-watch: run it from the consuming repo or pass --repo <dir>" >&2
+  exit 2
+fi
+cd "$REPO" || exit 2
 
 STALL_SECS=${WOLFPACK_STALL_SECS:-300}
 
@@ -161,8 +183,24 @@ def slug_cell(slug, tier, w=None):
     code = TIER_ANSI.get((tier or "").lower())
     return f"\033[{code}m{cell}\033[0m" if (color and code) else cell
 
+# Both harness worktree layouts; a layout that is a symlink to the other is scanned once.
+WT_ROOTS = []
+_seen_wt = set()
+for _r in (".agents/worktrees", ".claude/worktrees"):
+    _real = os.path.realpath(_r)
+    if os.path.isdir(_r) and _real not in _seen_wt:
+        _seen_wt.add(_real)
+        WT_ROOTS.append(_r)
+
+def wt_glob(pattern):
+    """pattern relative to a worktree root, e.g. '*/.wolfpack/heartbeats/*.json'."""
+    out = []
+    for r in WT_ROOTS:
+        out += glob.glob(f"{r}/{pattern}")
+    return out
+
 paths = (glob.glob(".wolfpack/heartbeats/*.json")
-         + glob.glob(".agents/worktrees/*/.wolfpack/heartbeats/*.json"))
+         + wt_glob("*/.wolfpack/heartbeats/*.json"))
 
 best = {}  # slug -> (mtime, path)
 for p in paths:
@@ -190,7 +228,7 @@ if HIDE_SECS > 0:
 import re
 
 def read_meta(slug):
-    for cand in (sorted(glob.glob(f".agents/worktrees/{slug}/.wolfpack/plans/{slug}/metadata.json"))
+    for cand in (sorted(wt_glob(f"{slug}/.wolfpack/plans/{slug}/metadata.json"))
                  + [f".wolfpack/plans/{slug}/metadata.json"]):
         try:
             return json.load(open(cand))
@@ -338,7 +376,7 @@ for slug, (m, p) in best.items():
     detail = d.get("detail", "")
     model, tier = meta_for(slug, phase, detail)
     rows.append((m, slug, tier, phase, model, d.get("agent", "?"),
-                 detail, "wt" if ".agents/worktrees" in p else "main"))
+                 detail, "wt" if "/worktrees/" in p else "main"))
 
 rows.sort(key=lambda r: -r[0])  # most-recently-active first
 
@@ -355,8 +393,8 @@ LONG_PHASES = {"Plan", "Debrief", "Review", "Code Review", "Test", "Certify"}
 def last_progress(slug, hb_mtime):
     """Newest of: the heartbeat, and anything the agent has written into the plan dir."""
     newest = hb_mtime
-    for d in (f".agents/worktrees/{slug}/.wolfpack/plans/{slug}",
-              f".wolfpack/plans/{slug}"):
+    for d in ([f"{r}/{slug}/.wolfpack/plans/{slug}" for r in WT_ROOTS]
+              + [f".wolfpack/plans/{slug}"]):
         for f in glob.glob(d + "/*"):
             try:
                 newest = max(newest, os.path.getmtime(f))
@@ -612,7 +650,7 @@ try:
 except KeyboardInterrupt:
     pass
 PYCURSES
-    SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")" \
+    SELF="$_wp_self" \
     WOLFPACK_SCROLL_INTERVAL="$interval" \
     WOLFPACK_WATCH_COLOR="${WOLFPACK_WATCH_COLOR:-1}" \
     python3 "$_wp_tmp"
