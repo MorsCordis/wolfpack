@@ -112,7 +112,7 @@ test('(a2) a non-allow-listed project command → exit 1 with the Project comman
   const ok = fixtureConsumer({ '.claude/commands/foo.md': 'x\n', '.claude/commands/bar-2.md': 'x\n' }, { commands: '`foo`, `bar-2` — project skills' })
   const r2 = guard(ok, PACK)
   assert.equal(r2.code, 0, r2.out + r2.err)
-  assert.equal(r2.out, '✓ no-copies: clean (consumer: commands, skills, workflows)\n')
+  assert.equal(r2.out, '✓ no-copies: clean (consumer: commands, skills, workflows, scripts)\n')
 })
 
 test('(a3) a pack command under .agents/commands/ in a consumer → exit 1', () => {
@@ -214,7 +214,7 @@ test('consumer output: one line per offending path, sorted by path, then the cou
 test('pack mode: the fixture pack with its three links → exit 0', () => {
   const r = run(['--pack', PACK, PACK])
   assert.equal(r.code, 0, r.out + r.err)
-  assert.equal(r.out, '✓ no-copies: clean (pack: commands, skills, workflows)\n')
+  assert.equal(r.out, '✓ no-copies: clean (pack: commands, skills, workflows, scripts)\n')
   // the repo argument defaults to the cwd's git toplevel (run from a subdirectory)
   const sub = run(['--pack', PACK], { cwd: join(PACK, '.agents', 'commands') })
   assert.equal(sub.code, 0, sub.out + sub.err)
@@ -259,7 +259,7 @@ test('pack mode: an untracked-but-present correct link does not count (the guard
 test('the REAL wolfpack checkout (--pack default = the script\'s own repo) → exit 0 in pack mode', () => {
   const r = run([ROOT])
   assert.equal(r.code, 0, r.out + r.err)
-  assert.equal(r.out, '✓ no-copies: clean (pack: commands, skills, workflows)\n')
+  assert.equal(r.out, '✓ no-copies: clean (pack: commands, skills, workflows, scripts)\n')
   const r2 = run([], { cwd: here })
   assert.equal(r2.code, 0, r2.out + r2.err)
 })
@@ -289,9 +289,85 @@ test('consumer without wolfpack-config.md → exit 2; a config reader problem �
   assert.match(r2.err, /Project Identity → Project commands: invalid name/)
 })
 
-test('CLASSES is exactly commands, skills, workflows (no script class — 4B appends it)', () => {
-  assert.deepEqual(CLASSES.map(c => c.name), ['commands', 'skills', 'workflows'])
+test('CLASSES is exactly commands, skills, workflows, scripts (scripts-unfork appended the 4th)', () => {
+  assert.deepEqual(CLASSES.map(c => c.name), ['commands', 'skills', 'workflows', 'scripts'])
   for (const c of CLASSES) assert.equal(typeof c.check, 'function')
+})
+
+// ─── scripts-unfork (AC11): the `scripts` class ──────────────────────────────────────────────
+// A fixture pack that also tracks pack scripts, so the fix can tell a pack-named copy ("delete the
+// copy") from a project file squatting on the reserved prefix ("rename it").
+function fixturePackWithScripts() {
+  const p = repo('pack-scripts')
+  put(p, '.agents/commands/hunt.md')
+  put(p, '.agents/skills/alpha/SKILL.md')
+  put(p, '.agents/workflows/hunt-pipeline.js')
+  put(p, 'scripts/wolfpack-routing.mjs')
+  put(p, 'scripts/lib/wolfpack-x.mjs')
+  put(p, 'scripts/podman-vibe.sh')
+  for (const x of ['commands', 'skills', 'workflows']) link(p, `.claude/${x}`, `../.agents/${x}`)
+  commit(p)
+  return p
+}
+const SPACK = fixturePackWithScripts()
+
+test('AC11 scripts: a consumer tracking scripts/wolfpack-foo.mjs + scripts/lib/wolfpack-bar.sh → exit 1, one ✗ line each, the fix names the pack', () => {
+  const c = fixtureConsumer({ 'scripts/wolfpack-foo.mjs': 'x\n', 'scripts/lib/wolfpack-bar.sh': 'x\n', 'scripts/run_tests.sh': 'x\n' })
+  const r = guard(c, SPACK)
+  assert.equal(r.code, 1, r.out + r.err)
+  const lines = r.out.trim().split('\n')
+  assert.deepEqual(lines, [
+    '✗ scripts/lib/wolfpack-bar.sh — rename it — the wolfpack- prefix under scripts/ is reserved for pack scripts (they run from the Wolfpack home), or move it into the pack',
+    '✗ scripts/wolfpack-foo.mjs — rename it — the wolfpack- prefix under scripts/ is reserved for pack scripts (they run from the Wolfpack home), or move it into the pack',
+    '✗ no-copies: 2 offending path(s) (consumer)',
+  ])
+  assert.equal(r.err, '')
+})
+
+test('AC11 scripts: a tracked copy of a REAL pack script gets the "delete the copy" fix naming $WOLFPACK_HOME/<path> (top level and lib/)', () => {
+  const c = fixtureConsumer({ 'scripts/wolfpack-routing.mjs': 'copy\n', 'scripts/lib/wolfpack-x.mjs': 'copy\n' })
+  const r = guard(c, SPACK)
+  assert.equal(r.code, 1, r.out + r.err)
+  assert.match(r.out, /^✗ scripts\/wolfpack-routing\.mjs — delete the copy — the pack's scripts\/wolfpack-routing\.mjs runs from the Wolfpack home \("\$WOLFPACK_HOME\/scripts\/wolfpack-routing\.mjs", else wolfpack-config\.md → Wolfpack home\)$/m)
+  assert.match(r.out, /^✗ scripts\/lib\/wolfpack-x\.mjs — delete the copy — the pack's scripts\/lib\/wolfpack-x\.mjs runs from the Wolfpack home/m)
+  assert.match(r.out, /^✗ no-copies: 2 offending path\(s\) \(consumer\)$/m)
+})
+
+test('AC11 scripts: only project scripts (scripts/run_tests.sh, scripts/podman-vibe.sh, un-prefixed, nested, other dirs) → exit 0', () => {
+  // podman-vibe.sh IS a pack file — the class is prefix-only by design (A6), so an un-prefixed
+  // name a project may legitimately own never trips it.
+  const c = fixtureConsumer({
+    'scripts/run_tests.sh': 'x\n', 'scripts/podman-vibe.sh': 'x\n', 'scripts/pack-home.sh': 'x\n',
+    'scripts/wolfpack-dir/nested.mjs': 'x\n',   // nested under a wolfpack- dir: not matched (the regex is [^/]*$)
+    'scripts/lib/deeper/wolfpack-y.mjs': 'x\n', // deeper than lib/: not matched
+    'tools/wolfpack-z.mjs': 'x\n',              // outside scripts/
+    'docs/scripts/wolfpack-w.md': 'x\n',        // a scripts/ dir that is not the root one
+  })
+  const r = guard(c, SPACK)
+  assert.equal(r.code, 0, r.out + r.err)
+  assert.equal(r.out, '✓ no-copies: clean (consumer: commands, skills, workflows, scripts)\n')
+})
+
+test('AC11 scripts: an UNTRACKED scripts/wolfpack-* file is not a copy (the guard reads git ls-files)', () => {
+  const c = fixtureConsumer()
+  put(c, 'scripts/wolfpack-local.mjs', 'scratch\n')
+  const r = guard(c, SPACK)
+  assert.equal(r.code, 0, r.out + r.err)
+})
+
+test('AC11 scripts: pack mode is a no-op — the fixture pack tracking scripts/wolfpack-* is clean', () => {
+  const r = run(['--pack', SPACK, SPACK])
+  assert.equal(r.code, 0, r.out + r.err)
+  assert.equal(r.out, '✓ no-copies: clean (pack: commands, skills, workflows, scripts)\n')
+})
+
+test('AC11 scripts: the scripts check only reports scripts paths and runs alongside the other classes (a command copy + a script copy → 2 lines)', () => {
+  const c = fixtureConsumer({ '.claude/commands/hunt.md': 'copy\n', 'scripts/wolfpack-routing.mjs': 'copy\n' })
+  const r = guard(c, SPACK)
+  assert.equal(r.code, 1, r.out + r.err)
+  assert.match(r.out, /^✗ \.claude\/commands\/hunt\.md — delete it/m)
+  assert.match(r.out, /^✗ scripts\/wolfpack-routing\.mjs — delete the copy/m)
+  assert.match(r.out, /^✗ no-copies: 2 offending path\(s\) \(consumer\)$/m)
 })
 
 test('packInventory: command names = basenames of .agents/commands/*.md, skills = the 3rd path segment', () => {

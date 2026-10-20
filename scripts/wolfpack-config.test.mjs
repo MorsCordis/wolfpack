@@ -756,3 +756,138 @@ test('D3/D4: the REAL wolfpack-config.md and the example → smokeLoginHook null
   const e = runCli(['--exec', REAL])
   assert.doesNotMatch(e.stdout, /smoke|projectCommands|Project commands/i, '--exec output carries only the execution-layer keys')
 })
+
+// ─── scripts-unfork: Model Pool `gate=<ENV>` → gates (the router's enabled set) ─────────────
+const gatedPool = (lines) => FULL.replace(POOL, `## Model Pool
+### Family → model mapping
+${lines}
+`)
+const BASE_LINES = {
+  j: '- judgment    → fam-a:big:high',
+  w: '- work-horse  → fam-a:small',
+  a: '- reviewer-a  → fam-b:1',
+  b: '- reviewer-b  → fam-c:2',
+}
+const lines = (over = {}) => Object.values({ ...BASE_LINES, ...over }).join('\n')
+
+test('gates: gate= on reviewer and coder-alt lines → { family: ENV }; none → {} (never null on a clean pool)', () => {
+  const c = readConfig(gatedPool(lines({
+    a: '- reviewer-a  → fam-b:1 gate=WOLFPACK_ENABLE_B   # first examiner',
+    b: '- reviewer-b  → fam-c:2   gate=WOLFPACK_ENABLE_C_AUTO',
+    x: '- reviewer-c  → fam-d:3 gate=WOLFPACK_ENABLE_D',
+    y: '- coder-alt   → fam-b:1 gate=WOLFPACK_ENABLE_B',
+  })))
+  assert.deepEqual(c.problems, [])
+  assert.deepEqual(c.gates, { 'fam-b': 'WOLFPACK_ENABLE_B', 'fam-c': 'WOLFPACK_ENABLE_C_AUTO', 'fam-d': 'WOLFPACK_ENABLE_D' })
+  // the token is still the first word — gate= never leaks into models/pool
+  assert.equal(c.models['reviewer-a'], 'fam-b:1')
+  assert.equal(c.pool.reviewerB, 'fam-c')
+  assert.deepEqual(readConfig(FULL).gates, {})
+})
+
+test('gates: a family gated on one line and ungated on another is gated (the gate names the family)', () => {
+  const c = readConfig(gatedPool(lines({ a: '- reviewer-a  → fam-b:1', y: '- coder-alt   → fam-b:1 gate=WOLFPACK_ENABLE_B' })))
+  assert.deepEqual(c.problems, [])
+  assert.deepEqual(c.gates, { 'fam-b': 'WOLFPACK_ENABLE_B' })
+})
+
+test('gates: `#`-comment text is never parsed — prose like (WOLFPACK_ENABLE_X=0 disables) or gate=… after # is ignored', () => {
+  const c = readConfig(gatedPool(lines({
+    a: '- reviewer-a  → fam-b:1   # first link (WOLFPACK_ENABLE_B=0 disables) gate=WOLFPACK_ENABLE_B',
+    b: '- reviewer-b  → fam-c:2 # gate=WOLFPACK_ENABLE_C',
+  })))
+  assert.deepEqual(c.problems, [])
+  assert.deepEqual(c.gates, {})
+})
+
+test('gates: an invalid name → problem naming the role; gates/pool/models all null (reader exit 2)', () => {
+  for (const bad of ['enable_b', 'WOLFPACK_', 'WOLFPACK_enable', 'OTHER_ENABLE_B', 'WOLFPACK_A-B', '']) {
+    const text = gatedPool(lines({ a: `- reviewer-a  → fam-b:1 gate=${bad}` }))
+    const c = readConfig(text)
+    assert.deepEqual(c.problems, [`Model Pool: reviewer-a gate '${bad}' must match WOLFPACK_[A-Z0-9_]+`], bad)
+    assert.equal(c.gates, null, bad)
+    assert.equal(c.pool, null, bad)
+    assert.equal(c.models, null, bad)
+  }
+  withTemp((dir) => {
+    const r = runCli(['--json', writeCfg(dir, gatedPool(lines({ a: '- reviewer-a  → fam-b:1 gate=nope' })))])
+    assert.equal(r.status, 2)
+    assert.match(r.stderr, /✗ wolfpack-config: .*Model Pool: reviewer-a gate 'nope' must match WOLFPACK_\[A-Z0-9_\]\+/)
+    assert.equal(JSON.parse(r.stdout).gates, null)
+  })
+})
+
+test('gates: judgment / work-horse cannot be gated (implementer families are always on)', () => {
+  for (const [k, role] of [['j', 'judgment'], ['w', 'work-horse']]) {
+    const c = readConfig(gatedPool(lines({ [k]: `${BASE_LINES[k]} gate=WOLFPACK_ENABLE_A` })))
+    assert.deepEqual(c.problems, [`Model Pool: ${role} cannot be gated (implementer families are always on)`], role)
+    assert.equal(c.gates, null)
+  }
+})
+
+test('gates: two roles of the SAME family with different gates → conflicting-gates problem', () => {
+  const c = readConfig(gatedPool(lines({
+    a: '- reviewer-a  → fam-b:1 gate=WOLFPACK_ENABLE_B',
+    y: '- coder-alt   → fam-b:9 gate=WOLFPACK_ENABLE_OTHER',
+  })))
+  assert.deepEqual(c.problems, ['Model Pool: family fam-b has conflicting gates WOLFPACK_ENABLE_B, WOLFPACK_ENABLE_OTHER'])
+  assert.equal(c.gates, null)
+  // family match is case-insensitive (the pool lowercases the token before `:`)
+  const d = readConfig(gatedPool(lines({ a: '- reviewer-a  → FAM-B:1 gate=WOLFPACK_ENABLE_B', y: '- coder-alt   → fam-b:1 gate=WOLFPACK_ENABLE_C' })))
+  assert.match(d.problems.join(';'), /family fam-b has conflicting gates/)
+})
+
+test('gates: more than one gate= on a line → problem (even when both name the same env)', () => {
+  for (const tail of ['gate=WOLFPACK_ENABLE_B gate=WOLFPACK_ENABLE_C', 'gate=WOLFPACK_ENABLE_B gate=WOLFPACK_ENABLE_B']) {
+    const c = readConfig(gatedPool(lines({ a: `- reviewer-a  → fam-b:1 ${tail}` })))
+    assert.deepEqual(c.problems, ['Model Pool: reviewer-a has more than one gate= word'], tail)
+    assert.equal(c.gates, null)
+  }
+})
+
+test('gates: unknown roles keep landing in unknownRoles (no problem) — a gate= on one is not parsed as a gate', () => {
+  const c = readConfig(gatedPool(lines({ z: '- reviewer-z  → fam-a:big:high gate=WOLFPACK_ENABLE_Z   # LAST RESORT' })))
+  assert.deepEqual(c.problems, [])
+  assert.deepEqual(c.unknownRoles, ['reviewer-z'])
+  assert.deepEqual(c.gates, {})
+})
+
+test('gates: the REAL pack config yields {glm: WOLFPACK_ENABLE_GLM, mistral: WOLFPACK_ENABLE_MISTRAL_AUTO}; --json and the summary carry it', () => {
+  const c = loadConfig(REAL)
+  assert.deepEqual(c.gates, { glm: 'WOLFPACK_ENABLE_GLM', mistral: 'WOLFPACK_ENABLE_MISTRAL_AUTO' })
+  const j = runCli(['--json', REAL])
+  assert.equal(j.status, 0, j.stderr)
+  assert.deepEqual(JSON.parse(j.stdout).gates, c.gates)
+  const s = runCli([REAL])
+  assert.match(s.stdout, /^gate glm ← WOLFPACK_ENABLE_GLM$/m)
+  assert.match(s.stdout, /^gate mistral ← WOLFPACK_ENABLE_MISTRAL_AUTO$/m)
+  // the example template documents the word and still reads clean with gates
+  const ex = loadConfig(join(ROOT, 'wolfpack-config.example.md'))
+  assert.deepEqual(ex.problems, [])
+  assert.ok(ex.gates && Object.keys(ex.gates).length >= 1, JSON.stringify(ex.gates))
+  // the env names the workflows read are exactly the ones the pack's config declares
+  for (const wf of ['hunt-pipeline.js', 'campaign-runner.js']) {
+    const src = readFileSync(join(ROOT, '.agents', 'workflows', wf), 'utf8')
+    for (const env of Object.values(c.gates)) assert.ok(src.includes(env), `${wf} reads ${env}`)
+  }
+})
+
+test('mainWorktree: a hunt worktree resolves to its MAIN checkout; outside git → null', async () => {
+  const { mainWorktree } = await import('./wolfpack-config.mjs')
+  const { execFileSync } = await import('node:child_process')
+  const { realpathSync, mkdirSync } = await import('node:fs')
+  withTemp((dir) => {
+    const main = realpathSync(dir)
+    const gg = (...a) => execFileSync('git', ['-C', main, ...a], { stdio: 'ignore' })
+    gg('init', '-q', '-b', 'main')
+    gg('-c', 'user.email=t@example.invalid', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'i')
+    const wt = join(main, '.claude', 'worktrees', 'h')
+    gg('worktree', 'add', '-q', '-b', 'feat/h', wt)
+    mkdirSync(join(wt, 'sub', 'deeper'), { recursive: true })
+    assert.equal(mainWorktree(main), main)
+    assert.equal(mainWorktree(wt), main)
+    assert.equal(mainWorktree(join(wt, 'sub', 'deeper')), main)
+  })
+  withTemp((dir) => assert.equal(mainWorktree(dir), null))
+  assert.equal(mainWorktree('/nonexistent/path/for/wolfpack-test'), null)
+})
