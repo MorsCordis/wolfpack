@@ -4,7 +4,8 @@
 // Run: node --test scripts/wolfpack-install-vibe-agents.test.mjs
 //
 // AC1: the ten pack seat profiles are tracked under vibe-agents/, with no project leak.
-// AC2: review/certify seats grant bash (git_bash mirrors it); edit/write_file/task stay never;
+// AC2: review/certify seats grant bash (git_bash mirrors it) and write_file (seat-handoff-writes:
+//      the handoff file, confined to the shim's out dir by mount); edit/task stay never;
 //      the as-is seats (alpha, shepherd, tracker) and shepherd-glm keep today's permissions.
 // AC3: the installer is idempotent, backs up what it replaces, reports each file, has a
 //      --check that writes nothing, and never touches a non-pack file. Every AC3 case runs
@@ -68,13 +69,13 @@ test('AC1: no template leaks a project path, ID, domain or name', () => {
 
 // ─── AC2 ───────────────────────────────────────────────────────
 
-test('AC2: the six review/certify seats grant bash + git_bash; edit/write_file/task stay never', () => {
+test('AC2: the six review/certify seats grant bash + git_bash + write_file; edit/task stay never', () => {
   for (const s of REVIEW_SEATS) {
     const p = perms(`wolfpack-${s}.toml`)
     assert.equal(p.bash, 'always', `${s}: bash`)
     assert.equal(p.git_bash, 'always', `${s}: git_bash`)
     assert.equal(p.edit, 'never', `${s}: edit`)
-    assert.equal(p.write_file, 'never', `${s}: write_file`)
+    assert.equal(p.write_file, 'always', `${s}: write_file (handoff file, confined to the shim out dir)`)
     assert.equal(p.task, 'never', `${s}: task`)
     assert.equal(p.read_file, 'always', `${s}: read_file`)
     assert.equal(p.grep, 'always', `${s}: grep`)

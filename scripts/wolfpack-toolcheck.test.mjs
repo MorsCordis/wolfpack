@@ -139,17 +139,17 @@ test('CLI exits 1 on a re-boxed shim', () => {
 
 // A capable shim fragment carrying BOTH halves: the Mistral loop and the GLM lists.
 const fullShim = `${capableShim}
-GLM_REVIEW_TOOLS_DEFAULT="read_file grep bash dev_cortex_repo_map dev_cortex_file_outline"
+GLM_REVIEW_TOOLS_DEFAULT="read_file grep bash write_file dev_cortex_repo_map dev_cortex_file_outline"
 GLM_IMPLEMENT_TOOLS_DEFAULT="read_file grep write_file edit dev_cortex_repo_map dev_cortex_file_outline"
-GLM_REVIEW_DROP="task"
+GLM_REVIEW_DROP="task edit"
 GLM_IMPLEMENT_DROP="bash task"
 `
 
 // The permission shapes the tracked templates carry (AC2).
 const MISTRAL_REVIEW = { read_file: 'always', grep: 'always', bash: 'always', git_bash: 'always',
-  edit: 'never', write_file: 'never', task: 'never', skill: 'never' }
+  edit: 'never', write_file: 'always', task: 'never', skill: 'never' }
 const GLM_REVIEW = { read_file: 'always', grep: 'always', dev_cortex_repo_map: 'always', dev_cortex_file_outline: 'always',
-  bash: 'always', git_bash: 'always', edit: 'never', write_file: 'never', task: 'never' }
+  bash: 'always', git_bash: 'always', edit: 'never', write_file: 'always', task: 'never' }
 const GLM_IMPLEMENT = { read_file: 'always', grep: 'always', write_file: 'always', edit: 'always',
   dev_cortex_repo_map: 'always', dev_cortex_file_outline: 'always', bash: 'never', git_bash: 'never', task: 'never' }
 // Alpha/Shepherd/Tracker as they are (ask permissions) — never parity-checked.
@@ -223,26 +223,26 @@ test('parseSeatProfile: an unknown or unquoted permission is a PROBLEM (fail lou
 
 test('analyzeGlmShim: the fixture GLM block passes; each missing or wrong list fails loud', () => {
   assert.deepEqual(analyzeGlmShim(fullShim).problems, [])
-  const noBash = analyzeGlmShim(fullShim.replace('read_file grep bash dev_cortex', 'read_file grep dev_cortex'))
+  const noBash = analyzeGlmShim(fullShim.replace('read_file grep bash write_file', 'read_file grep write_file'))
   assert.ok(noBash.problems.some(p => /GLM_REVIEW_TOOLS_DEFAULT lacks "bash"/.test(p)))
   const missing = analyzeGlmShim(fullShim.replace(/^GLM_REVIEW_DROP=.*$/m, ''))
   assert.ok(missing.problems.some(p => /GLM_REVIEW_DROP not found/.test(p)))
   const comma = analyzeGlmShim(fullShim.replace('GLM_IMPLEMENT_DROP="bash task"', 'GLM_IMPLEMENT_DROP="bash,task"'))
   assert.ok(comma.problems.some(p => /GLM_IMPLEMENT_DROP="bash,task" contains a comma/.test(p)))
-  const unquoted = analyzeGlmShim(fullShim.replace('GLM_REVIEW_DROP="task"', 'GLM_REVIEW_DROP=task'))
+  const unquoted = analyzeGlmShim(fullShim.replace('GLM_REVIEW_DROP="task edit"', 'GLM_REVIEW_DROP=task'))
   assert.ok(unquoted.problems.some(p => /GLM_REVIEW_DROP=task is not quoted/.test(p)))
   const implBash = analyzeGlmShim(fullShim.replace('GLM_IMPLEMENT_DROP="bash task"', 'GLM_IMPLEMENT_DROP="task"'))
   assert.ok(implBash.problems.some(p => /GLM_IMPLEMENT_DROP lacks "bash"/.test(p)))
-  const reviewDropsBash = analyzeGlmShim(fullShim.replace('GLM_REVIEW_DROP="task"', 'GLM_REVIEW_DROP="bash task"'))
+  const reviewDropsBash = analyzeGlmShim(fullShim.replace('GLM_REVIEW_DROP="task edit"', 'GLM_REVIEW_DROP="bash task edit"'))
   assert.ok(reviewDropsBash.problems.some(p => /GLM_REVIEW_DROP drops "bash"/.test(p)))
-  const taskKept = analyzeGlmShim(fullShim.replace('GLM_REVIEW_DROP="task"', 'GLM_REVIEW_DROP=""'))
+  const taskKept = analyzeGlmShim(fullShim.replace('GLM_REVIEW_DROP="task edit"', 'GLM_REVIEW_DROP="edit"'))
   assert.ok(taskKept.problems.some(p => /GLM_REVIEW_DROP lacks "task"/.test(p)))
 })
 
 test('shimToolsFor mirrors the shim per seat (family, mode, Bloodhound task strip, drop lists, env overrides)', () => {
   assert.deepEqual(shimToolsFor(fullShim, 'wolfpack-pointer').tools, ['read_file', 'grep', 'edit', 'write_file', 'bash'])
   assert.deepEqual(shimToolsFor(fullShim, 'wolfpack-pointer-glm').tools,
-    ['read_file', 'grep', 'bash', 'dev_cortex_repo_map', 'dev_cortex_file_outline'])
+    ['read_file', 'grep', 'bash', 'write_file', 'dev_cortex_repo_map', 'dev_cortex_file_outline'])
   assert.deepEqual(shimToolsFor(fullShim, 'wolfpack-shepherd-glm').tools,
     ['read_file', 'grep', 'write_file', 'edit', 'dev_cortex_repo_map', 'dev_cortex_file_outline'])
   // operator overrides are honoured, and the drop lists still apply to them
@@ -290,9 +290,11 @@ test('AC4: the Mistral repro — watchdog bash = "never" while the shim enables 
   })
 })
 
-test('AC4: edit/write_file "never" on a Mistral review seat is an INTENDED role denial (shim enables them; not a mismatch)', () => {
-  // ROLE_POLICY.review.roleDeny — the reading of AC4 that keeps AC2 satisfiable
-  assert.deepEqual(ROLE_POLICY.review.roleDeny, ['edit', 'write_file'])
+test('AC4: edit "never" on a Mistral review seat is an INTENDED role denial (shim enables it; not a mismatch)', () => {
+  // ROLE_POLICY.review.roleDeny — the reading of AC4 that keeps AC2 satisfiable. seat-handoff-writes:
+  // write_file is no longer role-denied (the seat writes its handoff file into the shim out dir).
+  assert.deepEqual(ROLE_POLICY.review.roleDeny, ['edit'])
+  assert.ok(ROLE_POLICY.review.require.includes('write_file'), 'the review role requires write_file')
   const problems = checkSeatParity('wolfpack-pointer', { tools: MISTRAL_REVIEW }, shimToolsFor(fullShim, 'wolfpack-pointer').tools)
   assert.deepEqual(problems, [])
 })
@@ -310,9 +312,9 @@ test('AC4 rule 5: Bloodhound [tools.task] "always" (shim omits task) → fails n
 test('AC4 rule 7: edit "always" on a review seat → fails (read-only by role)', () => {
   const p = checkSeatParity('wolfpack-pointer-glm', { tools: { ...GLM_REVIEW, edit: 'always' } }, shimToolsFor(fullShim, 'wolfpack-pointer-glm').tools)
   assert.ok(p.some(x => /wolfpack-pointer-glm: profile sets "edit" to "always" — the review role is read-only/.test(x)), p.join('\n'))
-  const unset = { ...GLM_REVIEW }; delete unset.write_file
+  const unset = { ...GLM_REVIEW }; delete unset.edit
   const q = checkSeatParity('wolfpack-pointer-glm', { tools: unset }, shimToolsFor(fullShim, 'wolfpack-pointer-glm').tools)
-  assert.ok(q.some(x => /profile sets "write_file" to nothing \(Vibe default\)/.test(x)), 'an UNSET role-denied tool also fails')
+  assert.ok(q.some(x => /profile sets "edit" to nothing \(Vibe default\)/.test(x)), 'an UNSET role-denied tool also fails')
 })
 
 test('AC4 rule 8: git_bash ≠ bash → fails (shell companion must mirror bash)', () => {
@@ -358,7 +360,7 @@ test('AC4 rule 9: a pipeline seat with no installed profile → fails naming the
 })
 
 test('AC4 rule 1: the GLM shim without bash in GLM_REVIEW_TOOLS_DEFAULT → every GLM review seat fails + analyzeGlmShim fails', () => {
-  const boxed = fullShim.replace('read_file grep bash dev_cortex', 'read_file grep dev_cortex')
+  const boxed = fullShim.replace('read_file grep bash write_file', 'read_file grep write_file')
   withProfiles({}, (dir) => {
     const res = checkProfiles(boxed, dir, {})
     for (const s of ['wolfpack-bloodhound-glm', 'wolfpack-pointer-glm', 'wolfpack-watchdog-glm']) {
@@ -548,4 +550,82 @@ test('CLI default shim: an explicit --shim that does not exist → exit 2 with t
   const res = runCli(['--shim', '/nonexistent/scripts/podman-vibe.sh', '--profiles', '/nonexistent'], { WOLFPACK_HOME: '' })
   assert.equal(res.status, 2)
   assert.match(res.stderr, /^✗ toolcheck: shim not found: \/nonexistent\/scripts\/podman-vibe\.sh — /m)
+})
+
+// ─── seat-handoff-writes: review seats write their own handoff file ─────────
+//
+// AC3: write_file is REQUIRED (always) on a review/certify seat; edit stays role-denied.
+// The GLM shim must enable write_file for review, never enable edit, and drop edit from
+// an operator override.
+
+test('seat-handoff-writes AC3: a review profile with write_file "always" passes (both families)', () => {
+  assert.deepEqual(checkSeatParity('wolfpack-pointer', { tools: MISTRAL_REVIEW }, shimToolsFor(fullShim, 'wolfpack-pointer').tools), [])
+  assert.deepEqual(checkSeatParity('wolfpack-watchdog-glm', { tools: GLM_REVIEW }, shimToolsFor(fullShim, 'wolfpack-watchdog-glm').tools), [])
+  assert.deepEqual(checkSeatParity('wolfpack-bloodhound-glm', { tools: GLM_REVIEW }, shimToolsFor(fullShim, 'wolfpack-bloodhound-glm').tools), [])
+})
+
+test('seat-handoff-writes AC3: a review profile with write_file "never" or "ask" or unset fails, naming write_file', () => {
+  for (const seat of ['wolfpack-pointer', 'wolfpack-pointer-glm']) {
+    const base = seat.endsWith('-glm') ? GLM_REVIEW : MISTRAL_REVIEW
+    const shimTools = shimToolsFor(fullShim, seat).tools
+    const never = checkSeatParity(seat, { tools: { ...base, write_file: 'never' } }, shimTools)
+    assert.ok(never.some(x => x.includes(`${seat}: profile sets "write_file" to "never", but the review role requires "always"`)), never.join('\n'))
+    const ask = checkSeatParity(seat, { tools: { ...base, write_file: 'ask' } }, shimTools)
+    assert.ok(ask.some(x => x.includes(`${seat}: profile sets "write_file" to "ask", but the review role requires "always"`)), ask.join('\n'))
+    const unset = { ...base }; delete unset.write_file
+    const u = checkSeatParity(seat, { tools: unset }, shimTools)
+    assert.ok(u.some(x => x.includes(`${seat}: profile does not set [tools.write_file]`)), u.join('\n'))
+  }
+})
+
+test('seat-handoff-writes AC3: a review profile with edit "always" fails naming edit (both families)', () => {
+  for (const seat of ['wolfpack-bloodhound', 'wolfpack-watchdog-glm']) {
+    const base = seat.endsWith('-glm') ? GLM_REVIEW : MISTRAL_REVIEW
+    const p = checkSeatParity(seat, { tools: { ...base, edit: 'always' } }, shimToolsFor(fullShim, seat).tools)
+    assert.ok(p.some(x => x.startsWith(`${seat}: profile sets "edit" to "always"`)), p.join('\n'))
+  }
+})
+
+test('seat-handoff-writes: analyzeGlmShim — review list lacking write_file, enabling edit, or a drop list lacking edit each fail loud', () => {
+  const noWrite = analyzeGlmShim(fullShim.replace('read_file grep bash write_file dev_cortex', 'read_file grep bash dev_cortex'))
+  assert.equal(noWrite.ok, false)
+  assert.ok(noWrite.problems.includes('GLM_REVIEW_TOOLS_DEFAULT lacks "write_file" — review/certify seats cannot write their handoff file'), noWrite.problems.join('\n'))
+  const withEdit = analyzeGlmShim(fullShim.replace('read_file grep bash write_file dev_cortex', 'read_file grep bash write_file edit dev_cortex'))
+  assert.equal(withEdit.ok, false)
+  assert.ok(withEdit.problems.includes('GLM_REVIEW_TOOLS_DEFAULT enables "edit" — review/certify seats are edit-denied by role'), withEdit.problems.join('\n'))
+  const dropNoEdit = analyzeGlmShim(fullShim.replace('GLM_REVIEW_DROP="task edit"', 'GLM_REVIEW_DROP="task"'))
+  assert.equal(dropNoEdit.ok, false)
+  assert.deepEqual(dropNoEdit.problems, ['GLM_REVIEW_DROP lacks "edit" — an operator override could hand a review seat edit'])
+  // the pre-change GLM block (the shim before seat-handoff-writes) fails on exactly the two new list rules
+  const preChange = analyzeGlmShim(fullShim.replace('read_file grep bash write_file dev_cortex', 'read_file grep bash dev_cortex')
+    .replace('GLM_REVIEW_DROP="task edit"', 'GLM_REVIEW_DROP="task"'))
+  assert.equal(preChange.problems.length, 2, preChange.problems.join('\n'))
+})
+
+test('seat-handoff-writes: an operator override WOLFPACK_GLM_TOOLS that adds edit is dropped for review seats (shim parity)', () => {
+  assert.deepEqual(shimToolsFor(fullShim, 'wolfpack-pointer-glm', { WOLFPACK_GLM_TOOLS: 'read_file grep bash write_file edit' }).tools,
+    ['read_file', 'grep', 'bash', 'write_file'])
+  // the implement mode keeps edit (its drop list is bash task)
+  assert.ok(shimToolsFor(fullShim, 'wolfpack-shepherd-glm').tools.includes('edit'))
+})
+
+test('seat-handoff-writes: the REAL committed shim\'s GLM block passes analyzeGlmShim (write_file in review, edit dropped)', { skip: !existsSync(vibePath) && 'no pack shim' }, () => {
+  const real = readFileSync(vibePath, 'utf8')
+  assert.deepEqual(analyzeGlmShim(real).problems, [])
+  const tools = shimToolsFor(real, 'wolfpack-watchdog-glm').tools
+  assert.ok(tools.includes('write_file') && !tools.includes('edit'), tools.join(' '))
+})
+
+test('seat-handoff-writes: the installer output + the real shim → toolcheck CLI exits 0', { skip: !existsSync(vibePath) && 'no pack shim' }, () => {
+  const installer = join(here, 'wolfpack-install-vibe-agents.mjs')
+  if (!existsSync(installer)) return
+  const dest = mkdtempSync(join(tmpdir(), 'tc-install-'))
+  try {
+    execFileSync(process.execPath, [installer, '--dest', join(dest, 'agents')], { stdio: 'pipe' })
+    const r = runCli(['--shim', vibePath, '--profiles', join(dest, 'agents')])
+    assert.equal(r.status, 0, r.stdout + r.stderr)
+    for (const name of Object.keys(PIPELINE_SEATS)) assert.match(r.stdout, new RegExp(`✓ ${name}: profile matches the shim`))
+  } finally {
+    rmSync(dest, { recursive: true, force: true })
+  }
 })

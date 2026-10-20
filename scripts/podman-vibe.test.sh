@@ -4,7 +4,8 @@
 # `vibe` call) against a FAKE `vibe` on PATH that echoes its argv, with an isolated
 # HOME + TMPDIR. Asserts the per-family command line (mistral unchanged, glm gets
 # --auto-approve + the strict allow-list), --implement gating, and the per-family
-# rate-limit exit contract (exit 75 + WOLFPACK_RATE_LIMITED:<family>).
+# rate-limit exit contract (exit 75 + WOLFPACK_RATE_LIMITED:<family>), and seat handoff mode
+# (seat-handoff-writes: a git fixture worktree + a fake seat that writes into the out dir).
 # The podman path (a FAKE podman on PATH) reads a fixture wolfpack-config.md → Execution Layer
 # through WOLFPACK_CONFIG: image names, the image build chain, seat extra mounts, the secrets
 # guard, the Vibe agent dir, the seat test env and the fail-loud missing-key cases.
@@ -89,9 +90,9 @@ has "$out" "15" "mistral: caller's max-turns passed through"
 # ─── glm review ───────────────────────────────────────────────
 out=$(run wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt"); rc=$?
 check "$rc" 0 "glm review → rc 0"
-check "$(tools "$out")" "read_file grep bash dev_cortex_repo_map dev_cortex_file_outline" "glm review: sandbox-scoped shell, no edit/write"
+check "$(tools "$out")" "read_file grep bash write_file dev_cortex_repo_map dev_cortex_file_outline" "glm review: sandbox-scoped shell + write_file, no edit"
 hasnt "$out" "edit" "glm review: no edit"
-hasnt "$out" "write_file" "glm review: no write_file"
+has "$out" "write_file" "glm review: write_file (the seat writes its own handoff file — seat-handoff-writes)"
 hasnt "$out" "task" "glm review: no task"
 has "$out" "--auto-approve" "glm review: --auto-approve (the allow-list is the sandbox)"
 has "$out" "80" "glm review: default max-turns 80"
@@ -110,6 +111,12 @@ check "$(tools "$out")" "read_file bash grep" "glm review: an operator allow-lis
 out=$(WOLFPACK_GLM_TOOLS="read_file task grep" run wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt")
 check "$(tools "$out")" "read_file grep" "glm review: task is stripped from an operator allow-list"
 grep -q "'task' dropped from the GLM review allow-list" "$SCRATCH/err" && ok "…with a warning naming the tool and mode" || no "review task-drop warning ($(cat "$SCRATCH/err"))"
+# seat-handoff-writes AC2: edit is dropped from a REVIEW override too (review seats are edit-denied by role).
+out=$(WOLFPACK_GLM_TOOLS="read_file grep bash edit" run wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt")
+check "$(tools "$out")" "read_file grep bash" "glm review: edit is stripped from an operator allow-list"
+grep -q "'edit' dropped from the GLM review allow-list" "$SCRATCH/err" && ok "…with a warning naming edit and review" || no "review edit-drop warning ($(cat "$SCRATCH/err"))"
+out=$(WOLFPACK_GLM_TOOLS="read_file grep bash write_file edit" run wolfpack-pointer-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt")
+check "$(tools "$out")" "read_file grep bash write_file" "glm review: an override keeps write_file and loses edit"
 # bash smuggled into the IMPLEMENT allow-list is dropped (implement stays shell-free).
 out=$(WOLFPACK_GLM_IMPLEMENT_TOOLS="read_file bash edit" run --implement wolfpack-shepherd-glm "$SCRATCH/wt" "$SCRATCH/prompt.txt")
 check "$(tools "$out")" "read_file edit" "glm implement: bash is stripped from an operator allow-list"
@@ -677,6 +684,459 @@ SANDBOX_SH="$HERE/run-pipeline-sandbox.sh"
 grep -qF -- '-v "${HOME}/.cache/wolfpack:${HOME}/.cache/wolfpack:ro"' "$SANDBOX_SH" && ok "run-pipeline-sandbox mounts ~/.cache/wolfpack :ro" || no "snapshot mount missing / not :ro"
 grep -qF -- 'mkdir -p "${HOME}/.cache/wolfpack"' "$SANDBOX_SH" && ok "run-pipeline-sandbox creates the bind source first" || no "no mkdir for the snapshot bind source"
 bash -n "$SANDBOX_SH" && ok "run-pipeline-sandbox.sh parses" || no "run-pipeline-sandbox.sh syntax"
+
+# ═══ seat-handoff-writes: the seat writes its OWN handoff file; the shim delivers it ════════
+# A git fixture worktree (a committed file, a gitignored plan dir + cache dir) and a fake SEAT:
+# FAKE_SEAT names a helper the fake vibe (sandbox path: <--workdir>/$FAKE_OUT_REL, the seat's
+# RELATIVE write path) and the fake podman (podman path: the host side of the ONE `-v …:rw,z`
+# bind) call with the out dir. The helper mimics Vibe's write_file (create only — it refuses an
+# existing file) and can also break the contract on demand:
+#   FAKE_SEAT_WRITE="<name>=<fixture> …"  write each fixture into the out dir as <name>
+#   FAKE_SEAT_EXTRA="<rel> …"             an extra file (a/b = an extra subdir) in the out dir
+#   FAKE_SEAT_TOUCH="<wt-rel path> …"     append to a worktree path (a source change)
+#   FAKE_SEAT_CMD="<bash>"                anything else, run with WT/OUT/PD exported
+#   FAKE_SEAT_FAIL_FIRST=<counter file>   attempt 1 writes a PARTIAL artifact, then a 429
+cat > "$SCRATCH/bin/fake-seat" <<'FAKE'
+#!/usr/bin/env bash
+out="$1"; export OUT="$out" WT="$FAKE_WT" PD="$FAKE_PD"
+[ -n "${FAKE_SEAT_LOG:-}" ] && echo "seat out=$out" >> "$FAKE_SEAT_LOG"
+wf() { if [ -e "$2" ]; then echo "write_file: refusing to overwrite $2" >&2; return 1; fi; cp "$1" "$2"; }
+if [ -n "${FAKE_SEAT_FAIL_FIRST:-}" ] && [ ! -s "$FAKE_SEAT_FAIL_FIRST" ]; then
+  echo 1 > "$FAKE_SEAT_FAIL_FIRST"
+  for spec in ${FAKE_SEAT_WRITE:-}; do printf 'partial' > "$out/${spec%%=*}"; done
+  echo "HTTP 429 Too Many Requests" >&2; exit 1
+fi
+for spec in ${FAKE_SEAT_WRITE:-}; do wf "${spec#*=}" "$out/${spec%%=*}" || exit 1; done
+for rel in ${FAKE_SEAT_EXTRA:-}; do mkdir -p "$(dirname "$out/$rel")"; echo extra > "$out/$rel"; done
+for rel in ${FAKE_SEAT_TOUCH:-}; do mkdir -p "$(dirname "$WT/$rel")"; echo touched >> "$WT/$rel"; done
+if [ -n "${FAKE_SEAT_CMD:-}" ]; then bash -c "$FAKE_SEAT_CMD" || exit 1; fi
+exit 0
+FAKE
+chmod +x "$SCRATCH/bin/fake-seat"
+# The fake vibe runs the seat (before its sleep / error knobs) when FAKE_SEAT is set.
+cat > "$SCRATCH/bin/vibe" <<'FAKE'
+#!/usr/bin/env bash
+if [ "${1:-}" = "--help" ]; then [ -z "${FAKE_VIBE_OLD:-}" ] && echo "  --auto-approve, --yolo"; exit 0; fi
+if [ "${1:-}" = "--version" ]; then echo "vibe 0.0-fake"; exit 0; fi
+[ -n "${FAKE_VIBE_COUNT:-}" ] && echo x >> "$FAKE_VIBE_COUNT"
+if [ -n "${FAKE_SEAT:-}" ]; then
+  wd=""; prev=""; for a in "$@"; do [ "$prev" = "--workdir" ] && wd="$a"; prev="$a"; done
+  "$FAKE_SEAT" "$wd/$FAKE_OUT_REL" || exit $?
+fi
+[ -n "${FAKE_VIBE_SLEEP:-}" ] && sleep "$FAKE_VIBE_SLEEP"
+if [ -n "${FAKE_VIBE_ERR:-}" ]; then echo "$FAKE_VIBE_ERR" >&2; exit "${FAKE_VIBE_RC:-1}"; fi
+for a in "$@"; do printf '%s\n' "$a"; done
+FAKE
+chmod +x "$SCRATCH/bin/vibe"
+# The fake podman logs every call, and on `run` hands the seat the host side of the rw bind.
+cat > "$SCRATCH/bin/podman" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >> "$PODMAN_LOG"
+[ "${1:-}" = "image" ] && exit 0
+[ "${1:-}" = "build" ] && exit 0
+if [ -n "${FAKE_SEAT:-}" ]; then
+  rw=""; prev=""
+  for a in "$@"; do if [ "$prev" = "-v" ]; then case "$a" in *:rw,z) rw="${a%%:*}" ;; esac; fi; prev="$a"; done
+  if [ -n "$rw" ]; then "$FAKE_SEAT" "$rw" || exit $?; fi
+fi
+for a in "$@"; do printf '%s\n' "$a"; done
+FAKE
+chmod +x "$SCRATCH/bin/podman"
+rm -f "$TMPDIR/wolfpack-sem/"*.cooldown "$TMPDIR/wolfpack-sem/"*.fails
+
+HWT="$SCRATCH/hwt"; mkdir -p "$HWT"; HWT=$(realpath "$HWT")
+git -C "$HWT" init -q -b main 2>/dev/null || git -C "$HWT" init -q
+printf '.wolfpack/plans/\ncache/\n' > "$HWT/.gitignore"
+echo "source v1" > "$HWT/src.txt"
+git -C "$HWT" add .gitignore src.txt
+git -C "$HWT" -c user.email=t@t -c user.name=t commit -q -m init
+HBASE=$(git -C "$HWT" rev-parse HEAD)
+HPD="$HWT/.wolfpack/plans/x"; HREL=".wolfpack/plans/x"
+export FAKE_WT="$HWT" FAKE_PD="$HPD"
+# Fixtures: a 70 KiB artifact with multi-byte UTF-8, trailing spaces and NO final newline.
+FX="$SCRATCH/fixtures"; mkdir -p "$FX"
+python3 - "$FX/review.md" <<'PY'
+import sys
+line = "## Finding — é… 中文 «quoted» `code`   \n"
+body = "# Review\n\n" + line * (72 * 1024 // len(line.encode()))
+body += '<verdict>\n{"verdict": "APPROVED", "findings": []}\n</verdict>   '
+open(sys.argv[1], "w", encoding="utf-8", newline="").write(body)
+PY
+cp "$FX/review.md" "$FX/certification.md"
+printf '{"feature":"x","notes":"é 中文","scores":{"adherence":5}}' > "$FX/pedigree.json"
+FXSZ=$(stat -c %s "$FX/review.md")
+[ "$FXSZ" -ge 71680 ] && ok "fixture: ≥70 KiB ($FXSZ bytes)" || no "fixture too small ($FXSZ)"
+[ "$(tail -c1 "$FX/review.md" | od -An -c | tr -d ' ')" != '\n' ] && ok "fixture: no final newline" || no "fixture ends with a newline"
+grep -q '中文' "$FX/review.md" && grep -q '   $' "$FX/review.md" && ok "fixture: multi-byte UTF-8 + trailing spaces" || no "fixture content"
+
+# hreset: the fixture back to a clean committed state with a fresh plan dir.
+hreset() {
+  git -C "$HWT" reset -q --hard "$HBASE"; git -C "$HWT" clean -fdq
+  git -C "$HWT" for-each-ref --format='%(refname)' refs/heads/ | grep -vx "refs/heads/main" | while read -r r; do git -C "$HWT" update-ref -d "$r"; done
+  chmod -R u+w "$HPD" 2>/dev/null; rm -rf "$HWT/.wolfpack" "$HWT/cache"
+  mkdir -p "$HPD"; echo '{"feature":"x","status":"reviewed"}' > "$HPD/metadata.json"; : > "$HPD/rate-limits.jsonl"
+}
+# hrun <out name> <expect…> -- <agent> [extra shim args]: handoff run on the SANDBOX path
+# (WOLFPACK_SANDBOX=1, direct vibe); prints stdout, stderr to $SCRATCH/err, sets $rc.
+hargs() { local n="$1"; shift; local a=(--deliver-to "$HPD" --out-dir "$HPD/.seat-out/$n"); local e; for e in "$@"; do a+=(--expect "$e"); done; printf '%s\0' "${a[@]}"; }
+hrun() {
+  local n="$1" agent="$2"; shift 2
+  local -a ha; mapfile -d '' ha < <(hargs "$n" "$@")
+  FAKE_SEAT="$SCRATCH/bin/fake-seat" FAKE_OUT_REL="$HREL/.seat-out/$n" bash "$SHIM" "${ha[@]}" "$agent" "$HWT" "$SCRATCH/prompt.txt" 2>"$SCRATCH/err"
+}
+# prun: the same on the PODMAN path (fake podman; config from WOLFPACK_CONFIG).
+prun() {
+  local n="$1" agent="$2"; shift 2
+  local -a ha; mapfile -d '' ha < <(hargs "$n" "$@")
+  : > "$PODMAN_LOG"
+  ( cd "$SCRATCH/wt" && WOLFPACK_SANDBOX= FAKE_SEAT="$SCRATCH/bin/fake-seat" bash "$SHIM" "${ha[@]}" "$agent" "$HWT" "$SCRATCH/prompt.txt" 2>"$SCRATCH/err" )
+}
+delivered_ok() {  # <name> <fixture> <label>
+  if cmp -s "$HPD/$1" "$2"; then ok "$3: $1 byte-identical (cmp)"; else no "$3: $1 differs from what the seat wrote"; fi
+  local sha bytes; sha=$(sha256sum < "$HPD/$1" | cut -d' ' -f1); bytes=$(stat -c %s "$HPD/$1")
+  grep -qxF "WOLFPACK_ARTIFACT_DELIVERED: $1 sha256=$sha bytes=$bytes" "$SCRATCH/err" \
+    && ok "$3: DELIVERED line for $1 carries the delivered file's sha256 + size" || no "$3: DELIVERED line for $1 ($(grep DELIVERED "$SCRATCH/err" | tr '\n' '|'))"
+}
+quarantined() { # <out name> <label>
+  local n="$1"
+  [ ! -e "$HPD/.seat-out/$n" ] && ok "$2: the out dir is gone" || no "$2: the out dir is still there"
+  compgen -G "$HPD/.seat-out/$n.rejected-*" >/dev/null && ok "$2: the out dir is quarantined (*.rejected-*)" || no "$2: no quarantine dir"
+}
+err_marker() { grep -qxF "WOLFPACK_ARTIFACT_ERROR: $1" "$SCRATCH/err" && ok "$2" || no "$2 (stderr: $(grep -E 'ARTIFACT|ERROR' "$SCRATCH/err" | tr '\n' '|'))"; }
+not_delivered() { [ ! -e "$HPD/$1" ] && ok "$2: $1 NOT delivered to the plan dir" || no "$2: $1 reached the plan dir"; }
+
+# ─── AC5: byte-identical delivery, one and two artifacts, both paths ───
+for path in sandbox podman; do
+  for agent in wolfpack-bloodhound-glm wolfpack-bloodhound; do
+    hreset
+    if [ "$path" = sandbox ]; then out=$(FAKE_SEAT_WRITE="review-1.md=$FX/review.md" hrun bloodhound-r1 "$agent" review-1.md); rc=$?
+    else out=$(FAKE_SEAT_WRITE="review-1.md=$FX/review.md" prun bloodhound-r1 "$agent" review-1.md); rc=$?; fi
+    check "$rc" 0 "AC5 $path $agent: one artifact → rc 0"
+    delivered_ok review-1.md "$FX/review.md" "AC5 $path $agent"
+    [ ! -e "$HPD/.seat-out/bloodhound-r1" ] && ok "AC5 $path $agent: the out dir is removed after delivery" || no "AC5 $path $agent: out dir left behind"
+    compgen -G "$HPD/.seat-out/*.rejected-*" >/dev/null && no "AC5 $path $agent: a quarantine dir appeared" || ok "AC5 $path $agent: nothing quarantined"
+  done
+  hreset
+  if [ "$path" = sandbox ]; then out=$(FAKE_SEAT_WRITE="certification.md=$FX/certification.md pedigree.json=$FX/pedigree.json" hrun watchdog-r0 wolfpack-watchdog-glm certification.md pedigree.json); rc=$?
+  else out=$(FAKE_SEAT_WRITE="certification.md=$FX/certification.md pedigree.json=$FX/pedigree.json" prun watchdog-r0 wolfpack-watchdog-glm certification.md pedigree.json); rc=$?; fi
+  check "$rc" 0 "AC5 $path watchdog: two artifacts → rc 0"
+  delivered_ok certification.md "$FX/certification.md" "AC5 $path watchdog"
+  delivered_ok pedigree.json "$FX/pedigree.json" "AC5 $path watchdog"
+  node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$HPD/pedigree.json" && ok "AC5 $path watchdog: pedigree.json parses" || no "AC5 $path watchdog: pedigree.json JSON"
+  [ ! -e "$HPD/.seat-out/watchdog-r0" ] && ok "AC5 $path watchdog: out dir removed" || no "AC5 $path watchdog: out dir left"
+done
+# P4: the sandbox seat wrote through the worktree-RELATIVE path (resolved against --workdir).
+hreset; FAKE_SEAT_LOG="$SCRATCH/seat.log"; : > "$FAKE_SEAT_LOG"
+FAKE_SEAT_LOG="$SCRATCH/seat.log" FAKE_SEAT_WRITE="review-1.md=$FX/review.md" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null
+grep -qxF "seat out=$HWT/$HREL/.seat-out/bloodhound-r1" "$SCRATCH/seat.log" && ok "P4: the seat's relative path resolves to the out dir under --workdir" || no "P4: seat path ($(cat "$SCRATCH/seat.log"))"
+
+# ─── AC4: the podman path adds exactly ONE rw bind (the out dir); the worktree stays ro ───
+hreset
+out=$(FAKE_SEAT_WRITE="pointer-review-2.md=$FX/review.md" prun pointer-r2 wolfpack-pointer-glm pointer-review-2.md); rc=$?
+check "$rc" 0 "AC4 podman glm: handoff run → rc 0"
+check "$(grep -c ':rw,z$' <<<"$out")" 1 "AC4 podman glm: exactly one :rw,z bind"
+vmount "$out" "$HPD/.seat-out/pointer-r2:$HWT/$HREL/.seat-out/pointer-r2:rw,z" "AC4 podman glm: <out>:<host worktree>/<rel>:rw,z (container path = host path)"
+vmount "$out" "$HWT:$HWT:ro,z" "AC4 podman glm: the worktree bind stays :ro,z"
+check "$(grep -c -- '--tmpfs' <<<"$out")" 3 "AC4 podman glm: the three tmpfs entries are unchanged"
+hreset
+out=$(FAKE_SEAT_WRITE="pointer-review-2.md=$FX/review.md" prun pointer-r2 wolfpack-pointer pointer-review-2.md); rc=$?
+check "$rc" 0 "AC4 podman mistral: handoff run → rc 0"
+check "$(grep -c ':rw,z$' <<<"$out")" 1 "AC4 podman mistral: exactly one :rw,z bind"
+vmount "$out" "$HPD/.seat-out/pointer-r2:/workspace/$HREL/.seat-out/pointer-r2:rw,z" "AC4 podman mistral: <out>:/workspace/<rel>:rw,z (inside --workdir /workspace)"
+vmount "$out" "$HWT:/workspace:ro,z" "AC4 podman mistral: the worktree bind stays :ro,z"
+check "$(grep -c -- '--tmpfs' <<<"$out")" 3 "AC4 podman mistral: the three tmpfs entries are unchanged"
+# Without the handoff options: no rw bind at all on a review seat, no out dir created.
+hreset
+for agent in wolfpack-pointer-glm wolfpack-pointer; do
+  : > "$PODMAN_LOG"
+  out=$( cd "$SCRATCH/wt" && WOLFPACK_SANDBOX= bash "$SHIM" "$agent" "$HWT" "$SCRATCH/prompt.txt" 2>"$SCRATCH/err" ); rc=$?
+  check "$rc" 0 "AC4 $agent without handoff args → rc 0 (unchanged)"
+  grep -q ':rw,z$' <<<"$out" && no "AC4 $agent without handoff: a rw bind appeared" || ok "AC4 $agent without handoff: no rw bind"
+  check "$(grep -c -- '--tmpfs' <<<"$out")" 3 "AC4 $agent without handoff: the same three tmpfs entries"
+done
+[ ! -e "$HPD/.seat-out" ] && ok "AC4: no .seat-out dir without handoff args" || no "AC4: .seat-out created without handoff"
+
+# ─── AC6: a missing artifact → exit 78, nothing delivered, out dir quarantined ───
+for path in sandbox podman; do
+  hreset
+  if [ "$path" = sandbox ]; then hrun watchdog-r0 wolfpack-watchdog-glm certification.md pedigree.json >/dev/null; rc=$?
+  else prun watchdog-r0 wolfpack-watchdog-glm certification.md pedigree.json >/dev/null; rc=$?; fi
+  check "$rc" 78 "AC6 $path: nothing written → exit 78"
+  err_marker "missing certification.md" "AC6 $path: missing certification.md"
+  err_marker "missing pedigree.json" "AC6 $path: missing pedigree.json"
+  not_delivered certification.md "AC6 $path"
+  hreset
+  if [ "$path" = sandbox ]; then FAKE_SEAT_WRITE="certification.md=$FX/certification.md" hrun watchdog-r0 wolfpack-watchdog-glm certification.md pedigree.json >/dev/null; rc=$?
+  else FAKE_SEAT_WRITE="certification.md=$FX/certification.md" prun watchdog-r0 wolfpack-watchdog-glm certification.md pedigree.json >/dev/null; rc=$?; fi
+  check "$rc" 78 "AC6 $path: only certification.md of two → exit 78"
+  err_marker "missing pedigree.json" "AC6 $path: names the missing pedigree.json"
+  grep -q "missing certification.md" "$SCRATCH/err" && no "AC6 $path: certification.md reported missing" || ok "AC6 $path: certification.md is not reported missing"
+  not_delivered certification.md "AC6 $path (partial)"
+  quarantined watchdog-r0 "AC6 $path (partial)"
+  [ -f "$(compgen -G "$HPD/.seat-out/watchdog-r0.rejected-*" | head -1)/certification.md" ] && ok "AC6 $path: the quarantine keeps the seat's file as evidence" || no "AC6 $path: evidence missing from quarantine"
+  grep -q "WOLFPACK_ARTIFACT_DELIVERED" "$SCRATCH/err" && no "AC6 $path: a DELIVERED line was printed" || ok "AC6 $path: no DELIVERED line"
+done
+
+# ─── AC7: anything extra in the out dir → exit 78 unexpected; plan-dir metadata untouched ───
+for extra in "notes.txt" "sub/deep.md" "metadata.json" ".hidden"; do
+  hreset; MSHA=$(sha256sum < "$HPD/metadata.json")
+  FAKE_SEAT_WRITE="review-3.md=$FX/review.md" FAKE_SEAT_EXTRA="$extra" hrun bloodhound-r3 wolfpack-bloodhound-glm review-3.md >/dev/null; rc=$?
+  check "$rc" 78 "AC7 extra '$extra' → exit 78"
+  top=${extra%%/*}
+  err_marker "unexpected $HREL/.seat-out/bloodhound-r3/$top" "AC7 extra '$extra': unexpected <rel path> named"
+  [ "$extra" = "sub/deep.md" ] && err_marker "unexpected $HREL/.seat-out/bloodhound-r3/sub/deep.md" "AC7 extra subdir: its contents are named too"
+  not_delivered review-3.md "AC7 extra '$extra'"
+  check "$(sha256sum < "$HPD/metadata.json")" "$MSHA" "AC7 extra '$extra': plan-dir metadata.json sha256 unchanged"
+  quarantined bloodhound-r3 "AC7 extra '$extra'"
+done
+# podman path too
+hreset
+FAKE_SEAT_WRITE="review-3.md=$FX/review.md" FAKE_SEAT_EXTRA="metadata.json" prun bloodhound-r3 wolfpack-bloodhound-glm review-3.md >/dev/null; rc=$?
+check "$rc" 78 "AC7 podman: an extra metadata.json in the out dir → exit 78"
+not_delivered review-3.md "AC7 podman"
+
+# ─── symlink / non-regular artifact → exit 78 not-a-regular-file ───
+hreset
+FAKE_SEAT_CMD='ln -s "$WT/src.txt" "$OUT/review-1.md"' hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 78 "symlink artifact → exit 78"
+err_marker "not-a-regular-file review-1.md" "symlink artifact: not-a-regular-file named"
+[ ! -L "$HPD/review-1.md" ] && [ ! -e "$HPD/review-1.md" ] && ok "symlink artifact: nothing in the plan dir" || no "symlink artifact delivered"
+check "$(cat "$HWT/src.txt")" "source v1" "symlink artifact: the link target is untouched"
+hreset
+FAKE_SEAT_CMD='mkdir "$OUT/review-1.md"' hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 78 "a DIRECTORY named like the artifact → exit 78"
+err_marker "not-a-regular-file review-1.md" "directory artifact: not-a-regular-file named"
+
+# ─── AC8: source changes are caught (sandbox AND podman); documented exclusions pass ───
+for path in sandbox podman; do
+  for touch in "src.txt" "newfile.txt" "deep/new/untracked.py"; do
+    hreset
+    if [ "$path" = sandbox ]; then FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT_TOUCH="$touch" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+    else FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT_TOUCH="$touch" prun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?; fi
+    check "$rc" 78 "AC8 $path: seat touches $touch → exit 78"
+    err_marker "source-touched $touch" "AC8 $path: source-touched $touch"
+    not_delivered review-1.md "AC8 $path ($touch)"
+    quarantined bloodhound-r1 "AC8 $path ($touch)"
+  done
+done
+# Exclusions (P5): gitignored cache churn, the heartbeat, the plan dir's rate-limits/timing logs.
+for c in 'mkdir -p "$WT/cache"; echo x > "$WT/cache/pyc"' \
+         'mkdir -p "$WT/.wolfpack/heartbeats"; echo "{\"agent\":\"working\"}" > "$WT/.wolfpack/heartbeats/x.json"' \
+         'echo "{\"family\":\"glm\"}" >> "$PD/rate-limits.jsonl"' \
+         'echo "{\"phase\":\"Review\"}" >> "$PD/timing.jsonl"' \
+         'mkdir -p "$PD/seat-notes"'; do
+  hreset
+  FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT_CMD="$c" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+  check "$rc" 0 "AC8 exclusion → rc 0: $c"
+  grep -q "source-touched" "$SCRATCH/err" && no "AC8 exclusion flagged: $(grep source-touched "$SCRATCH/err")" || ok "AC8 exclusion: no source-touched"
+  cmp -s "$HPD/review-1.md" "$FX/review.md" && ok "AC8 exclusion: still delivered" || no "AC8 exclusion: not delivered"
+done
+# A pre-existing heartbeat rewritten mid-run is excluded too (it exists BEFORE and changes).
+hreset; mkdir -p "$HWT/.wolfpack/heartbeats"; echo '{"agent":"starting"}' > "$HWT/.wolfpack/heartbeats/x.json"
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT_CMD='echo "{\"agent\":\"done\"}" > "$WT/.wolfpack/heartbeats/x.json"' hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 0 "AC8 exclusion: an existing heartbeat rewritten mid-run → rc 0"
+# The plan dir's own files are sha-pinned (sandbox path: the worktree is writable there).
+for c in 'echo "{\"status\":\"hacked\"}" > "$PD/metadata.json"|metadata.json' \
+         'cp "$OUT/review-1.md" "$PD/review-1.md.tmp" && mv "$PD/review-1.md.tmp" "$PD/review-2.md"|review-2.md' \
+         'echo stray > "$PD/plan-final.md"|plan-final.md'; do
+  cmd=${c%|*}; name=${c##*|}
+  hreset
+  FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT_CMD="$cmd" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+  check "$rc" 78 "AC8 plan-dir pin: the seat writes $name in the plan dir → exit 78"
+  err_marker "source-touched $HREL/$name" "AC8 plan-dir pin: source-touched names $HREL/$name"
+  not_delivered review-1.md "AC8 plan-dir pin ($name)"
+done
+# A review written STRAIGHT into the plan dir (not the out dir) → caught, never mistaken for delivery.
+hreset
+FAKE_SEAT_CMD='cp "'"$FX"'/review.md" "$PD/review-1.md"' hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 78 "AC8: review-1.md written straight into the plan dir → exit 78"
+err_marker "source-touched $HREL/review-1.md" "AC8: source-touched names the plan-dir review-1.md"
+err_marker "missing review-1.md" "AC8: …and the out-dir artifact is missing"
+grep -q "WOLFPACK_ARTIFACT_DELIVERED" "$SCRATCH/err" && no "AC8: straight-to-plan-dir write was reported delivered" || ok "AC8: no DELIVERED line"
+# Refs are NOT snapshotted (P5): a parallel hunt moving another branch is not a violation…
+hreset
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT_CMD='git -C "$WT" update-ref refs/heads/other-track HEAD' hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 0 "AC8 refs: a foreign branch ref created mid-run → rc 0 (refs are repo-global)"
+grep -q "source-touched" "$SCRATCH/err" && no "AC8 refs: flagged source-touched" || ok "AC8 refs: no source-touched"
+# …but a commit on the checked-out branch moves HEAD and IS caught.
+hreset
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT_CMD='git -C "$WT" -c user.email=s@s -c user.name=s commit -q --allow-empty -m seat' hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 78 "AC8: a seat commit (HEAD moves) → exit 78"
+err_marker "source-touched HEAD" "AC8: source-touched HEAD"
+not_delivered review-1.md "AC8 commit"
+# A staged-only change (index) is caught as well.
+hreset
+FAKE_SEAT_CMD='echo staged >> "$WT/src.txt"; git -C "$WT" add src.txt' FAKE_SEAT_WRITE="review-1.md=$FX/review.md" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 78 "AC8: a staged change → exit 78"
+err_marker "source-touched src.txt" "AC8: staged change names src.txt"
+# A worktree that was ALREADY dirty before the run is fine as long as the seat does not change it.
+hreset; echo "pre-existing edit" >> "$HWT/src.txt"; echo new > "$HWT/untracked-before.txt"
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 0 "AC8: pre-existing dirt the seat leaves alone → rc 0"
+hreset; echo "pre-existing edit" >> "$HWT/src.txt"
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT_TOUCH="src.txt" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 78 "AC8: a further change to an already-dirty file → exit 78 (content sha, not just status)"
+
+# ─── AC9: a pre-populated out dir is refused before anything runs ───
+for path in sandbox podman; do
+  hreset; mkdir -p "$HPD/.seat-out/bloodhound-r1"; echo stale > "$HPD/.seat-out/bloodhound-r1/review-1.md"
+  : > "$SCRATCH/count"
+  if [ "$path" = sandbox ]; then FAKE_VIBE_COUNT="$SCRATCH/count" FAKE_SEAT_WRITE="review-1.md=$FX/review.md" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+  else FAKE_SEAT_WRITE="review-1.md=$FX/review.md" prun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?; fi
+  check "$rc" 2 "AC9 $path: non-empty out dir → exit 2"
+  err_has "seat out dir is not empty: $HPD/.seat-out/bloodhound-r1" "AC9 $path: names the dir"
+  if [ "$path" = sandbox ]; then check "$(wc -l < "$SCRATCH/count" | tr -d ' ')" 0 "AC9 sandbox: vibe never ran"; else no_podman "AC9 podman: podman never called"; fi
+  check "$(cat "$HPD/.seat-out/bloodhound-r1/review-1.md")" "stale" "AC9 $path: the stale evidence is left in place (never deleted)"
+  not_delivered review-1.md "AC9 $path"
+done
+hreset; mkdir -p "$HPD/.seat-out/bloodhound-r1/.hidden-dir"
+hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 2 "AC9: an out dir holding only a hidden entry is not empty → exit 2"
+hreset; mkdir -p "$HPD/.seat-out"; echo f > "$HPD/.seat-out/bloodhound-r1"
+hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 2 "AC9: an out dir path that is a FILE → exit 2"
+hreset; mkdir -p "$HPD/.seat-out" "$SCRATCH/elsewhere"; ln -s "$SCRATCH/elsewhere" "$HPD/.seat-out/bloodhound-r1"
+: > "$PODMAN_LOG"
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" prun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 2 "AC9: a SYMLINKED out dir (would redirect the rw bind) → exit 2"
+no_podman "AC9 symlinked out dir: podman never called"
+[ -z "$(ls -A "$SCRATCH/elsewhere")" ] && ok "AC9 symlinked out dir: nothing written through the link" || no "AC9: wrote through the symlink"
+# An empty leftover out dir is fine (reused fresh).
+hreset; mkdir -p "$HPD/.seat-out/bloodhound-r1"
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 0 "AC9: an EMPTY pre-existing out dir is accepted"
+
+# ─── AC10: malformed handoff calls → exit 2, nothing runs ───
+hreset
+ac10() {  # <label> <shim args…>  (agent/worktree/prompt appended unless the label says raw)
+  local label="$1"; shift
+  : > "$SCRATCH/count"; : > "$PODMAN_LOG"
+  FAKE_VIBE_COUNT="$SCRATCH/count" FAKE_SEAT="$SCRATCH/bin/fake-seat" FAKE_OUT_REL="$HREL/.seat-out/s" bash "$SHIM" "$@" 2>"$SCRATCH/err" >/dev/null; rc=$?
+  check "$rc" 2 "AC10 $label → exit 2"
+  check "$(wc -l < "$SCRATCH/count" | tr -d ' ')" 0 "AC10 $label: vibe never ran"
+  [ -s "$PODMAN_LOG" ] && no "AC10 $label: podman called" || ok "AC10 $label: podman never called"
+  [ -z "$(ls -A "$HPD" | grep -vxE 'metadata.json|rate-limits.jsonl|\.seat-out')" ] && ok "AC10 $label: plan dir untouched" || no "AC10 $label: plan dir changed ($(ls -A "$HPD"))"
+}
+A=(wolfpack-bloodhound-glm "$HWT" "$SCRATCH/prompt.txt")
+D=(--deliver-to "$HPD"); O=(--out-dir "$HPD/.seat-out/s")
+ac10 "--expect metadata.json" "${D[@]}" "${O[@]}" --expect metadata.json "${A[@]}"
+err_has "--expect 'metadata.json' is not a handoff artifact name" "AC10 metadata.json: names the value"
+ac10 "--expect ../x.md" "${D[@]}" "${O[@]}" --expect ../x.md "${A[@]}"
+err_has "--expect '../x.md'" "AC10 ../x.md: names the value"
+ac10 "--expect a/review-1.md" "${D[@]}" "${O[@]}" --expect a/review-1.md "${A[@]}"
+err_has "--expect 'a/review-1.md'" "AC10 a/review-1.md: names the value"
+ac10 "--expect notes.txt" "${D[@]}" "${O[@]}" --expect notes.txt "${A[@]}"
+ac10 "--expect REVIEW-1.md (case)" "${D[@]}" "${O[@]}" --expect REVIEW-1.md "${A[@]}"
+ac10 "duplicate --expect" "${D[@]}" "${O[@]}" --expect review-1.md --expect review-1.md "${A[@]}"
+err_has "--expect 'review-1.md' given twice" "AC10 duplicate: says so"
+ac10 "only --deliver-to" "${D[@]}" "${A[@]}"
+err_has "handoff mode needs --deliver-to, --out-dir and at least one --expect" "AC10 partial: names the three options"
+ac10 "only --out-dir" "${O[@]}" "${A[@]}"
+ac10 "only --expect" --expect review-1.md "${A[@]}"
+ac10 "no --expect" "${D[@]}" "${O[@]}" "${A[@]}"
+ac10 "--out-dir without a value" "${D[@]}" --expect review-1.md --out-dir
+ac10 "--implement + handoff" --implement "${D[@]}" "${O[@]}" --expect review-1.md wolfpack-shepherd-glm "$HWT" "$SCRATCH/prompt.txt"
+err_has "--implement cannot be combined with the handoff options" "AC10 --implement + handoff: says so"
+ac10 "handoff + --implement (other order)" "${D[@]}" "${O[@]}" --expect review-1.md --implement wolfpack-shepherd-glm "$HWT" "$SCRATCH/prompt.txt"
+ac10 "out dir not under .seat-out" "${D[@]}" --out-dir "$HPD/out" --expect review-1.md "${A[@]}"
+err_has "--out-dir must be <deliver-to>/.seat-out/<name>" "AC10 out dir layout: says so"
+ac10 "out dir nested two levels" "${D[@]}" --out-dir "$HPD/.seat-out/a/b" --expect review-1.md "${A[@]}"
+ac10 "out dir name starting with a dot" "${D[@]}" --out-dir "$HPD/.seat-out/.x" --expect review-1.md "${A[@]}"
+ac10 "out dir under ANOTHER plan dir" "${D[@]}" --out-dir "$HWT/.wolfpack/plans/y/.seat-out/s" --expect review-1.md "${A[@]}"
+ac10 "out dir .. escape" "${D[@]}" --out-dir "$HPD/.seat-out/../../y/.seat-out/s" --expect review-1.md "${A[@]}"
+ac10 "deliver-to outside the worktree" --deliver-to "$SCRATCH/wt" --out-dir "$SCRATCH/wt/.seat-out/s" --expect review-1.md "${A[@]}"
+err_has "--deliver-to must lie inside the worktree" "AC10 deliver-to outside: says so"
+ac10 "deliver-to = the worktree root itself" --deliver-to "$HWT" --out-dir "$HWT/.seat-out/s" --expect review-1.md "${A[@]}"
+ac10 "deliver-to missing" --deliver-to "$HWT/.wolfpack/plans/nope" --out-dir "$HWT/.wolfpack/plans/nope/.seat-out/s" --expect review-1.md "${A[@]}"
+mkdir -p "$HWT/.wolfpack/plans/c:x"
+ac10 "deliver-to with ':'" --deliver-to "$HWT/.wolfpack/plans/c:x" --out-dir "$HWT/.wolfpack/plans/c:x/.seat-out/s" --expect review-1.md "${A[@]}"
+err_has "contains ':' or a newline" "AC10 ':' path: says so"
+ac10 "unknown option" --frobnicate "${A[@]}"
+err_has "unknown option '--frobnicate'" "AC10 unknown option: names it"
+NG="$SCRATCH/nongit"; mkdir -p "$NG/plans/x"
+: > "$SCRATCH/count"
+FAKE_VIBE_COUNT="$SCRATCH/count" bash "$SHIM" --deliver-to "$NG/plans/x" --out-dir "$NG/plans/x/.seat-out/s" --expect review-1.md wolfpack-bloodhound-glm "$NG" "$SCRATCH/prompt.txt" >/dev/null 2>"$SCRATCH/err"; rc=$?
+check "$rc" 2 "AC10 a non-git worktree in handoff mode → exit 2 (P6)"
+err_has "handoff mode needs a git checkout" "AC10 non-git: says so"
+check "$(wc -l < "$SCRATCH/count" | tr -d ' ')" 0 "AC10 non-git: vibe never ran"
+[ ! -e "$NG/plans/x/.seat-out" ] && ok "AC10 non-git: no out dir created" || no "AC10 non-git: out dir created"
+# P1: the options come in any order before <agent>, and `--` ends them.
+hreset
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT="$SCRATCH/bin/fake-seat" FAKE_OUT_REL="$HREL/.seat-out/bloodhound-r1" \
+  bash "$SHIM" --expect review-1.md --out-dir "$HPD/.seat-out/bloodhound-r1" --deliver-to "$HPD" -- wolfpack-bloodhound-glm "$HWT" "$SCRATCH/prompt.txt" >/dev/null 2>"$SCRATCH/err"; rc=$?
+check "$rc" 0 "P1: options in another order + '--' → rc 0"
+cmp -s "$HPD/review-1.md" "$FX/review.md" && ok "P1: …and delivered" || no "P1: not delivered"
+# A relative --deliver-to/--out-dir (resolved against the caller's CWD) works too.
+hreset
+( cd "$HWT" && FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT="$SCRATCH/bin/fake-seat" FAKE_OUT_REL="$HREL/.seat-out/bloodhound-r1" \
+  bash "$SHIM" --deliver-to "$HREL" --out-dir "$HREL/.seat-out/bloodhound-r1" --expect review-1.md wolfpack-bloodhound-glm "$HWT" "$SCRATCH/prompt.txt" >/dev/null 2>"$SCRATCH/err" ); rc=$?
+check "$rc" 0 "P1: relative handoff paths → rc 0"
+
+# ─── retry: attempt 1 leaves a PARTIAL artifact + a 429, attempt 2 writes → one clean delivery ───
+for agent in wolfpack-bloodhound-glm wolfpack-bloodhound; do
+  hreset; : > "$SCRATCH/count"; rm -f "$SCRATCH/first"
+  FAKE_VIBE_COUNT="$SCRATCH/count" FAKE_SEAT_FAIL_FIRST="$SCRATCH/first" FAKE_SEAT_WRITE="review-1.md=$FX/review.md" WOLFPACK_CB_FAILS=99 \
+    hrun bloodhound-r1 "$agent" review-1.md >/dev/null; rc=$?
+  check "$rc" 0 "retry $agent: transient attempt 1 + clean attempt 2 → rc 0"
+  check "$(wc -l < "$SCRATCH/count" | tr -d ' ')" 2 "retry $agent: two attempts"
+  delivered_ok review-1.md "$FX/review.md" "retry $agent"
+  check "$(grep -c '^WOLFPACK_ARTIFACT_DELIVERED' "$SCRATCH/err")" 1 "retry $agent: exactly one delivered file"
+  rm -f "$TMPDIR/wolfpack-sem/"*.cooldown "$TMPDIR/wolfpack-sem/"*.fails
+done
+
+# ─── a seat that exits non-zero keeps ITS exit code (not 78); the out dir is quarantined ───
+hreset
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_VIBE_ERR="Error: not authenticated (401)" hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 1 "non-zero seat (permanent rc 1) after writing → rc 1, not 78"
+grep -q "WOLFPACK_ARTIFACT" "$SCRATCH/err" && no "non-zero seat: the artifact check ran" || ok "non-zero seat: no artifact check (no ARTIFACT markers)"
+not_delivered review-1.md "non-zero seat"
+quarantined bloodhound-r1 "non-zero seat"
+hreset
+FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_VIBE_SLEEP=5 WOLFPACK_VIBE_REVIEW_TIMEOUT=1 hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 76 "seat timeout after writing → 76 (WOLFPACK_TIMEOUT), not 78"
+grep -q '^WOLFPACK_TIMEOUT:glm' "$SCRATCH/err" && ok "seat timeout: the sentinel is preserved" || no "seat timeout sentinel"
+not_delivered review-1.md "seat timeout"
+quarantined bloodhound-r1 "seat timeout"
+hreset
+FAKE_VIBE_ERR="HTTP 429 Too Many Requests" WOLFPACK_MAX_RETRIES=1 WOLFPACK_CB_FAILS=99 hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+check "$rc" 75 "seat rate-limited (nothing written) → 75 preserved"
+[ ! -e "$HPD/.seat-out/bloodhound-r1" ] && ok "rate-limited, empty out dir → removed (nothing to quarantine)" || no "empty out dir left behind"
+compgen -G "$HPD/.seat-out/bloodhound-r1.rejected-*" >/dev/null && no "an EMPTY out dir was quarantined" || ok "an empty out dir is not quarantined"
+rm -f "$TMPDIR/wolfpack-sem/"*.cooldown "$TMPDIR/wolfpack-sem/"*.fails
+# podman path keeps the seat's rc too
+cat > "$SCRATCH/bin/podman-fail" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >> "$PODMAN_LOG"; [ "${1:-}" = "image" ] && exit 0
+rw=""; prev=""; for a in "$@"; do if [ "$prev" = "-v" ]; then case "$a" in *:rw,z) rw="${a%%:*}" ;; esac; fi; prev="$a"; done
+[ -n "$rw" ] && echo "half" > "$rw/review-1.md"
+echo "Error: boom (500 permanent)" >&2; exit 3
+FAKE
+chmod +x "$SCRATCH/bin/podman-fail"; cp "$SCRATCH/bin/podman" "$SCRATCH/podman.keep"; cp "$SCRATCH/bin/podman-fail" "$SCRATCH/bin/podman"
+hreset
+WOLFPACK_MAX_RETRIES=1 WOLFPACK_CB_FAILS=99 prun bloodhound-r1 wolfpack-bloodhound review-1.md >/dev/null; rc=$?
+check "$rc" 3 "podman mistral seat rc 3 → rc 3 preserved (not 78)"
+quarantined bloodhound-r1 "podman non-zero seat"
+cp "$SCRATCH/podman.keep" "$SCRATCH/bin/podman"
+
+# ─── move failure: a plan dir that cannot take the rename → exit 78 move-failed ───
+if [ "$(id -u)" != 0 ]; then
+  hreset
+  FAKE_SEAT_WRITE="review-1.md=$FX/review.md" FAKE_SEAT_CMD='chmod a-w "$PD"' hrun bloodhound-r1 wolfpack-bloodhound-glm review-1.md >/dev/null; rc=$?
+  chmod u+w "$HPD"
+  check "$rc" 78 "move-failed: an unwritable plan dir → exit 78"
+  err_marker "move-failed review-1.md" "move-failed: names the artifact"
+  grep -q "WOLFPACK_ARTIFACT_DELIVERED" "$SCRATCH/err" && no "move-failed: a DELIVERED line" || ok "move-failed: no DELIVERED line"
+  quarantined bloodhound-r1 "move-failed"
+fi
+
+# ─── AC11: the --implement path never sees the handoff machinery ───
+: > "$PODMAN_LOG"
+out=$( cd "$SCRATCH/wt" && WOLFPACK_SANDBOX= bash "$SHIM" --implement wolfpack-shepherd-glm "$HWT" "$SCRATCH/prompt.txt" 2>"$SCRATCH/err" ); rc=$?
+check "$rc" 0 "AC11 --implement on the git fixture → rc 0"
+check "$(grep -c ':rw,z$' <<<"$out")" 1 "AC11 --implement: only the worktree rw bind (no out-dir bind)"
+vmount "$out" "$HWT:$HWT:rw,z" "AC11 --implement: the worktree is the rw bind"
+grep -q "WOLFPACK_ARTIFACT" "$SCRATCH/err" && no "AC11 --implement: artifact markers" || ok "AC11 --implement: no artifact markers"
+hreset
 
 echo
 echo "──────────────────────────────"
