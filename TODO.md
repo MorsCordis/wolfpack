@@ -19,6 +19,8 @@ keep their original filing dates.
 
 - [ ] Unified sandbox image needs `node` for the hunt-pipeline toolcheck preflight; until it has it, container (`WOLFPACK_SANDBOX`) campaign runs park `toolcheck_failed` at the preflight.
 
+- [ ] **Track the Vibe seat system prompts in the pack** — `~/.vibe/prompts/wolfpack-{bloodhound,pointer,watchdog}.md` are untracked, still say "You are read-only" and name stale output files (`bloodhound-review-N.md`, `watchdog-certification.md`); seat-handoff-writes overrides them from the pipeline prompt. Move them into `vibe-agents/prompts/` and install them with the seat profiles (installer work).
+
 - [ ] **Role prompts name a skill path consumers don't have** (Low, 2026-10-17; from prespec-sweep AC10):
   `hunt-pipeline.js` tells each headless role to "read `.agents/skills/<role>/SKILL.md`". The runtime sync
   rewrites that to `.claude/skills/<role>/SKILL.md`, and that path is absent in a consumer that loads the

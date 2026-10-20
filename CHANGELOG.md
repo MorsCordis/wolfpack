@@ -4,6 +4,19 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+### Added
+- Review and certify seats (Bloodhound, Pointer, Watchdog; GLM and Mistral) write their own handoff file with `write_file` into one shim-mounted read-write out dir (`<plan dir>/.seat-out/<seat>-r<N>[-<lens>]/`); the worktree stays read-only and `edit` stays denied. <!-- hunt:seat-handoff-writes -->
+- `podman-vibe.sh --deliver-to <plan dir> --out-dir <dir> --expect <artifact>…`: after the seat exits the shim moves exactly the expected artifact(s) byte-for-byte into the plan dir and prints `WOLFPACK_ARTIFACT_DELIVERED: <name> sha256=…`; a missing artifact, any extra file, a symlink or any change to tracked/untracked source fails with exit 78 and `WOLFPACK_ARTIFACT_ERROR:` markers, and the out dir is quarantined, never delivered. A non-empty out dir at start is refused (exit 2). <!-- hunt:seat-handoff-writes -->
+
+### Changed
+- The shim agent no longer re-transcribes a Vibe seat's stdout into `review-N.md` / `pointer-review-N.md` or authors `certification.md` / `pedigree.json` from it; it reads the verdict from the delivered file, records each artifact's sha256 in `metadata.seat_artifacts`, and logs `handoff_violations`. <!-- hunt:seat-handoff-writes -->
+- The grounding line and the `> audit_only: true` note now go to a pipeline-written sidecar (`<plan dir>/seat-notes/<artifact>`) instead of being prepended to the seat's artifact. <!-- hunt:seat-handoff-writes -->
+- `write_file` is no longer a read-only-by-role tool: a review/certify seat that reports it denied is recorded audit-only. The toolcheck now requires `write_file` and role-denies only `edit` for review seats; `GLM_REVIEW_DROP` also drops `edit`. <!-- hunt:seat-handoff-writes -->
+- Watchdog's PASS-only actions (pedigree index append, lessons, commit) are performed by the pipeline after the certifier, not requested from the seat. <!-- hunt:seat-handoff-writes -->
+
+### Fixed
+- The self-hosting AC2 test no longer asserts a header-only pedigree index; it checks the header, the separator and that every data row is well-formed, so certifying a wolfpack-hosted hunt no longer breaks it. <!-- hunt:seat-handoff-writes -->
+
 ## [v0.2.0] - 2026-10-19
 
 ### Added

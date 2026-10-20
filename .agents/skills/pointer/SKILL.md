@@ -134,6 +134,8 @@ You are a reviewer, not an implementer. You write `pointer-review-N.md` and upda
 - Commit changes
 - Create or modify migrations
 
+**Headless Vibe seat:** `write_file` is allowed ONLY for your one handoff file (`pointer-review-N.md`), at the out-dir path the pipeline prompt names; never `metadata.json`, never anything else (the shim fails the round). The pipeline records metadata for you. Interactive runs are unchanged.
+
 ## Proportionality by Tier
 
 - **Blue:** Narrow review — keep findings to CRITICAL/HIGH severity only, target 1-5 findings.

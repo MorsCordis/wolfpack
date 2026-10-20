@@ -18,8 +18,10 @@
 // scripts/wolfpack-install-vibe-agents.mjs) and cross-checks it against the tools the
 // shim actually enables for that seat (both families, both modes, operator env
 // overrides honoured), under a per-role policy (ROLE_POLICY):
-//   review    — must have read_file, grep, bash; edit/write_file are denied BY ROLE
-//               (a `never` there is intended); task is forbidden.
+//   review    — must have read_file, grep, bash, write_file (seat-handoff-writes: the seat
+//               writes its own handoff file into ONE shim-mounted read-write out dir; the
+//               worktree stays read-only); edit is denied BY ROLE (a `never` there is
+//               intended); task is forbidden.
 //   implement — must have read_file, grep, write_file, edit; bash and task forbidden.
 // Any other disagreement fails loud: a profile that denies a tool the shim enables,
 // enables one the shim omits, leaves a shim tool on "ask" (headless vibe -p denies or
@@ -42,8 +44,10 @@
 //      action="append"), not collapsed to one flag.
 //   5. `task` is NOT in the default set — cross-model self-orchestration stays off.
 //   6. (analyzeGlmShim) the GLM review/implement lists and their drop lists exist,
-//      are quoted, space-separated and comma-free; review includes bash; task is
-//      dropped in both modes; bash is dropped in implement mode.
+//      are quoted, space-separated and comma-free; review includes bash and write_file
+//      and not edit; edit is in the review drop list (an operator override can never
+//      hand a review seat edit); task is dropped in both modes; bash is dropped in
+//      implement mode.
 // Then, per pipeline seat, the profile × shim parity rules in checkSeatParity.
 //
 // WHY NODE / NO CLOCK: pure string analysis, host-side; no Date/random. Exit 0 =
@@ -136,7 +140,7 @@ export const RENAMED_TOOLS = { read: 'read_file', search_replace: 'edit' }
 // companion: its permission must equal bash's, and it is exempt from "shim omits it".
 export const SHELL_COMPANIONS = { git_bash: 'bash' }
 export const ROLE_POLICY = {
-  review:    { require: ['read_file', 'grep', 'bash'], roleDeny: ['edit', 'write_file'], forbid: ['task'] },
+  review:    { require: ['read_file', 'grep', 'bash', 'write_file'], roleDeny: ['edit'], forbid: ['task'] },
   implement: { require: ['read_file', 'grep', 'write_file', 'edit'], roleDeny: [], forbid: ['bash', 'task'] },
 }
 // The agents hunt-pipeline.js dispatches through the shim.
@@ -240,6 +244,9 @@ export function analyzeGlmShim(text) {
   const rDrop = vals.GLM_REVIEW_DROP
   const iDrop = vals.GLM_IMPLEMENT_DROP
   if (review && !review.includes('bash')) problems.push(`GLM_REVIEW_TOOLS_DEFAULT lacks "bash" — GLM review/certify seats cannot run git diff or the tests`)
+  if (review && !review.includes('write_file')) problems.push(`GLM_REVIEW_TOOLS_DEFAULT lacks "write_file" — review/certify seats cannot write their handoff file`)
+  if (review && review.includes('edit')) problems.push(`GLM_REVIEW_TOOLS_DEFAULT enables "edit" — review/certify seats are edit-denied by role`)
+  if (rDrop && !rDrop.includes('edit')) problems.push(`GLM_REVIEW_DROP lacks "edit" — an operator override could hand a review seat edit`)
   if (rDrop && !rDrop.includes('task')) problems.push(`GLM_REVIEW_DROP lacks "task" — GLM review seats must not self-orchestrate`)
   if (rDrop && rDrop.includes('bash')) problems.push(`GLM_REVIEW_DROP drops "bash" — GLM review/certify seats would run without a shell`)
   if (iDrop && !iDrop.includes('task')) problems.push(`GLM_IMPLEMENT_DROP lacks "task" — the GLM implementer must not self-orchestrate`)
