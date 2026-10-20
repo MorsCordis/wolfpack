@@ -9,9 +9,16 @@ Scaffold a new Wolfpack hunt.
 ## ⚠ Finishing message is MANDATORY VERBATIM
 Your final response MUST end with the exact block in "## Finishing message" below. Do NOT paraphrase, reformat, or drop `/clear` or the `cd` line. It's the user's copy-paste handoff — dropping steps forces them to reconstruct the cadence themselves.
 
+## Resolve first (pack + worktree root)
+Before any step below, from the main checkout:
+
+**Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
+
+**Worktree root (`WT_ROOT`).** In the main checkout run `node "$PACK/scripts/wolfpack-config.mjs" --json` and take `worktreeRoot` (wolfpack-config.md → Project Identity → Worktree root, repo-relative). If the reader exits 2 or `worktreeRoot` is null, STOP with the fix: "add ``- **Worktree root:** `<repo-relative dir, e.g. .agents/worktrees>` `` under ## Project Identity in wolfpack-config.md". Never assume a default location.
+
 ## Input
 Parse `$ARGUMENTS` as: `[--no-worktree] [--shepherd=<model>] [--bloodhound=<model>] [--watchdog=<model>] [--campaign=<campaign-slug>] <slug> "<description>"`.
-- **Default behavior:** Create an isolated git worktree at `.agents/worktrees/<slug>/` with branch `feat/<slug>`. Keeps hunt artifacts out of the main working tree and enables parallel work on main while the hunt proceeds.
+- **Default behavior:** Create an isolated git worktree at `$WT_ROOT/<slug>/` with branch `feat/<slug>`. Keeps hunt artifacts out of the main working tree and enables parallel work on main while the hunt proceeds.
 - Optional flag: `--no-worktree` — branch in the current working tree instead (`git checkout -b feat/<slug>` from `main`). Use when the hunt is tiny and worktree ceremony isn't worth it.
 - Optional flag: `--shepherd=<model>` — pin the Shepherd model for this hunt, overriding the tier-based default.
 - Optional flag: `--bloodhound=<model>` — pin the Bloodhound (reviewer) model.
@@ -33,7 +40,7 @@ When `$ARGUMENTS` contains `--campaign=<slug>` WITHOUT a hunt slug/description:
 2. Parse the hunt list from `## Proposed Hunts` and the wave/track assignments.
 3. For each hunt in wave order, check completion status:
    - Look for `.wolfpack/plans/<hunt-slug>/metadata.json` — if `status: "merged"`, mark done.
-   - Look for `.agents/worktrees/<hunt-slug>/.wolfpack/plans/<hunt-slug>/metadata.json` — if exists, mark in-progress (show its current `phase`).
+   - Look for `$WT_ROOT/<hunt-slug>/.wolfpack/plans/<hunt-slug>/metadata.json` — if exists, mark in-progress (show its current `phase`).
    - If neither exists, mark unstarted.
 4. Find the first unstarted hunt in wave order. If all hunts in the current wave are done or in-progress, advance to the next wave.
 5. Print campaign progress:
@@ -138,7 +145,7 @@ If ZERO fields are confidently pre-filled (vague description like "improve the s
 5. **Version tag.** (Asked unless pre-filled from campaign. Skip entirely if the project does not tag releases.) Before asking, scan for context:
    - Run `git fetch --tags --quiet` to ensure local tags are up to date with the remote.
    - Run `git describe --tags --abbrev=0 --match 'v[0-9]*'` to get the latest release tag on main. The `--match` matters: it skips non-release tags (rollback markers like `pre-hunt-*`), which otherwise win `--abbrev=0` and poison the bump math. Adjust the pattern if the project's release tags use a different prefix.
-   - **Claimed-tag scan:** Scan BOTH `.wolfpack/plans/*/metadata.json` AND `.agents/worktrees/*/.wolfpack/plans/*/metadata.json` for `proposed_version.tag` values from hunts whose status is NOT `merged` — any hunt that hasn't landed yet holds a live claim on its tag.
+   - **Claimed-tag scan:** Scan BOTH `.wolfpack/plans/*/metadata.json` AND `$WT_ROOT/*/.wolfpack/plans/*/metadata.json` for `proposed_version.tag` values from hunts whose status is NOT `merged` — any hunt that hasn't landed yet holds a live claim on its tag.
    - **Compute suggested next:** The "next" version is NOT simply latest-git-tag + bump. It must account for claimed tags from in-progress hunts. Find the highest version among {latest git tag, all claimed in-progress tags}, then increment from THAT. Example: if the latest git tag is `v0.22.1` and an in-progress hunt claims `v0.22.2`, the next PATCH is `v0.22.3`, not `v0.22.2`.
    - Present: "Version tag? Current: `<latest-tag>`. Claimed by in-progress hunts: `<list or 'none'>`. Suggested next: `<computed>`. Bump type: PATCH / MINOR / skip?" — The user can reply with an exact tag, a bump type, or `skip` to defer to Alpha.
 
@@ -170,12 +177,15 @@ Before scaffolding, verify main is clean. Uncommitted edits on main won't carry 
 ## Setup steps
 
 0. **Worktree mode (DEFAULT — skip this ONLY if `--no-worktree` was passed):**
-   - Verify `.agents/worktrees/<slug>/` does NOT exist (run `git worktree list` and grep for it). If it does, stop — pick a different slug.
+   - Verify `$WT_ROOT/<slug>/` does NOT exist (run `git worktree list` and grep for it). If it does, stop — pick a different slug.
    - From the main repo (not a sibling worktree), run:
      ```bash
-     git worktree add .agents/worktrees/<slug> -b feat/<slug>
+     git worktree add "$WT_ROOT/<slug>" -b feat/<slug>
      ```
-   - Capture the ABSOLUTE path via `cd .agents/worktrees/<slug> && pwd`. Store this as `$WORKTREE_ABS`. This value is written to `metadata.worktree_path` in step 3 — it's how every downstream skill self-navigates.
+   - **Chain-mode campaign:** if `--campaign=<c>` and `.wolfpack/campaigns/<c>/metadata.json` has
+     `chain.mode == "chain"`, fork from the campaign branch: `git worktree add "$WT_ROOT/<slug>" -b feat/<slug> campaign/<c>`;
+     if `campaign/<c>` is missing, STOP: run `node "$PACK/scripts/wolfpack-chain.mjs" init --campaign <c>` first.
+   - Capture the ABSOLUTE path via `cd "$WT_ROOT/<slug>" && pwd`. Store this as `$WORKTREE_ABS`. This value is written to `metadata.worktree_path` in step 3 — it's how every downstream skill self-navigates.
    - All remaining setup steps run inside the new worktree.
    - **CWD assertion:** Before writing ANY file in steps 1-3, verify with `pwd` that you are inside the worktree. If not, `cd "$WORKTREE_ABS"` first. All `mkdir` and `Write` calls in steps 1-3 MUST use absolute paths prefixed with `$WORKTREE_ABS`:
      ```bash
@@ -244,6 +254,7 @@ Before scaffolding, verify main is clean. Uncommitted edits on main won't carry 
      }
    }
    ```
+   For a chain-mode campaign hunt (step 0), also add `"base_branch": "campaign/<c>"` (otherwise omit the key).
    Set `is_worktree: false` and `worktree_path: null` when `--no-worktree` was passed. Dimensions stay 0 — Alpha fills them during `/alpha`. Round caps (`bloodhound_rounds`, `pointer_rounds`, `tracker_rounds`) stay 0 — Alpha sets them based on tier scoring.
 
    - **No alias links in the worktree:** the pack's skills and commands are installed user-level by the pack's `install.sh` (`~/.claude/skills`, `~/.claude/commands`), and the pipeline reads role skills from `$WOLFPACK_HOME/.agents/skills`, so a fresh worktree needs no `.agents/` ↔ `.claude/` alias links. A project that still tracks such links should remove them (they check out as text files under `core.symlinks=false`).
@@ -263,7 +274,7 @@ Before scaffolding, verify main is clean. Uncommitted edits on main won't carry 
 If created in a worktree (default), end with EXACTLY:
 ```
 ✓ Hunt scaffolded: <slug> (worktree)
-  .agents/worktrees/<slug>/  |  branch feat/<slug>
+  $WT_ROOT/<slug>/  |  branch feat/<slug>
   Scope: <target-surface-from-answer>
   Pipeline: /spec → /alpha → /bloodhound → /debrief → /shepherd → /pointer → /tracker → /watchdog → /merge
   Fixed models: Alpha and Tracker on the judgment family | Others assigned by Alpha during Debrief
@@ -271,7 +282,11 @@ If created in a worktree (default), end with EXACTLY:
 Next: /clear → /spec <slug>
 
 Use the judgment-family model with /spec <slug>
+
+Or run it autonomously (spec interview now, then Spec → … → Certify unattended): /run-hunt-local <slug>
 ```
+
+(In the message you print, `$WT_ROOT/<slug>/` is rendered as the resolved absolute path, `$WORKTREE_ABS` from step 0.)
 
 If branched in-place (`--no-worktree`), end with EXACTLY:
 ```
@@ -284,9 +299,11 @@ If branched in-place (`--no-worktree`), end with EXACTLY:
 Next: /clear → /spec <slug>
 
 Use the judgment-family model with /spec <slug>
+
+Or run it autonomously (spec interview now, then Spec → … → Certify unattended): /run-hunt-local <slug>
 ```
 
-Both finishing messages are identical in the "Next" line because `/spec`'s (and `/alpha`'s) preflight reads `metadata.worktree_path` and self-navigates — no manual `cd` needed from the user. `/spec` is Phase 0 (intent → `acceptance.md` + confidence gate) and runs before `/alpha`; a hunt that parks `needs_spec` does not advance to `/alpha` until the spec is resolved. If `--shepherd=`, `--bloodhound=`, or `--watchdog=` was passed, add one more line above "Next": `Model pins: Shepherd=<value>, Bloodhound=<value>, Watchdog=<value>`.
+Both finishing messages are identical in the "Next" line because `/spec`'s (and `/alpha`'s) preflight reads `metadata.worktree_path` and self-navigates — no manual `cd` needed from the user. `/spec` is Phase 0 (intent → `acceptance.md` + confidence gate) and runs before `/alpha`; a hunt that parks `needs_spec` does not advance to `/alpha` until the spec is resolved. The last line offers the autonomous path: `/run-hunt-local <slug>` front-loads the `/spec` interview in this session, then drives the whole pipeline via the `hunt-pipeline` workflow — the single-hunt equivalent of a campaign run. If `--shepherd=`, `--bloodhound=`, or `--watchdog=` was passed, add one more line above "Next": `Model pins: Shepherd=<value>, Bloodhound=<value>, Watchdog=<value>`.
 
 ## What NOT to do
 - Do NOT invoke any LLM phases (that's what `/spec` and `/alpha` are for)

@@ -43,7 +43,7 @@ The one invariant that never relaxes: **review roles must be a different model f
 
 ## Quick Start
 
-Wolfpack ships as a self-contained repo. You don't copy files into your project — `install.sh` points your agent harness at this repo's `.agents/` tree, then you drop a `wolfpack-config.md` into your project so the roles know your conventions. Full walkthrough: [SETUP.md](SETUP.md).
+Wolfpack ships as a self-contained repo. You don't copy files into your project — `install.sh` points your agent harness at this repo's `.agents/` tree, then you drop a `wolfpack-config.md` into your project so the roles know your conventions; the pack's no-copies guard keeps consuming projects from tracking copies. Full walkthrough: [SETUP.md](SETUP.md).
 
 ### 1. Clone Wolfpack
 

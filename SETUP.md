@@ -92,6 +92,18 @@ What project conventions should Pointer enforce? Think about the mistakes you've
 - Every database query must have an index strategy
 ```
 
+### Project commands and the no-copies guard
+A consuming project tracks **no** copy of a pack command, skill or workflow. Keep only project commands, list them under Project commands, and run the guard in CI: `node "$WOLFPACK_HOME/scripts/wolfpack-no-copies.mjs" .` (exit 0 clean, 1 offending paths with fixes, 2 setup error).
+
+```markdown
+- **Project commands:** `doc-reviewer`, `structural-audit` — or none
+```
+
+A tracked copy is shadowed by the user-level link `install.sh` makes, so it never runs and silently drifts from the pack. The guard fails on any tracked `.claude/commands/` or `.agents/commands/` file not on that list, any `.claude/skills/<name>/` (or `.agents/skills/<name>/`) whose name is a pack skill, and any tracked `.claude/workflows/` file other than `README.md`. A project skill with its own name is fine. The guard is the installed pack's, never a vendored copy: a CI runner needs the pack checkout (`WOLFPACK_HOME`, or the `Wolfpack home` key) and the job must fail loud when it is missing. Run against the pack itself, the guard checks that `.claude/{commands,skills,workflows}` are the tracked links to `.agents/`.
+
+### Smoke login hook
+If `/smoke` and `/smoke-wave` should sign a smoke browser in to your dev host, set `Smoke login hook` under `## Deployment Notes` to a backticked command template with `{host}` (and optional `{account}`) plus its account names. The contract (exit codes, the `--check` probe printing `SIGNED_IN`/`SIGNED_OUT`, `none`) is in `wolfpack-config.example.md` → "Smoke login hook". With `none`, both commands say so and use your own browser session.
+
 ## Step 3b: Generate the workflows
 
 From your project root, run the installer again — inside a project that has a `wolfpack-config.md` it also generates the project's workflow copies:

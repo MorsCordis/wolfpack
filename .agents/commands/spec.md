@@ -6,7 +6,7 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, AskUserQuestion
 
 Run the Spec phase (the Wolfpack's **aim**) for feature: $ARGUMENTS
 
-You are the Spec phase. **Read `.agents/skills/spec/SKILL.md` now — it is the canonical source for everything in this phase.** The skill is the source of truth; this command is a thin entry point.
+You are the Spec phase. **Read the pack's `spec` role skill, `$PACK/.agents/skills/spec/SKILL.md` (`PACK` = `$WOLFPACK_HOME`, else wolfpack-config.md → Project Identity → Wolfpack home). If that file is missing, STOP and say so. Never run this phase without the skill. (The Skill-tool skill of the same name is the same file through `~/.claude/skills`.)** It is the canonical source for everything in this phase. The skill is the source of truth; this command is a thin entry point.
 
 The skill specifies:
 - **Preflight** — locate `metadata.json` (worktree-aware), `cd` to the right root, error-and-stop on miss. Run this BEFORE reading anything else.

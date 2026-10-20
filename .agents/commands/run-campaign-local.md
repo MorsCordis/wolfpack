@@ -1,5 +1,5 @@
 ---
-description: Run/resume a Wolfpack campaign IN-SESSION via the Workflow tool (no headless `claude -p` container). Keeps Alpha/Shepherd/Tracker on your interactive session's billing; GLM/Mistral still run in their pods. Usage: /run-campaign-local [--no-prespec | --prespec=all | --prespec=wave] <slug> [max-parallel]
+description: Run/resume a Wolfpack campaign IN-SESSION via the Workflow tool (no headless `claude -p` container). Keeps Alpha/Shepherd/Tracker on your interactive session's billing; GLM/Mistral still run in their pods. Usage: /run-campaign-local [--no-prespec | --prespec=all | --prespec=wave] [--chain] <slug> [max-parallel]
 ---
 
 Launch (or resume) a Wolfpack campaign using the built-in **Workflow tool from THIS interactive
@@ -15,8 +15,9 @@ usage page; news reports have flip-flopped). Even if `-p` is NOT metered, this p
 no container, no podman-in-podman for the reviewer shims, and worktree git registration uses host
 paths (no `/workspace` mismatch).
 
-Parse `$ARGUMENTS` as `[--no-prespec | --prespec=all | --prespec=wave] <campaign-slug> [max-parallel]`
-(default max-parallel **2**). The pre-spec flag picks Step 1.5's scope:
+Parse `$ARGUMENTS` as `[--no-prespec | --prespec=all | --prespec=wave] [--chain] <campaign-slug> [max-parallel]`
+(default max-parallel **2**). `--chain` may appear in any position; strip it before the positional parse; with it
+max-parallel defaults to 1 (see § Chain mode). The pre-spec flag picks Step 1.5's scope:
 - *(no flag)* or `--prespec=all` — **whole-campaign sweep (the default):** the pending hunts of every wave.
 - `--prespec=wave` — the resume wave only (the old behaviour).
 - `--no-prespec` — skip Step 1.5; hunts self-spec headlessly in-run and may park mid-wave.
@@ -26,6 +27,8 @@ Refuse before doing anything else, naming the problem:
 - any other `--prespec=<v>` → *"Unknown --prespec value '<v>' — use all or wave."*
 
 Note: a plain `/run-campaign-local <slug>` now sweeps every wave. Use `--prespec=wave` for the old behaviour.
+
+**Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
 
 ## Preconditions — state them, then proceed
 1. **This must be an interactive session.** That's what keeps the workflow's subagents on the
@@ -39,7 +42,7 @@ Note: a plain `/run-campaign-local <slug>` now sweeps every wave. Use `--prespec
    user to `/expedition` first.
 
 ## Step 1 — RESUME PLAN preflight (READ-ONLY)
-Run the **exact** RESUME PLAN preflight from `.agents/commands/run-campaign.md` **Step 2** — read
+Run the **exact** RESUME PLAN preflight from `"$PACK/.agents/commands/run-campaign.md"` **Step 2** — read
 that file and follow it verbatim: parse the hunts in wave order, resolve each hunt's live status
 via the worktree-first dual path, classify with `campaign-runner.js`'s own rules
 (`DONE_STATUSES`, `parked:model_quota` auto-resumes, other `parked:`/`needs_spec` are
@@ -57,8 +60,8 @@ in Step 2. Run it from the main checkout.
 
 ### Select the hunts (script, not by hand)
 ```
-node scripts/wolfpack-prespec.mjs list .wolfpack/campaigns/<slug>/campaign.md          # --prespec=all (default)
-node scripts/wolfpack-prespec.mjs list .wolfpack/campaigns/<slug>/campaign.md --wave   # --prespec=wave
+node "$PACK/scripts/wolfpack-prespec.mjs" list .wolfpack/campaigns/<slug>/campaign.md          # --prespec=all (default)
+node "$PACK/scripts/wolfpack-prespec.mjs" list .wolfpack/campaigns/<slug>/campaign.md --wave   # --prespec=wave
 ```
 The JSON `selected` list is the scope, in wave order. It holds every hunt with no `acceptance.md`, or
 `needs_spec`. Shipped/certified, `parked:<reason>` and past-Spec hunts land in `skipped`. `--wave` keeps only
@@ -90,7 +93,7 @@ else `null` (answers go in `acceptance.md` only; `spec_plan_note` says why).
      no-question draft that doesn't clear it stays `needs_spec` and is named in the summary as still parked
      (`gate: <reason>`).
    - You may draft each hunt in its own subagent, one at a time.
-3. **Lint** each draft: `node scripts/wolfpack-prespec.mjs lint <plan_dir>/acceptance.md`. Fix (rewrite or
+3. **Lint** each draft: `node "$PACK/scripts/wolfpack-prespec.mjs" lint <plan_dir>/acceptance.md`. Fix (rewrite or
    re-tag) and re-lint. A hunt whose `acceptance.md` still fails is **not ready**: set it `needs_spec` and name
    it in the summary.
 
@@ -134,7 +137,7 @@ else `null` (answers go in `acceptance.md` only; `spec_plan_note` says why).
   - status: if the gate lets it build (autonomous/flagged), `needs_spec` → `ready_for_alpha`, so the in-run
     probe returns `Plan` and Spec is skipped. Otherwise it stays `needs_spec`.
 - **Plan-level answers → the plan's decisions table** (`hunt`-scope answers go to `acceptance.md` only):
-  `node scripts/wolfpack-prespec.mjs record-decision <main-checkout spec_plan> --hunt <hunt> --question "<question>" --answer "<answer>"`
+  `node "$PACK/scripts/wolfpack-prespec.mjs" record-decision <main-checkout spec_plan> --hunt <hunt> --question "<question>" --answer "<answer>"`
   - This appends the next `D<n>` row, `**Decided <date>** (pre-spec sweep, <hunt>): <answer>`. Re-asking the
     same question is a no-op.
   - A non-zero exit (no recognisable table, a conflicting earlier answer) means: show the error, don't touch
@@ -179,6 +182,7 @@ Live progress — paste into a separate terminal:
 
 Then call the **Workflow tool**:
 - `Workflow({ name: "campaign-runner", args: { campaignSlug: "<slug>", maxParallel: <N> } })`
+- With --chain: args: { campaignSlug, maxParallel: <N, default 1 when --chain>, chain: true } — see § Chain mode.
 
 It runs as a **background task in this session**: `campaign-runner` → `workflow('hunt-pipeline')`
 per hunt → `agent()` Claude subagents (this-session billing) → `podman-vibe.sh`
@@ -194,16 +198,53 @@ wave barrier exactly like the container path. Relay the barrier verdict when the
   hooks still block; the GLM/Mistral pods keep their own isolation). For full isolation, run
   this session inside a workspace pod (then the reviewer shims need host-podman-socket passthrough
   or rootless podman-in-podman).
-- **No pipeline code changes** — `campaign-runner.js` / `hunt-pipeline.js` are already
-  Workflow-native; only the launch path differs.
+- **Pipeline changes go canonical-first:** change `$PACK/.agents/workflows/<file>` on a pack branch, merge it,
+  then `bash "$PACK/install.sh" --consumer <repo>` regenerates this project's stamped copies, then restart
+  Claude Code; never hand-edit `.claude/workflows/*.js`. The launch path is the only difference from `/run-campaign`.
 
 ## Wave barriers (unchanged)
 The run STOPS at every wave barrier. Release a wave the same way: `/merge-wave <slug> <wave>` →
 the configured Dev deploy command (+ Migration command if flagged) → `/smoke-wave <slug> <wave>` — or, when wolfpack-config.md declares no deploy step, nothing after `/merge-wave`; `/resolve <slug>` for any
 human-parked hunt. Re-run `/run-campaign-local <slug>` to resume — Step 1 shows the next wave.
+With `--chain` there are no wave barriers — see § Chain mode.
+
+## Chain mode (--chain)
+Opt-in: the campaign runs every wave on a LOCAL `campaign/<slug>` branch with no wave barriers. Hunts fork
+from and rebase onto it, certified hunts auto-merge into it (`--no-ff`, no tag, no push), `main` is merged in
+at each wave start, and a blocked hunt only holds the hunts that conflict with it. Barrier mode stays the
+default.
+- `--chain` may appear in any position of `$ARGUMENTS`. Strip it before the positional parse. With it,
+  max-parallel defaults to **1**.
+- **Preflight** (fail loud — never fall back to barrier mode), from the main checkout:
+  `grep -q 'WOLFPACK_CHAIN_RUNNER=1' .claude/workflows/campaign-runner.js && grep -q 'WOLFPACK_CHAIN_PROTOCOL=1' .claude/workflows/hunt-pipeline.js`
+  (the project's runtime copies; in the pack itself `.claude/workflows` is the link to the canonical files).
+  If either fails → STOP and tell the user to regenerate the stamped copies with
+  `bash "$PACK/install.sh" --consumer <repo>`, then restart Claude Code.
+- **Before Step 1.5**, run `node "$PACK/scripts/wolfpack-chain.mjs" init --campaign <slug>` from the main checkout
+  (creates `campaign/<slug>` from `main`, or adopts it). **Step 1.5 scaffolds in chain mode:** this section (not
+  Step 1.5, which stays as it is) says that, with `--chain`, every Step 1.5 scaffold is invoked as
+  `/hunt --campaign=<slug> <hunt-slug> "<desc>"` — the `--campaign=<slug>` flag is what makes `/hunt` fork the
+  hunt from `campaign/<slug>` and stamp `base_branch`; the init above guarantees that branch exists. A
+  pre-spec hunt scaffolded without it (an older run) forks from `main` and is healed by the Shepherd ("set
+  `base_branch` if absent" + rebase onto the campaign branch).
+- **RESUME PLAN additions:** a header line `Mode: chain mode (campaign/<slug>)`. Classify the chain statuses:
+  `merged_to_campaign` / `merged_to_campaign_pending_compliance` → done (campaign-merged; the latter awaits
+  sign-off at the release); `certified` / `certified_pending_compliance` / `certified_held_overlap` →
+  "merges next pass"; `parked:campaign_merge_conflict` / `parked:reverted_from_campaign` / any other
+  `parked:*` / `needs_spec` → blocked, with its `/resolve <hunt>` (or `/spec <hunt>`) command;
+  `reverted_with_dependency` → "auto re-merges after <reverted_because>".
+- Re-running a chain campaign **without** `--chain` still runs chain mode (the runner logs it — sticky).
+- **Ending:** the runner returns
+  - `CAMPAIGN_READY_FOR_RELEASE` → `/release-campaign <slug>`.
+  - `CAMPAIGN_AWAITING_HUMAN` → the listed `/resolve`s (each blocked hunt names the hunts waiting on it), then re-run.
+  - `CAMPAIGN_PARKED_MAIN_CONFLICT` → resolve the main→campaign merge by hand, then re-run.
+  - `WAVE_PAUSED_QUOTA` / `WAVE_PAUSED_BUDGET` → re-run later; it resumes mid-chain.
+  - Checkpoint (ship what is already campaign-merged, keep the campaign running): `/release-campaign <slug> --checkpoint`.
+- A smoke-blocked or rejected hunt is reverted from the campaign branch (never from `main`):
+  `node "$PACK/scripts/wolfpack-release.mjs" revert --campaign <slug> --hunt <hunt> --reason "<why>"`.
 
 ## What NOT to do
 - Do NOT `exec run-pipeline-sandbox.sh` or call `claude -p` — that's the metered/headless path
   this command exists to avoid.
-- Do NOT modify `campaign-runner.js` / `hunt-pipeline.js` — they need no changes.
+- Do NOT hand-edit `.claude/workflows/campaign-runner.js` / `hunt-pipeline.js` — pipeline changes go canonical-first, then `install.sh --consumer` (above).
 - Do NOT deploy or push — the workflow stops at wave barriers; the user drives releases.

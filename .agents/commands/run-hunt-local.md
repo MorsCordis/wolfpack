@@ -28,8 +28,12 @@ Parse `$ARGUMENTS` as `[--no-prespec] <slug> ["<description>"]`.
    runs are strictly sequential (usage window).
 
 ## Step 1 — Resolve the hunt (READ-ONLY, then scaffold only if absent)
+**Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
+
+**Worktree root (`WT_ROOT`).** In the main checkout run `node "$PACK/scripts/wolfpack-config.mjs" --json` and take `worktreeRoot` (wolfpack-config.md → Project Identity → Worktree root, repo-relative). If the reader exits 2 or `worktreeRoot` is null, STOP with the fix: "add ``- **Worktree root:** `<repo-relative dir, e.g. .agents/worktrees>` `` under ## Project Identity in wolfpack-config.md". Never assume a default location.
+
 Find metadata worktree-first:
-`.agents/worktrees/<slug>/.wolfpack/plans/<slug>/metadata.json`, else
+`$WT_ROOT/<slug>/.wolfpack/plans/<slug>/metadata.json`, else
 `.wolfpack/plans/<slug>/metadata.json`.
 
 - **Not found** → need a description (stop with usage if none). Run `/hunt <slug> "<description>"`

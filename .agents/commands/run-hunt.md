@@ -10,7 +10,16 @@ Parse `$ARGUMENTS` as: `<slug> "<description>"`. The description should be in qu
 
 ## Steps
 
-1. Verify the slug doesn't already have an active hunt: check `.wolfpack/plans/$SLUG/metadata.json`. If it exists and `status` is not `certified`, warn the user and stop.
+0. **Resolve the pack and the worktree root first** (from the main checkout):
+
+   **Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
+
+   **Worktree root (`WT_ROOT`).** In the main checkout run `node "$PACK/scripts/wolfpack-config.mjs" --json` and take `worktreeRoot` (wolfpack-config.md → Project Identity → Worktree root, repo-relative). If the reader exits 2 or `worktreeRoot` is null, STOP with the fix: "add ``- **Worktree root:** `<repo-relative dir, e.g. .agents/worktrees>` `` under ## Project Identity in wolfpack-config.md". Never assume a default location.
+
+1. Resolve the hunt worktree-first: `$WT_ROOT/$SLUG/.wolfpack/plans/$SLUG/metadata.json`, else `.wolfpack/plans/$SLUG/metadata.json`.
+   - Not found → a fresh hunt; `$DESCRIPTION` is required.
+   - Found with `status` `certified`/`done`/`merged`, or human-gated `parked:*` (other than `parked:model_quota`) / `needs_spec` → stop and say why (`/merge` or `/resolve`).
+   - Found otherwise (e.g. scaffolded by `/hunt`, `ready_for_alpha`) → **resume it**: the workflow's resume probe adopts the existing worktree. Use `metadata.description` verbatim as `$DESCRIPTION` (ignore any argument). For an interactive pre-spec first, prefer `/run-hunt-local` — this container path is headless.
 
 2. Show what's about to run:
    - Display: "Hunt: $SLUG"
@@ -22,14 +31,8 @@ Parse `$ARGUMENTS` as: `<slug> "<description>"`. The description should be in qu
    line, so it copies cleanly), then exec. Do NOT auto-run the watcher (an in-process `--loop`
    just creates an endless scroll):
 
-   **Resolve the pack home first** (the launcher is the PACK's, never a copy in this repo):
-   `PACK="$WOLFPACK_HOME"`; if that is empty, use the `Wolfpack home` value from
-   `node <any pack checkout>/scripts/wolfpack-config.mjs --json` (its `wolfpackHome`
-   field), or read it by eye from `wolfpack-config.md` → Project Identity →
-   Wolfpack home if the reader is not at hand (expand a leading `~`). If neither is set, or
-   `"$PACK/scripts/run-pipeline-sandbox.sh"` does not exist, STOP and give the user the fix:
-   "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add
-   a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md".
+   The launcher is the PACK's (`PACK` from Step 0), never a copy in this repo. If
+   `"$PACK/scripts/run-pipeline-sandbox.sh"` does not exist, STOP with Step 0's fix.
    Never run a `./scripts/run-pipeline-sandbox.sh` from the consuming repo.
 
    ```bash
