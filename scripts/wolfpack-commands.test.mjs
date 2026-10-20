@@ -187,15 +187,59 @@ test('AC7: the seven seat commands carry no project tooling and name the pack ro
 })
 
 // ── D1: pack scripts resolve through $PACK ────────────────────────────
-test('D1: no command runs a repo-relative pack script (`node scripts/wolfpack-…`); the watcher exception stays', () => {
+test('D1: no command runs a repo-relative pack script (`node scripts/wolfpack-…`) — the watcher included (scripts-unfork dropped its exception)', () => {
   for (const [f, t] of Object.entries(ALL)) lacks(t, 'node scripts/wolfpack-', f)
   for (const [f, t] of Object.entries(ALL)) {
     for (const m of t.matchAll(/(?<![$\w/"])scripts\/wolfpack-[\w-]+\.(mjs|sh)/g)) {
       const line = t.slice(t.lastIndexOf('\n', m.index) + 1, t.indexOf('\n', m.index))
-      if (m[0] === 'scripts/wolfpack-watch.sh') continue
       assert.ok(/\$PACK|pack's|the pack|PACK\//i.test(line), `${f}: bare pack script ${m[0]} in: ${line}`)
     }
   }
+})
+
+// ── scripts-unfork AC8: skills + commands invoke pack scripts through 4A's PACK resolver ───────
+const AC8_RE = /(node|bash|sh) +(\.\/)?scripts\/(lib\/)?wolfpack-|(^|[ `"])\.\/scripts\/(lib\/)?wolfpack-/
+const PACK_FILES = () => {
+  const out = []
+  const walk = (d) => { for (const e of readdirSync(d, { withFileTypes: true })) { const p = join(d, e.name); if (e.isDirectory()) walk(p); else if (e.name.endsWith('.md')) out.push(p) } }
+  walk(join(ROOT, '.agents', 'commands')); walk(join(ROOT, '.agents', 'skills'))
+  return out
+}
+test('AC8: the acceptance grep finds no repo-relative pack-script invocation in .agents/commands or .agents/skills', () => {
+  const g = spawnSync('git', ['-C', ROOT, 'grep', '-nE', AC8_RE.source.replace(/\\\//g, '/'), '--', '.agents/skills', '.agents/commands'], { encoding: 'utf8' })
+  assert.equal(g.status, 1, `git grep hit (exit 0 = matches):\n${g.stdout}${g.stderr}`)
+  assert.equal(g.stdout, '')
+  // the same rule line-by-line in JS (no dependence on git grep's ERE dialect)
+  for (const p of PACK_FILES()) {
+    readFileSync(p, 'utf8').split('\n').forEach((l, i) => assert.doesNotMatch(l, AC8_RE, `${p}:${i + 1}: ${l}`))
+  }
+})
+
+test('AC8: every skill/command that runs "$PACK/scripts/…" defines PACK (4A\'s resolver sentence or a PACK= line) in the same file', () => {
+  const RESOLVER = 'Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.'
+  let skillsUsing = 0
+  for (const p of PACK_FILES()) {
+    const t = readFileSync(p, 'utf8')
+    if (!/\$PACK\/scripts\//.test(t)) continue
+    if (p.includes('/skills/')) {
+      skillsUsing++
+      // the five re-pointed skills carry 4A's resolver sentence verbatim (plan A9)
+      assert.ok(t.includes(RESOLVER) && t.includes('**Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`'), `${p}: 4A's resolver sentence`)
+    }
+    assert.ok(t.includes(RESOLVER) || /PACK="\$WOLFPACK_HOME"/.test(t) || t.includes('`PACK` = `$WOLFPACK_HOME`'), `${p} uses $PACK/scripts/ without resolving PACK`)
+  }
+  assert.ok(skillsUsing >= 5, `alpha/spec/watchdog/release-notes/wolfpack skills re-pointed (found ${skillsUsing})`)
+})
+
+test('AC8: the four watcher lines print an ABSOLUTE pack path + --repo, never ./scripts/wolfpack-watch.sh', () => {
+  const R = (n) => readFileSync(join(ROOT, '.agents', 'commands', n), 'utf8')
+  for (const n of ['run-campaign.md', 'run-hunt.md']) {
+    assert.ok(R(n).includes('echo "\\"$PACK/scripts/wolfpack-watch.sh\\" --repo \\"$(pwd)\\" --loop 5"'), n)
+  }
+  for (const n of ['run-campaign-local.md', 'run-hunt-local.md']) {
+    assert.ok(R(n).includes('"<PACK>/scripts/wolfpack-watch.sh" --repo "<this repo\'s root>" --loop 5'), n)
+  }
+  for (const n of ['run-campaign.md', 'run-hunt.md', 'run-campaign-local.md', 'run-hunt-local.md']) assert.ok(!R(n).includes('./scripts/wolfpack-watch.sh'), n)
 })
 
 test('P1: every command that runs a pack script resolves the pack home first', () => {

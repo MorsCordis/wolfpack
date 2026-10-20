@@ -384,7 +384,9 @@ run-until-converged cycle. The old "always escalate to the top judgment-tier mod
 
 ### The router decides — don't hand-pick from folklore
 
-`node scripts/wolfpack-routing.mjs <planDir>` is the authoritative recommender (run it from the
+**Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
+
+`node "$PACK/scripts/wolfpack-routing.mjs" <planDir>` is the authoritative recommender (run it from the
 Plan phase, after writing `predicted_dimensions` + `tier`). It reads the per-model meter
 (`.wolfpack/pedigree/model-stats.json`, signal/noise/miss/spend sliced by domain) and returns
 assignments. **Adopt them** unless you have a specific, documented reason to override (note it in

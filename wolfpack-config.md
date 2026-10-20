@@ -47,9 +47,9 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 ### Family → model mapping
 - judgment    → claude:opus:high     # planner (fixed) + heavy/Orange/Red implementer + Tracker default
 - work-horse  → claude:opus:high     # light-tier implementer (Sonnet stays off until enabled — see TODO.md "Sonnet re-entry")
-- reviewer-a  → glm:5.3              # first examiner-chain link (WOLFPACK_ENABLE_GLM=0 disables)
-- reviewer-b  → mistral:large-4      # second link (WOLFPACK_ENABLE_MISTRAL_AUTO=0 disables)
-- coder-alt   → glm:5.3              # optional Shepherd on Green/Blue/Yellow non-compliance hunts
+- reviewer-a  → glm:5.3 gate=WOLFPACK_ENABLE_GLM          # first examiner-chain link (WOLFPACK_ENABLE_GLM=0 disables)
+- reviewer-b  → mistral:large-4 gate=WOLFPACK_ENABLE_MISTRAL_AUTO  # second link (WOLFPACK_ENABLE_MISTRAL_AUTO=0 disables)
+- coder-alt   → glm:5.3 gate=WOLFPACK_ENABLE_GLM          # optional Shepherd on Green/Blue/Yellow non-compliance hunts
 ### Hard constraints (enforced by the router — never relax)
 - Alpha is ALWAYS the judgment family (load-bearing planner).
 - Reviewers (Bloodhound, Pointer, Watchdog) are NEVER an implementer family —

@@ -1,5 +1,5 @@
 export const meta = {
-// Wolfpack campaign runner — the canonical, durable orchestrator. Consuming projects run a GENERATED, stamped copy (`bash <pack>/install.sh --consumer <repo>`), checked at run start; wolfpack itself runs this file via its .claude/workflows link. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here.
+// Wolfpack campaign runner — the canonical, durable orchestrator. Consuming projects run a GENERATED, stamped copy (`bash <pack>/install.sh --consumer <repo>`), checked at run start; wolfpack itself runs this file via its .claude/workflows link. Project specifics come from the consuming repo's wolfpack-config.md (read by <pack>/scripts/wolfpack-config.mjs) — never hard-code one project's values here. Every pack script runs from WOLFPACK_HOME (env, else wolfpack-config.md → Wolfpack home), never the consuming repo.
   name: 'campaign-runner',
   description: 'Run all hunts in a Wolfpack campaign wave by wave',
   phases: [
@@ -118,7 +118,7 @@ const nextCrossExaminer = () => (EXAMINER_ROTATION.length ? EXAMINER_ROTATION[hu
 // overnight run ("how much of my window I'll spend"), `budget.remaining()` what's left.
 // This is the runaway guard (NOT the account rate-limit). The account rate-limit is the
 // USAGE GATE (usage-limit-gate, AC5), which is now IN-RUNNER: before claiming each NEW hunt
-// the runner asks scripts/wolfpack-window-gate.mjs (via a sonnet agent Bash step — this
+// the runner asks <pack>/scripts/wolfpack-window-gate.mjs (via a sonnet agent Bash step — this
 // file cannot read the clock or fs) for the live 5h/weekly decision; see usageGate below.
 // Before scaffolding each NEW hunt we check we
 // can afford to FINISH it: if remaining < one hunt's estimated cost, stop scaffolding
@@ -180,7 +180,7 @@ const USAGE_GATE_SCHEMA = {
   },
   required: ['decision', 'source', 'degraded', 'exitCode'],
 }
-// Pointer r1 F2 — LEGACY gate (a consumer's scripts/wolfpack-window-gate.mjs that predates
+// Pointer r1 F2 — LEGACY gate (a pack's <pack>/scripts/wolfpack-window-gate.mjs that predates
 // usage-limit-gate: no WOLFPACK_GATE_PROTOCOL marker). It emits only {decision, exit,
 // gateEnabled, reason, used, remaining, reset_at} — no source/degraded — so the full schema
 // would reject EVERY result and abort every hunt claim. Same merge→sync reasoning as the
@@ -205,7 +205,7 @@ const usageGate = async (hunt) => {
   const tier = normTier(hunt.tier)
   const g = legacyGate ? await agent(`
 READ-ONLY — modify nothing. From the repo root run exactly:
-  node scripts/wolfpack-window-gate.mjs --json
+  node ${shq(packScript('wolfpack-window-gate.mjs'))} --json
 Exit code 10 is a NORMAL "defer", not an error. Return the parsed JSON fields VERBATIM
 (decision, reason, reset_at) plus exitCode = the script's real exit code.
 If the script is missing, exits with anything other than 0 or 10, or prints no parseable
@@ -214,7 +214,7 @@ did not run>, reason:<first stderr line>}. Never invent a proceed/defer.
 `, { label: `usage-gate-legacy:${hunt.slug}`, phase: 'Execute', model: 'sonnet', schema: LEGACY_GATE_SCHEMA })
   : await agent(`
 READ-ONLY — modify nothing. From the repo root run exactly:
-  node scripts/wolfpack-window-gate.mjs --json --tier ${tier}
+  node ${shq(packScript('wolfpack-window-gate.mjs'))} --json --tier ${tier}
 Exit code 10 is a NORMAL "defer", not an error. Return the parsed JSON fields VERBATIM
 (decision, reason, reset_at, source, degraded, degraded_reason, offload, offload_reason,
 five_hour_pct, seven_day_pct, weekly_pace) plus exitCode = the script's real exit code.
@@ -235,7 +235,7 @@ Never invent a proceed/defer.
   const out = legacyGate ? {
     decision: g.decision, reason: g.reason || '', reset_at: g.reset_at ?? null,
     source: 'legacy_gate', degraded: true,
-    degraded_reason: `STALE gate script (pre-usage-limit-gate, no WOLFPACK_GATE_PROTOCOL) — transcript estimate only; update the project's scripts/wolfpack-window-gate.mjs from the pack (${wolfpackHome.home}/scripts/)`,
+    degraded_reason: `STALE gate script (pre-usage-limit-gate, no WOLFPACK_GATE_PROTOCOL) — transcript estimate only; the pack at ${wolfpackHome.home} has no scripts/wolfpack-window-gate.mjs (or it predates the usage gate) — point WOLFPACK_HOME / Wolfpack home at an up-to-date wolfpack checkout`,
     offload: false, offload_reason: null, five_hour_pct: null, seven_day_pct: null, weekly_pace: null,
   } : {
     decision: g.decision, reason: g.reason || '', reset_at: g.reset_at ?? null,
@@ -288,7 +288,7 @@ log(`Parsing campaign: ${campaignSlug}`)
 // worktreeRoot. Order: config probe (read-only) → pack home → stamp check.
 // The runner surfaces the project's deploy step in the release queue, and every hunt it
 // launches reads the same config. The Workflow script has no filesystem access, so one
-// read-only agent runs the deterministic reader (scripts/wolfpack-config.mjs) and relays its
+// read-only agent runs the deterministic reader (<pack>/scripts/wolfpack-config.mjs) and relays its
 // JSON. Fail closed: a missing/incomplete config, a garbled relay or a dead seat THROWS
 // before any hunt launches — the runner never guesses a project value.
 // workflow-meta-runtime: the two run-start probes (project-config, workflow-stamp) must run in
@@ -299,7 +299,26 @@ const PROBE_NO_CD = 'Run in your STARTING directory exactly as launched — do N
 // closed). '' when absent, empty or not absolute; callers treat '' as a mismatch.
 const probeRoot = (v) => (typeof v === 'string' && v.trim().startsWith('/')) ? (v.trim().replace(/\/+$/, '') || '/') : ''
 let hostRepoRoot = ''
-const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' }, cwd: { type: 'string' } }, required: ['exitCode', 'output', 'cwd'] }
+const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' }, cwd: { type: 'string' }, pack: { type: 'string' } }, required: ['exitCode', 'output', 'cwd', 'pack'] }
+// scripts-unfork: the config probe runs the PACK's reader (`<pack>/scripts/wolfpack-config.mjs`),
+// never a copy in the consuming repo. The probe runs before the pack home is known, so it
+// bootstraps with the same resolver: the workflow INJECTS its own WOLFPACK_HOME as a literal
+// (the probe seat's env is never consulted — it may be curated); unset → the probe takes
+// wolfpack-config.md → Project Identity → Wolfpack home VERBATIM and the shell expands only a
+// leading `~` (the reader's expandHome rule). It reports the PACK it used as PACK_HOME=, and
+// requireProbedPack() fails closed unless that equals resolveWolfpackHome(). Body identical
+// in both workflows.
+let probedPackHome = ''
+const configProbeCommand = (envHome) => {
+  const run = 'echo "PROBE_PWD=$(pwd)"; echo "PACK_HOME=$PACK"; node "$PACK/scripts/wolfpack-config.mjs" --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"'
+  if (envHome) return `Run exactly:
+  PACK=${shq(envHome)}; ${run}`
+  return `First read wolfpack-config.md (in your starting directory) → ## Project Identity → **Wolfpack home**: its backticked path, VERBATIM — do NOT expand \`~\`, resolve symlinks or substitute any other path (the workflow rejects a non-absolute or mismatched home itself). Substitute it for <home> below, inside the double quotes; if there is no such key, use an empty <home>. Then run exactly:
+  PACK="<home>"; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; ${run}`
+}
+const requireProbedPack = (who, home) => {
+  if (probeRoot(probedPackHome) !== probeRoot(home.home)) throw new Error(`${who}: the config probe ran the reader from '${probedPackHome}' but the pack home resolves to '${home.home}' (${home.source}) — the config was not read by this pack's reader. Fix: make WOLFPACK_HOME and wolfpack-config.md → Wolfpack home name the same absolute path, then relaunch.`)
+}
 // The first brace-balanced {…} block of a text (string-aware, so braces inside JSON strings
 // never end it early; a non-greedy first-} match would truncate inside nested objects).
 const firstJsonObject = (text) => {
@@ -323,10 +342,9 @@ const firstJsonObject = (text) => {
 }
 let projectConfig = null
 {
-  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. ${PROBE_NO_CD} Run exactly:
-  echo "PROBE_PWD=$(pwd)"; node scripts/wolfpack-config.mjs --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"
-Return cwd = the path after PROBE_PWD= VERBATIM, exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the PROBE_PWD and CONFIG_RC lines.
-If the command could not run at all, return exitCode 2, the error text as output, and cwd = the output of pwd. Never create, fix or edit anything.`,
+  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. ${PROBE_NO_CD} ${configProbeCommand((_envRunner('WOLFPACK_HOME') || '').trim())}
+Return cwd = the path after PROBE_PWD= VERBATIM, pack = the path after PACK_HOME= VERBATIM, exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the PROBE_PWD, PACK_HOME and CONFIG_RC lines.
+If the command could not run at all, return exitCode 2, the error text as output, pack = the PACK value you used (or ''), and cwd = the output of pwd. Never create, fix or edit anything.`,
     { label: 'project-config', phase: 'Parse', model: 'sonnet', schema: PROJECT_CONFIG_SCHEMA })
   const out = (pc && typeof pc.output === 'string') ? pc.output : ''
   // The reader's ✗ line names the missing keys; surface it first, then the head of the output.
@@ -345,11 +363,12 @@ If the command could not run at all, return exitCode 2, the error text as output
     else if (!Array.isArray(parsed.compliancePaths)) why = 'compliancePaths is not an array'
   }
   if (why) {
-    throw new Error(`campaign-runner: wolfpack-config.md is missing or incomplete — no hunt may start. ${why}: ${detail}. Fix: copy wolfpack-config.example.md to wolfpack-config.md and fill the required keys (Name, Test command, Compliance areas, Risk-surface paths, Model Pool judgment + reviewer-a); check with node scripts/wolfpack-config.mjs --json`)
+    throw new Error(`campaign-runner: wolfpack-config.md is missing or incomplete — no hunt may start. ${why}: ${detail}. Fix: copy wolfpack-config.example.md to wolfpack-config.md and fill the required keys (Name, Test command, Compliance areas, Risk-surface paths, Model Pool judgment + reviewer-a); check with node <pack>/scripts/wolfpack-config.mjs --json, and make sure WOLFPACK_HOME / Wolfpack home points at a wolfpack checkout (the reader is <pack>/scripts/wolfpack-config.mjs)`)
   }
   const root = probeRoot(pc.cwd)
   if (!root) throw new Error(`campaign-runner: the project-config probe did not report the directory it ran in (cwd ${JSON.stringify(pc.cwd ?? null)}) — the host repo is UNKNOWN, so the stamp check cannot confirm both probes read the same repo. Relaunch from the consuming repo's root.`)
   hostRepoRoot = root
+  probedPackHome = typeof pc.pack === 'string' ? pc.pack : ''
   projectConfig = parsed
   log(`Project config: ${projectConfig.name} — tests: ${projectConfig.testCommand}; deploy: ${projectConfig.devDeployCommand || 'none'}`)
 }
@@ -370,13 +389,16 @@ const resolveWolfpackHome = (who) => {
 }
 // Top-level (pack-install-model): the stamp check and the Execute-phase fix texts need it.
 const wolfpackHome = resolveWolfpackHome('campaign-runner')
+requireProbedPack('campaign-runner', wolfpackHome)
+// scripts-unfork: every pack script runs from the pack home, never the consuming repo.
+const packScript = (name) => `${wolfpackHome.home}/scripts/${name}`
 log(`Pack home (WOLFPACK_HOME): ${wolfpackHome.home} — from ${wolfpackHome.source}`)
 // pack-install-model: where hunt worktrees live (wolfpack-config.md → Project Identity →
 // Worktree root, repo-relative). Required — the pipeline never guesses it. Re-validated here
 // with the reader's validWorktreeRoot rule (fail closed on a garbled relay). Body identical in
 // hunt-pipeline.js and campaign-runner.js.
 const requireWorktreeRoot = (who, value) => {
-  const fix = 'Fix: add "- **Worktree root:** `<dir>`" under ## Project Identity, where <dir> is the repo-relative, gitignored directory this project\'s hunt worktrees live in (e.g. `.agents/worktrees` or `.claude/worktrees`); check: node scripts/wolfpack-config.mjs --json'
+  const fix = 'Fix: add "- **Worktree root:** `<dir>`" under ## Project Identity, where <dir> is the repo-relative, gitignored directory this project\'s hunt worktrees live in (e.g. `.agents/worktrees` or `.claude/worktrees`); check: node <pack>/scripts/wolfpack-config.mjs --json'
   if (typeof value !== 'string' || !value) throw new Error(`${who}: wolfpack-config.md has no Worktree root — the pipeline will not guess where hunt worktrees live. ${fix}`)
   const segs = value.split('/')
   const ok = !value.startsWith('/') && !value.startsWith('~') && segs[0] !== '.git' &&
@@ -527,17 +549,17 @@ READ-ONLY check — modify nothing. From the current repo root, pick the runtime
 .claude/workflows/hunt-pipeline.js if it exists, else .agents/workflows/hunt-pipeline.js.
 Run: grep -o 'WOLFPACK_EXAMINER_PROTOCOL=[0-9]*' <that file> | head -1
 Also run: grep -o 'WOLFPACK_USAGE_PROTOCOL=[0-9]*' <that file> | head -1
-Then, for the usage gate script, run: test -f scripts/wolfpack-window-gate.mjs && echo present
-and: grep -o 'WOLFPACK_GATE_PROTOCOL=[0-9]*' scripts/wolfpack-window-gate.mjs | head -1
+Then, for the usage gate script (the PACK's), run: test -f ${shq(packScript('wolfpack-window-gate.mjs'))} && echo present
+and: grep -o 'WOLFPACK_GATE_PROTOCOL=[0-9]*' ${shq(packScript('wolfpack-window-gate.mjs'))} | head -1
 Chain mode: grep -o 'WOLFPACK_CHAIN_PROTOCOL=[0-9]*' <the runtime workflow file> | head -1
-and: test -f scripts/wolfpack-chain.mjs && echo present
+and: test -f ${shq(packScript('wolfpack-chain.mjs'))} && echo present
 Return path (the file you checked, or "" if neither exists), protocol (the integer after
 the first marker's "=", or 0 if the marker is absent / the file is missing),
 usageProtocol (the integer after the second marker's "=", or 0 if absent), gatePresent
-(true only if scripts/wolfpack-window-gate.mjs exists) and gateProtocol (the integer after
+(true only if ${packScript('wolfpack-window-gate.mjs')} exists) and gateProtocol (the integer after
 the WOLFPACK_GATE_PROTOCOL marker's "=", or 0 if absent / the file is missing),
 chainProtocol (the integer after the WOLFPACK_CHAIN_PROTOCOL marker's "=", or 0 if absent)
-and chainScriptPresent (true only if scripts/wolfpack-chain.mjs exists).
+and chainScriptPresent (true only if ${packScript('wolfpack-chain.mjs')} exists).
 `, { label: 'pipeline-capability', phase: 'Parse', model: 'sonnet', schema: {
     type: 'object',
     properties: {
@@ -574,11 +596,11 @@ and chainScriptPresent (true only if scripts/wolfpack-chain.mjs exists).
   // gate at all is not a degrade we can label). PRESENT but pre-protocol ⇒ WARN and run the
   // labelled legacy mode (see legacyGate) instead of letting the schema reject every claim.
   if (!(cap && cap.gatePresent)) {
-    throw new Error(`campaign-runner: scripts/wolfpack-window-gate.mjs is MISSING — the usage gate cannot run, so no hunt may start. Fix: update the project's scripts/wolfpack-window-gate.mjs from the pack (${wolfpackHome.home}/scripts/), then relaunch.`)
+    throw new Error(`campaign-runner: ${packScript('wolfpack-window-gate.mjs')} is MISSING — the usage gate cannot run, so no hunt may start. Fix: the pack at ${wolfpackHome.home} has no scripts/wolfpack-window-gate.mjs (or it predates the usage gate) — point WOLFPACK_HOME / Wolfpack home at an up-to-date wolfpack checkout, then relaunch.`)
   }
   if ((Number(cap.gateProtocol) || 0) < 1) {
     legacyGate = true
-    log(`⚠ STALE USAGE GATE: scripts/wolfpack-window-gate.mjs predates usage-limit-gate (no WOLFPACK_GATE_PROTOCOL marker). Gating on its TRANSCRIPT ESTIMATE only (source legacy_gate, degraded) — live 5h/weekly figures and usage offload are INACTIVE until you update the project's scripts/wolfpack-window-gate.mjs from the pack (${wolfpackHome.home}/scripts/)`)
+    log(`⚠ STALE USAGE GATE: ${packScript('wolfpack-window-gate.mjs')} predates usage-limit-gate (no WOLFPACK_GATE_PROTOCOL marker). Gating on its TRANSCRIPT ESTIMATE only (source legacy_gate, degraded) — live 5h/weekly figures and usage offload are INACTIVE until fixed: the pack at ${wolfpackHome.home} has no scripts/wolfpack-window-gate.mjs (or it predates the usage gate) — point WOLFPACK_HOME / Wolfpack home at an up-to-date wolfpack checkout`)
   } else {
     log(`Usage gate capability OK: gate protocol ${cap.gateProtocol}`)
   }
@@ -591,7 +613,7 @@ and chainScriptPresent (true only if scripts/wolfpack-chain.mjs exists).
 // merged in at each wave start, and a blocked hunt only holds the hunts that CONFLICT with it
 // (dependency, shared migration app, or overlapping files). One `/release-campaign` merges the
 // branch into `main` with one tag, after the human approves. This file cannot run git, so every git
-// step goes through scripts/wolfpack-chain.mjs (a deterministic, temp-repo-tested CLI) via a
+// step goes through <pack>/scripts/wolfpack-chain.mjs (a deterministic, temp-repo-tested CLI) via a
 // sonnet agent that returns its JSON verbatim. The BARRIER loop below is untouched: runChain()
 // is a separate path (its rolling pool deliberately duplicates the barrier pool's claim logic —
 // keep the two twins in step).
@@ -696,7 +718,7 @@ async function chainCli(cliArgs, label, schema = CHAIN_CLI_SCHEMA) {
 You run ONE deterministic chain-mode git step for campaign ${campaignSlug}. The script does ALL
 the git work — you do NOT run any git command yourself, do NOT edit any file, and do NOT retry.
 From the MAIN repo root (the current directory — not a hunt worktree) run exactly:
-  node scripts/wolfpack-chain.mjs ${cliArgs}
+  node ${shq(packScript('wolfpack-chain.mjs'))} ${cliArgs}
 Exit code 0 means the step DECIDED — a "conflict" or held:true result is a normal, decided outcome.
 Read the JSON the script prints on stdout and return it VERBATIM (every field it printed), plus
 exitCode = the script's real exit code. Never invent or "fix up" a result.
@@ -1140,7 +1162,7 @@ if (chainMode) {
     throw new Error(`campaign-runner: STALE PIPELINE for chain mode — the runtime hunt-pipeline (${ccap.path || 'not found'}) reports chain protocol ${Number(ccap.chainProtocol) || 0} < 1 (no WOLFPACK_CHAIN_PROTOCOL marker), so its hunts would fork from main and rebase onto origin/main. Regenerate it: bash '${wolfpackHome.home}/install.sh' --consumer <this repo> (then restart Claude Code), then relaunch.`)
   }
   if (ccap.chainScriptPresent !== true) {
-    throw new Error(`campaign-runner: scripts/wolfpack-chain.mjs is MISSING (or the probe could not confirm it) — chain mode cannot run its git steps. Copy it from wolfpack canonical scripts/, then relaunch.`)
+    throw new Error(`campaign-runner: ${packScript('wolfpack-chain.mjs')} is MISSING (or the probe could not confirm it) — chain mode cannot run its git steps. Fix: point WOLFPACK_HOME / Wolfpack home at an up-to-date wolfpack checkout, then relaunch.`)
   }
   return await runChain(campaign)   // the barrier loop below is byte-identical to today
 }

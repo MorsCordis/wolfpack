@@ -37,12 +37,22 @@
 // NO CLOCK: pure aggregation; generated_at only if passed via --stamp <iso> (the host
 // driver supplies the agent clock — this script never calls Date, AC5-clean).
 //
-// Usage:
-//   node scripts/wolfpack-model-stats.mjs [--stamp <iso>] [--out <path>] [<plansDir>]
+// Usage (run it from the pack, with cwd inside the consuming repo):
+//   node "$WOLFPACK_HOME/scripts/wolfpack-model-stats.mjs" [--stamp <iso>] [--out <path>] [<plansDir>]
+//
+// DATA ROOT = the INVOKING repo, never this script's location: root = the main worktree of
+// the cwd's git repo (a hunt worktree resolves to its main checkout, so Watchdog's run from
+// the worktree writes the same meter the router reads). Defaults: plansDir =
+// <root>/.wolfpack/plans, out = <root>/.wolfpack/pedigree/model-stats.json. Not inside a git
+// repo → exit 2 with the fix. The family vocabulary comes from <root>/wolfpack-config.md →
+// Model Pool (so concrete tokens such as `<brand>:<model>` fill their family's cells); an
+// unusable pool exits 2; no config → the neutral DEFAULT_POOL + a stderr warning and
+// meta.pool_source 'default' ('config' otherwise).
 
-import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { loadConfig, mainWorktree } from './wolfpack-config.mjs'
 // providerFamily() in wolfpack-routing.mjs owns the model-name → family mapping, so the
 // model strings used here (and in the test) are routing's PROVIDER-NEUTRAL family
 // vocabulary: judgment / work-horse / reviewer-a / reviewer-b. A real project maps those
@@ -239,15 +249,37 @@ export function mergeHuntSources(meta, ped) {
 
 // ─── CLI ────────────────────────────────────────────────────────
 function main(argv) {
-  const here = dirname(fileURLToPath(import.meta.url))
   let stamp = null, out = null, plansDir = null
   for (let i = 2; i < argv.length; i++) {
     if (argv[i] === '--stamp') stamp = argv[++i]
     else if (argv[i] === '--out') out = argv[++i]
     else plansDir = argv[i]
   }
-  plansDir = plansDir || join(here, '..', '.wolfpack', 'plans')
-  out = out || join(here, '..', '.wolfpack', 'pedigree', 'model-stats.json')
+  const root = mainWorktree(process.cwd())
+  if (!root) {
+    console.error(`✗ model-stats: run from inside the consuming repo (not a git repo: ${process.cwd()})`)
+    process.exit(2)
+  }
+  plansDir = plansDir || join(root, '.wolfpack', 'plans')
+  out = out || join(root, '.wolfpack', 'pedigree', 'model-stats.json')
+
+  // The consuming project's Model Pool names the families (same rule as the router CLI).
+  const cfgPath = join(root, 'wolfpack-config.md')
+  let pool
+  let poolSource = 'default'
+  if (existsSync(cfgPath)) {
+    const cfg = loadConfig(cfgPath)
+    const poolProblems = cfg.problems.filter((x) => x.startsWith('Model Pool:'))
+    if (poolProblems.length || !cfg.pool || !cfg.pool.judgment || !cfg.pool.reviewerA) {
+      const why = poolProblems.length ? poolProblems.join('; ') : 'missing required role(s) judgment/reviewer-a'
+      console.error(`✗ model-stats: ${cfgPath}: Model Pool unusable — ${why}`)
+      process.exit(2)
+    }
+    pool = cfg.pool
+    poolSource = 'config'
+  } else {
+    console.error(`⚠ model-stats: no wolfpack-config.md at ${cfgPath} — family names fall back to the neutral DEFAULT_POOL`)
+  }
 
   if (!existsSync(plansDir)) { console.error(`plans dir not found: ${plansDir}`); process.exit(2) }
   const hunts = []
@@ -258,13 +290,14 @@ function main(argv) {
     try {
       const ped = JSON.parse(readFileSync(pj, 'utf8'))
       const meta = existsSync(mj) ? JSON.parse(readFileSync(mj, 'utf8')) : null
-      hunts.push(normalizeHunt(mergeHuntSources(meta, ped)))
+      hunts.push(normalizeHunt(mergeHuntSources(meta, ped), pool))
     } catch (e) { console.error(`skip ${name}: ${e.message}`) }
   }
   const agg = aggregateModelStats(hunts)
   const doc = { meta: { hunts: hunts.filter(Boolean).length, sourced: agg.sourced,
-    provisional: agg.provisional, ...(stamp ? { generated_at: stamp } : {}) },
+    provisional: agg.provisional, pool_source: poolSource, ...(stamp ? { generated_at: stamp } : {}) },
     model_stats: agg.model_stats }
+  mkdirSync(dirname(out), { recursive: true })
   writeFileSync(out, JSON.stringify(doc, null, 2) + '\n')
   console.log(`model-stats: ${doc.meta.hunts} hunts → ${out} (${agg.provisional.length} provisional cells)`)
 }

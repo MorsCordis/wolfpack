@@ -255,3 +255,37 @@ test('normalizeHunt: an optional reviewer-c family resolves (and before reviewer
   assert.equal(h.models.pointer, 'glm')
   assert.equal(h.models.watchdog, 'mistral')
 })
+
+// ─── scripts-unfork: the consumer fork's brand-native cases, ported as fixture-pool cases ─────
+// The consumer fork resolved its own brands natively; canonical code is pool-driven, so the same
+// guarantees are pinned with the consumer's pool SHAPE (reviewer-a glm, reviewer-b mistral). The
+// CLI threads the real Model Pool (wolfpack-data-root.test.mjs drives it end to end).
+const GPOOL = { judgment: 'claude', workHorse: 'claude', reviewerA: 'glm', reviewerB: 'mistral', coderAlt: 'glm' }
+
+test('normalizeHunt: glm seats resolve to the glm family (not mistral via "vibe")', () => {
+  const h = normalizeHunt({
+    predicted_dimensions: {},
+    model_assignments: { shepherd: 'glm:5.3', pointer: 'Vibe/GLM', bloodhound: 'zai-glm-5-3', watchdog: 'vibe:mistral-medium', alpha: 'claude:opus:high' },
+  }, GPOOL)
+  assert.equal(h.models.shepherd, 'glm')
+  assert.equal(h.models.pointer, 'glm')
+  assert.equal(h.models.bloodhound, 'glm')
+  assert.equal(h.models.watchdog, 'mistral')
+  assert.equal(h.models.alpha, 'claude')
+  // a label carrying BOTH brands (reviewer-a served via reviewer-b's API) is reviewer-a's
+  assert.equal(normalizeHunt({ predicted_dimensions: {}, model_assignments: { pointer: 'mistral:zai-glm-5-3' } }, GPOOL).models.pointer, 'glm')
+})
+
+test('aggregate: glm and mistral cells never merge', () => {
+  const mk = (bh) => normalizeHunt({ predicted_dimensions: { frontend_complexity: 1 }, model_assignments: { bloodhound: bh } }, GPOOL)
+  const { model_stats } = aggregateModelStats([mk('glm:5.3'), mk('glm-5.3'), mk('mistral:medium')])
+  assert.equal(model_stats.glm.bloodhound.backend.runs, 2)
+  assert.equal(model_stats.mistral.bloodhound.backend.runs, 1)
+  assert.deepEqual(Object.keys(model_stats).sort(), ['glm', 'mistral'])
+})
+
+test('normalizeHunt: concrete tokens do NOT resolve under the neutral DEFAULT_POOL (why the CLI threads the config pool)', () => {
+  const h = normalizeHunt({ predicted_dimensions: {}, model_assignments: { bloodhound: 'glm:5.3', pointer: 'mistral:large-4' } })
+  assert.equal(h.models.bloodhound ?? null, null)
+  assert.equal(h.models.pointer ?? null, null)
+})

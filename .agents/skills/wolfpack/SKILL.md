@@ -208,7 +208,8 @@ Opt-in campaign mode with **no wave barriers**. Barrier mode stays the default a
   `scripts/wolfpack-release.mjs` (`revert`, `sign-off`, `check`, `summary`, `deploy`, `changelog`, `merge-commands`,
   `stamp-released` — the release), and the runner itself. All git logic is deterministic, temp-repo-tested code.
 - **Revert** a campaign-merged hunt (and its dependents, newest first) with
-  `node scripts/wolfpack-release.mjs revert --campaign <c> --hunt <slug> --reason "<why>"`.
+  `node "$PACK/scripts/wolfpack-release.mjs" revert --campaign <c> --hunt <slug> --reason "<why>"`.
+  **Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
 - **End states:** `CAMPAIGN_READY_FOR_RELEASE`, `CAMPAIGN_AWAITING_HUMAN` (each blocked hunt + its `/resolve` + who
   waits on it), `WAVE_PAUSED_QUOTA` / `WAVE_PAUSED_BUDGET` (resume mid-chain).
 - **Release** is a project-provided command (e.g. `/release-campaign <slug> [--checkpoint]`): one dev deploy of the

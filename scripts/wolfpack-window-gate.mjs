@@ -72,12 +72,14 @@
 // Env (degraded fallback only):
 //   WOLFPACK_AGENT_WINDOW_LIMIT    total tokens in the 5h window for your plan (ENABLES
 //                                  the estimate; unset ⇒ estimate disabled / proceed-with-warning)
+//   WOLFPACK_CLAUDE_WINDOW_LIMIT   DEPRECATED legacy name of the same limit — still honoured
+//                                  (stderr deprecation warning whenever it is set); both names
+//                                  set to DIFFERENT values is a hard error (exit 1).
 //   WOLFPACK_WINDOW_HEADROOM_PCT   % of the limit to keep in reserve (default 15)
 //   WOLFPACK_WINDOW_HOURS          window length in hours (default 5)
-//   WOLFPACK_TRANSCRIPT_DIR        transcript root. Default is the agent harness's local
-//                                  transcript dir; TODO(de-fracture): the default path
-//                                  (~/.agents/projects) is harness-specific — set this env
-//                                  var to your harness's transcript location (see wolfpack-config.md).
+//   WOLFPACK_TRANSCRIPT_DIR        transcript root. Default: the first existing of the two
+//                                  harness layouts ~/.agents/projects, ~/.claude/projects
+//                                  (else ~/.agents/projects).
 // Exit codes: 0 = proceed, 10 = defer, 1 = internal error.
 //
 // Gate protocol 1 = the usage-limit-gate output contract above (source / degraded / offload /
@@ -411,12 +413,32 @@ export function computeUsageDecision({ snapshot, snapshotError, nowMs, tier, thr
 }
 
 // The degraded-fallback ESTIMATE, configured from env exactly as the original gate was.
-// Exported so wolfpack-usage.mjs reuses it verbatim (the env NAMES are fork-specific and
-// live only here). rootDir defaults to WOLFPACK_TRANSCRIPT_DIR / the harness default.
-export function defaultTranscriptDir(env = process.env) {
-  // TODO(de-fracture): the default transcript dir (~/.agents/projects) is harness-specific —
-  // override with WOLFPACK_TRANSCRIPT_DIR or parameterize via wolfpack-config.md.
-  return env.WOLFPACK_TRANSCRIPT_DIR || join(homedir(), '.agents', 'projects')
+// Exported so wolfpack-usage.mjs reuses it verbatim (the env NAMES live only here).
+// rootDir defaults to WOLFPACK_TRANSCRIPT_DIR, else the first existing harness layout
+// (~/.agents/projects, ~/.claude/projects), else ~/.agents/projects.
+export function defaultTranscriptDir(env = process.env, exists = existsSync) {
+  if (env.WOLFPACK_TRANSCRIPT_DIR) return env.WOLFPACK_TRANSCRIPT_DIR
+  const candidates = [join(homedir(), '.agents', 'projects'), join(homedir(), '.claude', 'projects')]
+  return candidates.find((d) => exists(d)) || candidates[0]
+}
+
+const stderrWarn = (msg) => process.stderr.write(`⚠ wolfpack-window-gate: ${msg}\n`)
+
+// The configured window limit (raw string, undefined when neither name is set).
+// WOLFPACK_AGENT_WINDOW_LIMIT wins; the legacy WOLFPACK_CLAUDE_WINDOW_LIMIT is honoured with a
+// deprecation warning (fired whenever it is set); both set to different values → throw.
+export function windowLimitFromEnv(env = process.env, warn = stderrWarn) {
+  const isSet = (v) => v !== undefined && v !== null && String(v).trim() !== ''
+  const cur = env.WOLFPACK_AGENT_WINDOW_LIMIT
+  const legacy = env.WOLFPACK_CLAUDE_WINDOW_LIMIT
+  if (isSet(legacy)) {
+    warn('WOLFPACK_CLAUDE_WINDOW_LIMIT is deprecated — rename it WOLFPACK_AGENT_WINDOW_LIMIT')
+    if (isSet(cur) && String(cur).trim() !== String(legacy).trim()) {
+      throw new Error(`conflicting window limits: WOLFPACK_AGENT_WINDOW_LIMIT=${cur} vs WOLFPACK_CLAUDE_WINDOW_LIMIT=${legacy} — keep only WOLFPACK_AGENT_WINDOW_LIMIT`)
+    }
+    if (!isSet(cur)) return legacy
+  }
+  return isSet(cur) ? cur : undefined
 }
 // The estimate's tuning knobs, validated with the SAME hard-error rule as thresholdsFromEnv:
 // a malformed WOLFPACK_WINDOW_HEADROOM_PCT / WOLFPACK_WINDOW_HOURS used to yield NaN / 0 and
@@ -429,8 +451,8 @@ export function estimateConfigFromEnv(env = process.env) {
     windowHours: readNumEnv(env, 'WOLFPACK_WINDOW_HOURS', 5, { pct: false }),
   }
 }
-export function estimateFromEnv(env, nowMs, rootDir = defaultTranscriptDir(env)) {
-  const limit = Number(env.WOLFPACK_AGENT_WINDOW_LIMIT)
+export function estimateFromEnv(env, nowMs, rootDir = defaultTranscriptDir(env), { warn = stderrWarn } = {}) {
+  const limit = Number(windowLimitFromEnv(env, warn))
   const { headroomPct, windowHours } = estimateConfigFromEnv(env)
   const windowMs = windowHours * 60 * 60 * 1000
   // Only read transcripts when the estimate is enabled (limit set) — no point walking the
@@ -460,6 +482,7 @@ function main() {
     // Validate the degraded-fallback knobs up front too, so a bad value hard-errors on
     // every run — not only on the run that happens to fall back to the estimate.
     estimateConfigFromEnv(process.env)
+    windowLimitFromEnv(process.env)   // conflicting legacy/current limits → exit 1; warns on the legacy name
   } catch (e) {
     process.stderr.write(`wolfpack-window-gate: ERROR — ${e.message}\n`)
     process.exit(ERROR)
@@ -467,7 +490,7 @@ function main() {
 
   const nowMs = Date.now()
   // Degraded fallback (lazy): the original transcript estimate, unchanged.
-  const estimate = () => estimateFromEnv(process.env, nowMs, rootDir)
+  const estimate = () => estimateFromEnv(process.env, nowMs, rootDir, { warn: () => {} })   // warned above
 
   const snap = readSnapshot(snapPath)
   const decision = computeUsageDecision({

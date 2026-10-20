@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import {
   usageTokens, parseTranscript, computeDecision, collectEvents, PROCEED, DEFER,
 } from './wolfpack-window-gate.mjs'
-import { mkdtempSync, writeFileSync, utimesSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, utimesSync, rmSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -136,7 +136,6 @@ test('collectEvents: file older than the window is SKIPPED but still counts as r
 
 // ════════════════════════════════════════════════════════════════════════════
 // usage-limit-gate — live snapshot decision core (AC2/AC3/AC4, A-6, A-7, A-11).
-// This block is kept byte-identical with consuming-project copies until scripts-unfork reconciles them.
 // ════════════════════════════════════════════════════════════════════════════
 import {
   computeUsageDecision, thresholdsFromEnv, readSnapshot, normTier, isValidWindow,
@@ -526,7 +525,7 @@ test('usage CLI AC3: missing / unparseable snapshot ⇒ degraded JSON AND a stde
 test('usage CLI AC3: stale snapshot with the estimate configured but unreadable ⇒ fail-closed defer (exit 10), degraded', () => {
   const s = liveSnap()
   s.captured_at = new Date(Date.now() - 30 * 60 * 1000).toISOString()
-  const r = runGate(['--json'], { snapshot: s, env: { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000000', WOLFPACK_AGENT_WINDOW_LIMIT: '1000000' } })
+  const r = runGate(['--json'], { snapshot: s, env: { WOLFPACK_AGENT_WINDOW_LIMIT: '1000000' } })
   assert.equal(r.code, 10)
   assert.equal(r.json.decision, 'defer')
   assert.equal(r.json.degraded, true)
@@ -591,13 +590,14 @@ test('r2 F1: estimateFromEnv throws on a malformed knob even with the estimate e
   const dir = mkdtempSync(join(tmpdir(), 'wfest-'))
   try {
     for (const env of [
-      { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HEADROOM_PCT: 'x' },
-      { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HOURS: '0' },
+      { WOLFPACK_AGENT_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HEADROOM_PCT: 'x' },
+      { WOLFPACK_AGENT_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HOURS: '0' },
       { WOLFPACK_WINDOW_HOURS: 'bogus' },                     // estimate disabled — still validated
     ]) assert.throws(() => estimateFromEnv(env, NOW, dir), /invalid/, JSON.stringify(env))
     // valid knobs still produce a finite decision
-    const ok = estimateFromEnv({ WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HEADROOM_PCT: '20' }, NOW, dir)
+    const ok = estimateFromEnv({ WOLFPACK_AGENT_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HEADROOM_PCT: '20' }, NOW, dir)
     assert.ok(ok && typeof ok === 'object')
+    assert.equal(ok.gateEnabled, true, 'the estimate really is enabled (it walked the transcript dir)')
     noNaN(ok)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
@@ -611,17 +611,19 @@ test('r2 F1 CLI: a malformed estimate knob exits 1 even when a FRESH live snapsh
     assert.equal(r.stdout, '', 'no decision JSON on a config error')
   }
   // ...and on the degraded path too (missing snapshot): exit 1, not a silent proceed
-  const deg = runGate(['--json'], { env: { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HEADROOM_PCT: 'x' } })
+  const deg = runGate(['--json'], { env: { WOLFPACK_AGENT_WINDOW_LIMIT: '1000', WOLFPACK_WINDOW_HEADROOM_PCT: 'x' } })
   assert.equal(deg.code, 1)
   assert.equal(deg.stdout, '')
 })
 
-test('r2 F1 CLI: WOLFPACK_CLAUDE_WINDOW_LIMIT unset / 0 stays the documented estimate opt-out (proceed, loud), not an error', () => {
-  for (const lim of [undefined, '0']) {
-    const r = runGate(['--json'], { env: lim === undefined ? {} : { WOLFPACK_CLAUDE_WINDOW_LIMIT: lim } })
+test('r2 F1 CLI: WOLFPACK_AGENT_WINDOW_LIMIT (or the legacy name) unset / 0 stays the documented estimate opt-out (proceed, loud), not an error', () => {
+  for (const env of [{}, { WOLFPACK_AGENT_WINDOW_LIMIT: '0' }, { WOLFPACK_CLAUDE_WINDOW_LIMIT: '0' }]) {
+    const r = runGate(['--json'], { env })
     assert.equal(r.code, 0, r.stderr)
     assert.equal(r.json.degraded, true)
-    assert.equal(r.json.gateEnabled, false)
+    assert.equal(r.json.gateEnabled, false, JSON.stringify(env))
+    // scripts-unfork: the legacy name is live now, so setting it (even to 0) is warned
+    assert.equal(/WOLFPACK_CLAUDE_WINDOW_LIMIT is deprecated/.test(r.stderr), 'WOLFPACK_CLAUDE_WINDOW_LIMIT' in env, JSON.stringify(env))
   }
 })
 
@@ -630,4 +632,87 @@ test('r1 F2: the gate carries the WOLFPACK_GATE_PROTOCOL=1 marker in the exact f
   const hits = src.match(/WOLFPACK_GATE_PROTOCOL=[0-9]*/g) || []
   assert.ok(hits.length >= 1, 'marker missing — the runner would drop to the legacy-degraded gate')
   assert.equal(hits[0], 'WOLFPACK_GATE_PROTOCOL=1', 'the FIRST match is what `grep -o … | head -1` returns')
+})
+
+// ─── scripts-unfork (A5): the legacy WOLFPACK_CLAUDE_WINDOW_LIMIT alias + dual transcript layouts ───
+import { windowLimitFromEnv, defaultTranscriptDir } from './wolfpack-window-gate.mjs'
+import { homedir as osHome } from 'node:os'
+
+test('windowLimitFromEnv: AGENT wins; legacy alone is honoured + warned; equal → used + warned; different → throws; neither → undefined', () => {
+  const warns = []
+  const w = (m) => warns.push(m)
+  const DEP = 'WOLFPACK_CLAUDE_WINDOW_LIMIT is deprecated — rename it WOLFPACK_AGENT_WINDOW_LIMIT'
+  assert.equal(windowLimitFromEnv({ WOLFPACK_AGENT_WINDOW_LIMIT: '500' }, w), '500')
+  assert.deepEqual(warns, [], 'the current name never warns')
+  assert.equal(windowLimitFromEnv({ WOLFPACK_CLAUDE_WINDOW_LIMIT: '700' }, w), '700')
+  assert.deepEqual(warns, [DEP])
+  warns.length = 0
+  assert.equal(windowLimitFromEnv({ WOLFPACK_AGENT_WINDOW_LIMIT: '900', WOLFPACK_CLAUDE_WINDOW_LIMIT: ' 900 ' }, w), '900')
+  assert.deepEqual(warns, [DEP], 'equal values: no throw, the warning still fires [review-2 F1]')
+  warns.length = 0
+  assert.throws(() => windowLimitFromEnv({ WOLFPACK_AGENT_WINDOW_LIMIT: '900', WOLFPACK_CLAUDE_WINDOW_LIMIT: '800' }, w),
+    /conflicting window limits: WOLFPACK_AGENT_WINDOW_LIMIT=900 vs WOLFPACK_CLAUDE_WINDOW_LIMIT=800 — keep only WOLFPACK_AGENT_WINDOW_LIMIT/)
+  assert.deepEqual(warns, [DEP])
+  warns.length = 0
+  for (const env of [{}, { WOLFPACK_AGENT_WINDOW_LIMIT: '' }, { WOLFPACK_CLAUDE_WINDOW_LIMIT: '   ' }, { WOLFPACK_AGENT_WINDOW_LIMIT: '  ', WOLFPACK_CLAUDE_WINDOW_LIMIT: '' }]) {
+    assert.equal(windowLimitFromEnv(env, w), undefined, JSON.stringify(env))
+  }
+  assert.deepEqual(warns, [], 'a blank legacy value is "unset" — no warning')
+})
+
+test('estimateFromEnv: the legacy name ENABLES the estimate (it walks transcripts) and warns through the given warn', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wfalias-'))
+  try {
+    const warns = []
+    const on = estimateFromEnv({ WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000' }, NOW, dir, { warn: (m) => warns.push(m) })
+    assert.equal(on.gateEnabled, true)
+    assert.equal(warns.length, 1)
+    const off = estimateFromEnv({}, NOW, dir, { warn: (m) => warns.push(m) })
+    assert.equal(off.gateEnabled, false)
+    assert.equal(warns.length, 1)
+    assert.throws(() => estimateFromEnv({ WOLFPACK_CLAUDE_WINDOW_LIMIT: '1', WOLFPACK_AGENT_WINDOW_LIMIT: '2' }, NOW, dir, { warn: () => {} }), /conflicting window limits/)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('CLI alias: legacy only → estimate enabled + ONE deprecation line; both different → exit 1, no JSON; both equal → used, warned', () => {
+  const legacy = runGate(['--json'], { env: { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000000' } })
+  assert.equal(legacy.json.gateEnabled, true, legacy.stderr)
+  assert.equal(legacy.stderr.split('\n').filter(l => /WOLFPACK_CLAUDE_WINDOW_LIMIT is deprecated/.test(l)).length, 1, legacy.stderr)
+  assert.match(legacy.stderr, /^⚠ wolfpack-window-gate: WOLFPACK_CLAUDE_WINDOW_LIMIT is deprecated — rename it WOLFPACK_AGENT_WINDOW_LIMIT$/m)
+  const cur = runGate(['--json'], { env: { WOLFPACK_AGENT_WINDOW_LIMIT: '1000000' } })
+  assert.equal(cur.json.gateEnabled, true)
+  assert.doesNotMatch(cur.stderr, /deprecated/)
+  assert.equal(legacy.code, cur.code, 'the alias decides exactly like the current name')
+  const conflict = runGate(['--json', '--tier', 'Yellow'], { snapshot: liveSnap({ fh: 10 }), env: { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1', WOLFPACK_AGENT_WINDOW_LIMIT: '2' } })
+  assert.equal(conflict.code, 1, conflict.stderr)
+  assert.equal(conflict.stdout, '')
+  assert.match(conflict.stderr, /wolfpack-window-gate: ERROR — conflicting window limits/)
+  const same = runGate(['--json'], { env: { WOLFPACK_CLAUDE_WINDOW_LIMIT: '1000000', WOLFPACK_AGENT_WINDOW_LIMIT: '1000000' } })
+  assert.notEqual(same.code, 1, same.stderr)
+  assert.equal(same.json.gateEnabled, true)
+  assert.match(same.stderr, /WOLFPACK_CLAUDE_WINDOW_LIMIT is deprecated/)
+})
+
+test('defaultTranscriptDir: env wins; else the first EXISTING of ~/.agents/projects, ~/.claude/projects; else ~/.agents/projects', () => {
+  const h = osHome()
+  const A = join(h, '.agents', 'projects'), C = join(h, '.claude', 'projects')
+  assert.equal(defaultTranscriptDir({ WOLFPACK_TRANSCRIPT_DIR: '/t/x' }, () => true), '/t/x')
+  assert.equal(defaultTranscriptDir({}, (d) => d === C), C, 'only the .claude layout exists')
+  assert.equal(defaultTranscriptDir({}, (d) => d === A), A)
+  assert.equal(defaultTranscriptDir({}, () => true), A, 'both exist → .agents first')
+  assert.equal(defaultTranscriptDir({}, () => false), A, 'neither → the .agents default')
+  assert.equal(defaultTranscriptDir({ WOLFPACK_TRANSCRIPT_DIR: '' }, (d) => d === C), C, 'an empty env value is unset')
+})
+
+test('defaultTranscriptDir (real fs, HOME overridden): a home with only .claude/projects resolves there', () => {
+  const home = mkdtempSync(join(tmpdir(), 'wfhome-'))
+  try {
+    mkdirSync(join(home, '.claude', 'projects'), { recursive: true })
+    const run = () => spawnSync(process.execPath, ['--input-type=module', '-e',
+      `import(${JSON.stringify(GATE)}).then(m => process.stdout.write(m.defaultTranscriptDir({})))`],
+      { encoding: 'utf8', env: { ...process.env, HOME: home, WOLFPACK_TRANSCRIPT_DIR: '' } })
+    assert.equal(run().stdout, join(home, '.claude', 'projects'))
+    mkdirSync(join(home, '.agents', 'projects'), { recursive: true })
+    assert.equal(run().stdout, join(home, '.agents', 'projects'))
+  } finally { rmSync(home, { recursive: true, force: true }) }
 })

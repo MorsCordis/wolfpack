@@ -41,7 +41,15 @@ const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/tes
   tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [],
   wolfpackHome: '/pack',   // exec-layer-into-pack: Project Identity → Wolfpack home
   worktreeRoot: '.agents/worktrees' }   // pack-install-model: Project Identity → Worktree root (required)
-const configAnswer = (cfg = FIXTURE_CONFIG, cwd = '/repo') => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2), cwd })
+// scripts-unfork: the probe also reports the PACK it ran the reader from (PACK_HOME=). Simulate the
+// seat: the env leg's injected literal `PACK='<home>'` (shq-quoted) in the prompt wins; otherwise the
+// seat copied the config key (the reader JSON's wolfpackHome). Callers pass the probe prompt.
+const probePack = (prompt, keyHome) => {
+  const m = /PACK='((?:[^']|'\\'')*)'; /.exec(prompt || '')
+  return m ? m[1].replace(/'\\''/g, "'") : (typeof keyHome === 'string' ? keyHome : '')
+}
+const configAnswer = (cfg = FIXTURE_CONFIG, cwd = '/repo', prompt = '') =>
+  ({ exitCode: 0, output: JSON.stringify(cfg, null, 2), cwd, pack: probePack(prompt, cfg.wolfpackHome) })
 // pack-install-model (AC5): the runner's run-start stamp probe relays `wolfpack-workflows.mjs check --json`.
 // Default: both workflows are the pack's canonical files, as the UNSTAMPED canonical RUNNER expects.
 const PACK_COMMIT = 'a'.repeat(40)
@@ -61,7 +69,7 @@ const tick = () => new Promise(r => setImmediate(r))
 
 async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usageProtocol = 1, workflowDelayTicks = 3,
   capability, gatePresent = true, gateProtocol = 1, depCheck = { allMerged: true }, workflowResult = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY' }),
-  projectConfig = () => configAnswer(), stamp = () => stampAnswer(), env = {} } = {}) {
+  projectConfig = (p) => configAnswer(undefined, undefined, p), stamp = () => stampAnswer(), env = {} } = {}) {
   const events = []
   const logs = []
   const gateCalls = []
@@ -70,7 +78,7 @@ async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usagePr
   const agent = async (prompt, opts = {}) => {
     const label = opts.label || ''
     events.push({ type: 'agent', label })
-    if (label === 'project-config') { events[events.length - 1].prompt = prompt; events[events.length - 1].opts = opts; return projectConfig() }
+    if (label === 'project-config') { events[events.length - 1].prompt = prompt; events[events.length - 1].opts = opts; return projectConfig(prompt) }
     if (label === 'workflow-stamp') { events[events.length - 1].prompt = prompt; events[events.length - 1].opts = opts; return stamp() }
     if (label === 'parse-campaign') return { waves: [{ number: 1, hunts }] }
     if (label === 'pipeline-capability') {
@@ -136,7 +144,9 @@ test('AC5: the gate agent is a READ-ONLY sonnet step running the gate with the n
   for (const g of gateCalls) {
     assert.equal(g.opts.model, 'sonnet')
     assert.match(g.prompt, /READ-ONLY/)
-    assert.match(g.prompt, /node scripts\/wolfpack-window-gate\.mjs --json --tier Red\b/)
+    // scripts-unfork: the PACK's gate (FIXTURE_CONFIG Wolfpack home /pack), shq-quoted
+    assert.ok(g.prompt.includes(`node '/pack/scripts/wolfpack-window-gate.mjs' --json --tier Red\n`), g.prompt)
+    assert.doesNotMatch(g.prompt, /node scripts\/wolfpack-/)
     assert.match(g.prompt, /Never invent a proceed\/defer/)
     assert.deepEqual(g.opts.schema.required, ['decision', 'source', 'degraded', 'exitCode'])
     assert.deepEqual(g.opts.schema.properties.decision.enum, ['proceed', 'defer', 'error'])
@@ -281,8 +291,9 @@ const LEGACY_DEFER = { decision: 'defer', exitCode: 10, gateEnabled: true,
 test('preflight probe: prompt greps WOLFPACK_GATE_PROTOCOL in the gate script; schema REQUIRES gatePresent + gateProtocol', async () => {
   const { events } = await runRunner({ hunts: [hunt('a')] })
   const cap = events.find(e => e.label === 'pipeline-capability')
-  assert.match(cap.prompt, /test -f scripts\/wolfpack-window-gate\.mjs && echo present/)
-  assert.match(cap.prompt, /grep -o 'WOLFPACK_GATE_PROTOCOL=\[0-9\]\*' scripts\/wolfpack-window-gate\.mjs/)
+  assert.ok(cap.prompt.includes(`test -f '/pack/scripts/wolfpack-window-gate.mjs' && echo present`), cap.prompt)
+  assert.ok(cap.prompt.includes(`grep -o 'WOLFPACK_GATE_PROTOCOL=[0-9]*' '/pack/scripts/wolfpack-window-gate.mjs'`), cap.prompt)
+  assert.doesNotMatch(cap.prompt, / scripts\/wolfpack-/, 'never the consuming repo copy')
   assert.deepEqual(cap.opts.schema.required, ['protocol', 'gatePresent', 'gateProtocol'])
   assert.equal(cap.opts.schema.properties.gatePresent.type, 'boolean')
   assert.equal(cap.opts.schema.properties.gateProtocol.type, 'number')
@@ -299,8 +310,8 @@ test('preflight: a current gate (protocol 1) logs capability OK and uses the ful
 test('preflight: a MISSING gate script throws ONCE, naming the fix — nothing gated, nothing scaffolded', async () => {
   const { error, gateCalls, workflowCalls, events } = await runRunner({ hunts: [hunt('a'), hunt('b')], gatePresent: false })
   assert.ok(error, 'must throw')
-  assert.match(error.message, /scripts\/wolfpack-window-gate\.mjs is MISSING/)
-  assert.match(error.message, /Fix: update the project's scripts\/wolfpack-window-gate\.mjs from the pack \(\/pack\/scripts\/\), then relaunch\./)
+  assert.match(error.message, /\/pack\/scripts\/wolfpack-window-gate\.mjs is MISSING/)
+  assert.match(error.message, /Fix: the pack at \/pack has no scripts\/wolfpack-window-gate\.mjs \(or it predates the usage gate\) — point WOLFPACK_HOME \/ Wolfpack home at an up-to-date wolfpack checkout, then relaunch\./)
   assert.ok(!error.message.includes(RETIRED_SYNC))
   assert.equal(gateCalls.length, 0)
   assert.equal(workflowCalls.length, 0)
@@ -334,8 +345,8 @@ test('legacy gate (no WOLFPACK_GATE_PROTOCOL): loud STALE USAGE GATE warning; le
   const { error, logs, gateCalls, result } = await runRunner({ hunts: [hunt('a', { tier: 'Red' })], gateProtocol: 0, gate: () => LEGACY_PROCEED })
   assert.equal(error, undefined, error && error.stack)
   assert.equal(result.verdict, 'WAVE_COMPLETE_AWAITING_RELEASE')
-  assert.ok(logs.some(l => /⚠ STALE USAGE GATE: scripts\/wolfpack-window-gate\.mjs predates usage-limit-gate/.test(l)), logs.join('\n'))
-  assert.ok(logs.some(l => /STALE USAGE GATE.*update the project's scripts\/wolfpack-window-gate\.mjs from the pack \(\/pack\/scripts\/\)/.test(l)))
+  assert.ok(logs.some(l => /⚠ STALE USAGE GATE: \/pack\/scripts\/wolfpack-window-gate\.mjs predates usage-limit-gate/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /STALE USAGE GATE.*point WOLFPACK_HOME \/ Wolfpack home at an up-to-date wolfpack checkout/.test(l)))
   assert.equal(logs.some(l => l.includes(RETIRED_SYNC)), false)
   assert.equal(logs.some(l => /Usage gate capability OK/.test(l)), false)
   assert.equal(gateCalls.length, 1)
@@ -343,7 +354,7 @@ test('legacy gate (no WOLFPACK_GATE_PROTOCOL): loud STALE USAGE GATE warning; le
   assert.equal(g.label, 'usage-gate-legacy:a')
   assert.equal(g.opts.model, 'sonnet')
   assert.match(g.prompt, /READ-ONLY/)
-  assert.match(g.prompt, /node scripts\/wolfpack-window-gate\.mjs --json\n/)
+  assert.ok(g.prompt.includes(`node '/pack/scripts/wolfpack-window-gate.mjs' --json\n`), g.prompt)
   assert.doesNotMatch(g.prompt, /--tier/, 'the legacy gate does not know --tier')
   assert.match(g.prompt, /Never invent a proceed\/defer/)
   assert.deepEqual(g.opts.schema.required, ['decision', 'exitCode'])
@@ -395,7 +406,7 @@ const CERT = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', statu
 
 // Generic runner: any runner source, a parse result, and per-label stubs.
 async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => PROCEED, workflowResult = CERT,
-  init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] }, projectConfig = () => configAnswer(), stamp = () => stampAnswer() } = {}) {
+  init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] }, projectConfig = (p) => configAnswer(undefined, undefined, p), stamp = () => stampAnswer() } = {}) {
   const events = []
   const logs = []
   const workflowCalls = []
@@ -405,7 +416,7 @@ async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => P
     const label = opts.label || ''
     agentCalls.push({ label, prompt, opts })
     events.push({ type: 'agent', label })
-    if (label === 'project-config') return projectConfig()
+    if (label === 'project-config') return projectConfig(prompt)
     if (label === 'workflow-stamp') return stamp()
     if (label === 'parse-campaign') return JSON.parse(JSON.stringify(parse))
     if (label === 'pipeline-capability') return capability == null ? null : { ...capability }
@@ -501,7 +512,7 @@ test('AC2 first run: chain:true → chain-init (with --graph) before any workflo
   const init = r.agentCalls.find(c => c.label === 'chain-init')
   assert.ok(init, 'chain-init ran')
   assert.ok(r.idx(e => e.label === 'chain-init') < r.idx(e => e.type === 'workflow-start'))
-  assert.match(init.prompt, /node scripts\/wolfpack-chain\.mjs init --campaign 'c1' --graph '/)
+  assert.ok(init.prompt.includes(`node '/pack/scripts/wolfpack-chain.mjs' init --campaign 'c1' --graph '`), init.prompt)
   const graph = JSON.parse(init.prompt.match(/--graph '([^']*)'/)[1])
   assert.deepEqual(graph, { a: { dependsOn: [], migrationApps: ['billing'] }, b: { dependsOn: ['a'], migrationApps: [] } })
   assert.equal(init.opts.model, 'sonnet')
@@ -605,7 +616,7 @@ test('AC5: 3 waves in ONE run — one workflow per hunt, each merged after it ce
   assert.equal(r.result.completed, true)
   assert.deepEqual(r.result.campaignMergedHunts, ['a', 'b', 'c', 'd', 'e'])
   const mergeCall = r.agentCalls.find(c => c.label === 'chain-merge:a')
-  assert.match(mergeCall.prompt, /node scripts\/wolfpack-chain\.mjs merge-hunt --campaign 'c1' --hunt 'a'/)
+  assert.ok(mergeCall.prompt.includes(`node '/pack/scripts/wolfpack-chain.mjs' merge-hunt --campaign 'c1' --hunt 'a'`), mergeCall.prompt)
   assert.match(mergeCall.prompt, /do NOT run any git command yourself/)
   assert.equal(mergeCall.opts.model, 'sonnet')
 })
@@ -623,7 +634,7 @@ test('AC7: chain-sync-main:w<N> runs before each wave is scaffolded; a conflict 
   assert.ok(ok.idx(e => e.label === 'chain-sync-main:w1') < ok.idx(e => e.type === 'workflow-start' && e.slug === 'a'))
   assert.ok(ok.idx(e => e.label === 'chain-sync-main:w2') < ok.idx(e => e.type === 'workflow-start' && e.slug === 'b'))
   assert.ok(ok.idx(e => e.label === 'chain-sync-main:w2') > ok.idx(e => e.label === 'chain-merge:a'))
-  assert.match(ok.agentCalls.find(c => c.label === 'chain-sync-main:w1').prompt, /wolfpack-chain\.mjs sync-main --campaign 'c1'/)
+  assert.match(ok.agentCalls.find(c => c.label === 'chain-sync-main:w1').prompt, /'\/pack\/scripts\/wolfpack-chain\.mjs' sync-main --campaign 'c1'/)
   const bad = await runChainRunner([[ch('a')], [ch('b')]], { sync: () => ({ status: 'conflict', files: ['app/models.py', 'TODO.md'], sha: 's', exitCode: 0 }) })
   noErr(bad)
   assert.equal(bad.result.verdict, 'CAMPAIGN_PARKED_MAIN_CONFLICT')
@@ -840,13 +851,13 @@ test('preflight: chain mode with chainProtocol 0 or absent → STALE PIPELINE fo
     assert.equal(r.labels.includes('chain-init'), false)
   }
   const ns = await runChainRunner([[ch('a')]], { capability: { ...CHAIN_CAP, chainScriptPresent: false } })
-  assert.match(String(ns.error && ns.error.message), /scripts\/wolfpack-chain\.mjs is MISSING/)
+  assert.match(String(ns.error && ns.error.message), /\/pack\/scripts\/wolfpack-chain\.mjs is MISSING/)
   const barrier = await runChainRunner([[ch('a')]], { args: { chain: undefined }, capability: { ...CHAIN_CAP, chainProtocol: 0, chainScriptPresent: false } })
   noErr(barrier)
   assert.equal(barrier.result.verdict, 'WAVE_COMPLETE_AWAITING_RELEASE')
   const cap = barrier.agentCalls.find(c => c.label === 'pipeline-capability')
   assert.match(cap.prompt, /grep -o 'WOLFPACK_CHAIN_PROTOCOL=\[0-9\]\*'/)
-  assert.match(cap.prompt, /test -f scripts\/wolfpack-chain\.mjs && echo present/)
+  assert.ok(cap.prompt.includes(`test -f '/pack/scripts/wolfpack-chain.mjs' && echo present`), cap.prompt)
 })
 test('the runner carries the WOLFPACK_CHAIN_RUNNER=1 marker the launch command greps for', () => {
   assert.match(RUNNER, /^\/\/ WOLFPACK_CHAIN_RUNNER=1$/m)
@@ -1003,7 +1014,9 @@ test('AC10: the runner probe is a read-only sonnet step in phase Parse running t
   assert.ok(events.findIndex(e => e.type === 'workflow-start') > events.indexOf(pc), 'before any hunt launches')
   assert.equal(pc.opts.model, 'sonnet')
   assert.equal(pc.opts.phase, 'Parse')
-  assert.match(pc.prompt, /node scripts\/wolfpack-config\.mjs --json wolfpack-config\.md 2>&1; echo "CONFIG_RC=\$\?"/)
+  // scripts-unfork: the PACK's reader, and the probe reports the PACK it used
+  assert.match(pc.prompt, /echo "PACK_HOME=\$PACK"; node "\$PACK\/scripts\/wolfpack-config\.mjs" --json wolfpack-config\.md 2>&1; echo "CONFIG_RC=\$\?"/)
+  assert.deepEqual(pc.opts.schema.required, ['exitCode', 'output', 'cwd', 'pack'])
   assert.ok(logs.some(l => l === 'Project config: fixture-project — tests: bash scripts/test-all.sh; deploy: deploy-x'), logs.join('\n'))
 })
 
@@ -1275,4 +1288,54 @@ test('workflow-meta-runtime AC8: a missing / relative cwd fails closed', async (
     assertStoppedAtStamp(r, String(stampCwd))
     assert.match(r.error.message, /HOST REPO DRIFTED[\s\S]*\(not reported\)/, String(stampCwd))
   }
+})
+
+// ── scripts-unfork (AC7): consumer-hosted — every pack script from the Wolfpack home ─────────
+// repo /repo has no scripts/ dir; FIXTURE_CONFIG's Wolfpack home is /pack.
+test('AC7 consumer-hosted runner: window-gate / chain / capability-probe / config commands all name the pack home, never the repo', async () => {
+  const r = await runChainRunner([[ch('a'), ch('b')], [ch('c')]])
+  noErr(r)
+  const seen = new Set()
+  for (const c of r.agentCalls) {
+    assert.doesNotMatch(c.prompt, /\/repo\/scripts\/wolfpack-/, `${c.label}: a consuming-repo script path`)
+    assert.doesNotMatch(c.prompt, /(^|[\s'"`(])\.\/scripts\/(lib\/)?wolfpack-/m, `${c.label}: a ./scripts/ invocation`)
+    assert.doesNotMatch(c.prompt, /(node|bash|sh|test -f|grep -o '[^']*') +['"]?scripts\/(lib\/)?wolfpack-/, `${c.label}: a repo-relative path`)
+    for (const m of c.prompt.matchAll(/wolfpack-(window-gate|chain|config|usage)\.mjs/g)) {
+      const before = c.prompt.slice(Math.max(0, m.index - 16), m.index)
+      assert.ok(before.endsWith('/pack/scripts/') || before.endsWith('$PACK/scripts/') || before.endsWith('<pack>/scripts/') || before.endsWith('has no scripts/'),
+        `${c.label}: ${m[0]} is not under the pack home (…${before})`)
+      seen.add(m[1])
+    }
+  }
+  for (const s of ['window-gate', 'chain', 'config']) assert.ok(seen.has(s), `no runner prompt ran wolfpack-${s}`)
+  const by = (p) => r.agentCalls.find(c => c.label.startsWith(p)).prompt
+  assert.ok(by('usage-gate:a').includes(`node '/pack/scripts/wolfpack-window-gate.mjs' --json --tier Yellow`))
+  assert.ok(by('chain-init').includes(`node '/pack/scripts/wolfpack-chain.mjs' init`))
+  assert.ok(by('chain-merge:a').includes(`node '/pack/scripts/wolfpack-chain.mjs' merge-hunt`))
+  assert.ok(by('pipeline-capability').includes(`test -f '/pack/scripts/wolfpack-chain.mjs' && echo present`))
+})
+
+test('AC7 runner config probe: env leg injects PACK=\'<env>\'; a mismatching probe pack throws before parse — the helpers match hunt-pipeline\'s', async () => {
+  const env = await runRunner({ hunts: [hunt('a')], env: { WOLFPACK_HOME: '/pack' } })
+  assert.equal(env.error, undefined, env.error && env.error.stack)
+  const p = env.events.find(e => e.label === 'project-config').prompt
+  assert.ok(p.includes(`PACK='/pack'; echo "PROBE_PWD=$(pwd)"; echo "PACK_HOME=$PACK"; node "$PACK/scripts/wolfpack-config.mjs"`), p)
+  assert.doesNotMatch(p, /\$WOLFPACK_HOME/)
+  const key = await runRunner({ hunts: [hunt('a')] })
+  assert.match(key.events.find(e => e.label === 'project-config').prompt, /VERBATIM — do NOT expand `~`/)
+  for (const pack of ['/other', '']) {
+    const bad = await runRunner({ hunts: [hunt('a')], projectConfig: () => ({ ...configAnswer(), pack }) })
+    assert.match(String(bad.error && bad.error.message), new RegExp(`^campaign-runner: the config probe ran the reader from '${pack.replace(/\//g, '\\/')}' but the pack home resolves to '\\/pack'`))
+    assert.deepEqual(agentLabels(bad.events), ['project-config'], 'nothing after the probe')
+  }
+  const slash = await runRunner({ hunts: [hunt('a')], projectConfig: () => ({ ...configAnswer(), pack: '/pack/' }) })
+  assert.equal(slash.error, undefined, slash.error && slash.error.stack)
+  // byte-identical probe helpers in both workflows (the plan's "body identical" rule)
+  const HP = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8')
+  const RN = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8')
+  const grab = (src, start) => { const i = src.indexOf(start); assert.ok(i >= 0, start); return src.slice(i, src.indexOf('\n}\n', i) + 3) }
+  for (const start of ['const configProbeCommand = (envHome) => {', 'const requireProbedPack = (who, home) => {']) {
+    assert.equal(grab(HP, start), grab(RN, start), start)
+  }
+  for (const line of ['let probedPackHome = \'\'']) { assert.ok(HP.includes(line) && RN.includes(line), line) }
 })

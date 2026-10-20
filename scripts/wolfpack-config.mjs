@@ -1,6 +1,4 @@
 #!/usr/bin/env node
-// Byte-identical copy of the pack's scripts/wolfpack-config.mjs — retired by scripts-unfork.
-//
 // scripts/wolfpack-config.mjs — the ONE deterministic reader of a consuming project's
 // wolfpack-config.md. The router CLI, both workflows (through a one-command probe
 // agent that relays this script's --json output) and the tests all read project
@@ -58,6 +56,12 @@
 //                    reviewer-a, reviewer-b, reviewer-c, coder-alt) → full token;
 //                    pool by the router's camelCase role → family (token before the
 //                    first `:`, lowercased). Other role names land in unknownRoles.
+//   gates            Model Pool → an optional `gate=<ENV>` word after the token (before any `#`):
+//                    { <family>: <ENV> }, {} when none. ENV must match WOLFPACK_[A-Z0-9_]+; only
+//                    reviewer-a/b/c and coder-alt may be gated (implementer families are always on);
+//                    one gate per line; two roles of one family must not name different gates.
+//                    The router turns it into the enabled set (unset/""/1/true → on, else off).
+//                    null on any pool defect (like pool/models).
 //   sections         every section key, in order
 //   missing          required non-pool keys absent (or NONE where none is not allowed)
 //   problems         every Model Pool defect, each prefixed `Model Pool:`; on any pool
@@ -79,6 +83,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { resolve, dirname, isAbsolute } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
 
 // Config spelling → router camelCase role.
 export const POOL_ROLES = {
@@ -145,13 +150,18 @@ export function list(v) {
   return String(v).split(',').map((s) => s.trim()).filter(Boolean)
 }
 
+// Roles a `gate=<ENV>` word may sit on (the examiner families + the optional alt coder).
+export const GATEABLE_ROLES = ['reviewer-a', 'reviewer-b', 'reviewer-c', 'coder-alt']
+const GATE_NAME = /^WOLFPACK_[A-Z0-9_]+$/
+
 // Parse the Model Pool section body. body === undefined → section absent.
 export function modelPool(body) {
   const problems = []
   if (body === undefined) {
-    return { pool: null, models: null, unknownRoles: [], problems: ['Model Pool: section absent'] }
+    return { pool: null, models: null, gates: null, unknownRoles: [], problems: ['Model Pool: section absent'] }
   }
   const models = {}
+  const roleGates = {}
   const unknownRoles = []
   const emptyToken = []
   const duplicate = []
@@ -168,17 +178,51 @@ export function modelPool(body) {
     if (!token) { emptyToken.push(role); continue }
     if (role in models) { if (!duplicate.includes(role)) duplicate.push(role); continue }
     models[role] = token
+    // gate=<ENV> words: the rest of the line after the token, before the first `#` (comment
+    // text is never parsed — `(WOLFPACK_ENABLE_GLM=0 disables)` in a comment is prose).
+    const words = m[2].split('#')[0].trim().split(/\s+/).slice(1)
+    const gateWords = words.filter((w) => w.startsWith('gate='))
+    if (gateWords.length > 1) { problems.push(`Model Pool: ${role} has more than one gate= word`); continue }
+    if (gateWords.length === 1) {
+      const name = gateWords[0].slice('gate='.length)
+      if (!GATEABLE_ROLES.includes(role)) problems.push(`Model Pool: ${role} cannot be gated (implementer families are always on)`)
+      else if (!GATE_NAME.test(name)) problems.push(`Model Pool: ${role} gate '${name}' must match WOLFPACK_[A-Z0-9_]+`)
+      else roleGates[role] = name
+    }
   }
   const absent = REQUIRED_POOL_ROLES.filter((r) => !(r in models) && !emptyToken.includes(r))
   if (absent.length) problems.push(`Model Pool: missing required role(s) ${absent.join(', ')}`)
   if (emptyToken.length) problems.push(`Model Pool: empty model token for role(s) ${emptyToken.join(', ')}`)
   if (duplicate.length) problems.push(`Model Pool: duplicate line(s) for role(s) ${duplicate.join(', ')}`)
-  if (problems.length) return { pool: null, models: null, unknownRoles, problems }
+  const family = (token) => token.split(':')[0].toLowerCase()
+  const gates = {}
+  for (const [role, name] of Object.entries(roleGates)) {
+    const fam = family(models[role])
+    if (fam in gates && gates[fam] !== name) {
+      problems.push(`Model Pool: family ${fam} has conflicting gates ${gates[fam]}, ${name}`)
+      continue
+    }
+    gates[fam] = name
+  }
+  if (problems.length) return { pool: null, models: null, gates: null, unknownRoles, problems }
   const pool = {}
   for (const [role, token] of Object.entries(models)) {
-    pool[POOL_ROLES[role]] = token.split(':')[0].toLowerCase()
+    pool[POOL_ROLES[role]] = family(token)
   }
-  return { pool, models, unknownRoles, problems }
+  return { pool, models, gates, unknownRoles, problems }
+}
+
+// The MAIN working tree of the git repository that contains `dir` (a hunt worktree resolves to
+// its main checkout), or null when `dir` is not inside a git repo. Pack scripts take their
+// cross-worktree DATA root from here — the invoking repo — never from their own location.
+export function mainWorktree(dir = process.cwd()) {
+  try {
+    const common = execFileSync('git', ['-C', dir, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    return common ? dirname(common) : null
+  } catch {
+    return null
+  }
 }
 
 // `~` or `~/…` → the home directory; anything else unchanged.
@@ -346,7 +390,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
   if (pathsRaw === undefined) missing.push('compliancePaths')
   const compliancePaths = list(pathsRaw)
 
-  const { pool, models, unknownRoles, problems } = modelPool(sec('Model Pool'))
+  const { pool, models, gates, unknownRoles, problems } = modelPool(sec('Model Pool'))
 
   let wolfpackHome = optionalCode('Project Identity', 'Wolfpack home')
   if (wolfpackHome !== null) {
@@ -396,6 +440,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     exec,
     pool,
     models,
+    gates,
     unknownRoles,
     sections: secs.map((s) => s.key),
     missing,
@@ -431,6 +476,7 @@ function summary(cfg) {
       : `exec: sandbox ${cfg.exec?.sandboxImage} · glm ${cfg.exec?.glmImage} · layer ${cfg.exec?.projectLayer ?? 'none'}`,
   ]
   if (cfg.models) for (const [role, token] of Object.entries(cfg.models)) lines.push(`pool ${role} → ${token}`)
+  if (cfg.gates) for (const [fam, name] of Object.entries(cfg.gates)) lines.push(`gate ${fam} ← ${name}`)
   if (cfg.missing.length) lines.push(`missing: ${cfg.missing.join(', ')}`)
   if (cfg.problems.length) lines.push(`problems: ${cfg.problems.join('; ')}`)
   return lines.join('\n')

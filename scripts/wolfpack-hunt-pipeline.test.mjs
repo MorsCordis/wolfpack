@@ -47,7 +47,16 @@ const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/tes
   worktreeRoot: '.agents/worktrees',
   exec: { sandboxImage: 'fx-sandbox:latest', glmImage: 'fx-sandbox-glm:latest', projectLayer: null, seatExtraMounts: [],
     sandboxExtraMounts: [], secretsPaths: [], vibeAgentDir: '/agents', seatTestEnv: [], missing: [], problems: [] } }
-const configAnswer = (cfg = FIXTURE_CONFIG, cwd = '/repo') => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2), cwd })
+// scripts-unfork: the probe also reports the PACK it ran the reader from (PACK_HOME=). The answer
+// simulates the seat: the env leg's injected literal `PACK='<home>'` (shq-quoted) wins; otherwise
+// the seat copied the config key (the reader JSON's wolfpackHome — the shell's `~` case already
+// expanded, as the reader's expandHome does). A function of the prompt, like the real seat.
+const probePack = (prompt, keyHome) => {
+  const m = /PACK='((?:[^']|'\\'')*)'; /.exec(prompt || '')
+  return m ? m[1].replace(/'\\''/g, "'") : (typeof keyHome === 'string' ? keyHome : '')
+}
+const configAnswer = (cfg = FIXTURE_CONFIG, cwd = '/repo') => (prompt) =>
+  ({ exitCode: 0, output: JSON.stringify(cfg, null, 2), cwd, pack: probePack(prompt, cfg.wolfpackHome) })
 // pack-install-model (AC5): the run-start stamp probe relays `wolfpack-workflows.mjs check --json`.
 // Default: both workflows are the pack's own canonical files (wolfpack's layout), which is what
 // the UNSTAMPED canonical SRC expects. A scenario passes per-file states / extra fields.
@@ -384,7 +393,7 @@ async function runRunner({ env = {}, protocol }) {
   const calls = []
   const agent = async (_p, opts = {}) => {
     calls.push(opts.label)
-    if (opts.label === 'project-config') return configAnswer()
+    if (opts.label === 'project-config') return configAnswer()(_p)
     if (opts.label === 'workflow-stamp') return stampAnswer()
     if (opts.label === 'parse-campaign') return { waves: [] }
     if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol, gatePresent: true, gateProtocol: 1 }
@@ -457,13 +466,22 @@ test('writer record: seat probe cross-checks git trailers; GLM wrapper pre-marks
 })
 
 test('node helper invocations quote repo/plan paths (space + quote)', async () => {
+  // scripts-unfork: the helpers run from the PACK home (here one with a space — a single quote in
+  // a pack home is refused up front, see the pack-install-model test), while the plan dir keeps
+  // the space + quote of the worktree path, so shq is exercised on both arguments.
   const wt = "/re po/it's/.agents/worktrees/h"
-  const { find } = await runHunt({ answers: { scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
+  const pack = '/pa ck/home'
+  const { find } = await runHunt({ env: { WOLFPACK_HOME: pack }, answers: { scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
   const q = (x) => `'${x.replace(/'/g, `'\\''`)}'`
-  assert.ok(find('alpha:')[0].prompt.includes(`node ${q("/re po/it's/scripts/wolfpack-routing.mjs")} ${q(`${wt}/.wolfpack/plans/h`)}`))
+  assert.ok(find('alpha:')[0].prompt.includes(`node ${q(`${pack}/scripts/wolfpack-routing.mjs`)} ${q(`${wt}/.wolfpack/plans/h`)}`))
   const wd = find('watchdog:')[0].prompt
-  assert.ok(wd.includes(`node ${q("/re po/it's/scripts/wolfpack-timing.mjs")} ${q(`${wt}/.wolfpack/plans/h`)}`))
-  assert.ok(wd.includes(`node ${q("/re po/it's/scripts/wolfpack-model-stats.mjs")} --stamp`))
+  assert.ok(wd.includes(`node ${q(`${pack}/scripts/wolfpack-timing.mjs`)} ${q(`${wt}/.wolfpack/plans/h`)}`))
+  assert.ok(wd.includes(`node ${q(`${pack}/scripts/wolfpack-model-stats.mjs`)} --stamp`))
+  assert.ok(wd.includes(`bash ${q(`${pack}/scripts/wolfpack-lessons.sh`)}`), 'Watchdog step 4.6 runs the pack lessons aggregator')
+  // never the consuming repo's (or the worktree's) scripts dir
+  for (const p of [find('alpha:')[0].prompt, wd]) {
+    assert.doesNotMatch(p, /\/re po\/it'\\''s\/scripts\/wolfpack-|\.\/scripts\/wolfpack-/)
+  }
 })
 
 // ─── Tracker coverage (retire-gemini-glm-large4) ─────────────────────────────
@@ -619,7 +637,7 @@ async function runRunnerLogged({ env = {}, protocol }) {
   const logs = []
   const agent = async (_p, opts = {}) => {
     calls.push(opts.label)
-    if (opts.label === 'project-config') return configAnswer()
+    if (opts.label === 'project-config') return configAnswer()(_p)
     if (opts.label === 'workflow-stamp') return stampAnswer()
     if (opts.label === 'parse-campaign') return { waves: [] }
     if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol, gatePresent: true, gateProtocol: 1 }
@@ -772,7 +790,7 @@ test('offload record: args.usageOffload ⇒ record-offload agent runs once (quot
   const rec = withIt.find('usage-offload:')
   assert.equal(rec.length, 1)
   assert.equal(rec[0].opts.model, 'sonnet')
-  assert.match(rec[0].prompt, /node '\/repo\/scripts\/wolfpack-usage\.mjs' record-offload --plan-dir '\/repo\/\.agents\/worktrees\/h\/\.wolfpack\/plans\/h' --reason 'weekly pace \+16\.4 — it'\\''s ahead'/)
+  assert.match(rec[0].prompt, /node '\/pack\/scripts\/wolfpack-usage\.mjs' record-offload --plan-dir '\/repo\/\.agents\/worktrees\/h\/\.wolfpack\/plans\/h' --reason 'weekly pace \+16\.4 — it'\\''s ahead'/)
   assert.ok(withIt.logs.some(l => /⚖ usage offload: weekly pace \+16\.4/.test(l)))
   // the record runs BEFORE the seat probe reads metadata.usage_offload
   const idx = (p) => withIt.calls.findIndex(c => c.label.startsWith(p))
@@ -785,7 +803,8 @@ test('offload record: args.usageOffload ⇒ record-offload agent runs once (quot
 
 test('usage stamp AC7/AC8: every timed phase heartbeat carries the GUARDED stamp (absolute CLI, -f and -w, --plan-dir); Scaffold uses -f only', async () => {
   const { find } = await runHunt()
-  const timedStamp = `if [ -f "/repo/scripts/wolfpack-usage.mjs" ] && [ -w "${WT}/.wolfpack/plans/h" ]; then node "/repo/scripts/wolfpack-usage.mjs" stamp --heartbeat .wolfpack/heartbeats/h.json --plan-dir "${WT}/.wolfpack/plans/h"; fi`
+  // scripts-unfork: the meter CLI is the PACK's (FIXTURE_CONFIG Wolfpack home /pack), never /repo/scripts/.
+  const timedStamp = `if [ -f "/pack/scripts/wolfpack-usage.mjs" ] && [ -w "${WT}/.wolfpack/plans/h" ]; then node "/pack/scripts/wolfpack-usage.mjs" stamp --heartbeat .wolfpack/heartbeats/h.json --plan-dir "${WT}/.wolfpack/plans/h"; fi`
   for (const p of ['alpha:', 'bloodhound:', 'shepherd:', 'pointer:', 'tracker:', 'watchdog:']) {
     const c = find(p)[0]
     assert.ok(c, p)
@@ -795,8 +814,12 @@ test('usage stamp AC7/AC8: every timed phase heartbeat carries the GUARDED stamp
     assert.match(c.prompt, /expected in a sandboxed seat/)
   }
   const sc = find('scaffold:')[0].prompt
-  assert.match(sc, /if \[ -f "scripts\/wolfpack-usage\.mjs" \]; then node "scripts\/wolfpack-usage\.mjs" stamp --heartbeat \.wolfpack\/heartbeats\/h\.json; fi/)
+  assert.match(sc, /if \[ -f "\/pack\/scripts\/wolfpack-usage\.mjs" \]; then node "\/pack\/scripts\/wolfpack-usage\.mjs" stamp --heartbeat \.wolfpack\/heartbeats\/h\.json; fi/)
   assert.doesNotMatch(sc, /stamp --heartbeat[^\n]*--plan-dir/, 'Scaffold never stamps metadata (no plan dir yet)')
+  const { calls } = await runHunt()
+  for (const c of calls) {
+    assert.doesNotMatch(c.prompt, /\/repo\/scripts\/wolfpack-usage|"scripts\/wolfpack-usage/, `${c.label}: no repo-relative / consuming-repo meter CLI`)
+  }
 })
 
 test('metadata preserve clause: the Plan prompt and every "update metadata.json" prompt carry it', async () => {
@@ -1232,7 +1255,7 @@ test('AC5: a pointer-glm profile with bash = "never" → the REAL toolcheck exit
     for (const p of SEAT_CALLS) assert.equal(find(p).length, 0, `${p} never ran`)
     const pf = find('toolcheck-preflight:')
     assert.equal(pf.length, 1)
-    assert.match(pf[0].prompt, /'\/repo\/scripts\/wolfpack-toolcheck\.mjs' --shim '\/pack\/scripts\/podman-vibe\.sh' --profiles '\/agents'/, 'targets the pack shim (WOLFPACK_HOME) + the configured Vibe agent dir')
+    assert.match(pf[0].prompt, /node '\/pack\/scripts\/wolfpack-toolcheck\.mjs' --shim '\/pack\/scripts\/podman-vibe\.sh' --profiles '\/agents'/, 'the PACK toolcheck (scripts-unfork) targets the pack shim (WOLFPACK_HOME) + the configured Vibe agent dir')
     const park = find('park:h:toolcheck_failed')
     assert.equal(park.length, 1)
     assert.match(park[0].prompt, /wolfpack-pointer-glm/)
@@ -1625,12 +1648,12 @@ const PACK_ROOT = join(here, '..')
 const WT_PACK = '/x/wolfpack/.agents/worktrees/h'
 const PD_PACK = `${WT_PACK}/.wolfpack/plans/h`
 // The probe answer: exit code + stdout/stderr verbatim, exactly as the probe agent relays it.
-const realConfig = (cfgPath = join(PACK_ROOT, 'wolfpack-config.md')) => () => {
+const realConfig = (cfgPath = join(PACK_ROOT, 'wolfpack-config.md')) => (prompt) => {
   try {
     const out = execFileSync(process.execPath, [join(here, 'wolfpack-config.mjs'), '--json', cfgPath], { encoding: 'utf8', stdio: 'pipe' })
-    return { exitCode: 0, output: out, cwd: '/repo' }
+    return { exitCode: 0, output: out, cwd: '/repo', pack: probePack(prompt, JSON.parse(out).wolfpackHome) }
   } catch (e) {
-    return { exitCode: e.status, output: `${e.stdout || ''}${e.stderr || ''}`, cwd: '/repo' }
+    return { exitCode: e.status, output: `${e.stdout || ''}${e.stderr || ''}`, cwd: '/repo', pack: probePack(prompt, '') }
   }
 }
 const PACK_ANSWERS = { 'project-config': realConfig(), scaffold: { worktreePath: WT_PACK, planDir: PD_PACK } }
@@ -1660,13 +1683,15 @@ test('AC10 (b): the scaffold uses .agents/worktrees/h; shim + toolcheck resolve 
   assert.doesNotMatch(scaffold, /\.claude\/worktrees/)
   assert.match(scaffold, /7\. Convenience links \(wolfpack-config\.md → Worktree links\): for each of \(none configured — skip this step\)/)
   assert.doesNotMatch(scaffold, /adcValid|application-default/)
-  // exec-layer-into-pack: the repo-local scripts stay under the repo root; the SHIM comes from the
-  // pack home the real config names (Project Identity → Wolfpack home, ~ expanded).
+  // exec-layer-into-pack + scripts-unfork: the SHIM and every pack script (toolcheck here) come from
+  // the pack home the real config names (Project Identity → Wolfpack home, ~ expanded) — never the
+  // hosting repo's root (/x/wolfpack is only the worktree math).
   const packHome = JSON.parse(realConfig()().output).wolfpackHome
   assert.ok(typeof packHome === 'string' && packHome.startsWith('/'), `the real config names a Wolfpack home (${packHome})`)
   assert.ok(logs.some(l => l === 'Repo root: /x/wolfpack'), logs.join('\n'))
   assert.ok(logs.some(l => l === `Pack home (WOLFPACK_HOME): ${packHome} — from wolfpack-config.md → Project Identity → Wolfpack home; seat shim ${packHome}/scripts/podman-vibe.sh`), logs.join('\n'))
-  assert.ok(find('toolcheck-preflight:')[0].prompt.includes(`'/x/wolfpack/scripts/wolfpack-toolcheck.mjs' --shim '${packHome}/scripts/podman-vibe.sh'`))
+  assert.ok(find('toolcheck-preflight:')[0].prompt.includes(`node '${packHome}/scripts/wolfpack-toolcheck.mjs' --shim '${packHome}/scripts/podman-vibe.sh'`))
+  assert.ok(!find('toolcheck-preflight:')[0].prompt.includes('/x/wolfpack/scripts/'))
   assert.ok(hasHandoffCall(find('pointer:')[0].prompt, `'${packHome}/scripts/podman-vibe.sh'`, ` 'wolfpack-pointer-glm' `))
   assert.ok(logs.some(l => /^Project config: wolfpack .* — tests: bash scripts\/test-all\.sh; deploy: none; risk surfaces: 0$/.test(l)), logs.join('\n'))
 })
@@ -1679,8 +1704,10 @@ test('AC10 (b): the project-config probe runs FIRST — read-only sonnet, the ex
   assert.equal(calls[2].label, 'resume-probe:h')
   assert.equal(calls[0].opts.model, 'sonnet')
   assert.equal(calls[0].opts.phase, 'Scaffold')
-  assert.deepEqual(calls[0].opts.schema.required, ['exitCode', 'output', 'cwd'])
-  assert.match(calls[0].prompt, /node scripts\/wolfpack-config\.mjs --json wolfpack-config\.md 2>&1; echo "CONFIG_RC=\$\?"/)
+  // scripts-unfork: the probe runs the PACK's reader and reports which PACK it used.
+  assert.deepEqual(calls[0].opts.schema.required, ['exitCode', 'output', 'cwd', 'pack'])
+  assert.match(calls[0].prompt, /echo "PACK_HOME=\$PACK"; node "\$PACK\/scripts\/wolfpack-config\.mjs" --json wolfpack-config\.md 2>&1; echo "CONFIG_RC=\$\?"/)
+  assert.doesNotMatch(calls[0].prompt, /node scripts\/wolfpack-config\.mjs/)
   assert.match(calls[0].prompt, /modify nothing/)
 })
 
@@ -1753,7 +1780,9 @@ test('AC10 (e): a failing / garbled / empty project-config probe THROWS naming w
     await assert.rejects(runHunt({ answers: { 'project-config': () => ans, 'resume-probe': record('resume-probe'), scaffold: record('scaffold'), spec: record('spec') } }), (e) => {
       assert.match(e.message, /^hunt-pipeline: h: wolfpack-config\.md is missing or incomplete — the pipeline will not guess project values\./, JSON.stringify(ans))
       assert.match(e.message, why, JSON.stringify(ans))
-      assert.match(e.message, /node scripts\/wolfpack-config\.mjs --json$/)
+      // scripts-unfork: the fix names the PACK's reader, never a repo-relative copy
+      assert.match(e.message, /check with node <pack>\/scripts\/wolfpack-config\.mjs --json, and make sure WOLFPACK_HOME \/ Wolfpack home points at a wolfpack checkout \(the reader is <pack>\/scripts\/wolfpack-config\.mjs\)$/)
+      assert.doesNotMatch(e.message, /node scripts\/wolfpack-config/)
       return true
     })
     assert.deepEqual(ran, [], `${JSON.stringify(ans)}: nothing after the probe ran`)
@@ -1762,7 +1791,7 @@ test('AC10 (e): a failing / garbled / empty project-config probe THROWS naming w
 
 test('AC10 (e): a relayed output with a leading banner and nested braces in strings still parses (brace-balanced, string-aware)', async () => {
   const tricky = { ...FIXTURE_CONFIG, name: 'odd } name { "quoted"', testCommand: 'make test ARGS="{a}"' }
-  const { logs, find } = await runHunt({ answers: { 'project-config': { exitCode: 0, output: `note: relayed\n${JSON.stringify(tricky, null, 2)}\ntrailing {junk}`, cwd: '/repo' } } })
+  const { logs, find } = await runHunt({ answers: { 'project-config': { exitCode: 0, output: `note: relayed\n${JSON.stringify(tricky, null, 2)}\ntrailing {junk}`, cwd: '/repo', pack: '/pack' } } })
   assert.ok(logs.some(l => l.startsWith('Project config: odd } name { "quoted" — tests: make test ARGS="{a}"')), logs.join('\n'))
   assert.match(find('tracker:')[0].prompt, /Run tests using: make test ARGS="\{a\}"/)
 })
@@ -2151,7 +2180,9 @@ test('seat-handoff-writes P10: the Watchdog SEAT prompt no longer commits or app
   assert.match(seat, /SAFETY: No git push\. No deploy commands\./, 'the SAFETY line stays')
   const s46 = wd.slice(wd.indexOf('4.6 PASS-ONLY ACTIONS'), wd.indexOf('5. If a link failed'))
   assert.match(s46, /YOU, the shim agent — never the certifier seat/)
-  assert.match(s46, /append to\s+\.wolfpack\/pedigree\/index\.md, run \.\/scripts\/wolfpack-lessons\.sh, then commit/)
+  // scripts-unfork: the lessons aggregator is the PACK's, run with cwd = the worktree
+  assert.match(s46, /append to\s+\.wolfpack\/pedigree\/index\.md, run `bash '\/pack\/scripts\/wolfpack-lessons\.sh'` \(cwd = the worktree\), then commit/)
+  assert.doesNotMatch(s46, /\.\/scripts\/wolfpack-lessons/)
   assert.ok(s46.includes('FIRST `cd /repo/.agents/worktrees/h`'))
   assert.match(s46, /NEVER `git add \.` \/ `git add -A` \/ `git add -f`\. NEVER stage certification\.md or\s+metadata\.json/)
   assert.match(s46, /only if\s+4\.5 allows it/)
@@ -2403,7 +2434,7 @@ test('AC8: no Worktree root in the config → throws with the key fix BEFORE the
     const stampRan = []
     await assert.rejects(runHunt({ answers: { ...answers, 'project-config': configAnswer(cfg), 'workflow-stamp': () => { stampRan.push(1); return stampAnswer() } } }), (e) => {
       assert.match(e.message, /^hunt-pipeline: h: wolfpack-config\.md has no Worktree root — the pipeline will not guess where hunt worktrees live\. Fix: add "- \*\*Worktree root:\*\* `<dir>`" under ## Project Identity/)
-      assert.match(e.message, /check: node scripts\/wolfpack-config\.mjs --json$/)
+      assert.match(e.message, /check: node <pack>\/scripts\/wolfpack-config\.mjs --json$/)
       return true
     })
     assert.deepEqual([...ran, ...stampRan], [])
@@ -2634,7 +2665,7 @@ test('workflow-meta-runtime AC7: trailing slashes are normalized (no realpath) a
 test('workflow-meta-runtime AC8: a missing / relative cwd fails closed', async () => {
   {
     const { ran, answers } = NO_STATE()
-    const { cwd, ...noCwd } = configAnswer()
+    const { cwd, ...noCwd } = configAnswer()('')
     await assert.rejects(runHunt({ answers: { ...answers, 'project-config': noCwd, 'workflow-stamp': () => { ran.push('workflow-stamp'); return stampAnswer() } } }),
       /project-config probe did not report the directory it ran in/)
     assert.deepEqual(ran, [], 'no stamp probe, no scaffold')
@@ -2703,4 +2734,105 @@ test('workflow-meta-runtime: the harness parallel() nulls a throwing unit like t
   const { result } = await runHunt({ answers: { bloodhound: () => { throw new Error('seat died') } } })
   assert.equal(result.verdict, 'PARKED')
   assert.equal(result.reason, 'review_error')
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// scripts-unfork (AC7): every pack script runs from the Wolfpack home, never the hosting repo.
+// The default fixture IS consumer-hosted: repo /repo (which has no scripts/ dir at all — nothing
+// in this harness can resolve one), pack home /pack (FIXTURE_CONFIG → Wolfpack home).
+// ════════════════════════════════════════════════════════════════════════════
+const PACK_SCRIPT_RE = /wolfpack-(routing|toolcheck|usage|timing|model-stats|lessons|config|window-gate|chain)\.(mjs|sh)/g
+
+test('AC7 consumer-hosted: every router / toolcheck / usage / timing / model-stats / lessons command names /pack/scripts/, never the repo', async () => {
+  const { calls, result } = await runHunt({ args: { usageOffload: { reason: 'weekly pace' } }, answers: { 'usage-offload': { ok: true, reason: 'weekly pace' } } })
+  assert.equal(result.status === undefined || typeof result.status === 'string', true)
+  const seen = new Set()
+  for (const c of calls) {
+    assert.doesNotMatch(c.prompt, /\/repo\/scripts\/wolfpack-/, `${c.label}: a consuming-repo script path`)
+    assert.doesNotMatch(c.prompt, /(^|[\s'"`(])\.\/scripts\/(lib\/)?wolfpack-/m, `${c.label}: a ./scripts/ invocation`)
+    assert.doesNotMatch(c.prompt, /(node|bash|sh) +['"]?scripts\/(lib\/)?wolfpack-/, `${c.label}: a repo-relative invocation`)
+    for (const m of c.prompt.matchAll(PACK_SCRIPT_RE)) {
+      // the char run before the name must end in the pack dir, or be the probe's $PACK variable
+      const before = c.prompt.slice(Math.max(0, m.index - 16), m.index)
+      assert.ok(before.endsWith('/pack/scripts/') || before.endsWith('$PACK/scripts/') || before.endsWith('<pack>/scripts/'),
+        `${c.label}: ${m[0]} is not under the pack home (…${before})`)
+      seen.add(m[1])
+    }
+  }
+  for (const s of ['routing', 'toolcheck', 'usage', 'timing', 'model-stats', 'lessons', 'config']) assert.ok(seen.has(s), `no prompt ran wolfpack-${s}`)
+  // the exact command shapes
+  const by = (p) => calls.find(c => c.label.startsWith(p)).prompt
+  assert.ok(by('alpha:').includes(`node '/pack/scripts/wolfpack-routing.mjs' '${PD}'`))
+  assert.ok(by('usage-offload:').includes(`node '/pack/scripts/wolfpack-usage.mjs' record-offload`))
+  assert.ok(by('toolcheck-preflight:').includes(`node '/pack/scripts/wolfpack-toolcheck.mjs' --shim '/pack/scripts/podman-vibe.sh'`))
+  const wd = by('watchdog:')
+  assert.ok(wd.includes(`node '/pack/scripts/wolfpack-timing.mjs' '${PD}'`))
+  assert.ok(wd.includes(`node '/pack/scripts/wolfpack-model-stats.mjs' --stamp`))
+  assert.ok(wd.includes(`bash '/pack/scripts/wolfpack-lessons.sh'`))
+})
+
+test('AC7 the stamp CLI is set only once the pack home resolves: the config / stamp probes carry no heartbeat stamp', async () => {
+  const { calls } = await runHunt()
+  for (const label of ['project-config:h', 'workflow-stamp:h']) {
+    const c = calls.find(x => x.label === label)
+    assert.ok(c, label)
+    assert.doesNotMatch(c.prompt, /wolfpack-usage\.mjs/, `${label} predates the pack home`)
+  }
+  assert.ok(calls.find(x => x.label.startsWith('scaffold:')).prompt.includes('node "/pack/scripts/wolfpack-usage.mjs" stamp'))
+})
+
+test('AC7 config probe, env leg: WOLFPACK_HOME in the WORKFLOW env is injected as a literal PACK=\'…\' — the seat\'s own env is never consulted', async () => {
+  const { calls } = await runHunt({ env: { WOLFPACK_HOME: '/pack' } })
+  const p = calls[0]
+  assert.equal(p.label, 'project-config:h')
+  assert.ok(p.prompt.includes(`PACK='/pack'; echo "PROBE_PWD=$(pwd)"; echo "PACK_HOME=$PACK"; node "$PACK/scripts/wolfpack-config.mjs" --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"`), p.prompt)
+  assert.doesNotMatch(p.prompt, /\$WOLFPACK_HOME/)
+  assert.doesNotMatch(p.prompt, /VERBATIM — do NOT expand/)
+  assert.match(p.prompt, /pack = the path after PACK_HOME= VERBATIM/)
+  // a home with a space is shq-quoted, and still matched by the resolver
+  const sp = await runHunt({ env: { WOLFPACK_HOME: '/pa ck/home' } })
+  assert.ok(sp.calls[0].prompt.includes(`PACK='/pa ck/home'; echo`))
+  assert.ok(sp.logs.some(l => l.startsWith('Pack home (WOLFPACK_HOME): /pa ck/home — from env WOLFPACK_HOME')), sp.logs.join('\n'))
+})
+
+test('AC7 config probe, key leg (env unset): the seat copies Wolfpack home VERBATIM; the shell expands only a leading ~ (deviation 2)', async () => {
+  for (const env of [{}, { WOLFPACK_HOME: '' }, { WOLFPACK_HOME: '   ' }]) {
+    const { calls } = await runHunt({ env })
+    const p = calls[0].prompt
+    assert.match(p, /Wolfpack home\*\*: its backticked path, VERBATIM — do NOT expand `~`, resolve symlinks or substitute any other path/, JSON.stringify(env))
+    assert.ok(p.includes(`PACK="<home>"; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; echo "PROBE_PWD=$(pwd)"; echo "PACK_HOME=$PACK"; node "$PACK/scripts/wolfpack-config.mjs"`), p)
+    assert.doesNotMatch(p, /PACK='/)
+  }
+  // the probe's case line is the reader's expandHome rule — run it for real on the key shapes
+  for (const [key, want] of [['~/pk', `${process.env.HOME}/pk`], ['~', process.env.HOME], ['/abs/pk', '/abs/pk'], ['~other/pk', '~other/pk'], ['', '']]) {
+    const out = execFileSync('bash', ['-c', `PACK="${key}"; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; printf %s "$PACK"`], { encoding: 'utf8' })
+    assert.equal(out, want, key)
+  }
+})
+
+test('AC7 probe-equality: a probe pack equal up to trailing slashes passes; a different / empty / missing pack throws naming both paths — before any scaffold', async () => {
+  const ok = await runHunt({ answers: { 'project-config': { ...configAnswer()(''), pack: '/pack//' } } })
+  assert.ok(ok.logs.some(l => l.startsWith('Pack home (WOLFPACK_HOME): /pack')), ok.logs.join('\n'))
+  for (const pack of ['/other', '', undefined, 'pack', '/pack/sub']) {
+    const ran = []
+    const rec = (l) => () => { ran.push(l); return {} }
+    const ans = { ...configAnswer()('') }
+    if (pack === undefined) delete ans.pack; else ans.pack = pack
+    await assert.rejects(runHunt({ answers: { 'project-config': ans, 'workflow-stamp': rec('workflow-stamp'), 'resume-probe': rec('resume-probe'), scaffold: rec('scaffold') } }), (e) => {
+      assert.ok(e.message.startsWith(`hunt-pipeline: h: the config probe ran the reader from '${pack ?? ''}' but the pack home resolves to '/pack' (wolfpack-config.md → Project Identity → Wolfpack home)`), e.message)
+      assert.match(e.message, /Fix: make WOLFPACK_HOME and wolfpack-config\.md → Wolfpack home name the same absolute path, then relaunch\.$/)
+      return true
+    }, String(pack))
+    assert.deepEqual(ran, [], `${pack}: nothing ran after the probe`)
+  }
+  // env leg: the resolved home is the ENV value — a probe that used the config key instead mismatches
+  await assert.rejects(runHunt({ env: { WOLFPACK_HOME: '/envpack' }, answers: { 'project-config': { ...configAnswer()(''), pack: '/pack' } } }),
+    /the config probe ran the reader from '\/pack' but the pack home resolves to '\/envpack' \(env WOLFPACK_HOME\)/)
+})
+
+test("AC7 both examiner gates off + a Claude writer: the plan review PARKS no_cross_family_reviewer (the pipeline twin of the router's exit 3)", async () => {
+  const { result, find } = await runHunt({ env: { WOLFPACK_ENABLE_GLM: '0', WOLFPACK_ENABLE_MISTRAL_AUTO: '0' } })
+  assert.equal(result.status, 'parked:no_cross_family_reviewer', JSON.stringify(result))
+  assert.equal(find('bloodhound:').length, 0, 'no same-family (Claude) plan review')
+  assert.equal(find('shepherd').length, 0)
 })
