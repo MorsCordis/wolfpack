@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # scripts/test-all.sh — the ONE test entry point (CI + local + the wolfpack-config.md Test command).
-# Runs every scripts/**/*.test.mjs (node --test), every scripts/**/*.test.sh (bash), then the leak grep.
+# Runs every scripts/**/*.test.mjs (node --test), every scripts/**/*.test.sh (bash), then the leak grep
+# and the no-copies guard (scripts/wolfpack-no-copies.mjs on this checkout: pack mode).
 # Podman marker: a test whose first 15 lines contain "wolfpack-test: needs podman" is SKIPPED —
 # printed as "SKIP: needs podman <file>" and counted — when podman is not on PATH or
 # WOLFPACK_TEST_NO_PODMAN=1. Exit 0 = no failures; 1 = any failure, or no tests discovered; 2 = usage.
@@ -85,6 +86,26 @@ else
     echo "FAIL $LEAK (exit $rc)"
     failed=$((failed + 1))
     FAILED_FILES+=("$LEAK")
+  fi
+fi
+
+GUARD=scripts/wolfpack-no-copies.mjs
+echo "── no-copies guard"
+if [ ! -f "$GUARD" ]; then
+  echo "✗ no-copies guard missing ($GUARD)" >&2
+  echo "FAIL $GUARD (missing)"
+  failed=$((failed + 1))
+  FAILED_FILES+=("$GUARD")
+else
+  node "$GUARD" "$ROOT"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "PASS $GUARD"
+    passed=$((passed + 1))
+  else
+    echo "FAIL $GUARD (exit $rc)"
+    failed=$((failed + 1))
+    FAILED_FILES+=("$GUARD")
   fi
 fi
 
