@@ -62,7 +62,7 @@ test('AC1: run-campaign-local parses --chain (description + Parse line), chain: 
   assert.match(desc, /\[--chain\]/, 'the description line carries the [--chain] grammar')
   const parse = lines.filter((l) => /parse/i.test(l) && l.includes('[--chain]'))
   assert.ok(parse.length >= 1, 'a Parse line carries [--chain]')
-  for (const s of ['No pipeline code changes', 'Do NOT modify `campaign-runner.js`', 'wolfpack-sync-runtime']) lacks(t, s, 'run-campaign-local')
+  for (const s of ['No pipeline code changes', 'Do NOT modify `campaign-runner.js`', ['wolfpack', 'sync', 'runtime'].join('-')]) lacks(t, s, 'run-campaign-local')
 })
 
 test('AC1: the chain markers the launch command greps for really exist in the pack workflows', () => {
