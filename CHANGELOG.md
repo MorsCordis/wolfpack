@@ -4,6 +4,8 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+## [v0.4.0] - 2026-10-20
+
 ### Added
 - `docs/autonomy/` (README + 01–07): the autonomy design set — spec-driven hunts, park/resolve/resume, convergence and verdict, batch merge and smoke, limits and timing, model tiers and routing, cross-model execution — now lives in the pack, project-neutral (project specifics are labelled examples or `wolfpack-config.md` references). <!-- hunt:autonomy-docs-into-pack -->
 - `docs/user-guide.md`: the operator's guide (phase walkthrough, tier and mode tables, artifacts, slash commands, usage limits, troubleshooting), moved from the first consuming project's pipeline guide and genericized. <!-- hunt:autonomy-docs-into-pack -->
