@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # scripts/test-all.test.sh — the single test entry point (AC4), exercised against fixture
 # trees via WOLFPACK_TEST_ROOT. Each fixture carries a stub scripts/wolfpack-leak-grep.sh
-# (exit 0) unless the case is about the leak grep itself. Fixtures never contain this file
+# (exit 0) and a stub scripts/wolfpack-no-copies.mjs (exit 0) unless the case is about the leak
+# grep or the no-copies guard itself. Fixtures never contain this file
 # (no recursion). Run: bash scripts/test-all.test.sh
 set -uo pipefail
 
@@ -15,11 +16,13 @@ fail() { echo "FAIL $*"; FAILS=$((FAILS + 1)); }
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# fixture <name> → creates $TMP/<name>/scripts with a passing leak-grep stub; echoes the root
+# fixture <name> → creates $TMP/<name>/scripts with passing leak-grep + no-copies stubs; echoes the root
+# (the guard stub echoes its argv so a case can check test-all.sh passes the tree root)
 fixture() {
   local root="$TMP/$1"
   mkdir -p "$root/scripts"
   printf '#!/usr/bin/env bash\necho "stub leak grep"\nexit 0\n' > "$root/scripts/wolfpack-leak-grep.sh"
+  printf "console.log('stub no-copies argv=' + process.argv.slice(2).join(' '))\n" > "$root/scripts/wolfpack-no-copies.mjs"
   echo "$root"
 }
 pass_mjs() { printf "import { test } from 'node:test'\ntest('ok', () => {})\n" > "$1"; }
@@ -46,17 +49,19 @@ R="$(fixture a)"; pass_mjs "$R/scripts/one.test.mjs"; mkdir -p "$R/scripts/sub";
 run_ta "$R" WOLFPACK_TEST_NO_PODMAN=1
 if [ "$RC" -eq 0 ] && grep -q '^PASS scripts/one.test.mjs$' <<<"$OUT" && grep -q '^PASS scripts/sub/two.test.sh$' <<<"$OUT" \
    && grep -q 'fixture-sh-ran' <<<"$OUT" && grep -q '^PASS scripts/wolfpack-leak-grep.sh$' <<<"$OUT" \
-   && grep -q '^test-all: 3 passed, 0 failed, 0 skipped (needs podman)$' <<<"$OUT"; then
-  ok "(a) passing node + shell tests (nested dirs discovered) → exit 0"
+   && grep -q '^PASS scripts/wolfpack-no-copies.mjs$' <<<"$OUT" \
+   && grep -qxF "stub no-copies argv=$R" <<<"$OUT" \
+   && grep -q '^test-all: 4 passed, 0 failed, 0 skipped (needs podman)$' <<<"$OUT"; then
+  ok "(a) passing node + shell tests (nested dirs discovered) + leak grep + no-copies guard on the root → exit 0"
 else
-  fail "(a) expected exit 0 with 3 PASS; rc=$RC"; echo "$OUT"
+  fail "(a) expected exit 0 with 4 PASS; rc=$RC"; echo "$OUT"
 fi
 
 # (b) a planted failing .test.mjs → exit 1, FAIL line, the other test still runs
 R="$(fixture b)"; fail_mjs "$R/scripts/bad.test.mjs"; pass_mjs "$R/scripts/good.test.mjs"
 run_ta "$R" WOLFPACK_TEST_NO_PODMAN=1
 if [ "$RC" -eq 1 ] && grep -q '^FAIL scripts/bad.test.mjs (exit 1)$' <<<"$OUT" && grep -q '^PASS scripts/good.test.mjs$' <<<"$OUT" \
-   && grep -q '^  failed: scripts/bad.test.mjs$' <<<"$OUT" && grep -q '^test-all: 2 passed, 1 failed, 0 skipped' <<<"$OUT"; then
+   && grep -q '^  failed: scripts/bad.test.mjs$' <<<"$OUT" && grep -q '^test-all: 3 passed, 1 failed, 0 skipped' <<<"$OUT"; then
   ok "(b) failing test → exit 1, FAIL line, keeps going"
 else
   fail "(b) expected exit 1 + FAIL line; rc=$RC"; echo "$OUT"
@@ -78,7 +83,7 @@ if PATH="$MINBIN" command -v podman >/dev/null 2>&1; then
 fi
 run_ta "$R" PATH="$MINBIN"
 if [ "$RC" -eq 0 ] && grep -q '^SKIP: needs podman scripts/pod.test.sh$' <<<"$OUT" && ! grep -q 'podman-test-ran' <<<"$OUT" \
-   && grep -q '^test-all: 2 passed, 0 failed, 1 skipped (needs podman)$' <<<"$OUT"; then
+   && grep -q '^test-all: 3 passed, 0 failed, 1 skipped (needs podman)$' <<<"$OUT"; then
   ok "(c) no podman on PATH → SKIP: needs podman, exit 0"
 else
   fail "(c) expected SKIP + exit 0; rc=$RC"; echo "$OUT"
@@ -139,6 +144,29 @@ if [ "$RC" -eq 1 ] && grep -q '^FAIL scripts/wolfpack-leak-grep.sh (exit 1)$' <<
 else
   fail "(f2) expected leak-grep FAIL; rc=$RC"; echo "$OUT"
 fi
+
+# (f3) a missing no-copies guard is a FAIL, never a skip (pack-commands-canonical AC9)
+R="$(fixture f3)"; rm -f "$R/scripts/wolfpack-no-copies.mjs"; pass_mjs "$R/scripts/one.test.mjs"
+run_ta "$R" WOLFPACK_TEST_NO_PODMAN=1
+if [ "$RC" -eq 1 ] && grep -q '✗ no-copies guard missing' <<<"$OUT" && grep -q '^FAIL scripts/wolfpack-no-copies.mjs (missing)$' <<<"$OUT" \
+   && grep -q '^  failed: scripts/wolfpack-no-copies.mjs$' <<<"$OUT" && grep -q '^test-all: 2 passed, 1 failed, 0 skipped' <<<"$OUT"; then
+  ok "(f3) missing no-copies guard → FAIL, exit 1"
+else
+  fail "(f3) expected missing no-copies guard FAIL; rc=$RC"; echo "$OUT"
+fi
+
+# (f4) a guard that finds copies (exit 1) or a setup error (exit 2) fails the run, exit code named
+for code in 1 2; do
+  R="$(fixture "f4-$code")"; pass_mjs "$R/scripts/one.test.mjs"
+  printf "console.log('✗ .claude/commands/hunt.md — delete it')\nprocess.exit(%s)\n" "$code" > "$R/scripts/wolfpack-no-copies.mjs"
+  run_ta "$R" WOLFPACK_TEST_NO_PODMAN=1
+  if [ "$RC" -eq 1 ] && grep -q "^FAIL scripts/wolfpack-no-copies.mjs (exit $code)$" <<<"$OUT" \
+     && grep -q '^PASS scripts/wolfpack-leak-grep.sh$' <<<"$OUT" && grep -q '^test-all: 2 passed, 1 failed, 0 skipped' <<<"$OUT"; then
+    ok "(f4) a failing no-copies guard (exit $code) → exit 1"
+  else
+    fail "(f4) expected no-copies FAIL (exit $code); rc=$RC"; echo "$OUT"
+  fi
+done
 
 # (g) node_modules is pruned from discovery
 R="$(fixture g)"; pass_mjs "$R/scripts/one.test.mjs"; mkdir -p "$R/scripts/node_modules/x"; fail_mjs "$R/scripts/node_modules/x/dep.test.mjs"
