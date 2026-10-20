@@ -224,7 +224,7 @@ const COMPLIANCE_GATE_SCHEMA = {
 // proceeds with surfaced assumptions, `parked` halts the hunt as needs_spec (no
 // build until a human resolves it — full /resolve plumbing is [02]). Headless runs
 // can't AskUserQuestion, so anything that would need a question parks rather than
-// silently defaulting (per docs/wolfpack-autonomy/01 § interview interface).
+// silently defaulting (per docs/autonomy/01 § interview interface).
 const SPEC_SCHEMA = {
   type: 'object',
   properties: {
@@ -374,7 +374,7 @@ function commitRound(history, findings, cumulativeCrit) {
 
 // The ledger row-set for one round: a coarse {fp, severity, id, title} per finding —
 // the model-grading substrate ([06] queries it; here we just record it). Bare keys
-// widened to rows per docs/wolfpack-autonomy/03 § the ledger as model-grading substrate.
+// widened to rows per docs/autonomy/03 § the ledger as model-grading substrate.
 const ledgerRows = (findings) => (findings || []).map(f => ({
   fp: f.fingerprint || null, severity: f.severity || null, id: f.id, title: f.title || null,
 }))
@@ -566,7 +566,7 @@ let trackerFamily = 'claude'
 let testWriterRecorded = false   // set by noteTrackerWrote() or by the seat probe's union
 
 // AC22 / Risk 6: reaching Certify does NOT prove a Test phase ran — Green tier skips Tracker
-// entirely (docs/wolfpack.md tier table: "trust-Shepherd") yet still certifies. So this is a
+// entirely (docs/user-guide.md tier table: "trust-Shepherd") yet still certifies. So this is a
 // deliberate over-seed, not an inference: if neither channel recorded a test writer, assume the
 // Tracker seat's family wrote. Worst case (Green) it REMOVES an examiner link that was
 // legitimately live, and says so in the log; it can never ADD one. Over-seeding is the safe
@@ -2257,7 +2257,7 @@ if ((alphaPlan.trackerRounds || 0) === 0) {
 
   log(`Tier: ${tier} | BH rounds: ${bloodhoundRounds} | Ptr rounds: ${pointerRounds} | Trk rounds: ${trackerRounds}`)
 } else {
-  // [02] FAIL-CLOSED tier on resume (edge case, docs/wolfpack-autonomy/02): a hunt
+  // [02] FAIL-CLOSED tier on resume (edge case, docs/autonomy/02): a hunt
   // that lost its tier must NOT silently downgrade to a lighter ceremony. Prefer
   // the park-carried tier, then live metadata, then default to RED (most rounds,
   // full ceremony) rather than Yellow — over-reviewing a small hunt is cheap; under-

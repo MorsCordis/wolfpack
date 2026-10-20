@@ -167,6 +167,7 @@ Add a Wolfpack section to your project's agent instructions file (`CLAUDE.md`, `
 Multi-agent workflow: plan → review → implement → code review → test → certify.
 Six roles, five tiers. Slash commands only; `/clear` between phases.
 See the `wolfpack` skill for full detail.
+Pack docs: the wolfpack repo's docs/user-guide.md and docs/autonomy/.
 
 Project configuration: `wolfpack-config.md`
 ```

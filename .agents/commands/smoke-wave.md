@@ -7,7 +7,7 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, mcp__plugin_chrome-devtools-
 Run the **consolidated wave smoke** for wave **$ARGUMENTS** (`<campaign> <wave>`).
 
 The wave is already `/merge-wave`'d and `deploy-dev`'d. This is the automation-first
-consolidated smoke from `docs/wolfpack-autonomy/04-batch-merge-smoke.md`. The keystone is
+consolidated smoke from `docs/autonomy/04-batch-merge-smoke.md`. The keystone is
 `acceptance.md`: every released hunt's acceptance criteria are run **batched by owning hunt** —
 one self-contained block per hunt, each closing with an explicit pass/fail verdict — so a real
 failure maps to exactly one hunt at a glance instead of drowning in a flat surface-ordered

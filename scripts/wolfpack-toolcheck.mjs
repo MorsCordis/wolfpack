@@ -3,7 +3,7 @@
 //
 // Asserts the cross-model REVIEWER still holds its full CAPABLE toolset and has
 // NOT silently re-boxed back to the 2-tool cage (read,grep) that blinded the
-// cross-model reviewer in the run-#5 shakedown. Per docs/wolfpack-autonomy/06 § "Guard against
+// cross-model reviewer in the run-#5 shakedown. Per docs/autonomy/06 § "Guard against
 // regression": the `--enabled-tools read,grep` comma bug was a SILENT re-boxing —
 // it filtered every tool out and nobody noticed until the reviewer hallucinated a
 // whole review. So a preflight MUST assert the capable set before a run and FAIL
@@ -69,7 +69,7 @@ import { readFileSync, existsSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// The capable reviewer toolset (docs/wolfpack-autonomy/06 § "give models their
+// The capable reviewer toolset (docs/autonomy/06 § "give models their
 // tools"). read+grep+edit+write_file+bash maps the spec's enumerated
 // read/grep/git-read/write/search_replace onto Vibe's live tool names. `task` is
 // the one deliberate exclusion (self-orchestration disabled).

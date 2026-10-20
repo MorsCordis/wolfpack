@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // scripts/wolfpack-routing.mjs — [06] data-driven model→role routing (AC4 + AC5).
 //
-// Turns the work-horse/judgment tier table from docs/wolfpack-autonomy/06 into a
+// Turns the work-horse/judgment tier table from docs/autonomy/06 into a
 // DETERMINISTIC recommender that learns from the [03] fingerprint ledger + [05]
 // spend telemetry (aggregated by scripts/wolfpack-model-stats.mjs) — and FAILS
 // SAFE to the tier defaults whenever the data is too thin to route on (the spec's
@@ -154,7 +154,7 @@ export function exploreEligible(tier, dimensions) {
 }
 
 // ─── Tier defaults — the work-horse/judgment table (the HYPOTHESIS until data) ───
-// Per docs/wolfpack-autonomy/06 § "The two tiers": the work-horse family implements,
+// Per docs/autonomy/06 § "The two tiers": the work-horse family implements,
 // reviewer-b reviews volume (work horse), the judgment family plans + reviewer-a
 // verifies (judgment). Domain overrides the reviewer/verify picks (AC5);
 // Red/compliance forces the judgment family.

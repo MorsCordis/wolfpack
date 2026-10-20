@@ -2,7 +2,7 @@
 // scripts/wolfpack-model-stats.mjs — [06] AC3 per-model stats meter.
 //
 // Aggregates the per-hunt pedigree.json scorecards into the per-model,
-// per-role, per-domain metrics the [06] router reads — per docs/wolfpack-autonomy/06
+// per-role, per-domain metrics the [06] router reads — per docs/autonomy/06
 // AC3: "pedigree.json + index carry per-model spend and ledger-derived signal/noise
 // + miss rate, sliced by domain — and the routing reads THESE, not the cert score."
 //

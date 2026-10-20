@@ -369,7 +369,7 @@ After the review loop ends (APPROVED or max rounds reached), synthesize `debrief
 ## Model Pool Selection Algorithm
 
 The project's configured model pool (`wolfpack-config.md` → Model Pool) is split into two tiers
-(docs/wolfpack-autonomy/06 § "The two tiers"):
+(docs/autonomy/06 § "The two tiers"):
 
 | Tier | Roles |
 |------|-------|

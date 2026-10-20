@@ -14,7 +14,7 @@ This skill backs the two human-checkpoint commands:
 
 The rule the whole layer enforces: **you resolve; cron resumes.** The runner only touches
 `ready`/in-flight hunts; you only touch the human states. See
-`docs/wolfpack-autonomy/02-park-resolve-resume.md` for the full design.
+`docs/autonomy/02-park-resolve-resume.md` for the full design.
 
 ## The hunt state model
 
