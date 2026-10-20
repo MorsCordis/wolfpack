@@ -6,6 +6,9 @@
 // citation names a real file (AC6), and README/SETUP link the docs.
 // The name sits OUTSIDE scripts/wolfpack-* on purpose (AC7's pathspec). Old/fake paths are
 // assembled at runtime so the real-repo scans never match this file's own text.
+// The tracked-file scans skip .wolfpack/pedigree/: it is append-only history, and the certify
+// step writes a row there that names the paths this hunt retired. A scan that read it would go
+// red after certification.
 // Run: node --test scripts/pack-docs.test.mjs
 
 import { test } from 'node:test'
@@ -33,12 +36,29 @@ const AUTO_FILES = [
 ]
 
 const gitIn = (root, ...a) => spawnSync('git', ['-C', root, ...a], { encoding: 'utf8' })
+// append-only history is out of scope for the citation scans (see header)
+const HISTORY_EXCLUDE = ':(exclude).wolfpack/pedigree/'
+const scanGrep = (root, ...a) => gitIn(root, 'grep', ...a, '--', '.', HISTORY_EXCLUDE)
+
+// AC4: tracked-file hits for the retired doc-set directory name.
+function oldDirHits(root) {
+  const r = scanGrep(root, '-n', OLD)
+  assert.ok(r.status === 0 || r.status === 1, `git grep failed: ${r.stderr}`)
+  return r.stdout.split('\n').filter(Boolean)
+}
+
+// AC6: retired consumer-guide citations that name no existing file.
+function danglingRetiredGuide(root) {
+  const r = scanGrep(root, '-ohE', RETIRED_GUIDE.replace('.', '\\.'))
+  assert.ok(r.status === 0 || r.status === 1, `git grep failed: ${r.stderr}`)
+  return [...new Set(r.stdout.split('\n').filter(Boolean))].filter((p) => !existsSync(join(root, p)))
+}
 
 // AC5 resolver: same rule as the acceptance one-liner
 // (git grep -ohE 'docs/autonomy/[A-Za-z0-9._-]*[A-Za-z0-9]' → ls -d $p $p-*).
 function danglingCitations(root) {
   const re = AUTO + '/[A-Za-z0-9._-]*[A-Za-z0-9]'
-  const r = gitIn(root, 'grep', '-ohE', re)
+  const r = scanGrep(root, '-ohE', re)
   assert.ok(r.status === 0 || r.status === 1, `git grep failed: ${r.stderr}`)
   const all = r.stdout.split('\n').filter(Boolean)
   const cites = [...new Set(all)]
@@ -63,8 +83,7 @@ test('AC1: the eight docs/autonomy/ files exist and are non-empty', () => {
 })
 
 test('AC4: the retired doc-set path appears in no tracked file', () => {
-  const r = gitIn(ROOT, 'grep', '-n', OLD)
-  assert.equal(r.status, 1, `unexpected hits:\n${r.stdout}`)
+  assert.deepEqual(oldDirHits(ROOT), [])
 })
 
 test('AC5: every docs/autonomy/ citation in tracked files resolves (direct or numeric prefix)', () => {
@@ -99,15 +118,43 @@ test('AC5 negative: the resolver flags a dangling numeric citation and a bare RE
 })
 
 test('AC6: any retired consumer-guide citation in tracked files names an existing file', () => {
-  const r = gitIn(ROOT, 'grep', '-ohE', RETIRED_GUIDE.replace('.', '\\.'))
-  assert.ok(r.status === 0 || r.status === 1)
-  for (const p of new Set(r.stdout.split('\n').filter(Boolean))) {
-    assert.ok(existsSync(join(ROOT, p)), `dangling ${p}`)
-  }
+  assert.deepEqual(danglingRetiredGuide(ROOT), [])
   // the hunt-pipeline tier-table comment now cites the pack guide, which carries "trust-Shepherd"
   const wf = readFileSync(join(ROOT, '.agents/workflows/hunt-pipeline.js'), 'utf8')
   assert.match(wf, /docs\/user-guide\.md tier table: "trust-Shepherd"/)
   assert.match(readFileSync(join(ROOT, 'docs/user-guide.md'), 'utf8'), /trust-Shepherd/)
+})
+
+test('scans skip append-only pedigree history but still catch the same text anywhere else', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'pack-docs-hist-'))
+  try {
+    assert.equal(gitIn(tmp, 'init', '-q').status, 0)
+    mkdirSync(join(tmp, AUTO), { recursive: true })
+    writeFileSync(join(tmp, AUTO, '06-model-tiers.md'), 'x\n')
+    const bad09 = `${AUTO}/0` + '9'
+    // a certify-style pedigree row naming every retired path, plus lessons.md mentioning one
+    mkdirSync(join(tmp, '.wolfpack', 'pedigree'), { recursive: true })
+    const row = `| 2026-10-20 | some-hunt | Blue | PASS | moved docs/${OLD}/ out; consumer ${RETIRED_GUIDE} deduped; cited ${bad09} |\n`
+    writeFileSync(join(tmp, '.wolfpack', 'pedigree', 'index.md'), row)
+    writeFileSync(join(tmp, '.wolfpack', 'pedigree', 'lessons.md'), `- lesson about ${RETIRED_GUIDE}\n`)
+    writeFileSync(join(tmp, 'ok.md'), `see ${AUTO}/06 §\n`)
+    assert.equal(gitIn(tmp, 'add', '.wolfpack', 'ok.md', AUTO).status, 0)
+    // history-only mentions: every scan stays green
+    assert.deepEqual(oldDirHits(tmp), [])
+    assert.deepEqual(danglingRetiredGuide(tmp), [])
+    assert.deepEqual(danglingCitations(tmp).dangling, [])
+
+    // the same text in a non-history file (including one merely named like pedigree) still fails
+    mkdirSync(join(tmp, 'docs'), { recursive: true })
+    writeFileSync(join(tmp, 'docs', 'pedigree-notes.md'), row)
+    assert.equal(gitIn(tmp, 'add', 'docs/pedigree-notes.md').status, 0)
+    assert.equal(oldDirHits(tmp).length, 1)
+    assert.ok(oldDirHits(tmp)[0].startsWith('docs/pedigree-notes.md:'))
+    assert.deepEqual(danglingRetiredGuide(tmp), [RETIRED_GUIDE])
+    assert.deepEqual(danglingCitations(tmp).dangling, [bad09])
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('AC3: no project frontmatter tag under docs/; 01 and 02 defer to wolfpack-config.md', () => {
