@@ -43,7 +43,7 @@ The one invariant that never relaxes: **review roles must be a different model f
 
 ## Quick Start
 
-Wolfpack ships as a self-contained repo. You don't copy files into your project — you point your agent harness's skills directory at this repo's `.agents/skills`, then drop a `wolfpack-config.md` into your project so the roles know your conventions.
+Wolfpack ships as a self-contained repo. You don't copy files into your project — `install.sh` points your agent harness at this repo's `.agents/` tree, then you drop a `wolfpack-config.md` into your project so the roles know your conventions. Full walkthrough: [SETUP.md](SETUP.md).
 
 ### 1. Clone Wolfpack
 
@@ -51,22 +51,13 @@ Wolfpack ships as a self-contained repo. You don't copy files into your project 
 git clone <wolfpack-repo-url> ~/wolfpack
 ```
 
-### 2. Point your harness at the skills
-
-Wolfpack's canonical layout lives under `.agents/` (`skills/`, `commands/`, `workflows/`). `.agents/skills` is the open `SKILL.md` location that any skill-aware harness reads. A `.claude/` compatibility symlink → `.agents/` is included for Claude Code users.
-
-Symlink your harness's user-level skills directory at this repo's `.agents/skills`:
+### 2. Install
 
 ```bash
-# Generic, open SKILL.md location (Vibe, Aider, Cline, OpenCode, ...):
-ln -s ~/wolfpack/.agents/skills ~/.agents/skills
-
-# Claude Code reads ~/.claude/skills — point it at the same content:
-ln -s ~/wolfpack/.agents/skills ~/.claude/skills
-ln -s ~/wolfpack/.agents/commands ~/.claude/commands
+bash ~/wolfpack/install.sh
 ```
 
-(Adjust the destination to wherever your runtime discovers user-level skills/commands.)
+This links `~/.claude/{commands,skills}` to the pack's `.agents/` tree, installs the Vibe seat profiles and prints the pack version. Other harnesses can link the open location by hand (`ln -s ~/wolfpack/.agents/skills ~/.agents/skills`). See [SETUP.md](SETUP.md) Step 1.
 
 ### 3. Configure your project
 
@@ -84,6 +75,8 @@ Edit `wolfpack-config.md` with:
 - Compliance requirements (if any)
 - **Model Pool** — map the judgment / work-horse / reviewer-a / reviewer-b families onto the concrete models you have
 
+- **Worktree root** — the repo-relative, gitignored directory your hunt worktrees live in (required by the workflows)
+
 The pipeline roles read `wolfpack-config.md` for everything project-specific.
 
 ### 4. Install hooks
@@ -99,7 +92,14 @@ cp ~/wolfpack/hooks/settings.example.json .agents/settings.json
 
 See [HOOKS.md](HOOKS.md) for details and customization. (The example settings reference `.claude/hooks/…`; if your harness reads a different settings location, adjust the paths to match where you placed the scripts.)
 
-### 5. Run your first hunt
+### 5. Generate the workflows, then run your first hunt
+
+```bash
+cd /path/to/your/project && bash ~/wolfpack/install.sh   # writes the stamped .claude/workflows/*.js (gitignored)
+bash ~/wolfpack/install.sh --check                       # → install.sh --check: OK
+```
+
+A generated workflow copy is never tracked; a run on a stale copy stops with STALE WORKFLOW and the fix (regenerate, restart Claude Code). Details: [SETUP.md](SETUP.md) Step 3b.
 
 ```
 /hunt my-feature "Add user profile editing"

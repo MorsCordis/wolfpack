@@ -13,6 +13,7 @@ The pipeline itself (router, `hunt-pipeline`, `campaign-runner`) reads the machi
 - **Repo root:** (auto-detected from git)
 - **Test command:** `./scripts/run_tests.sh` or `npm test` or `go test ./...` — REQUIRED; the first backticked span is the command the pipeline runs (Tracker) and forbids Shepherd from running. Follow it with any notes on narrowing.
 - **Worktree links:** (optional; backticked main-repo paths symlinked into each worktree, e.g. `.env`, or none)
+- **Worktree root:** `.agents/worktrees` — REQUIRED by the workflows: the repo-relative directory hunt worktrees live in (where your /hunt creates them). Keep it gitignored.
 - **Deploy command (dev):** `deploy-dev` or `npm run deploy:staging` or `kubectl apply -f ...`
 - **Deploy command (prod):** USER ONLY — describe the process here so agents know not to run it
 - **Vault root:** `~/Vault` — absolute path to the Obsidian vault that holds `project-notes/<project>/` (session notes, `/memory` project/lesson/reference notes, `/recall` search). Must NOT be inside the code repo or its parent workspace.

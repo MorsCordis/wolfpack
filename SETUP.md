@@ -1,6 +1,6 @@
 # Setting Up Wolfpack for Your Project
 
-This guide walks through wiring Wolfpack into a new codebase. You can do this manually or ask your agent to help — either way, the result is a `wolfpack-config.md` in your project root plus a skills symlink that points your harness at this repo.
+This guide walks through wiring Wolfpack into a new codebase. You can do this manually or ask your agent to help — either way, the result is a `wolfpack-config.md` in your project root, the user-level links that point your harness at this repo, and your project's generated workflow copies — all but the config made by one command, `install.sh`.
 
 Wolfpack is harness-agnostic. The roles are `SKILL.md` files (an open standard) and work with any skill-aware agent runtime — Claude Code, Vibe, Aider, Cline, OpenCode, and others. Wherever this guide names Claude Code, it's only as one concrete example of "your agent harness."
 
@@ -12,23 +12,22 @@ Wolfpack is harness-agnostic. The roles are `SKILL.md` files (an open standard) 
 
 ## How distribution works
 
-You do **not** copy the skills and commands into each project. Wolfpack lives in one cloned repo; you point your harness's user-level skills directory at this repo's canonical `.agents/skills`. The framework's real home is `.agents/` (skills, commands, workflows); `.claude/` is a compatibility symlink → `.agents/` for Claude Code users. Each project then only needs its own `wolfpack-config.md` and a `.wolfpack/` artifacts directory.
+You do **not** copy the skills and commands into each project. Wolfpack lives in one cloned repo, and `install.sh` links your harness's user-level `~/.claude/commands` and `~/.claude/skills` at this repo's canonical `.agents/commands` and `.agents/skills`. The framework's real home is `.agents/` (skills, commands, workflows). Each project then only needs its own `wolfpack-config.md`, a `.wolfpack/` artifacts directory and the generated workflow copies `install.sh` writes into its `.claude/workflows/`.
 
-## Step 1: Clone Wolfpack and link the skills
+## Step 1: Clone Wolfpack and run install.sh
 
 ```bash
 git clone <wolfpack-repo-url> ~/wolfpack
+bash ~/wolfpack/install.sh
 ```
 
-Point your harness's user-level skills/commands directories at this repo's `.agents/` tree:
+`install.sh` links `~/.claude/commands` and `~/.claude/skills` to the pack, installs the Vibe seat profiles (see "Vibe seat profiles" below) and prints the pack version (`Wolfpack pack: <tag> (<commit>) at <path>`). It never replaces a real `~/.claude/commands` or `~/.claude/skills` directory — it stops and prints the `mv` that moves yours aside. Run it again any time: it is idempotent. `bash ~/wolfpack/install.sh --check` is read-only and names every problem with its exact fix.
+
+Other harnesses (optional, manual): link the generic, open SKILL.md location yourself:
 
 ```bash
-# Generic, open SKILL.md location (Vibe, Aider, Cline, OpenCode, ...):
+# Vibe, Aider, Cline, OpenCode, ...:
 ln -s ~/wolfpack/.agents/skills ~/.agents/skills
-
-# Claude Code reads ~/.claude/skills — link the same content:
-ln -s ~/wolfpack/.agents/skills ~/.claude/skills
-ln -s ~/wolfpack/.agents/commands ~/.claude/commands
 ```
 
 Adjust the destination to wherever your runtime discovers user-level skills and commands. The slash commands (`/hunt`, `/alpha`, …) become available once the harness sees them.
@@ -54,6 +53,12 @@ cp ~/wolfpack/wolfpack-config.example.md wolfpack-config.md
 ```
 
 Open `wolfpack-config.md` and fill in each section. The most important ones:
+
+### Worktree root (required)
+Where your hunt worktrees live, repo-relative and gitignored. The workflows refuse to run without it.
+```markdown
+- **Worktree root:** `.agents/worktrees`
+```
 
 ### Test command
 How do you run tests? This is what Tracker will call.
@@ -87,6 +92,21 @@ What project conventions should Pointer enforce? Think about the mistakes you've
 - Every database query must have an index strategy
 ```
 
+## Step 3b: Generate the workflows
+
+From your project root, run the installer again — inside a project that has a `wolfpack-config.md` it also generates the project's workflow copies:
+
+```bash
+cd <project> && bash ~/wolfpack/install.sh      # or: bash ~/wolfpack/install.sh --consumer <project>
+bash ~/wolfpack/install.sh --check              # must print: install.sh --check: OK
+```
+
+This writes `.claude/workflows/hunt-pipeline.js` and `.claude/workflows/campaign-runner.js`: copies of the pack's canonical workflows, each stamped with the pack commit, version and a hash of its source. Each run starts by logging the running script's version and checking that stamp against the pack.
+
+**The track-or-ignore rule:** A generated workflow copy is never tracked. `.claude/workflows/hunt-pipeline.js` and `.claude/workflows/campaign-runner.js` are gitignored in every consuming project and produced by `install.sh`; the run start refuses a stale one. (Step 5 adds the ignore lines.)
+
+**The stale-workflow fix:** a run that stops with STALE WORKFLOW: run the printed `install.sh --consumer …` command, restart Claude Code, relaunch. (Claude Code caches named workflows per session, so a regenerated copy only runs after a restart.) A copy that was hand-edited stops the run the same way — never edit a generated copy; change the pack and regenerate.
+
 ## Step 4: Install hooks (recommended)
 
 Hooks enforce pipeline discipline at the tool level — preventing agents from committing to main, `git add .`-ing secrets, or spinning in loops.
@@ -116,8 +136,12 @@ Add the Wolfpack artifacts that should be local-only:
 .wolfpack/plans/*/
 !.wolfpack/plans/*/pedigree.json
 
-# Wolfpack — worktrees
+# Wolfpack — worktrees (the directory your Worktree root names)
 .agents/worktrees/
+
+# Wolfpack — generated workflow copies (install.sh writes them; never tracked)
+.claude/workflows/hunt-pipeline.js
+.claude/workflows/campaign-runner.js
 
 # Wolfpack — spin detector state
 .agents/state/
@@ -178,7 +202,7 @@ local files:
   to run `git diff` and the tests; implementers stay shell-free). It exits non-zero on any
   mismatch, and `hunt-pipeline.js` runs it as a preflight before the first review seat.
 - Never hand-edit `~/.vibe/agents-headless/`: change the template, re-run the installer.
-  (A future `install.sh` takes this step over.)
+  `install.sh` runs this installer for you; `install.sh --check` reports drift.
 
 ## Execution layer
 
@@ -232,18 +256,22 @@ If you'd rather have your agent configure everything:
 ```
 I want to set up the Wolfpack pipeline for this project.
 The framework is cloned at ~/wolfpack/.
-Link the skills, create wolfpack-config.md with my project's
-conventions (including the Model Pool), and update .gitignore.
+Run ~/wolfpack/install.sh, create wolfpack-config.md with my project's
+conventions (including the Model Pool and the Worktree root), run
+install.sh again from the project root, and update .gitignore.
+Finish with: bash ~/wolfpack/install.sh --check
 ```
 
 The agent will read your codebase, infer conventions, and fill in the config. Review the config before running your first hunt — it's the foundation everything else builds on, especially the Model Pool mapping.
 
 ## Updating Wolfpack
 
-When the upstream framework updates (new role features, tier adjustments, scoring changes), just pull — your symlink picks up the new content automatically:
+When the upstream framework updates (new role features, tier adjustments, scoring changes), pull, then re-run the installer in each consuming project and restart Claude Code:
 
 ```bash
 cd ~/wolfpack && git pull
+cd <project> && bash ~/wolfpack/install.sh      # regenerates the stamped workflow copies
+bash ~/wolfpack/install.sh --check
 ```
 
-Because your harness reads the skills through a symlink to this repo, there's nothing to re-copy. Your `wolfpack-config.md` is your project's file (not the framework's) and is never touched by an update.
+The skills and commands are read through the user-level links, so they update with the pull. The workflow copies do not: a run started on an old copy stops with STALE WORKFLOW until you regenerate and restart. Your `wolfpack-config.md` is your project's file (not the framework's) and is never touched by an update.

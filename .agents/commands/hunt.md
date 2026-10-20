@@ -246,19 +246,9 @@ Before scaffolding, verify main is clean. Uncommitted edits on main won't carry 
    ```
    Set `is_worktree: false` and `worktree_path: null` when `--no-worktree` was passed. Dimensions stay 0 — Alpha fills them during `/alpha`. Round caps (`bloodhound_rounds`, `pointer_rounds`, `tracker_rounds`) stay 0 — Alpha sets them based on tier scoring.
 
-   - **Recreate alias-namespace symlinks (MANDATORY for non-Claude harnesses):** Git does not preserve symlinks into a new worktree — it checks them out as plain text files containing the target path. If the repo carries an alias directory so that multiple harnesses can find the same skills (commonly `.agents/` ↔ `.claude/`, whichever way the project points it), that alias will be a dead text file inside the fresh worktree, and any harness reading through it will fail to find Pointer/Tracker/Shepherd. Recreate it as a real symlink:
-     ```bash
-     MAIN_REPO="$(cd "$WORKTREE_ABS" && dirname "$(git rev-parse --git-common-dir)")"
-     # Mirror whichever alias the MAIN repo uses. Example, for a repo whose canonical
-     # skills live in .claude/ with .agents/ as the alias:
-     [ -d "$WORKTREE_ABS/.agents" ] || mkdir -p "$WORKTREE_ABS/.agents"
-     rm -f "$WORKTREE_ABS/.agents/skills" "$WORKTREE_ABS/.agents/commands"
-     ln -s ../.claude/skills   "$WORKTREE_ABS/.agents/skills"
-     ln -s ../.claude/commands "$WORKTREE_ABS/.agents/commands"
-     ```
-     Check which direction the main repo points before running this — copying the example blindly into a repo whose canonical location is `.agents/` creates a symlink loop.
+   - **No alias links in the worktree:** the pack's skills and commands are installed user-level by the pack's `install.sh` (`~/.claude/skills`, `~/.claude/commands`), and the pipeline reads role skills from `$WOLFPACK_HOME/.agents/skills`, so a fresh worktree needs no `.agents/` ↔ `.claude/` alias links. A project that still tracks such links should remove them (they check out as text files under `core.symlinks=false`).
 
-   - **Convenience symlinks (optional, non-blocking):** A worktree does not inherit gitignored files from the main repo, so anything untracked the tooling expects at the repo root (a virtualenv, a `.env`, a local settings file) will be missing. Symlink those from `$MAIN_REPO` into `$WORKTREE_ABS` if the project has any. If a symlink fails (permissions, missing target), log a warning and continue — none of these are blocking.
+   - **Convenience symlinks (optional, non-blocking):** A worktree does not inherit gitignored files from the main repo, so anything untracked the tooling expects at the repo root (a virtualenv, a `.env`, a local settings file) will be missing. Symlink those from `$MAIN_REPO` (the main checkout: `MAIN_REPO="$(cd "$WORKTREE_ABS" && dirname "$(git rev-parse --git-common-dir)")"`) into `$WORKTREE_ABS` if the project has any. If a symlink fails (permissions, missing target), log a warning and continue — none of these are blocking.
 
    **Model defaults:** read from `wolfpack-config.md` → `## Model Pool`. If `--bloodhound=` or `--watchdog=` flags were passed, use those values instead.
 4. **Branch (ONLY if `--no-worktree` was passed):** Read the git conventions from the project's `wolfpack-config.md` (`## Hard Rules`). If clean and on `main`, run `git checkout -b feat/<slug>`. If on a different branch with uncommitted changes, stop and tell the user to commit/stash first — do not switch branches with dirty state. In worktree mode (default) the branch was created in step 0 by `git worktree add -b`.

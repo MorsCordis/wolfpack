@@ -7,15 +7,26 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 ### Added
 - Review and certify seats (Bloodhound, Pointer, Watchdog; GLM and Mistral) write their own handoff file with `write_file` into one shim-mounted read-write out dir (`<plan dir>/.seat-out/<seat>-r<N>[-<lens>]/`); the worktree stays read-only and `edit` stays denied. <!-- hunt:seat-handoff-writes -->
 - `podman-vibe.sh --deliver-to <plan dir> --out-dir <dir> --expect <artifact>…`: after the seat exits the shim moves exactly the expected artifact(s) byte-for-byte into the plan dir and prints `WOLFPACK_ARTIFACT_DELIVERED: <name> sha256=…`; a missing artifact, any extra file, a symlink or any change to tracked/untracked source fails with exit 78 and `WOLFPACK_ARTIFACT_ERROR:` markers, and the out dir is quarantined, never delivered. A non-empty out dir at start is refused (exit 2). <!-- hunt:seat-handoff-writes -->
+- `install.sh`: one command links `~/.claude/{commands,skills}` to the pack, installs the Vibe seat profiles, generates a consuming project's workflow copies and prints the pack version; `--check` is read-only and names each problem with its exact fix (exit 0 ok · 1 drift · 2 error). <!-- hunt:pack-install-model -->
+- `scripts/wolfpack-workflows.mjs`: generates ONE stamped copy per consuming project of each named workflow (stamp = pack commit, `git describe --tags` version and the canonical's sha256) and checks freshness by content, so an unrelated pack commit never marks a copy stale. <!-- hunt:pack-install-model -->
+- Run-start stamp check in `hunt-pipeline.js` and `campaign-runner.js`: the first lines name the running script's version; a stale copy, a hand-edited copy or a session-cached old copy stops the run before any state changes, with the regenerate/restart fix. <!-- hunt:pack-install-model -->
+- `Worktree root` key under `## Project Identity` (`worktreeRoot` in `scripts/wolfpack-config.mjs`); both workflows build worktree paths and the main-checkout root from it and stop with the fix when it is missing. <!-- hunt:pack-install-model -->
 
 ### Changed
 - The shim agent no longer re-transcribes a Vibe seat's stdout into `review-N.md` / `pointer-review-N.md` or authors `certification.md` / `pedigree.json` from it; it reads the verdict from the delivered file, records each artifact's sha256 in `metadata.seat_artifacts`, and logs `handoff_violations`. <!-- hunt:seat-handoff-writes -->
 - The grounding line and the `> audit_only: true` note now go to a pipeline-written sidecar (`<plan dir>/seat-notes/<artifact>`) instead of being prepended to the seat's artifact. <!-- hunt:seat-handoff-writes -->
 - `write_file` is no longer a read-only-by-role tool: a review/certify seat that reports it denied is recorded audit-only. The toolcheck now requires `write_file` and role-denies only `edit` for review seats; `GLM_REVIEW_DROP` also drops `edit`. <!-- hunt:seat-handoff-writes -->
 - Watchdog's PASS-only actions (pedigree index append, lessons, commit) are performed by the pipeline after the certifier, not requested from the seat. <!-- hunt:seat-handoff-writes -->
+- Host-side pipeline seats read their role skill from the pack (`$WOLFPACK_HOME/.agents/skills/<role>/SKILL.md`) instead of a consumer path that did not exist. <!-- hunt:pack-install-model -->
+- One rule for generated workflow copies in every repo: they are gitignored and produced by `install.sh` (documented in SETUP.md). <!-- hunt:pack-install-model -->
+- The leak grep and the seat-template test assemble the consuming-project literal at runtime, so no script spells it. <!-- hunt:pack-install-model -->
 
 ### Fixed
 - The self-hosting AC2 test no longer asserts a header-only pedigree index; it checks the header, the separator and that every data row is well-formed, so certifying a wolfpack-hosted hunt no longer breaks it. <!-- hunt:seat-handoff-writes -->
+
+### Removed
+- `scripts/wolfpack-sync-runtime.sh` and its test — disposition: **deleted**; `install.sh` generates stamped copies through `scripts/wolfpack-workflows.mjs`, with no `.agents`→`.claude` namespace transform. <!-- hunt:pack-install-model -->
+- `/hunt`'s step that recreated `.agents/` ↔ `.claude/` alias links in each worktree; consuming projects drop their tracked alias links. <!-- hunt:pack-install-model -->
 
 ## [v0.2.0] - 2026-10-19
 

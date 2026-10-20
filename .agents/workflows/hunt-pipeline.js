@@ -1,5 +1,5 @@
 export const meta = {
-// Wolfpack hunt pipeline — the canonical, durable orchestrator. Consuming projects run a GENERATED copy (scripts/wolfpack-sync-runtime.sh <target>); wolfpack itself runs this file via .claude/workflows. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here. Execution shims resolve from WOLFPACK_HOME (env, else wolfpack-config.md → Wolfpack home), never the consuming repo.
+// Wolfpack hunt pipeline — the canonical, durable orchestrator. Consuming projects run a GENERATED, stamped copy (`bash <pack>/install.sh --consumer <repo>`), checked at run start; wolfpack itself runs this file via its .claude/workflows link. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here. Execution shims resolve from WOLFPACK_HOME (env, else wolfpack-config.md → Wolfpack home), never the consuming repo.
   name: 'hunt-pipeline',
   description: 'Run a full Wolfpack hunt pipeline: scaffold through certification',
   phases: [
@@ -15,6 +15,10 @@ export const meta = {
     { title: 'Verify', detail: 'Deploy feat branch to dev, smoke test before merge' },
   ],
 }
+// pack-install-model: THIS script's own stamp. The canonical carries the null form; the pack's
+// generator (scripts/wolfpack-workflows.mjs, run by install.sh) replaces exactly this one line in
+// a consumer's copy with {workflow, commit, version, source}. Keep it unique and on one line.
+const WOLFPACK_STAMP = null // wolfpack-stamp — generated copies carry {workflow, commit, version, source}; see scripts/wolfpack-workflows.mjs
 
 const VERDICT_SCHEMA = {
   type: 'object',
@@ -829,6 +833,71 @@ const resolveWolfpackHome = (who) => {
 const wolfpackHome = resolveWolfpackHome(`hunt-pipeline: ${slug}`)
 const shimPath = `${wolfpackHome.home}/scripts/podman-vibe.sh`
 log(`Pack home (WOLFPACK_HOME): ${wolfpackHome.home} — from ${wolfpackHome.source}; seat shim ${shimPath}`)
+// pack-install-model: where hunt worktrees live (wolfpack-config.md → Project Identity →
+// Worktree root, repo-relative). Required — the pipeline never guesses it. Re-validated here
+// with the reader's validWorktreeRoot rule (fail closed on a garbled relay). Body identical in
+// hunt-pipeline.js and campaign-runner.js.
+const requireWorktreeRoot = (who, value) => {
+  const fix = 'Fix: add "- **Worktree root:** `<dir>`" under ## Project Identity, where <dir> is the repo-relative, gitignored directory this project\'s hunt worktrees live in (e.g. `.agents/worktrees` or `.claude/worktrees`); check: node scripts/wolfpack-config.mjs --json'
+  if (typeof value !== 'string' || !value) throw new Error(`${who}: wolfpack-config.md has no Worktree root — the pipeline will not guess where hunt worktrees live. ${fix}`)
+  const segs = value.split('/')
+  const ok = !value.startsWith('/') && !value.startsWith('~') && segs[0] !== '.git' &&
+    segs.every(seg => /^\.?[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(seg))
+  if (!ok) throw new Error(`${who}: wolfpack-config.md → Worktree root '${value}' is not a repo-relative path (no leading / or ~, no . or .. segments, no spaces or shell characters, not under .git). ${fix}`)
+  return value
+}
+const worktreeRoot = requireWorktreeRoot(`hunt-pipeline: ${slug}`, cfg().worktreeRoot)
+log(`Worktree root: ${worktreeRoot} (wolfpack-config.md → Project Identity)`)
+// pack-install-model (D6): host-side seats read their role skill from the PACK, never a
+// consumer path (a consuming project has no .agents/skills of its own).
+const PACK_SKILLS = `${wolfpackHome.home}/.agents/skills`
+// pack-install-model (AC5): the run-start stamp check. WOLFPACK_STAMP is THIS script's own
+// stamp (null in the canonical). A read-only probe runs the pack's checker against the main
+// checkout; fail closed on any malformed/absent result. Throws BEFORE any state is mutated.
+// Body identical in hunt-pipeline.js and campaign-runner.js (apart from the call's args).
+const STAMP_PROBE_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+const checkWorkflowStamp = async (who, label, phaseName) => {
+  const self = `${meta.name}.js`
+  const home = wolfpackHome.home
+  if (home.includes("'")) throw new Error(`${who}: WOLFPACK_HOME contains a single quote — refusing to build the stamp probe`)
+  const p = await agent(`READ-ONLY workflow stamp probe — modify nothing. From the repo root (your starting directory), run exactly:
+  node '${home}/scripts/wolfpack-workflows.mjs' check --pack '${home}' --consumer "$(pwd)" --json 2>&1; echo "STAMP_RC=$?"
+Return exitCode = the number after STAMP_RC= and output = the command's stdout+stderr VERBATIM, minus the STAMP_RC line.
+If the command could not run at all, return exitCode 2 and the error text as output. Never create, fix, regenerate or edit anything.`,
+    { label, phase: phaseName, model: 'sonnet', schema: STAMP_PROBE_SCHEMA })
+  if (!p) throw new Error(`${who}: the workflow stamp probe returned no result — workflow freshness UNKNOWN; relaunch`)
+  const out = typeof p.output === 'string' ? p.output : ''
+  const head = out.split('\n').slice(0, 20).join('\n') || '(no output)'
+  if (p.exitCode !== 0 && p.exitCode !== 1) throw new Error(`${who}: the workflow stamp check failed (exit ${p.exitCode}) — workflow freshness UNKNOWN: ${head}. Fix: run node '${home}/scripts/wolfpack-workflows.mjs' check --consumer <this repo> and resolve what it names (bash '${home}/install.sh' --check lists every problem)`)
+  let parsed = null
+  try { const block = firstJsonObject(out); parsed = block ? JSON.parse(block) : null } catch { parsed = null }
+  if (!parsed || !Array.isArray(parsed.workflows)) throw new Error(`${who}: the workflow stamp probe output held no checker result (no workflows[] array) — workflow freshness UNKNOWN: ${head}`)
+  const entry = parsed.workflows.find(w => w && w.name === self)
+  if (!entry || typeof entry.state !== 'string') throw new Error(`${who}: the workflow stamp check did not report ${self} — workflow freshness UNKNOWN: ${head}`)
+  const S = WOLFPACK_STAMP
+  const packVersion = parsed.packVersion
+  const packCommit = String(parsed.packCommit || '')
+  if (S === null) {
+    if (entry.state === 'canonical') {
+      log(`Workflow version: ${self} canonical — pack ${packVersion} @ ${packCommit.slice(0, 12)} (${entry.file})`)
+      return parsed
+    }
+    throw new Error(`${who}: this run is the UNSTAMPED canonical ${self} but ${entry.file} is ${entry.state} — fix: ${entry.fix || `bash '${home}/install.sh' --consumer <this repo>`}, then restart Claude Code (named workflows are cached per session) and relaunch`)
+  }
+  if (S.source === entry.canonicalSource) {
+    if (entry.state === 'current') {
+      log(`Workflow version: ${self} ${S.version} @ ${String(S.commit).slice(0, 12)} (source ${String(S.source).slice(0, 19)}…) — current against the pack at ${home}`)
+      return parsed
+    }
+    throw new Error(`${who}: ${entry.file} is ${entry.state} — its stamp matches the pack but the copy on disk is not the generated bytes. ` +
+      `Fix: ${entry.fix || 'regenerate it'}, then restart Claude Code (named workflows are cached per session) and relaunch.`)
+  }
+  throw new Error(`${who}: STALE WORKFLOW — this run is ${self} ${S.version} @ ${String(S.commit).slice(0, 12)}, but the pack's canonical ${self} has changed. ` +
+    (entry.state === 'current'
+      ? `${entry.file} is already regenerated: this session is running a CACHED older copy — restart Claude Code (named workflows are cached per session) and relaunch.`
+      : `${entry.file} is ${entry.state}. Fix: ${entry.fix || `bash '${home}/install.sh' --consumer <this repo>`}, then restart Claude Code and relaunch.`))
+}
+await checkWorkflowStamp(`hunt-pipeline: ${slug}`, `workflow-stamp:${slug}`, 'Scaffold')
 
 const resumeProbe = await agent(`
 Read-only resume probe. Report the durable state of this hunt so the pipeline
@@ -839,8 +908,8 @@ Hunt slug: ${slug}
 
 Steps:
 1. Run \`pwd\` to get the repo root (call it REPO). The worktree is
-   REPO/.agents/worktrees/${slug}; its plan dir is
-   REPO/.agents/worktrees/${slug}/.wolfpack/plans/${slug}; the main plan dir is
+   REPO/${worktreeRoot}/${slug}; its plan dir is
+   REPO/${worktreeRoot}/${slug}/.wolfpack/plans/${slug}; the main plan dir is
    REPO/.wolfpack/plans/${slug}.
 2. The WORKTREE plan dir is the single source of truth. If the worktree dir EXISTS,
    read metadata.json from the WORKTREE plan dir ONLY. If the worktree dir does NOT
@@ -896,7 +965,7 @@ Steps:
    - bloodhoundModel: metadata.model_assignments.bloodhound provider family ("glm" or "mistral"), or null if unset
    - trackerModel: metadata.model_assignments.tracker as a raw string if non-empty, else ""
      (the Tracker writes TESTS — code on the branch — so its family is a code-writer family)
-   - worktreePath: absolute REPO/.agents/worktrees/${slug}
+   - worktreePath: absolute REPO/${worktreeRoot}/${slug}
    - planDir: absolute worktree plan dir
    - worktreeExists: true if the worktree directory exists (ls it)
    - branchExists: true if \`git branch --list feat/${slug}\` is non-empty
@@ -1046,7 +1115,7 @@ Description: ${description}
 Campaign: ${campaign || 'none'}
 
 Steps:
-1. Verify you are on the main branch. Existing .agents/worktrees/ and .wolfpack/plans/ entries from other or prior hunts are EXPECTED — ignore them. Only stop if there are uncommitted changes to TRACKED source files.
+1. Verify you are on the main branch. Existing ${worktreeRoot}/ and .wolfpack/plans/ entries from other or prior hunts are EXPECTED — ignore them. Only stop if there are uncommitted changes to TRACKED source files.
 2. Create directory: .wolfpack/plans/${slug}/
 3. Write metadata.json to .wolfpack/plans/${slug}/metadata.json with these fields:
    - feature: "${slug}"
@@ -1070,19 +1139,19 @@ Steps:
    - proposed_version: { bump: null, tag: null }${baseBranch ? `
    - base_branch: "${baseBranch}"   (chain mode: the LOCAL campaign integration branch this hunt forks from, rebases onto and diffs against)` : ''}
 4. Create (or ADOPT) the git worktree — idempotent so a resumed/retried hunt never collides:
-   - If .agents/worktrees/${slug} already EXISTS, do NOT recreate it — adopt it as-is and skip to step 5.
-   - Else if branch feat/${slug} exists but the dir does not: git worktree add .agents/worktrees/${slug} feat/${slug}
-   - Else create fresh: git worktree add .agents/worktrees/${slug} -b feat/${slug}${baseBranch ? ` ${baseBranch}` : ''}
+   - If ${worktreeRoot}/${slug} already EXISTS, do NOT recreate it — adopt it as-is and skip to step 5.
+   - Else if branch feat/${slug} exists but the dir does not: git worktree add ${worktreeRoot}/${slug} feat/${slug}
+   - Else create fresh: git worktree add ${worktreeRoot}/${slug} -b feat/${slug}${baseBranch ? ` ${baseBranch}` : ''}
 5. Copy .wolfpack/plans/${slug}/ into the worktree:
-   mkdir -p .agents/worktrees/${slug}/.wolfpack/plans/${slug}/
-   cp .wolfpack/plans/${slug}/metadata.json .agents/worktrees/${slug}/.wolfpack/plans/${slug}/
+   mkdir -p ${worktreeRoot}/${slug}/.wolfpack/plans/${slug}/
+   cp .wolfpack/plans/${slug}/metadata.json ${worktreeRoot}/${slug}/.wolfpack/plans/${slug}/
 6. Update metadata.json worktree_path to the absolute path of the worktree ${META_PRESERVE_NOTE}
 7. Convenience links (wolfpack-config.md → Worktree links): for each of ${cfg().worktreeLinks.length ? cfg().worktreeLinks.map(l => `\`${l}\``).join(', ') : '(none configured — skip this step)'} that exists in the main repo, symlink it into the worktree at the same relative path (skip any that already exist).
 
 8. SAFETY TAG — Create a rollback point on ${BASE} BEFORE any work begins:
    git tag -f pre-hunt-${slug} ${BASE}   # -f so a resumed hunt re-tags cleanly
    This tag marks the exact state of ${BASE} before the hunt. If anything goes wrong:
-   - git worktree remove --force .agents/worktrees/${slug}
+   - git worktree remove --force ${worktreeRoot}/${slug}
    - git branch -D feat/${slug}
    - ${BASE} is unchanged (the tag proves it)
 
@@ -1114,9 +1183,11 @@ log(`Examiner chain for this hunt (reviews of Claude-written work): ${chainLabel
 // pre-fix comma version made the reviewer run blind) and never the consuming repo. The
 // shim takes the worktree path as an ARG. repoRoot is the MAIN checkout of the consuming
 // repo (the worktree suffix stripped; the path itself for non-worktree runs) — it still
-// serves the repo-local scripts (usage meter, toolcheck, routing, timing…).
-const repoRoot = worktreePath.includes('/.agents/worktrees/')
-  ? worktreePath.split('/.agents/worktrees/')[0]
+// serves the repo-local scripts (usage meter, toolcheck, routing, timing…). The suffix is
+// /<Worktree root>/ from wolfpack-config.md (pack-install-model), never a hard-coded dir.
+const wtMarker = `/${worktreeRoot}/`
+const repoRoot = worktreePath.includes(wtMarker)
+  ? worktreePath.split(wtMarker)[0]
   : worktreePath
 log(`Repo root: ${repoRoot}`)
 usageCli = `${repoRoot}/scripts/wolfpack-usage.mjs`
@@ -1947,7 +2018,7 @@ specVerdict = await agent(`
 You are the Spec phase of the Wolfpack pipeline, running HEADLESSLY (no user
 available — you CANNOT ask questions).
 
-First, read your full instructions at .agents/skills/spec/SKILL.md — follow them
+First, read your full instructions at ${PACK_SKILLS}/spec/SKILL.md — follow them
 exactly, with this ONE headless adaptation: since no user is present you do NOT
 call AskUserQuestion. Instead, rate confidence on the anchored checklist and PARK
 (mode_for_build = parked) anything that would otherwise need a load-bearing
@@ -2049,7 +2120,7 @@ log(`Alpha planning: ${slug}`)
 const alphaPlan = await agent(`
 You are the Alpha planner in the Wolfpack pipeline, running headlessly (no user available).
 
-First, read your full instructions at .agents/skills/alpha/SKILL.md — follow them exactly.
+First, read your full instructions at ${PACK_SKILLS}/alpha/SKILL.md — follow them exactly.
 
 READ acceptance.md FIRST (at ${planDir}/acceptance.md) — it is the Spec phase's
 checkable Definition of Done (Intent + tagged acceptance criteria + Out of scope +
@@ -2085,7 +2156,7 @@ Execute Phase 1 (Initial Plan):
   metadata.json model_assignments
   unless you have a specific documented reason to override (note it in the Debrief). The
   meter is thin until a calibration batch accrues, so today it returns the tier defaults —
-  that is correct, not a bug. Follow .agents/skills/alpha/SKILL.md § Model Pool Selection.
+  that is correct, not a bug. Follow ${PACK_SKILLS}/alpha/SKILL.md § Model Pool Selection.
 - Read .wolfpack/cross-cutting-debt.md for known infra issues
 - Explore relevant source files based on the scope
 - Write plan.md to ${planDir}/plan.md with the full Alpha plan structure
@@ -2506,7 +2577,7 @@ Steps:
 
 2. Write the review prompt to a temp file (avoids shell escaping issues):
    Write to ${tmpFile}:
-   "You are reviewing Wolfpack hunt '${slug}', round ${round}, tier ${tier}. Read the plan at ${planDir}/${planFile}. Also read TODO.md, CLAUDE.md, and .wolfpack/pedigree/index.md for context. Read metadata.json at ${planDir}/metadata.json for tier and scope. Read .agents/skills/bloodhound/SKILL.md and follow it. Produce your adversarial review following your system prompt instructions. PLAN-REVIEW SCOPE (mandatory): you are reviewing the PLAN DOCUMENT's design — NOT whether it has been implemented. The code is NOT written yet (Shepherd implements in a LATER phase). Findings of the form 'not implemented / missing from the codebase / absent from the file / helper missing / code remains unchanged / pre-implementation state' are INVALID and MUST NOT be reported — that state is EXPECTED at plan-review time and reporting it is a misfire that falsely trips non-convergence. Use the code ONLY to verify the plan's factual claims about the CURRENT codebase are accurate; judge the plan's correctness, completeness, and compliance, never its implementation status.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): do NOT read whole large files — grep for the relevant symbols/lines first, then read only those ranges with a line offset/limit. Scope every grep to the relevant app directory (e.g. src/app/, lib/module/), never the repo root, or it times out. Reading entire 1000+ line files (models.py, views.py) bloats context and can crash the request mid-review.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive adversarial review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. The headless cross-model roster fan-out is disabled — the pipeline handles orchestration, not you.' : ''}${VERDICT_CONTRACT}${HANDOFF_NOTE(handoff)}${nudge || ''}"
+   "You are reviewing Wolfpack hunt '${slug}', round ${round}, tier ${tier}. Read the plan at ${planDir}/${planFile}. Also read TODO.md, CLAUDE.md, and .wolfpack/pedigree/index.md for context. Read metadata.json at ${planDir}/metadata.json for tier and scope. Read .agents/skills/bloodhound/SKILL.md (if present in this checkout; otherwise your seat profile carries the role) and follow it. Produce your adversarial review following your system prompt instructions. PLAN-REVIEW SCOPE (mandatory): you are reviewing the PLAN DOCUMENT's design — NOT whether it has been implemented. The code is NOT written yet (Shepherd implements in a LATER phase). Findings of the form 'not implemented / missing from the codebase / absent from the file / helper missing / code remains unchanged / pre-implementation state' are INVALID and MUST NOT be reported — that state is EXPECTED at plan-review time and reporting it is a misfire that falsely trips non-convergence. Use the code ONLY to verify the plan's factual claims about the CURRENT codebase are accurate; judge the plan's correctness, completeness, and compliance, never its implementation status.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): do NOT read whole large files — grep for the relevant symbols/lines first, then read only those ranges with a line offset/limit. Scope every grep to the relevant app directory (e.g. src/app/, lib/module/), never the repo root, or it times out. Reading entire 1000+ line files (models.py, views.py) bloats context and can crash the request mid-review.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive adversarial review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. The headless cross-model roster fan-out is disabled — the pipeline handles orchestration, not you.' : ''}${VERDICT_CONTRACT}${HANDOFF_NOTE(handoff)}${nudge || ''}"
 
 3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
 ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound', handoff)}
@@ -2747,7 +2818,7 @@ ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + un
       revisionResult = await agent(`
 You are the Alpha planner running a Phase 2 revision, headlessly.
 
-First, read your full instructions at .agents/skills/alpha/SKILL.md — follow the Phase 2 (Revision) section.
+First, read your full instructions at ${PACK_SKILLS}/alpha/SKILL.md — follow the Phase 2 (Revision) section.
 
 Hunt: ${slug}
 Worktree: ${worktreePath}
@@ -2817,7 +2888,7 @@ log(`Alpha debrief: ${slug}`)
 await agent(`
 You are the Alpha running the Debrief phase (Phase 2.5), headlessly.
 
-First, read your full instructions at .agents/skills/alpha/SKILL.md — follow the Phase 2.5 (Debrief) section.
+First, read your full instructions at ${PACK_SKILLS}/alpha/SKILL.md — follow the Phase 2.5 (Debrief) section.
 
 Hunt: ${slug}
 Worktree: ${worktreePath}
@@ -2936,7 +3007,7 @@ plan items. After fixing, re-run your self-check (git diff ${BASE}..HEAD) and co
 const runClaudeShepherd = (fallbackNote = '') => agent(`
 You are the Shepherd implementing a Wolfpack hunt, running headlessly.
 
-First, read your full instructions at .agents/skills/shepherd/SKILL.md — follow them exactly.
+First, read your full instructions at ${PACK_SKILLS}/shepherd/SKILL.md — follow them exactly.
 
 Hunt: ${slug}
 Worktree: ${worktreePath}
@@ -2989,7 +3060,7 @@ write_file (creates NEW files only — it refuses a file that exists), edit (mod
 EXISTING file), dev_cortex_repo_map and dev_cortex_file_outline (code maps of this
 checkout). The worktree root is ${worktreePath} (already rebased); use absolute paths under it.
 ${rewriteDirective ? `${rewriteDirective}(A wrapper commits your changes after you finish — you cannot commit.)\n` : ''}
-1. Read ${worktreePath}/.agents/skills/shepherd/SKILL.md and follow it, skipping anything
+1. Read ${worktreePath}/.agents/skills/shepherd/SKILL.md (if present in this checkout; otherwise your seat profile carries the role) and follow it, skipping anything
    that needs a shell (rebase, git, tests — the wrapper handles git; Tracker runs tests).
 2. Read ${worktreePath}/CLAUDE.md for the project rules, then ${planDir}/plan-final.md and
    ${planDir}/debrief.md. Implement ALL plan items in the worktree.
@@ -3106,7 +3177,7 @@ Steps:
 
 2. Write the review prompt to a temp file:
    Write to ${tmpFile}:
-   "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff ${BASE}..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${HANDOFF_NOTE(handoff)}${nudge || ''}"
+   "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff ${BASE}..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md (if present in this checkout; otherwise your seat profile carries the role) and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${HANDOFF_NOTE(handoff)}${nudge || ''}"
 
 3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
 ${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChain, 'wolfpack-pointer', tmpFile, 'pointer', handoff)}
@@ -3368,7 +3439,7 @@ ${META_PRESERVE_NOTE}. Do NOT alter any other file. Do NOT commit. Return record
 You have NO shell (no git, no tests, no commands). Tools: read_file, grep, write_file (NEW files
 only — it refuses an existing file), edit (modify EXISTING files), dev_cortex_repo_map,
 dev_cortex_file_outline. Worktree root: ${worktreePath} (absolute paths under it).
-Read ${worktreePath}/.agents/skills/shepherd/SKILL.md (skip shell steps) and the full review at
+Read ${worktreePath}/.agents/skills/shepherd/SKILL.md (if present in this checkout; otherwise your seat profile carries the role) (skip shell steps) and the full review at
 ${planDir}/pointer-review-${pRound}.md (pipeline notes, if any: ${planDir}/seat-notes/pointer-review-${pRound}.md).
 MANDATORY: address EVERY finding below — ACCEPTED (change the code, say what changed) or
 REJECTED (say specifically why the finding is wrong). Skipping a finding is NOT allowed.
@@ -3398,7 +3469,7 @@ End your response with EXACTLY ONE block, strict JSON, nothing after it:
       rewriteResult = await agent(`
 You are the Shepherd addressing Pointer code review findings, running headlessly.
 
-Read .agents/skills/shepherd/SKILL.md for your instructions.
+Read ${PACK_SKILLS}/shepherd/SKILL.md for your instructions.
 
 Hunt: ${slug}
 Worktree: ${worktreePath}
@@ -3463,7 +3534,7 @@ if (at('Test')) {
     trackerResult = await agent(`
 You are the Tracker writing and running tests, headlessly.
 
-First, read your full instructions at .agents/skills/tracker/SKILL.md — follow them exactly.
+First, read your full instructions at ${PACK_SKILLS}/tracker/SKILL.md — follow them exactly.
 
 Hunt: ${slug}
 Worktree: ${worktreePath}
@@ -3569,7 +3640,7 @@ const vibeCertifyStep = `${shq(shimPath)} ${handoffArgs(wdHandoff)} wolfpack-wat
 // the shim agent walking this chain already IS Claude). Watchdog is the highest-stakes seat,
 // so this is spelled out in full rather than abbreviated.
 const CLAUDE_SELF_CERTIFY_STEP = `(no shim — YOU are Claude.) Read the certify prompt file and perform the certification
-       yourself, following the watchdog role skill it names (.agents/skills/watchdog/SKILL.md) —
+       yourself, following the watchdog role skill it names (${PACK_SKILLS}/watchdog/SKILL.md) —
        the full checklist and the Pedigree rubric, not an abridged pass. Emit the same <verdict>
        block the shims must emit (PASS / REWORK / FLAWED_PLAN), with "provider": "claude", and
        write certification.md + pedigree.json into the plan dir yourself. Before you do, print
@@ -3634,7 +3705,7 @@ Steps:
 1. cd to ${worktreePath}
 
 2. Write the Watchdog prompt to /tmp/watchdog-${slug}.txt:
-   Read .agents/skills/watchdog/SKILL.md for the full Watchdog instructions.
+   Read ${PACK_SKILLS}/watchdog/SKILL.md for the full Watchdog instructions.
    Build the prompt: "You are the Watchdog certifier for hunt '${slug}', tier ${tier}.
    Follow the Watchdog skill instructions.${tier === 'Red' ? ' SINGLE-PASS CERTIFICATION (mandatory, all models): do NOT spawn sub-agents or use the task tool. Run all certification lenses in ONE comprehensive pass, then emit the verdict block. Cross-model sub-agent fan-out is disabled.' : ''}
    Read plan-final.md at ${planDir}/plan-final.md,
@@ -3683,10 +3754,10 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
    DURATION value and the committed pedigree.json carries the timing block): append to
    .wolfpack/pedigree/index.md, run ./scripts/wolfpack-lessons.sh, then commit the wolfpack
    learning-loop artifacts. STRICT staging rules (a past bug force-committed gitignored
-   worktree plan files into main at .agents/worktrees/<slug>/… paths — these rules prevent
+   worktree plan files into main at ${worktreeRoot}/<slug>/… paths — these rules prevent
    that recurrence):
      - FIRST \`cd ${worktreePath}\` so every path you stage is WORKTREE-RELATIVE. NEVER
-       stage a path that begins with \`.agents/worktrees/\` (that path only exists from the
+       stage a path that begins with \`${worktreeRoot}/\` (that path only exists from the
        MAIN repo and force-commits the worktree's files into main).
      - Stage ONLY by EXACT name: \`.wolfpack/pedigree/index.md\`,
        \`.wolfpack/pedigree/lessons.md\` (if changed), and
