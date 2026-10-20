@@ -175,9 +175,10 @@ Do **NOT** `exec run-pipeline-sandbox.sh` and do **NOT** call `claude -p`. Surfa
 then invoke the Workflow tool directly.
 
 Surface first (own line, copies cleanly):
+Print it with `PACK` (resolved above) and this repo's root substituted — absolute paths.
 ```
 Live progress — paste into a separate terminal:
-./scripts/wolfpack-watch.sh --loop 5
+"<PACK>/scripts/wolfpack-watch.sh" --repo "<this repo's root>" --loop 5
 ```
 
 Then call the **Workflow tool**:

@@ -114,7 +114,7 @@ without ever seeing the gaps. The fix: **make the gaps the output.**
    strong "intent not captured" signal → record "NOT REPRODUCIBLE" and lean toward park.
    (Best-effort: a repro test is a confidence input, not a hard requirement — Tracker owns
    the real test suite. Write the repro under the worktree, never in the main repo.)
-6. **Lint before finishing.** Run `node scripts/wolfpack-prespec.mjs lint .wolfpack/plans/$ARGUMENTS/acceptance.md`.
+6. **Lint before finishing.** **Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo. Run `node "$PACK/scripts/wolfpack-prespec.mjs" lint .wolfpack/plans/$ARGUMENTS/acceptance.md`.
    Fix the criteria or re-tag them until it exits 0. If the project doesn't ship that script, apply its rules by
    hand (≤2 `[manual]`; every `- AC<n>` line tagged `[auto]`, `[manual]` or `[compliance]` and followed by text;
    no duplicate ids) and say so in the finishing message. A lint failure you can't fix is a park, not a pass.

@@ -1,5 +1,5 @@
 export const meta = {
-// Wolfpack hunt pipeline — the canonical, durable orchestrator. Consuming projects run a GENERATED, stamped copy (`bash <pack>/install.sh --consumer <repo>`), checked at run start; wolfpack itself runs this file via its .claude/workflows link. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here. Execution shims resolve from WOLFPACK_HOME (env, else wolfpack-config.md → Wolfpack home), never the consuming repo.
+// Wolfpack hunt pipeline — the canonical, durable orchestrator. Consuming projects run a GENERATED, stamped copy (`bash <pack>/install.sh --consumer <repo>`), checked at run start; wolfpack itself runs this file via its .claude/workflows link. Project specifics come from the consuming repo's wolfpack-config.md (scripts/wolfpack-config.mjs) — never hard-code one project's values here. Execution shims and every pack script resolve from WOLFPACK_HOME (env, else wolfpack-config.md → Wolfpack home), never the consuming repo.
   name: 'hunt-pipeline',
   description: 'Run a full Wolfpack hunt pipeline: scaffold through certification',
   phases: [
@@ -667,11 +667,11 @@ const campaignContext = [
 // already covers. detail is deliberately NOT interpolated into the marker (it's
 // already in the heartbeat JSON) so a detail containing a single quote can never
 // break the single-quoted printf format string. Paths are quoted defensively.
-// usage-limit-gate (A-4): the usage meter CLI. Relative until repoRoot is known (Scaffold
-// runs from the main repo root, where the relative path resolves); reassigned to the
-// ABSOLUTE main-repo path right after repoRoot is computed, so a stale worktree lacking the
-// script still stamps. (repoRoot is a later const — never reference it in heartbeat(): TDZ.)
-let usageCli = 'scripts/wolfpack-usage.mjs'
+// usage-limit-gate (A-4): the usage meter CLI — the PACK's copy (scripts-unfork), set to
+// `<pack>/scripts/wolfpack-usage.mjs` right after the pack home resolves. Until then it is
+// null and the heartbeat emits NO stamp (never a repo-relative fallback: a consuming repo has
+// no copy). (wolfpackHome is a later const — never reference it in heartbeat(): TDZ.)
+let usageCli = null
 // wolfpack-self-hosting (AC10): the consuming project's resolved wolfpack-config.md
 // (scripts/wolfpack-config.mjs --json), loaded by the project-config probe right after
 // phase('Scaffold'). Every project-specific value (test command, compliance surfaces,
@@ -699,15 +699,19 @@ printf '{"phase":"${phaseName}","event":"end","ts":"%s"}\\n' "$(date -Iseconds)"
   const stampGuard = timed
     ? `[ -f "${usageCli}" ] && [ -w "${worktreePath}/.wolfpack/plans/${slug}" ]`
     : `[ -f "${usageCli}" ]`
-  const stampCmd = `if ${stampGuard}; then node "${usageCli}" stamp --heartbeat .wolfpack/heartbeats/${slug}.json${timed ? ` --plan-dir "${worktreePath}/.wolfpack/plans/${slug}"` : ''}; fi`
+  const stampCmd = usageCli
+    ? `if ${stampGuard}; then node "${usageCli}" stamp --heartbeat .wolfpack/heartbeats/${slug}.json${timed ? ` --plan-dir "${worktreePath}/.wolfpack/plans/${slug}"` : ''}; fi`
+    : ''
+  const stampStart = stampCmd ? `
+then stamp the usage meter into it:
+${stampCmd}` : ''
+  const stampEnd = stampCmd ? `
+and run the usage stamp again:
+${stampCmd}` : ''
   return `
 HEARTBEAT + TIMING: Before doing anything else, run \`mkdir -p .wolfpack/heartbeats${planDirMk}\`, write this JSON to .wolfpack/heartbeats/${slug}.json:
-{"hunt":"${slug}","phase":"${phaseName}","detail":"${detail}","agent":"starting"}${startMarker}
-then stamp the usage meter into it:
-${stampCmd}
-Update the heartbeat "agent" field to "working" after you begin (preserve every other heartbeat field when you update \`agent\`). When you finish this phase, set the heartbeat "agent" field to "done"${endMarker}
-and run the usage stamp again:
-${stampCmd}
+{"hunt":"${slug}","phase":"${phaseName}","detail":"${detail}","agent":"starting"}${startMarker}${stampStart}
+Update the heartbeat "agent" field to "working" after you begin (preserve every other heartbeat field when you update \`agent\`). When you finish this phase, set the heartbeat "agent" field to "done"${endMarker}${stampEnd}
 USAGE STAMP: if the guard skips it, that is expected in a sandboxed seat — do not mention it. If the command itself fails, carry on and say so in your result: the usage meter is telemetry.
 
 TOOLING POLICY (every phase): Do NOT use the chrome-devtools MCP or any browser automation
@@ -774,7 +778,26 @@ const PROBE_NO_CD = 'Run in your STARTING directory exactly as launched — do N
 // closed). '' when absent, empty or not absolute; callers treat '' as a mismatch.
 const probeRoot = (v) => (typeof v === 'string' && v.trim().startsWith('/')) ? (v.trim().replace(/\/+$/, '') || '/') : ''
 let hostRepoRoot = ''
-const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' }, cwd: { type: 'string' } }, required: ['exitCode', 'output', 'cwd'] }
+const PROJECT_CONFIG_SCHEMA = { type: 'object', properties: { exitCode: { type: 'number' }, output: { type: 'string' }, cwd: { type: 'string' }, pack: { type: 'string' } }, required: ['exitCode', 'output', 'cwd', 'pack'] }
+// scripts-unfork: the config probe runs the PACK's reader (`<pack>/scripts/wolfpack-config.mjs`),
+// never a copy in the consuming repo. The probe runs before the pack home is known, so it
+// bootstraps with the same resolver: the workflow INJECTS its own WOLFPACK_HOME as a literal
+// (the probe seat's env is never consulted — it may be curated); unset → the probe takes
+// wolfpack-config.md → Project Identity → Wolfpack home VERBATIM and the shell expands only a
+// leading `~` (the reader's expandHome rule). It reports the PACK it used as PACK_HOME=, and
+// requireProbedPack() fails closed unless that equals resolveWolfpackHome(). Body identical
+// in both workflows.
+let probedPackHome = ''
+const configProbeCommand = (envHome) => {
+  const run = 'echo "PROBE_PWD=$(pwd)"; echo "PACK_HOME=$PACK"; node "$PACK/scripts/wolfpack-config.mjs" --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"'
+  if (envHome) return `Run exactly:
+  PACK=${shq(envHome)}; ${run}`
+  return `First read wolfpack-config.md (in your starting directory) → ## Project Identity → **Wolfpack home**: its backticked path, VERBATIM — do NOT expand \`~\`, resolve symlinks or substitute any other path (the workflow rejects a non-absolute or mismatched home itself). Substitute it for <home> below, inside the double quotes; if there is no such key, use an empty <home>. Then run exactly:
+  PACK="<home>"; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; ${run}`
+}
+const requireProbedPack = (who, home) => {
+  if (probeRoot(probedPackHome) !== probeRoot(home.home)) throw new Error(`${who}: the config probe ran the reader from '${probedPackHome}' but the pack home resolves to '${home.home}' (${home.source}) — the config was not read by this pack's reader. Fix: make WOLFPACK_HOME and wolfpack-config.md → Wolfpack home name the same absolute path, then relaunch.`)
+}
 // The first brace-balanced {…} block of a text (string-aware, so braces inside JSON strings
 // never end it early; a non-greedy first-} match would truncate inside nested objects).
 const firstJsonObject = (text) => {
@@ -797,10 +820,9 @@ const firstJsonObject = (text) => {
   return null
 }
 const loadProjectConfig = async (who, consequence, label, phaseName) => {
-  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. ${PROBE_NO_CD} Run exactly:
-  echo "PROBE_PWD=$(pwd)"; node scripts/wolfpack-config.mjs --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"
-Return cwd = the path after PROBE_PWD= VERBATIM, exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the PROBE_PWD and CONFIG_RC lines.
-If the command could not run at all, return exitCode 2, the error text as output, and cwd = the output of pwd. Never create, fix or edit anything.`,
+  const pc = await agent(`You ONLY read this project's Wolfpack config — modify nothing. ${PROBE_NO_CD} ${configProbeCommand((_env('WOLFPACK_HOME') || '').trim())}
+Return cwd = the path after PROBE_PWD= VERBATIM, pack = the path after PACK_HOME= VERBATIM, exitCode = the number after CONFIG_RC= and output = the command's stdout+stderr VERBATIM, minus the PROBE_PWD, PACK_HOME and CONFIG_RC lines.
+If the command could not run at all, return exitCode 2, the error text as output, pack = the PACK value you used (or ''), and cwd = the output of pwd. Never create, fix or edit anything.`,
     { label, phase: phaseName, model: 'sonnet', schema: PROJECT_CONFIG_SCHEMA })
   const out = (pc && typeof pc.output === 'string') ? pc.output : ''
   // The reader's ✗ line names the missing keys; surface it first, then the head of the output.
@@ -819,11 +841,12 @@ If the command could not run at all, return exitCode 2, the error text as output
     else if (!Array.isArray(parsed.compliancePaths)) why = 'compliancePaths is not an array'
   }
   if (why) {
-    throw new Error(`${who}: wolfpack-config.md is missing or incomplete — ${consequence}. ${why}: ${detail}. Fix: copy wolfpack-config.example.md to wolfpack-config.md and fill the required keys (Name, Test command, Compliance areas, Risk-surface paths, Model Pool judgment + reviewer-a); check with node scripts/wolfpack-config.mjs --json`)
+    throw new Error(`${who}: wolfpack-config.md is missing or incomplete — ${consequence}. ${why}: ${detail}. Fix: copy wolfpack-config.example.md to wolfpack-config.md and fill the required keys (Name, Test command, Compliance areas, Risk-surface paths, Model Pool judgment + reviewer-a); check with node <pack>/scripts/wolfpack-config.mjs --json, and make sure WOLFPACK_HOME / Wolfpack home points at a wolfpack checkout (the reader is <pack>/scripts/wolfpack-config.mjs)`)
   }
   const root = probeRoot(pc.cwd)
   if (!root) throw new Error(`${who}: the project-config probe did not report the directory it ran in (cwd ${JSON.stringify(pc.cwd ?? null)}) — the host repo is UNKNOWN, so the stamp check cannot confirm both probes read the same repo. Relaunch from the consuming repo's root.`)
   hostRepoRoot = root
+  probedPackHome = typeof pc.pack === 'string' ? pc.pack : ''
   if (!Array.isArray(parsed.worktreeLinks)) parsed.worktreeLinks = []
   return parsed
 }
@@ -846,6 +869,10 @@ const resolveWolfpackHome = (who) => {
   return { home: raw.replace(/\/+$/, '') || '/', source }
 }
 const wolfpackHome = resolveWolfpackHome(`hunt-pipeline: ${slug}`)
+requireProbedPack(`hunt-pipeline: ${slug}`, wolfpackHome)
+// scripts-unfork: every pack script runs from the pack home, never the consuming repo.
+const packScript = (name) => `${wolfpackHome.home}/scripts/${name}`
+usageCli = packScript('wolfpack-usage.mjs')
 const shimPath = `${wolfpackHome.home}/scripts/podman-vibe.sh`
 log(`Pack home (WOLFPACK_HOME): ${wolfpackHome.home} — from ${wolfpackHome.source}; seat shim ${shimPath}`)
 // pack-install-model: where hunt worktrees live (wolfpack-config.md → Project Identity →
@@ -853,7 +880,7 @@ log(`Pack home (WOLFPACK_HOME): ${wolfpackHome.home} — from ${wolfpackHome.sou
 // with the reader's validWorktreeRoot rule (fail closed on a garbled relay). Body identical in
 // hunt-pipeline.js and campaign-runner.js.
 const requireWorktreeRoot = (who, value) => {
-  const fix = 'Fix: add "- **Worktree root:** `<dir>`" under ## Project Identity, where <dir> is the repo-relative, gitignored directory this project\'s hunt worktrees live in (e.g. `.agents/worktrees` or `.claude/worktrees`); check: node scripts/wolfpack-config.mjs --json'
+  const fix = 'Fix: add "- **Worktree root:** `<dir>`" under ## Project Identity, where <dir> is the repo-relative, gitignored directory this project\'s hunt worktrees live in (e.g. `.agents/worktrees` or `.claude/worktrees`); check: node <pack>/scripts/wolfpack-config.mjs --json'
   if (typeof value !== 'string' || !value) throw new Error(`${who}: wolfpack-config.md has no Worktree root — the pipeline will not guess where hunt worktrees live. ${fix}`)
   const segs = value.split('/')
   const ok = !value.startsWith('/') && !value.startsWith('~') && segs[0] !== '.git' &&
@@ -1213,15 +1240,15 @@ log(`Examiner chain for this hunt (reviews of Claude-written work): ${chainLabel
 // copy (worktrees fork from main and can carry a STALE/drifted shim — v1-push-3: a
 // pre-fix comma version made the reviewer run blind) and never the consuming repo. The
 // shim takes the worktree path as an ARG. repoRoot is the MAIN checkout of the consuming
-// repo (the worktree suffix stripped; the path itself for non-worktree runs) — it still
-// serves the repo-local scripts (usage meter, toolcheck, routing, timing…). The suffix is
+// repo (the worktree suffix stripped; the path itself for non-worktree runs) — worktree math
+// and cd targets only: every pack script (usage meter, toolcheck, routing, timing, model-stats,
+// lessons) runs as <pack>/scripts/… (packScript), never from the consuming repo. The suffix is
 // /<Worktree root>/ from wolfpack-config.md (pack-install-model), never a hard-coded dir.
 const wtMarker = `/${worktreeRoot}/`
 const repoRoot = worktreePath.includes(wtMarker)
   ? worktreePath.split(wtMarker)[0]
   : worktreePath
 log(`Repo root: ${repoRoot}`)
-usageCli = `${repoRoot}/scripts/wolfpack-usage.mjs`
 
 // usage-limit-gate (AC6): the campaign runner's usage gate asked for a usage offload
 // (weekly pace too far ahead). Record it ONCE in metadata.usage_offload (first decision
@@ -1229,7 +1256,7 @@ usageCli = `${repoRoot}/scripts/wolfpack-usage.mjs`
 if (usageOffload && typeof usageOffload === 'object') {
   const rec = await agent(`
 You ONLY record a usage offload for Wolfpack hunt ${slug} — modify nothing else. Run exactly:
-  node ${shq(`${repoRoot}/scripts/wolfpack-usage.mjs`)} record-offload --plan-dir ${shq(planDir)} --reason ${shq(String(usageOffload.reason || 'weekly pace'))}
+  node ${shq(packScript('wolfpack-usage.mjs'))} record-offload --plan-dir ${shq(planDir)} --reason ${shq(String(usageOffload.reason || 'weekly pace'))}
 Return ok=true and the printed JSON's reason if it exits 0; otherwise ok=false and the first stderr line as error.
 `, { label: `usage-offload:${slug}`, phase: 'Scaffold', model: 'sonnet', schema: {
     type: 'object',
@@ -1257,7 +1284,7 @@ if (at('Certify') && EXAMINER_ORDER.some(f => f !== 'claude')) {
   const tcProfiles = (cfg().exec && typeof cfg().exec.vibeAgentDir === 'string' && cfg().exec.vibeAgentDir)
     ? ` --profiles ${shq(cfg().exec.vibeAgentDir)}` : ''
   const tc = await agent(`You ONLY run the Wolfpack seat toolcheck for hunt ${slug} — modify nothing. Run exactly:
-  node ${shq(`${repoRoot}/scripts/wolfpack-toolcheck.mjs`)} --shim ${shq(tcShim)}${tcProfiles} 2>&1; echo "TOOLCHECK_RC=$?"
+  node ${shq(packScript('wolfpack-toolcheck.mjs'))} --shim ${shq(tcShim)}${tcProfiles} 2>&1; echo "TOOLCHECK_RC=$?"
 Return exitCode = the number after TOOLCHECK_RC= (a number), ok = (exitCode == 0), and output = the
 command's stdout+stderr VERBATIM (first 60 lines). If the command could not run at all, return
 exitCode 2 and the error text as output. Never fix, install or edit anything.`,
@@ -2190,7 +2217,7 @@ Execute Phase 1 (Initial Plan):
 - Read CLAUDE.md, AGENTS.md, TODO.md for project context
 - Read .wolfpack/pedigree/index.md and .wolfpack/pedigree/lessons.md for model selection data
 - [06] ROUTING — base ALL model_assignments on the data-driven router, not folklore: run
-  \`node ${shq(`${repoRoot}/scripts/wolfpack-routing.mjs`)} ${shq(planDir)}\` AFTER you've written
+  \`node ${shq(packScript('wolfpack-routing.mjs'))} ${shq(planDir)}\` AFTER you've written
   predicted_dimensions + tier to ${planDir}/metadata.json. It reads those + the per-model meter
   (.wolfpack/pedigree/model-stats.json, [06] AC3) and returns the work-horse/judgment tier
   defaults overridden by capability×economics + domain (frontend→thorough verify;
@@ -3821,7 +3848,7 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
 4.6 PASS-ONLY ACTIONS (YOU, the shim agent — never the certifier seat). On PASS, and only if
    4.5 allows it, perform these AFTER step 8 below has run (so the index row carries the
    DURATION value and the committed pedigree.json carries the timing block): append to
-   .wolfpack/pedigree/index.md, run ./scripts/wolfpack-lessons.sh, then commit the wolfpack
+   .wolfpack/pedigree/index.md, run \`bash ${shq(packScript('wolfpack-lessons.sh'))}\` (cwd = the worktree), then commit the wolfpack
    learning-loop artifacts. STRICT staging rules (a past bug force-committed gitignored
    worktree plan files into main at ${worktreeRoot}/<slug>/… paths — these rules prevent
    that recurrence):
@@ -3852,7 +3879,7 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
 8. On PASS only — fold timing into the scorecard (non-blocking, like the lessons
    aggregator). Run this YOURSELF on the host AFTER the certifier returns (node is
    NOT in the sandbox container — do not put this in the certifier prompt):
-   \`node ${shq(`${repoRoot}/scripts/wolfpack-timing.mjs`)} ${shq(planDir)}\`.
+   \`node ${shq(packScript('wolfpack-timing.mjs'))} ${shq(planDir)}\`.
    It reads ${planDir}/timing.jsonl + metadata.json, writes a "timing" block into
    ${planDir}/pedigree.json, and prints a "DURATION=<…>" line plus an
    "INCOMPLETE" warning if any phase is missing a start/end. Capture the DURATION
@@ -3863,11 +3890,12 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
 8b. On PASS only — refresh the [06] per-model routing meter (host-side, non-blocking,
    same rules as step 8: run YOURSELF on the host after the certifier returns, node is
    NOT in the sandbox; pass the agent clock since the script has no Date):
-   \`node ${shq(`${repoRoot}/scripts/wolfpack-model-stats.mjs`)} --stamp "$(date -Iseconds)"\`.
+   \`node ${shq(packScript('wolfpack-model-stats.mjs'))} --stamp "$(date -Iseconds)"\` (cwd inside the
+   consuming repo — it writes that repo's main-checkout meter, never the pack's).
    It re-aggregates every .wolfpack/plans/*/pedigree.json (this hunt's now folded in:
    model_assignments, execution_scores, predicted_dimensions, and timing/review_fingerprints
    if present) into .wolfpack/pedigree/model-stats.json — per-model signal/noise/miss/spend
-   sliced by domain, the substrate Alpha's router (scripts/wolfpack-routing.mjs) reads next
+   sliced by domain, the substrate Alpha's router (<pack>/scripts/wolfpack-routing.mjs) reads next
    run. Metrics with no source data yet are NULL (honest thinness), and the file is
    gitignored (regenerated, fail-safes to tier defaults on a fresh clone). If it fails, log
    and continue — the meter is telemetry, not a gate.

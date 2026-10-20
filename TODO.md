@@ -17,6 +17,8 @@ keep their original filing dates.
 
 ## Orchestration layer
 
+- [ ] **Runtime examiner chain from the Model Pool** (Low, 2026-10-20; from scripts-unfork): `hunt-pipeline.js` / `campaign-runner.js` still hard-code `EXAMINER_ORDER` and the per-family seat agents; drive them from the pool + `gates` so a non-default pool's runtime chain matches the router's.
+
 - [ ] Unified sandbox image needs `node` for the hunt-pipeline toolcheck preflight; until it has it, container (`WOLFPACK_SANDBOX`) campaign runs park `toolcheck_failed` at the preflight.
 
 - [ ] **Track the Vibe seat system prompts in the pack** — `~/.vibe/prompts/wolfpack-{bloodhound,pointer,watchdog}.md` are untracked, still say "You are read-only" and name stale output files (`bloodhound-review-N.md`, `watchdog-certification.md`); seat-handoff-writes overrides them from the pipeline prompt. Move them into `vibe-agents/prompts/` and install them with the seat profiles (installer work).

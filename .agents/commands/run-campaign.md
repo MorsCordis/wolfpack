@@ -103,7 +103,7 @@ Parse `$ARGUMENTS` as: `<campaign-slug> [max-parallel]`. Default max-parallel is
 
    ```bash
    echo "Live progress — paste into a separate terminal:"
-   echo "./scripts/wolfpack-watch.sh --loop 5"
+   echo "\"$PACK/scripts/wolfpack-watch.sh\" --repo \"$(pwd)\" --loop 5"
    exec "$PACK/scripts/run-pipeline-sandbox.sh" --campaign $SLUG $MAX_PARALLEL
    ```
 

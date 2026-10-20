@@ -45,8 +45,10 @@ denylist (guessing the denylist risks leaking compliance/security detail).
   the prod tag — never assume). `to` = dev / `HEAD` (default).
 
 ### 2. Extract + filter (code — do NOT eyeball the changelog yourself)
+**Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
+
 ```bash
-node scripts/wolfpack-release-notes.mjs \
+node "$PACK/scripts/wolfpack-release-notes.mjs" \
   --changelog CHANGELOG.md --from <prod-version> \
   --denylist <denylist from wolfpack-config> \
   --compliance <compliance terms from wolfpack-config> --json
@@ -67,9 +69,9 @@ Group related items. Keep it short.
 Write the draft to a temp file and run:
 ```bash
 # digest mode — compliance terms must NOT appear in the note:
-node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <denylist> --compliance <compliance terms>
+node "$PACK/scripts/wolfpack-release-notes.mjs" --check <draft.md> --denylist <denylist> --compliance <compliance terms>
 # customer mode — compliance terms ARE allowed (you're telling the regulated user about them); scan denylist only:
-node scripts/wolfpack-release-notes.mjs --check <draft.md> --denylist <denylist>
+node "$PACK/scripts/wolfpack-release-notes.mjs" --check <draft.md> --denylist <denylist>
 ```
 Exit 1 = a forbidden term leaked → fix and re-check. Do **not** present a draft that hasn't passed.
 

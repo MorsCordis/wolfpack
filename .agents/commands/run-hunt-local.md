@@ -24,7 +24,7 @@ Parse `$ARGUMENTS` as `[--no-prespec] <slug> ["<description>"]`.
    user to run in an auto-accepting mode or it will prompt throughout. Note it — do not change
    their settings.
 3. **One pipeline at a time.** If another hunt/campaign workflow is already running in this
-   session (or a container run is live — `./scripts/wolfpack-watch.sh` shows it), STOP: pipeline
+   session (or a container run is live — `"$PACK/scripts/wolfpack-watch.sh"` shows it), STOP: pipeline
    runs are strictly sequential (usage window).
 
 ## Step 1 — Resolve the hunt (READ-ONLY, then scaffold only if absent)
@@ -66,9 +66,10 @@ Front-load it here, exactly as `/run-campaign-local` Step 1.5 does:
 
 ## Step 3 — Launch IN-SESSION via the Workflow tool
 Surface the watcher first (own line, copies cleanly):
+Print it with `PACK` (resolved above) and this repo's root substituted — absolute paths.
 ```
 Live progress — paste into a separate terminal:
-./scripts/wolfpack-watch.sh --loop 5
+"<PACK>/scripts/wolfpack-watch.sh" --repo "<this repo's root>" --loop 5
 ```
 
 Build the args **object** from the (worktree-first) metadata — never a bare string:

@@ -204,12 +204,12 @@ If your project runs cross-model review seats through Vibe (the pack's shim,
 local files:
 
 - The templates live in `vibe-agents/` (`wolfpack-*.toml`, one per seat).
-- Install or update them with `node scripts/wolfpack-install-vibe-agents.mjs` (default
+- Install or update them with `node "$WOLFPACK_HOME/scripts/wolfpack-install-vibe-agents.mjs"` (default
   destination `~/.vibe/agents-headless/`; `--dest DIR` or `WOLFPACK_VIBE_AGENTS_DIR` overrides).
   It reports each file as installed / unchanged / replaced, backs up any file it replaces
   (`<name>.bak-<timestamp>`), and leaves every other profile alone.
   `--check` writes nothing and exits 1 on drift.
-- `node scripts/wolfpack-toolcheck.mjs --shim "$WOLFPACK_HOME/scripts/podman-vibe.sh"` (or omit
+- `node "$WOLFPACK_HOME/scripts/wolfpack-toolcheck.mjs" --shim "$WOLFPACK_HOME/scripts/podman-vibe.sh"` (or omit
   `--shim`: it defaults to `WOLFPACK_HOME`'s shim) checks that every
   pipeline seat profile agrees with the tools the shim enables (review/certify seats need a shell
   to run `git diff` and the tests; implementers stay shell-free). It exits non-zero on any
