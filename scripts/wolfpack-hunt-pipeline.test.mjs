@@ -21,6 +21,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const SRC = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8')
   .replace(/^export const meta/m, 'const meta')
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+const RETIRED_SYNC = ['wolfpack', 'sync', 'runtime'].join('-')   // built, so AC7's literal git grep stays empty
 const WT = '/repo/.agents/worktrees/h'
 const PD = `${WT}/.wolfpack/plans/h`
 // seat-handoff-writes: a review/certify Vibe command carries the handoff args BETWEEN the shim
@@ -40,12 +41,29 @@ const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/tes
   tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [],
   // exec-layer-into-pack: the pack home (Project Identity → Wolfpack home) + the Execution Layer.
   wolfpackHome: '/pack',
+  // pack-install-model: Project Identity → Worktree root (required by both workflows).
+  worktreeRoot: '.agents/worktrees',
   exec: { sandboxImage: 'fx-sandbox:latest', glmImage: 'fx-sandbox-glm:latest', projectLayer: null, seatExtraMounts: [],
     sandboxExtraMounts: [], secretsPaths: [], vibeAgentDir: '/agents', seatTestEnv: [], missing: [], problems: [] } }
 const configAnswer = (cfg = FIXTURE_CONFIG) => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2) })
+// pack-install-model (AC5): the run-start stamp probe relays `wolfpack-workflows.mjs check --json`.
+// Default: both workflows are the pack's own canonical files (wolfpack's layout), which is what
+// the UNSTAMPED canonical SRC expects. A scenario passes per-file states / extra fields.
+const PACK_COMMIT = 'a'.repeat(40)
+const stampResult = ({ hunt = 'canonical', runner = 'canonical', huntExtra = {}, runnerExtra = {}, canonicalSource = `sha256:${'c'.repeat(64)}` } = {}) => {
+  const w = (name, state, extra) => ({ name, file: `/repo/.claude/workflows/${name}`, state, stamp: null, canonicalSource,
+    fix: ['current', 'canonical'].includes(state) ? null : "bash '/pack/install.sh' --consumer '/repo'", ...extra })
+  const workflows = [w('campaign-runner.js', runner, runnerExtra), w('hunt-pipeline.js', hunt, huntExtra)]
+  return { ok: workflows.every(x => ['current', 'canonical'].includes(x.state)), pack: '/pack', packVersion: 'v0.2.0-1-gaaaaaaa', packCommit: PACK_COMMIT, consumer: '/repo', workflows }
+}
+const stampAnswer = (opts = {}, exitCode) => {
+  const r = stampResult(opts)
+  return { exitCode: exitCode ?? (r.ok ? 0 : 1), output: JSON.stringify(r) }
+}
 
 const BASE = {
   'project-config': configAnswer(),
+  'workflow-stamp': stampAnswer(),
   'resume-probe': { fresh: true },
   // seat-profiles-into-pack: the toolcheck preflight passes by default (a missing answer
   // correctly parks toolcheck_failed — fail closed).
@@ -312,13 +330,24 @@ test('args: a JSON string still parses; a bare slug on a FRESH hunt fails loud (
   await assert.rejects(runHunt({ rawArgs: 'bad slug' }), /invalid slug/)
 })
 
-test('shell commands single-quote interpolated paths (worktree AND pack home with a space and a quote)', async () => {
+test('shell commands single-quote interpolated paths (worktree with a space and a quote; pack home with a space)', async () => {
+  // pack-install-model: a pack home containing a single quote is now REFUSED at the stamp probe
+  // (plan-final § checkWorkflowStamp), so the quote case for the pack home lives in its own test below.
   const wt = "/re po/it's/.agents/worktrees/h"
-  const { find } = await runHunt({ env: { WOLFPACK_HOME: "/pa ck/it's" }, answers: { scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
+  const { find } = await runHunt({ env: { WOLFPACK_HOME: '/pa ck/dir' }, answers: { scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
   const bh = find('bloodhound:')[0].prompt
   assert.ok(bh.includes(`'/re po/it'\\''s/.agents/worktrees/h'`), 'worktree path is POSIX single-quoted')
-  assert.ok(bh.includes(`'/pa ck/it'\\''s/scripts/podman-vibe.sh'`), 'shim path (from the pack home) is quoted too')
-  assert.match(find('toolcheck-preflight:')[0].prompt, /--shim '\/pa ck\/it'\\''s\/scripts\/podman-vibe\.sh'/)
+  assert.ok(bh.includes(`'/pa ck/dir/scripts/podman-vibe.sh'`), 'shim path (from the pack home) is quoted too')
+  assert.match(find('toolcheck-preflight:')[0].prompt, /--shim '\/pa ck\/dir\/scripts\/podman-vibe\.sh'/)
+  assert.ok(find('workflow-stamp:')[0].prompt.includes(`node '/pa ck/dir/scripts/wolfpack-workflows.mjs' check --pack '/pa ck/dir' --consumer "$(pwd)" --json`))
+})
+
+test('pack-install-model: a pack home containing a single quote is refused BEFORE the stamp probe or any state probe', async () => {
+  const ran = []
+  const rec = (l) => () => { ran.push(l); return {} }
+  await assert.rejects(runHunt({ env: { WOLFPACK_HOME: "/pa ck/it's" }, answers: { 'workflow-stamp': rec('workflow-stamp'), 'resume-probe': rec('resume-probe'), scaffold: rec('scaffold') } }),
+    /hunt-pipeline: h: WOLFPACK_HOME contains a single quote — refusing to build the stamp probe/)
+  assert.deepEqual(ran, [])
 })
 
 test('resume: a Tracker-bounce re-entry goes to the LAST writer (claude), not the glm pin', async () => {
@@ -353,6 +382,7 @@ async function runRunner({ env = {}, protocol }) {
   const agent = async (_p, opts = {}) => {
     calls.push(opts.label)
     if (opts.label === 'project-config') return configAnswer()
+    if (opts.label === 'workflow-stamp') return stampAnswer()
     if (opts.label === 'parse-campaign') return { waves: [] }
     if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol, gatePresent: true, gateProtocol: 1 }
     return {}
@@ -364,7 +394,7 @@ async function runRunner({ env = {}, protocol }) {
 }
 
 test('campaign-runner: stale runtime pipeline (no examiner protocol) fails loud before any hunt', async () => {
-  await assert.rejects(runRunner({ protocol: 0 }), /STALE .*wolfpack-sync-runtime\.sh/)
+  await assert.rejects(runRunner({ protocol: 0 }), /STALE .*Regenerate it: bash '\/pack\/install\.sh' --consumer <this repo> \(then restart Claude Code\)/)
 })
 
 test('campaign-runner: current runtime pipeline passes the capability preflight', async () => {
@@ -587,6 +617,7 @@ async function runRunnerLogged({ env = {}, protocol }) {
   const agent = async (_p, opts = {}) => {
     calls.push(opts.label)
     if (opts.label === 'project-config') return configAnswer()
+    if (opts.label === 'workflow-stamp') return stampAnswer()
     if (opts.label === 'parse-campaign') return { waves: [] }
     if (opts.label === 'pipeline-capability') return { path: '.claude/workflows/hunt-pipeline.js', protocol, gatePresent: true, gateProtocol: 1 }
     return {}
@@ -601,7 +632,8 @@ test('AC25: a protocol-2 runtime pipeline (merge→sync window) WARNS and contin
   const { calls, logs } = await runRunnerLogged({ protocol: 2 })
   assert.ok(calls.includes('pipeline-capability'))
   assert.ok(logs.some(l => /STALE PIPELINE/.test(l)), `no STALE PIPELINE warning: ${logs}`)
-  assert.ok(logs.some(l => /wolfpack-sync-runtime\.sh/.test(l)), 'the warning names the fix command')
+  assert.ok(logs.some(l => /STALE PIPELINE.*regenerate it: bash '\/pack\/install\.sh' --consumer <this repo> \(then restart Claude Code\)/.test(l)), 'the warning names the fix command')
+  assert.equal(logs.some(l => l.includes(RETIRED_SYNC)), false, 'the retired sync script is never named')
 })
 
 test('AC25: protocol 1 and 0 are still BELOW the floor and fail loud', async () => {
@@ -1634,7 +1666,9 @@ test('AC10 (b): the scaffold uses .agents/worktrees/h; shim + toolcheck resolve 
 test('AC10 (b): the project-config probe runs FIRST — read-only sonnet, the exact reader command, before the resume probe', async () => {
   const { calls } = await runHunt({ answers: PACK_ANSWERS })
   assert.equal(calls[0].label, 'project-config:h')
-  assert.equal(calls[1].label, 'resume-probe:h')
+  // pack-install-model (AC5): the read-only stamp probe sits between the config probe and the resume probe.
+  assert.equal(calls[1].label, 'workflow-stamp:h')
+  assert.equal(calls[2].label, 'resume-probe:h')
   assert.equal(calls[0].opts.model, 'sonnet')
   assert.equal(calls[0].opts.phase, 'Scaffold')
   assert.deepEqual(calls[0].opts.schema.required, ['exitCode', 'output'])
@@ -1932,12 +1966,13 @@ test('AC4 (g): source guard — no shim path is built from repoRoot in either wo
 // per-seat out dir; the shim delivers it byte-for-byte; the shim agent never re-transcribes it.
 // ════════════════════════════════════════════════════════════════════════════
 
-// Evaluate a claude-link constant from the deployed SRC with this harness's planDir, so the
-// prompt can be checked to carry it BYTE-EQUAL (the Out list: those texts are unchanged).
+// Evaluate a claude-link constant from the deployed SRC with this harness's planDir and pack
+// skills dir (FIXTURE_CONFIG's Wolfpack home), so the prompt can be checked to carry it
+// BYTE-EQUAL (the Out list: those texts are unchanged).
 const claudeConst = (name, ...callArgs) => {
   const m = SRC.match(new RegExp(`\\nconst ${name} = ([\\s\\S]*?\`)\\n`))
   assert.ok(m, `${name} found in hunt-pipeline.js`)
-  return new Function('planDir', `const v = ${m[1]}; return typeof v === 'function' ? v(...arguments[1]) : v`)(PD, callArgs)
+  return new Function('planDir', 'PACK_SKILLS', `const v = ${m[1]}; return typeof v === 'function' ? v(...arguments[2]) : v`)(PD, '/pack/.agents/skills', callArgs)
 }
 const ORANGE = { ...BASE.alpha, tier: 'Orange' }
 const SHELL_OK = { shell: 'ok', denied_tools: [] }
@@ -2214,4 +2249,189 @@ test('seat-handoff-writes AC13 (lens): a two-lens review gives each lens its own
     assert.ok(p.includes(`Write .wolfpack/plans/h/.seat-out/bloodhound-r1-${key}/review-1-${key}.md with the write_file tool`))
     assert.ok(p.includes(`${PD}/seat-notes/review-1-${key}.md`))
   }
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// pack-install-model (AC5, AC8): the run-start stamp check, the Worktree root key, and
+// host-side role skills read from the PACK. A STAMPED source is produced by the REAL generator
+// (render), so the script under test is byte-for-byte what a consumer's copy would run.
+// ════════════════════════════════════════════════════════════════════════════
+import { render as renderWorkflow } from './wolfpack-workflows.mjs'
+const CANON_HP = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8')
+const SRC_STAMP = { workflow: 'hunt-pipeline.js', commit: 'b'.repeat(40), version: 'v0.2.0-1-gbbbbbbb', source: `sha256:${'5'.repeat(64)}` }
+const stampedSrc = (stamp = SRC_STAMP) => renderWorkflow(CANON_HP, stamp).replace(/^export const meta/m, 'const meta')
+// The default FIXTURE_CONFIG has a deploy step, so a run that gets all the way through ends
+// awaiting_user_deploy (Verify surfaces the deploy).
+const NO_STATE = () => {
+  const ran = []
+  const rec = (l) => () => { ran.push(l); return {} }
+  return { ran, answers: { 'resume-probe': rec('resume-probe'), scaffold: rec('scaffold'), spec: rec('spec'), 'toolcheck-preflight': rec('toolcheck-preflight') } }
+}
+
+test('AC5 stamped-current: a stamped run whose source equals the pack\'s logs the version line and proceeds', async () => {
+  const { result, logs, find } = await runHunt({ src: stampedSrc(), answers: {
+    'workflow-stamp': stampAnswer({ hunt: 'current', canonicalSource: SRC_STAMP.source, huntExtra: { stamp: SRC_STAMP } }) } })
+  assert.equal(result.status, 'awaiting_user_deploy', JSON.stringify(result))
+  assert.ok(logs.some(l => l === `Workflow version: hunt-pipeline.js v0.2.0-1-gbbbbbbb @ bbbbbbbbbbbb (source sha256:555555555555…) — current against the pack at /pack`), logs.join('\n'))
+  assert.equal(find('resume-probe:').length, 1)
+  const probe = find('workflow-stamp:')[0]
+  assert.equal(probe.opts.model, 'sonnet')
+  assert.equal(probe.opts.phase, 'Scaffold')
+  assert.deepEqual(probe.opts.schema.required, ['exitCode', 'output'])
+  assert.match(probe.prompt, /READ-ONLY workflow stamp probe — modify nothing/)
+  assert.ok(probe.prompt.includes(`node '/pack/scripts/wolfpack-workflows.mjs' check --pack '/pack' --consumer "$(pwd)" --json 2>&1; echo "STAMP_RC=$?"`))
+})
+
+test('AC5 canonical-self: the UNSTAMPED canonical with its entry canonical logs the canonical version line and proceeds', async () => {
+  const { result, logs } = await runHunt()
+  assert.equal(result.status, 'awaiting_user_deploy')
+  assert.ok(logs.some(l => l === 'Workflow version: hunt-pipeline.js canonical — pack v0.2.0-1-gaaaaaaa @ aaaaaaaaaaaa (/repo/.claude/workflows/hunt-pipeline.js)'), logs.join('\n'))
+})
+
+test('AC5 stale: a stamped run whose source differs and the copy is stale → rejects with the file + install.sh fix; NO resume-probe / scaffold', async () => {
+  const { ran, answers } = NO_STATE()
+  await assert.rejects(runHunt({ src: stampedSrc(), answers: { ...answers, 'workflow-stamp': stampAnswer({ hunt: 'stale' }) } }), (e) => {
+    assert.match(e.message, /^hunt-pipeline: h: STALE WORKFLOW — this run is hunt-pipeline\.js v0\.2\.0-1-gbbbbbbb @ bbbbbbbbbbbb, but the pack's canonical hunt-pipeline\.js has changed\./)
+    assert.ok(e.message.includes("/repo/.claude/workflows/hunt-pipeline.js is stale. Fix: bash '/pack/install.sh' --consumer '/repo', then restart Claude Code and relaunch."), e.message)
+    return true
+  })
+  assert.deepEqual(ran, [])
+})
+
+test('AC5 session cache: source differs but the copy on disk is already current → the message says restart Claude Code (cached copy)', async () => {
+  const { ran, answers } = NO_STATE()
+  await assert.rejects(runHunt({ src: stampedSrc(), answers: { ...answers, 'workflow-stamp': stampAnswer({ hunt: 'current' }) } }),
+    /STALE WORKFLOW .*\/repo\/\.claude\/workflows\/hunt-pipeline\.js is already regenerated: this session is running a CACHED older copy — restart Claude Code \(named workflows are cached per session\) and relaunch\./)
+  assert.deepEqual(ran, [])
+})
+
+test('AC5 stamp-intact but the copy is modified / unstamped / missing → rejects naming the state + the install fix + restart; nothing runs', async () => {
+  for (const state of ['modified', 'unstamped', 'missing', 'foreign-link']) {
+    const { ran, answers } = NO_STATE()
+    await assert.rejects(runHunt({ src: stampedSrc(), answers: { ...answers, 'workflow-stamp': stampAnswer({ hunt: state, canonicalSource: SRC_STAMP.source }) } }), (e) => {
+      assert.ok(e.message.startsWith(`hunt-pipeline: h: /repo/.claude/workflows/hunt-pipeline.js is ${state} — its stamp matches the pack but the copy on disk is not the generated bytes.`), `${state}: ${e.message}`)
+      assert.ok(e.message.includes("Fix: bash '/pack/install.sh' --consumer '/repo', then restart Claude Code (named workflows are cached per session) and relaunch."), e.message)
+      return true
+    })
+    assert.deepEqual(ran, [], state)
+  }
+})
+
+test('AC5 the unstamped canonical running where the consumer copy is NOT the canonical (missing / current / stale) → throws with the fix', async () => {
+  for (const state of ['missing', 'current', 'stale', 'unstamped']) {
+    const { ran, answers } = NO_STATE()
+    await assert.rejects(runHunt({ answers: { ...answers, 'workflow-stamp': stampAnswer({ hunt: state }) } }),
+      new RegExp(`hunt-pipeline: h: this run is the UNSTAMPED canonical hunt-pipeline\\.js but /repo/\\.claude/workflows/hunt-pipeline\\.js is ${state} — fix: .*restart Claude Code`))
+    assert.deepEqual(ran, [], state)
+  }
+})
+
+test('AC5 fail closed: a null / exit-2 / garbled / workflows-less / self-less probe answer THROWS with freshness UNKNOWN; nothing runs', async () => {
+  const self = stampResult()
+  self.workflows = self.workflows.filter(w => w.name !== 'hunt-pipeline.js')
+  const cases = [
+    [null, /the workflow stamp probe returned no result — workflow freshness UNKNOWN; relaunch/],
+    [{ exitCode: 2, output: '✗ wolfpack-workflows check: cannot read the pack version' }, /the workflow stamp check failed \(exit 2\) — workflow freshness UNKNOWN: ✗ wolfpack-workflows check: cannot read the pack version\. Fix: run node '\/pack\/scripts\/wolfpack-workflows\.mjs' check/],
+    [{ exitCode: '0', output: JSON.stringify(stampResult()) }, /the workflow stamp check failed \(exit 0\)/],
+    [{ exitCode: 0, output: 'garbled' }, /held no checker result \(no workflows\[\] array\) — workflow freshness UNKNOWN: garbled/],
+    [{ exitCode: 0, output: '{"ok":true' }, /held no checker result/],
+    [{ exitCode: 0, output: JSON.stringify({ ok: true, workflows: 'x' }) }, /held no checker result/],
+    [{ exitCode: 0, output: JSON.stringify(self) }, /the workflow stamp check did not report hunt-pipeline\.js — workflow freshness UNKNOWN/],
+    [{}, /the workflow stamp check failed \(exit undefined\)/],
+  ]
+  for (const [ans, re] of cases) {
+    const { ran, answers } = NO_STATE()
+    await assert.rejects(runHunt({ answers: { ...answers, 'workflow-stamp': () => ans } }), re, JSON.stringify(ans))
+    assert.deepEqual(ran, [], JSON.stringify(ans))
+  }
+  // a banner before the JSON and exit 1 (some OTHER workflow drifted) still parses and proceeds
+  const { result } = await runHunt({ answers: { 'workflow-stamp': { exitCode: 1, output: `relayed:\n${JSON.stringify(stampResult({ runner: 'stale' }))}\n` } } })
+  assert.equal(result.status, 'awaiting_user_deploy', 'only THIS script\'s own entry decides the hunt')
+})
+
+test('AC8: no Worktree root in the config → throws with the key fix BEFORE the stamp probe or any resume-probe', async () => {
+  for (const cfg of [{ ...FIXTURE_CONFIG, worktreeRoot: null }, (({ worktreeRoot, ...rest }) => rest)(FIXTURE_CONFIG), { ...FIXTURE_CONFIG, worktreeRoot: '' }]) {
+    const { ran, answers } = NO_STATE()
+    const stampRan = []
+    await assert.rejects(runHunt({ answers: { ...answers, 'project-config': configAnswer(cfg), 'workflow-stamp': () => { stampRan.push(1); return stampAnswer() } } }), (e) => {
+      assert.match(e.message, /^hunt-pipeline: h: wolfpack-config\.md has no Worktree root — the pipeline will not guess where hunt worktrees live\. Fix: add "- \*\*Worktree root:\*\* `<dir>`" under ## Project Identity/)
+      assert.match(e.message, /check: node scripts\/wolfpack-config\.mjs --json$/)
+      return true
+    })
+    assert.deepEqual([...ran, ...stampRan], [])
+  }
+})
+
+test('AC8: a malformed relayed Worktree root (`../x`, `/abs`, `a b`, `.git/x`) throws (fail closed on a garbled relay)', async () => {
+  for (const v of ['../x', '/abs', 'a b', '.git/x', './x', '~/w']) {
+    const { ran, answers } = NO_STATE()
+    await assert.rejects(runHunt({ answers: { ...answers, 'project-config': configAnswer({ ...FIXTURE_CONFIG, worktreeRoot: v }) } }),
+      new RegExp(`Worktree root '${v.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')}' is not a repo-relative path`))
+    assert.deepEqual(ran, [], v)
+  }
+})
+
+test('AC8: a non-default root `.wt/hunts` reaches the resume probe, the scaffold, the repo-root split and the Watchdog staging rules', async () => {
+  const wt = '/repo/.wt/hunts/h'
+  const { result, find, logs } = await runHunt({ answers: {
+    'project-config': configAnswer({ ...FIXTURE_CONFIG, worktreeRoot: '.wt/hunts' }),
+    scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
+  assert.equal(result.status, 'awaiting_user_deploy', JSON.stringify(result))
+  assert.ok(logs.includes('Worktree root: .wt/hunts (wolfpack-config.md → Project Identity)'), logs.join('\n'))
+  const resume = find('resume-probe:')[0].prompt
+  assert.ok(resume.includes('REPO/.wt/hunts/h; its plan dir is'), resume)
+  assert.ok(resume.includes('worktreePath: absolute REPO/.wt/hunts/h'))
+  const scaffold = find('scaffold:')[0].prompt
+  assert.ok(scaffold.includes('git worktree add .wt/hunts/h -b feat/h'))
+  assert.ok(scaffold.includes('git worktree add .wt/hunts/h feat/h'))
+  assert.ok(scaffold.includes('mkdir -p .wt/hunts/h/.wolfpack/plans/h/'))
+  assert.ok(scaffold.includes('git worktree remove --force .wt/hunts/h'))
+  assert.doesNotMatch(scaffold, /\.agents\/worktrees/)
+  assert.ok(logs.includes('Repo root: /repo'), logs.join('\n'))
+  const wd = find('watchdog:')[0].prompt
+  assert.ok(wd.includes('NEVER\n       stage a path that begins with `.wt/hunts/`'), 'Watchdog staging rule uses the configured root')
+  for (const c of [...find('resume-probe:'), ...find('scaffold:'), ...find('watchdog:')]) assert.doesNotMatch(c.prompt, /\.agents\/worktrees/, c.label)
+})
+
+test('AC8: `.claude/worktrees` (a dot-segment root, the consumer value) is accepted and splits the repo root', async () => {
+  const wt = '/repo/.claude/worktrees/h'
+  const { result, logs, find } = await runHunt({ answers: {
+    'project-config': configAnswer({ ...FIXTURE_CONFIG, worktreeRoot: '.claude/worktrees' }),
+    scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
+  assert.equal(result.status, 'awaiting_user_deploy')
+  assert.ok(logs.includes('Repo root: /repo'), logs.join('\n'))
+  assert.ok(find('scaffold:')[0].prompt.includes('git worktree add .claude/worktrees/h -b feat/h'))
+})
+
+test('D6: host-side seats read their role skill from the PACK (/pack/.agents/skills/<role>/SKILL.md); container seats keep the checkout path + the seat-profile note', async () => {
+  const { find } = await runHunt()
+  const expect = [['spec', 'spec'], ['alpha:', 'alpha'], ['shepherd:', 'shepherd'], ['tracker:', 'tracker']]
+  for (const [label, role] of expect) {
+    const c = find(label)[0]
+    assert.ok(c, label)
+    assert.ok(c.prompt.includes(`/pack/.agents/skills/${role}/SKILL.md`), `${label} reads the pack skill`)
+    assert.doesNotMatch(c.prompt, /read your full instructions at \.agents\/skills\//, label)
+  }
+  assert.ok(find('alpha:')[0].prompt.includes('Follow /pack/.agents/skills/alpha/SKILL.md § Model Pool Selection.'))
+  assert.ok(find('watchdog:')[0].prompt.includes('Read /pack/.agents/skills/watchdog/SKILL.md for the full Watchdog instructions.'))
+  for (const label of ['bloodhound:', 'pointer:']) {
+    assert.match(find(label)[0].prompt, /Read \.agents\/skills\/(bloodhound|pointer)\/SKILL\.md \(if present in this checkout; otherwise your seat profile carries the role\) and follow it\./, label)
+  }
+  // the GLM Shepherd seat reads the worktree's copy with the same note
+  const glm = await runHunt({ answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })
+  assert.ok(glm.find('shepherd-glm')[0].prompt.includes(`${WT}/.agents/skills/shepherd/SKILL.md (if present in this checkout; otherwise your seat profile carries the role)`))
+})
+
+test('AC7: no workflow names the retired sync-runtime script; both carry exactly one null stamp line and identical stamp/root helpers', () => {
+  const RUN = readFileSync(join(here, '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8')
+  for (const [n, s] of [['hunt-pipeline.js', CANON_HP], ['campaign-runner.js', RUN]]) {
+    assert.ok(!s.includes(RETIRED_SYNC), n)
+    assert.doesNotMatch(s, /\$\{repoRoot\}\/scripts\/podman-vibe/, n)
+    assert.equal(s.match(/^const WOLFPACK_STAMP = null \/\/ wolfpack-stamp\b.*$/gm).length, 1, n)
+  }
+  const body = (src, re) => { const m = re.exec(src); assert.ok(m, String(re)); return m[0] }
+  const stampRe = /const checkWorkflowStamp = async \(who, label, phaseName\) => \{\n[\s\S]*?\n\}\n/
+  const rootRe = /const requireWorktreeRoot = \(who, value\) => \{\n[\s\S]*?\n\}\n/
+  assert.equal(body(CANON_HP, stampRe), body(RUN, stampRe), 'checkWorkflowStamp identical')
+  assert.equal(body(CANON_HP, rootRe), body(RUN, rootRe), 'requireWorktreeRoot identical')
 })

@@ -19,6 +19,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const RUNNER = readFileSync(join(here, '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8')
   .replace(/^export const meta/m, 'const meta')
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+const RETIRED_SYNC = ['wolfpack', 'sync', 'runtime'].join('-')   // built, so AC7's literal git grep stays empty
 
 const PROCEED = { decision: 'proceed', exitCode: 0, source: 'live', degraded: false, offload: false,
   reason: '5h 20% < 80% start ceiling (Yellow); week 30% (pace +2)', reset_at: '2026-10-16T14:00:00.000Z',
@@ -36,15 +37,29 @@ const DEGRADED = { decision: 'proceed', exitCode: 0, source: 'transcript_estimat
 const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/test-all.sh', worktreeLinks: [],
   complianceAreas: null, compliancePaths: [], devDeployCommand: 'deploy-x', changelogFile: 'CHANGELOG.md',
   tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [],
-  wolfpackHome: '/pack' }   // exec-layer-into-pack: Project Identity → Wolfpack home
+  wolfpackHome: '/pack',   // exec-layer-into-pack: Project Identity → Wolfpack home
+  worktreeRoot: '.agents/worktrees' }   // pack-install-model: Project Identity → Worktree root (required)
 const configAnswer = (cfg = FIXTURE_CONFIG) => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2) })
+// pack-install-model (AC5): the runner's run-start stamp probe relays `wolfpack-workflows.mjs check --json`.
+// Default: both workflows are the pack's canonical files, as the UNSTAMPED canonical RUNNER expects.
+const PACK_COMMIT = 'a'.repeat(40)
+const stampResult = ({ hunt = 'canonical', runner = 'canonical', huntExtra = {}, runnerExtra = {}, canonicalSource = `sha256:${'c'.repeat(64)}` } = {}) => {
+  const w = (name, state, extra) => ({ name, file: `/repo/.claude/workflows/${name}`, state, stamp: null, canonicalSource,
+    fix: ['current', 'canonical'].includes(state) ? null : "bash '/pack/install.sh' --consumer '/repo'", ...extra })
+  const workflows = [w('campaign-runner.js', runner, runnerExtra), w('hunt-pipeline.js', hunt, huntExtra)]
+  return { ok: workflows.every(x => ['current', 'canonical'].includes(x.state)), pack: '/pack', packVersion: 'v0.2.0-1-gaaaaaaa', packCommit: PACK_COMMIT, consumer: '/repo', workflows }
+}
+const stampAnswer = (opts = {}, exitCode) => {
+  const r = stampResult(opts)
+  return { exitCode: exitCode ?? (r.ok ? 0 : 1), output: JSON.stringify(r) }
+}
 
 const hunt = (slug, extra = {}) => ({ slug, description: `do ${slug}`, tier: 'Yellow', mode: 'feature', dependsOn: [], status: 'ready_for_alpha', ...extra })
 const tick = () => new Promise(r => setImmediate(r))
 
 async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usageProtocol = 1, workflowDelayTicks = 3,
   capability, gatePresent = true, gateProtocol = 1, depCheck = { allMerged: true }, workflowResult = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY' }),
-  projectConfig = () => configAnswer(), env = {} } = {}) {
+  projectConfig = () => configAnswer(), stamp = () => stampAnswer(), env = {} } = {}) {
   const events = []
   const logs = []
   const gateCalls = []
@@ -54,6 +69,7 @@ async function runRunner({ hunts, gate = () => PROCEED, maxParallel = 2, usagePr
     const label = opts.label || ''
     events.push({ type: 'agent', label })
     if (label === 'project-config') { events[events.length - 1].prompt = prompt; events[events.length - 1].opts = opts; return projectConfig() }
+    if (label === 'workflow-stamp') { events[events.length - 1].prompt = prompt; events[events.length - 1].opts = opts; return stamp() }
     if (label === 'parse-campaign') return { waves: [{ number: 1, hunts }] }
     if (label === 'pipeline-capability') {
       events[events.length - 1].prompt = prompt
@@ -282,7 +298,8 @@ test('preflight: a MISSING gate script throws ONCE, naming the fix — nothing g
   const { error, gateCalls, workflowCalls, events } = await runRunner({ hunts: [hunt('a'), hunt('b')], gatePresent: false })
   assert.ok(error, 'must throw')
   assert.match(error.message, /scripts\/wolfpack-window-gate\.mjs is MISSING/)
-  assert.match(error.message, /wolfpack-sync-runtime\.sh/)
+  assert.match(error.message, /Fix: update the project's scripts\/wolfpack-window-gate\.mjs from the pack \(\/pack\/scripts\/\), then relaunch\./)
+  assert.ok(!error.message.includes(RETIRED_SYNC))
   assert.equal(gateCalls.length, 0)
   assert.equal(workflowCalls.length, 0)
   assert.equal(events.filter(e => e.label === 'pipeline-capability').length, 1, 'probe runs once')
@@ -316,7 +333,8 @@ test('legacy gate (no WOLFPACK_GATE_PROTOCOL): loud STALE USAGE GATE warning; le
   assert.equal(error, undefined, error && error.stack)
   assert.equal(result.verdict, 'WAVE_COMPLETE_AWAITING_RELEASE')
   assert.ok(logs.some(l => /⚠ STALE USAGE GATE: scripts\/wolfpack-window-gate\.mjs predates usage-limit-gate/.test(l)), logs.join('\n'))
-  assert.ok(logs.some(l => /STALE USAGE GATE.*wolfpack-sync-runtime\.sh/.test(l)))
+  assert.ok(logs.some(l => /STALE USAGE GATE.*update the project's scripts\/wolfpack-window-gate\.mjs from the pack \(\/pack\/scripts\/\)/.test(l)))
+  assert.equal(logs.some(l => l.includes(RETIRED_SYNC)), false)
   assert.equal(logs.some(l => /Usage gate capability OK/.test(l)), false)
   assert.equal(gateCalls.length, 1)
   const g = gateCalls[0]
@@ -375,7 +393,7 @@ const CERT = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', statu
 
 // Generic runner: any runner source, a parse result, and per-label stubs.
 async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => PROCEED, workflowResult = CERT,
-  init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] }, projectConfig = () => configAnswer() } = {}) {
+  init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] }, projectConfig = () => configAnswer(), stamp = () => stampAnswer() } = {}) {
   const events = []
   const logs = []
   const workflowCalls = []
@@ -386,6 +404,7 @@ async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => P
     agentCalls.push({ label, prompt, opts })
     events.push({ type: 'agent', label })
     if (label === 'project-config') return projectConfig()
+    if (label === 'workflow-stamp') return stamp()
     if (label === 'parse-campaign') return JSON.parse(JSON.stringify(parse))
     if (label === 'pipeline-capability') return capability == null ? null : { ...capability }
     if (label.startsWith('usage-gate:') || label.startsWith('usage-gate-legacy:')) {
@@ -457,10 +476,11 @@ test('AC1: barrier mode (no chain) is identical to the pre-hunt runner — label
   const old = await runAny(base, opts)
   const now = await runAny(RUNNER, opts)
   noErr(old); noErr(now)
-  // wolfpack-self-hosting adds exactly ONE label (the project-config probe) the baseline predates;
-  // everything else must stay identical.
+  // wolfpack-self-hosting adds ONE label (the project-config probe) and pack-install-model ONE more
+  // (the workflow-stamp probe) the baseline predates; everything else must stay identical.
   assert.equal(now.labels.filter(l => l === 'project-config').length, 1)
-  const sansProbe = (ls) => ls.filter(l => l !== 'project-config')
+  assert.equal(now.labels.filter(l => l === 'workflow-stamp').length, 1)
+  const sansProbe = (ls) => ls.filter(l => l !== 'project-config' && l !== 'workflow-stamp')
   assert.deepEqual(sansProbe(now.labels), old.labels)
   assert.deepEqual(now.workflowCalls, old.workflowCalls)
   for (const w of now.workflowCalls) assert.equal('baseBranch' in w.args, false)
@@ -971,7 +991,10 @@ test('AC10: the runner probe is a read-only sonnet step in phase Parse running t
   assert.equal(error, undefined, error && error.stack)
   const agents = events.filter(e => e.type === 'agent')
   const i = agents.findIndex(e => e.label === 'project-config')
-  assert.ok(i > agents.findIndex(e => e.label === 'pipeline-capability'), 'after the capability preflight')
+  // pack-install-model (D9): the config probe moved to the very start of Parse — the event order is
+  // now project-config, workflow-stamp, parse-campaign, pipeline-capability.
+  assert.equal(i, 0, 'the config probe is the FIRST agent call')
+  assert.deepEqual(agents.slice(0, 4).map(e => e.label), ['project-config', 'workflow-stamp', 'parse-campaign', 'pipeline-capability'])
   const pc = agents[i]
   assert.ok(pc)
   const firstGate = agents.findIndex(e => e.label.startsWith('usage-gate:'))
@@ -1061,4 +1084,115 @@ test('AC3 parity: resolveWolfpackHome is identical in both workflows apart from 
   assert.equal(a, b)
   assert.match(a, /ENV\('WOLFPACK_HOME'\)/)
   assert.doesNotMatch(RUNNER, /repoRoot\}?\/scripts\/(podman-vibe|run-pipeline-sandbox)\.sh/, 'AC4 grep (runner)')
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// pack-install-model (AC5, D9): the runner's run-start stamp check, the Worktree root key and
+// the hunt-pipeline gate — all before parse-campaign. STAMPED sources come from the REAL generator.
+// ════════════════════════════════════════════════════════════════════════════
+import { render as renderWorkflow } from './wolfpack-workflows.mjs'
+const CANON_RUNNER = readFileSync(join(here, '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8')
+const RUNNER_STAMP = { workflow: 'campaign-runner.js', commit: 'b'.repeat(40), version: 'v0.2.0-1-gbbbbbbb', source: `sha256:${'5'.repeat(64)}` }
+const stampedRunner = (stamp = RUNNER_STAMP) => renderWorkflow(CANON_RUNNER, stamp).replace(/^export const meta/m, 'const meta')
+const agentLabels = (events) => events.filter(e => e.type === 'agent').map(e => e.label)
+const assertStoppedAtStamp = (r, why) => {
+  assert.ok(r.error, `${why}: must throw`)
+  assert.deepEqual(agentLabels(r.events), ['project-config', 'workflow-stamp'], `${why}: nothing after the stamp probe`)
+  assert.equal(r.workflowCalls.length, 0, why)
+}
+
+test('AC5 runner: the stamp probe is a read-only sonnet Parse step running the pack checker, right after the config probe', async () => {
+  const { error, events, logs } = await runRunner({ hunts: [hunt('a')] })
+  assert.equal(error, undefined, error && error.stack)
+  const p = events.find(e => e.label === 'workflow-stamp')
+  assert.equal(p.opts.model, 'sonnet')
+  assert.equal(p.opts.phase, 'Parse')
+  assert.deepEqual(p.opts.schema.required, ['exitCode', 'output'])
+  assert.ok(p.prompt.includes(`node '/pack/scripts/wolfpack-workflows.mjs' check --pack '/pack' --consumer "$(pwd)" --json 2>&1; echo "STAMP_RC=$?"`))
+  assert.ok(logs.includes('Workflow version: campaign-runner.js canonical — pack v0.2.0-1-gaaaaaaa @ aaaaaaaaaaaa (/repo/.claude/workflows/campaign-runner.js)'), logs.join('\n'))
+})
+
+test('AC5 runner: a STAMPED runner whose stamp is current logs its version line and runs the campaign', async () => {
+  const r = await runAny(stampedRunner(), { parse: { waves: [{ number: 1, hunts: [hunt('a')] }] }, args: { campaignSlug: 'c1' },
+    stamp: () => stampAnswer({ runner: 'current', hunt: 'current', canonicalSource: RUNNER_STAMP.source, runnerExtra: { stamp: RUNNER_STAMP } }) })
+  noErr(r)
+  assert.ok(r.logs.includes(`Workflow version: campaign-runner.js v0.2.0-1-gbbbbbbb @ bbbbbbbbbbbb (source sha256:555555555555…) — current against the pack at /pack`), r.logs.join('\n'))
+  assert.deepEqual(r.wf, ['a'])
+})
+
+test('AC5 runner: a STAMPED runner that is stale throws before parse-campaign and before any workflow()', async () => {
+  for (const [state, re] of [['stale', /campaign-runner\.js is stale\. Fix: bash '\/pack\/install\.sh' --consumer '\/repo', then restart Claude Code and relaunch\./],
+    ['current', /is already regenerated: this session is running a CACHED older copy — restart Claude Code/]]) {
+    const r = await runAny(stampedRunner(), { parse: { waves: [{ number: 1, hunts: [hunt('a')] }] }, args: { campaignSlug: 'c1' }, stamp: () => stampAnswer({ runner: state }) })
+    assertStoppedAtStamp(r, state)
+    assert.match(r.error.message, /^campaign-runner: STALE WORKFLOW — this run is campaign-runner\.js v0\.2\.0-1-gbbbbbbb @ bbbbbbbbbbbb/)
+    assert.match(r.error.message, re)
+  }
+})
+
+test('AC5 runner: a STAMPED runner with a matching source but its own entry modified / unstamped throws before parse-campaign', async () => {
+  for (const state of ['modified', 'unstamped', 'missing']) {
+    const r = await runAny(stampedRunner(), { parse: { waves: [{ number: 1, hunts: [hunt('a')] }] }, args: { campaignSlug: 'c1' },
+      stamp: () => stampAnswer({ runner: state, canonicalSource: RUNNER_STAMP.source }) })
+    assertStoppedAtStamp(r, state)
+    assert.ok(r.error.message.startsWith(`campaign-runner: /repo/.claude/workflows/campaign-runner.js is ${state} — its stamp matches the pack but the copy on disk is not the generated bytes.`), r.error.message)
+    assert.match(r.error.message, /restart Claude Code/)
+  }
+})
+
+test('AC5 runner: the runtime hunt-pipeline.js entry not current/canonical → throws naming it, before parse-campaign', async () => {
+  for (const state of ['stale', 'missing', 'modified', 'unstamped', 'foreign-link']) {
+    const r = await runRunner({ hunts: [hunt('a')], stamp: () => stampAnswer({ hunt: state }) })
+    assertStoppedAtStamp(r, state)
+    assert.equal(r.error.message, `campaign-runner: the runtime hunt-pipeline.js is ${state} — no hunt may start. Fix: bash '/pack/install.sh' --consumer '/repo', then restart Claude Code and relaunch.`)
+  }
+  // not reported at all → throws too (fail closed)
+  const res = stampResult(); res.workflows = res.workflows.filter(w => w.name !== 'hunt-pipeline.js')
+  const r = await runRunner({ hunts: [hunt('a')], stamp: () => ({ exitCode: 0, output: JSON.stringify(res) }) })
+  assertStoppedAtStamp(r, 'not reported')
+  assert.match(r.error.message, /the runtime hunt-pipeline\.js is not reported — no hunt may start/)
+  // a current hunt-pipeline next to the canonical runner proceeds
+  const ok = await runRunner({ hunts: [hunt('a')], stamp: () => stampAnswer({ hunt: 'current' }) })
+  assert.equal(ok.error, undefined, ok.error && ok.error.stack)
+  assert.equal(ok.workflowCalls.length, 1)
+})
+
+test('AC5 runner: a null / exit-2 / garbled stamp probe throws (fail closed) before parse-campaign', async () => {
+  for (const [ans, re] of [[null, /workflow stamp probe returned no result/], [{ exitCode: 2, output: 'boom' }, /stamp check failed \(exit 2\)/],
+    [{ exitCode: 0, output: 'nope' }, /held no checker result/]]) {
+    const r = await runRunner({ hunts: [hunt('a')], stamp: () => ans })
+    assertStoppedAtStamp(r, JSON.stringify(ans))
+    assert.match(r.error.message, /^campaign-runner: /)
+    assert.match(r.error.message, re)
+  }
+})
+
+test('D9 runner: a config without Worktree root throws the key fix (not a ReferenceError) before the stamp probe and parse-campaign', async () => {
+  for (const cfg of [(({ worktreeRoot, ...rest }) => rest)(FIXTURE_CONFIG), { ...FIXTURE_CONFIG, worktreeRoot: null }, { ...FIXTURE_CONFIG, worktreeRoot: '../x' }]) {
+    const r = await runRunner({ hunts: [hunt('a')], projectConfig: () => configAnswer(cfg) })
+    assert.ok(r.error, JSON.stringify(cfg))
+    assert.equal(r.error instanceof ReferenceError, false, r.error.stack)
+    assert.match(r.error.message, /^campaign-runner: wolfpack-config\.md (has no Worktree root|→ Worktree root '\.\.\/x' is not a repo-relative path)/)
+    assert.match(r.error.message, /Fix: add "- \*\*Worktree root:\*\* `<dir>`" under ## Project Identity/)
+    assert.deepEqual(agentLabels(r.events), ['project-config'])
+    assert.equal(r.workflowCalls.length, 0)
+  }
+})
+
+test('D9 runner: the parse prompt reads hunt status from the configured Worktree root', async () => {
+  const r = await runAny(RUNNER, { parse: { waves: [{ number: 1, hunts: [hunt('a')] }] }, args: { campaignSlug: 'c1' },
+    projectConfig: () => configAnswer({ ...FIXTURE_CONFIG, worktreeRoot: '.wt/hunts' }) })
+  noErr(r)
+  const p = r.agentCalls.find(c => c.label === 'parse-campaign').prompt
+  assert.ok(p.includes('.wt/hunts/<slug>/.wolfpack/plans/<slug>/metadata.json FIRST if it exists'), p)
+  assert.doesNotMatch(p, /\.agents\/worktrees/)
+  assert.ok(r.logs.includes('Worktree root: .wt/hunts (wolfpack-config.md → Project Identity)'))
+})
+
+test('AC7 runner: no fix text names the retired sync-runtime script; stale-pipeline fixes name install.sh --consumer', async () => {
+  assert.ok(!CANON_RUNNER.includes(RETIRED_SYNC))
+  const { error } = await runRunner({ hunts: [hunt('a')], capability: { path: '.claude/workflows/hunt-pipeline.js', protocol: 0, gatePresent: true, gateProtocol: 1 } })
+  assert.match(String(error && error.message), /Regenerate it: bash '\/pack\/install\.sh' --consumer <this repo> \(then restart Claude Code\), then relaunch\./)
+  const legacy = await runRunner({ hunts: [hunt('a')], usageProtocol: 0 })
+  assert.ok(legacy.logs.some(l => /predates the usage gate .* regenerate it: bash '\/pack\/install\.sh' --consumer <this repo>/.test(l)), legacy.logs.join('\n'))
 })
