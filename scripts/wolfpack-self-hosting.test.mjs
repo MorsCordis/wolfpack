@@ -175,3 +175,22 @@ test('wolfpack-config.md + the example declare Worktree root; the Module Map no 
   }
   assert.doesNotMatch(readFileSync(join(ROOT, 'wolfpack-config.md'), 'utf8'), /sync-runtime/)
 })
+
+test('CHANGELOG: every release section lists each ### category at most once (merged hunts share headings, no duplicates)', () => {
+  const cl = readFileSync(join(ROOT, 'CHANGELOG.md'), 'utf8')
+  const sections = cl.split(/^## /m).filter(s => /^\[(Unreleased|v[0-9][^\]]*)\]/.test(s))
+  assert.ok(sections.length >= 1)
+  for (const s of sections) {
+    const name = s.slice(0, s.indexOf('\n'))
+    const cats = [...s.matchAll(/^### (.+)$/gm)].map(m => m[1].trim())
+    assert.deepEqual(cats, [...new Set(cats)], `${name}: duplicate category heading`)
+  }
+  assert.ok(sections.some(s => s.includes('<!-- hunt:pack-install-model -->')), 'pack-install-model entries present')
+})
+
+test('CHANGELOG / TODO carry no merge-conflict markers; TODO drops the item pack-install-model fixed', () => {
+  for (const f of ['CHANGELOG.md', 'TODO.md']) {
+    assert.doesNotMatch(readFileSync(join(ROOT, f), 'utf8'), /^(<{7}|={7}|>{7})( |$)/m, f)
+  }
+  assert.ok(!readFileSync(join(ROOT, 'TODO.md'), 'utf8').includes("Role prompts name a skill path consumers don't have"))
+})

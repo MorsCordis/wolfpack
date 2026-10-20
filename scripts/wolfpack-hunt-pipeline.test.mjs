@@ -2435,3 +2435,77 @@ test('AC7: no workflow names the retired sync-runtime script; both carry exactly
   assert.equal(body(CANON_HP, stampRe), body(RUN, stampRe), 'checkWorkflowStamp identical')
   assert.equal(body(CANON_HP, rootRe), body(RUN, rootRe), 'requireWorktreeRoot identical')
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// pack-install-model × seat-handoff-writes — the rebase conflict resolutions (human-notes
+// 2026-10-20). Each hunk kept BOTH hunts' text; these pin that the merged prompts carry both
+// halves together, so a later conflict resolution cannot silently drop either side.
+// ════════════════════════════════════════════════════════════════════════════
+
+const SEAT_NOTE = '(if present in this checkout; otherwise your seat profile carries the role)'
+
+test('rebase hunk 3: one Bloodhound prompt carries the skill-read note AND the handoff write instruction', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE } })
+  const bh = find('bloodhound:')[0].prompt
+  assert.ok(bh.includes(`Read .agents/skills/bloodhound/SKILL.md ${SEAT_NOTE} and follow it.`), 'pack-install-model half')
+  assert.match(bh, /SANDBOXED SEAT HANDOFF \(mandatory for the Vibe seat\)/, 'seat-handoff-writes half (HANDOFF_NOTE)')
+  assert.ok(bh.includes('Write .wolfpack/plans/h/.seat-out/bloodhound-r1/review-1.md with the write_file tool'))
+  // the old unannotated read must not survive next to the annotated one
+  assert.doesNotMatch(bh, /Read \.agents\/skills\/bloodhound\/SKILL\.md and follow it/)
+})
+
+test('rebase hunk 3: every Pointer round prompt carries the skill-read note AND its own handoff out dir', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE, pointer: issuesThenApprove,
+    'shepherd-rewrite': { findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true } } })
+  const ptrs = find('pointer:')
+  assert.equal(ptrs.length, 2)
+  for (const [i, c] of ptrs.entries()) {
+    const n = i + 1
+    assert.ok(c.prompt.includes(`Read .agents/skills/pointer/SKILL.md ${SEAT_NOTE} and follow it.`), `round ${n}: skill-read note`)
+    assert.match(c.prompt, /SANDBOXED SEAT HANDOFF \(mandatory for the Vibe seat\)/, `round ${n}: HANDOFF_NOTE`)
+    assert.ok(c.prompt.includes(`Write .wolfpack/plans/h/.seat-out/pointer-r${n}/pointer-review-${n}.md with the write_file tool`), `round ${n}`)
+    assert.doesNotMatch(c.prompt, /Read \.agents\/skills\/pointer\/SKILL\.md and follow it/)
+  }
+})
+
+test('rebase hunk 3: the GLM Shepherd rework prompt carries the skill-read note AND the Pointer sidecar path', async () => {
+  const { find } = await runHunt({ answers: { 'shepherd-seat': GLM_SEAT, pointer: issuesThenApprove,
+    'shepherd-glm': (p) => (/addressing Pointer code-review round/.test(p)
+      ? { outcome: 'done', exitCode: 0, changedFiles: ['app/x.py'], committed: true, findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true }
+      : { outcome: 'done', exitCode: 0, changedFiles: ['app/x.py'], committed: true }) } })
+  const rw = find('shepherd-glm').map(c => c.prompt).find(p => /addressing Pointer code-review round 1/.test(p))
+  assert.ok(rw, 'the GLM rework ran')
+  assert.ok(rw.includes(`Read ${WT}/.agents/skills/shepherd/SKILL.md ${SEAT_NOTE} (skip shell steps) and the full review at\n${PD}/pointer-review-1.md (pipeline notes, if any: ${PD}/seat-notes/pointer-review-1.md).`), rw)
+})
+
+test('rebase hunk 3: the step-4.6 PASS-only staging rules use the configured worktree root, and live inside the seat-handoff-writes 4.6 block', async () => {
+  const wt = '/repo/.wt/hunts/h'
+  const { find } = await runHunt({ answers: {
+    'project-config': configAnswer({ ...FIXTURE_CONFIG, worktreeRoot: '.wt/hunts' }),
+    scaffold: { worktreePath: wt, planDir: `${wt}/.wolfpack/plans/h` } } })
+  const wd = find('watchdog:')[0].prompt
+  const at = wd.indexOf('4.6 PASS-ONLY ACTIONS (YOU, the shim agent — never the certifier seat).')
+  assert.ok(at >= 0, 'the seat-handoff-writes 4.6 block is present')
+  const block = wd.slice(at, wd.indexOf('\n\n', at))
+  assert.ok(block.includes('worktree plan files into main at .wt/hunts/<slug>/… paths'), block)
+  assert.ok(block.includes('stage a path that begins with `.wt/hunts/`'), block)
+  assert.doesNotMatch(block, /\.agents\/worktrees/)
+  // exactly one staging-rules block (the merge did not leave the pre-handoff copy behind)
+  assert.equal(wd.split('STRICT staging rules').length - 1, 1, 'one staging-rules block')
+})
+
+test('rebase hunk 4: CLAUDE_SELF_CERTIFY_STEP resolves PACK_SKILLS from Wolfpack home at run time (no literal, no undefined)', async () => {
+  const { find } = await runHunt({ answers: {
+    alpha: ORANGE, 'shepherd-seat': OFFLOAD_SEAT,
+    tracker: { verdict: 'TESTS_PASS', provider: 'mistral' },
+    pointer: { ...BASE.pointer, provider: 'mistral' },
+    watchdog: { verdict: 'PASS', provider: 'claude', deniedTools: [], toolAccess: SHELL_OK },
+  } })
+  const wd = find('watchdog:')[0].prompt
+  // FIXTURE_CONFIG's Wolfpack home is /pack — the real interpolation, independent of claudeConst's binding
+  assert.ok(wd.includes('following the watchdog role skill it names (/pack/.agents/skills/watchdog/SKILL.md)'), 'pack watchdog skill named')
+  assert.ok(!wd.includes('${PACK_SKILLS}'), 'no unexpanded placeholder')
+  assert.doesNotMatch(wd, /undefined\/\.agents\/skills/)
+  // and the source declares PACK_SKILLS before the top-level constant that reads it (no TDZ at load)
+  assert.ok(SRC.indexOf('const PACK_SKILLS = ') > 0 && SRC.indexOf('const PACK_SKILLS = ') < SRC.indexOf('const CLAUDE_SELF_CERTIFY_STEP = '))
+})
