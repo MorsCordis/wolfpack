@@ -5,9 +5,36 @@
 # 2-tool cage; `task` omitted so the reviewer can't self-orchestrate. The ro
 # worktree + sandbox are the guardrail; reviewer-writes-to-source are caught by
 # diff-catch, not a tool fence. See VIBE_TOOLS_DEFAULT below + wolfpack-toolcheck.mjs.
+# Handoff mode adds ONE read-write bind (the per-seat out dir) and fails the round on any
+# write outside it — see "Seat handoff mode" below.
 #
 # Usage: $WOLFPACK_HOME/scripts/podman-vibe.sh <agent-name> <worktree-path> <prompt-file> [max-turns]
 #        $WOLFPACK_HOME/scripts/podman-vibe.sh --implement <agent-name> <worktree-path> <prompt-file> [max-turns]
+#        $WOLFPACK_HOME/scripts/podman-vibe.sh --deliver-to <plan-dir> --out-dir <plan-dir>/.seat-out/<name> \
+#            --expect <artifact> [--expect <artifact>…] <agent-name> <worktree-path> <prompt-file> [max-turns]
+#
+# Seat handoff mode (review/certify seats; seat-handoff-writes): the seat writes its own handoff
+# file(s) with `write_file` instead of returning them inline. The three options are
+# all-or-nothing, any order before <agent-name>, never with --implement (exit 2). Rules:
+#   - the out dir is pinned to <deliver-to>/.seat-out/<name> (name ^[A-Za-z0-9][A-Za-z0-9._-]*$),
+#     the deliver-to dir lies inside the worktree, and the worktree is a git checkout (exit 2);
+#   - --expect is one of review-N[-lens].md, pointer-review-N[-lens].md, certification.md,
+#     pedigree.json — never metadata.json or a path (exit 2);
+#   - a non-empty out dir at start is refused (exit 2: "seat out dir is not empty");
+#   - podman path: that out dir is the ONLY read-write bind, mounted at
+#     <container worktree>/<its worktree-relative path> (inside --workdir for both families);
+#     the worktree stays :ro,z;
+#   - write_file only CREATES: the seat makes ONE call per file with the complete content; each
+#     retry attempt starts with an emptied out dir;
+#   - after the seat exits 0 the shim compares a host-side source snapshot (HEAD + git status
+#     entries + sha256, plus a sha-pinned listing of the deliver-to dir; see "Seat handoff:
+#     source snapshot" below for the exclusions and the known WOLFPACK_SANDBOX=1 gap), lists the
+#     out dir, and only if everything is clean renames each expected file into the deliver-to
+#     dir byte for byte, printing `WOLFPACK_ARTIFACT_DELIVERED: <name> sha256=<hex> bytes=<n>`;
+#   - otherwise exit 78 with `WOLFPACK_ARTIFACT_ERROR: missing <name>` / `unexpected <path>` /
+#     `source-touched <path>` / `not-a-regular-file <name>` / `move-failed <name>`; nothing is
+#     delivered and the out dir is quarantined as <out dir>.rejected-<epoch>-<pid>. A seat that
+#     exits non-zero keeps its own exit code and its out dir is quarantined the same way.
 #
 # Output goes to stdout (capture in calling script).
 #
@@ -26,6 +53,8 @@
 #   76  GLM wall-clock timeout      — WOLFPACK_TIMEOUT:glm (not a quota signal)
 #   77  INFRA fault in this shim's sandbox (disk full / ENOSPC …) — WOLFPACK_INFRA_ERROR:<family>.
 #       NOT a rate limit and NOT the model's fault: no breaker trip, never model_quota.
+#   78  seat handoff/artifact failure (handoff mode only) — WOLFPACK_ARTIFACT_ERROR: <kind> …
+#       (missing / unexpected / source-touched / not-a-regular-file / move-failed)
 #   2   usage / configuration error
 #
 # Env (usage-limit-gate):
@@ -80,14 +109,26 @@
 set -euo pipefail
 
 VIBE_MODE="review"
-if [ "${1:-}" = "--implement" ]; then
-    VIBE_MODE="implement"
-    shift
-fi
+HANDOFF_OUT=""; HANDOFF_DELIVER=""; HANDOFF_EXPECT=(); HANDOFF_GIVEN=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --implement)  VIBE_MODE="implement"; shift ;;
+        --out-dir)    [ $# -ge 2 ] || { echo "ERROR: --out-dir needs a value" >&2; exit 2; }
+                      HANDOFF_OUT="$2"; HANDOFF_GIVEN=1; shift 2 ;;
+        --deliver-to) [ $# -ge 2 ] || { echo "ERROR: --deliver-to needs a value" >&2; exit 2; }
+                      HANDOFF_DELIVER="$2"; HANDOFF_GIVEN=1; shift 2 ;;
+        --expect)     [ $# -ge 2 ] || { echo "ERROR: --expect needs a value" >&2; exit 2; }
+                      HANDOFF_EXPECT+=("$2"); HANDOFF_GIVEN=1; shift 2 ;;
+        --) shift; break ;;
+        -*) echo "ERROR: unknown option '$1'" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
 
-AGENT="${1:?Usage: podman-vibe.sh <agent-name> <worktree-path> <prompt-file> [max-turns]}"
-WORKTREE="${2:?Usage: podman-vibe.sh <agent-name> <worktree-path> <prompt-file> [max-turns]}"
-PROMPT_FILE="${3:?Usage: podman-vibe.sh <agent-name> <worktree-path> <prompt-file> [max-turns]}"
+_USAGE="Usage: podman-vibe.sh [--implement | --deliver-to <plan-dir> --out-dir <plan-dir>/.seat-out/<name> --expect <artifact>...] <agent-name> <worktree-path> <prompt-file> [max-turns]"
+AGENT="${1:?$_USAGE}"
+WORKTREE="${2:?$_USAGE}"
+PROMPT_FILE="${3:?$_USAGE}"
 # Turn cap — a U-shaped curve, tune for the middle (validated 2026-06-02):
 #   * TOO FEW turns -> starvation. Vibe spends ONE turn per tool call; --output text emits
 #     ONLY the final response, so hitting the cap mid-review returns EMPTY output and the
@@ -160,6 +201,99 @@ if [ "$VIBE_MODE" = "implement" ] && [ "$VIBE_FAMILY" != "glm" ]; then
 fi
 
 WORKTREE_ABS=$(realpath "$WORKTREE")
+
+# ─── Seat handoff mode (seat-handoff-writes) ───────────────────
+# --deliver-to/--out-dir/--expect: the seat writes its handoff file(s) with write_file into ONE
+# read-write out dir pinned at <deliver-to>/.seat-out/<name>; after it exits, this shim checks
+# the out dir + the source snapshot and moves exactly the expected artifact(s) into the plan dir
+# byte for byte (exit 78 on any breach). Validated HERE — before the config read, image build or
+# any podman/vibe call — so a bad call (exit 2) runs nothing.
+HANDOFF=0
+HANDOFF_EXIT_ARTIFACT=78
+# The only artifact names a seat may hand off. metadata.json, any path ('/' or '..') and any
+# other name are refused: metadata.json stays orchestrator-written.
+HANDOFF_EXPECT_RE='^(review-[0-9]+(-[a-z0-9][a-z0-9_-]*)?\.md|pointer-review-[0-9]+(-[a-z0-9][a-z0-9_-]*)?\.md|certification\.md|pedigree\.json)$'
+HANDOFF_OUT_NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+if [ "$HANDOFF_GIVEN" = 1 ]; then
+    HANDOFF=1
+    if [ -z "$HANDOFF_DELIVER" ] || [ -z "$HANDOFF_OUT" ] || [ "${#HANDOFF_EXPECT[@]}" -eq 0 ]; then
+        echo "ERROR: handoff mode needs --deliver-to, --out-dir and at least one --expect" >&2
+        exit 2
+    fi
+    if [ "$VIBE_MODE" = "implement" ]; then
+        echo "ERROR: --implement cannot be combined with the handoff options (--deliver-to/--out-dir/--expect)" >&2
+        exit 2
+    fi
+    _seen_expect=" "
+    for _e in "${HANDOFF_EXPECT[@]}"; do
+        if ! [[ "$_e" =~ $HANDOFF_EXPECT_RE ]]; then
+            echo "ERROR: --expect '${_e}' is not a handoff artifact name (review-N[-lens].md, pointer-review-N[-lens].md, certification.md, pedigree.json — never metadata.json or a path)" >&2
+            exit 2
+        fi
+        case "$_seen_expect" in
+            *" $_e "*) echo "ERROR: --expect '${_e}' given twice" >&2; exit 2 ;;
+        esac
+        _seen_expect="${_seen_expect}${_e} "
+    done
+    for _p in "$HANDOFF_DELIVER" "$HANDOFF_OUT"; do
+        case "$_p" in
+            *:*|*$'\n'*) echo "ERROR: handoff path contains ':' or a newline — cannot be bind-mounted safely: $_p" >&2; exit 2 ;;
+        esac
+    done
+    if ! HANDOFF_DELIVER_ABS=$(realpath -e "$HANDOFF_DELIVER" 2>/dev/null) || [ ! -d "$HANDOFF_DELIVER_ABS" ]; then
+        echo "ERROR: --deliver-to is not an existing directory: $HANDOFF_DELIVER" >&2
+        exit 2
+    fi
+    case "$HANDOFF_DELIVER_ABS" in
+        "$WORKTREE_ABS"/*) : ;;
+        *) echo "ERROR: --deliver-to must lie inside the worktree (${WORKTREE_ABS}): ${HANDOFF_DELIVER_ABS}" >&2; exit 2 ;;
+    esac
+    # Resolve the PARENT only and keep the leaf name as given, so a symlinked leaf can never
+    # redirect the rw bind (it is refused below); a symlinked .seat-out resolves elsewhere and
+    # fails the parent check.
+    _ho_parent=$(realpath -m "$(dirname "$HANDOFF_OUT")")
+    _ho_name=$(basename "$HANDOFF_OUT")
+    if [ "$_ho_parent" != "$HANDOFF_DELIVER_ABS/.seat-out" ] || ! [[ "$_ho_name" =~ $HANDOFF_OUT_NAME_RE ]]; then
+        echo "ERROR: --out-dir must be <deliver-to>/.seat-out/<name> (name ${HANDOFF_OUT_NAME_RE}); got: $HANDOFF_OUT" >&2
+        exit 2
+    fi
+    HANDOFF_OUT_ABS="${_ho_parent}/${_ho_name}"
+    if ! git -C "$WORKTREE_ABS" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "ERROR: handoff mode needs a git checkout (no source snapshot is possible without git): $WORKTREE_ABS" >&2
+        exit 2
+    fi
+    # AC9: a leftover out dir is refused, never reused — every seat starts with an empty one.
+    if [ -L "$HANDOFF_OUT_ABS" ] || { [ -e "$HANDOFF_OUT_ABS" ] && [ ! -d "$HANDOFF_OUT_ABS" ]; }; then
+        echo "✗ podman-vibe: seat out dir is not a plain directory: ${HANDOFF_OUT_ABS} — refusing to run" >&2
+        exit 2
+    fi
+    if [ -d "$HANDOFF_OUT_ABS" ] && [ -n "$(find "$HANDOFF_OUT_ABS" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+        echo "✗ podman-vibe: seat out dir is not empty: ${HANDOFF_OUT_ABS} — a previous seat left files there; refusing to run" >&2
+        exit 2
+    fi
+    mkdir -p "$HANDOFF_OUT_ABS"
+    HANDOFF_OUT_REL="${HANDOFF_OUT_ABS#"$WORKTREE_ABS"/}"
+    HANDOFF_WT_TOP=$(git -C "$WORKTREE_ABS" rev-parse --show-toplevel)
+    HANDOFF_DELIVER_REL="${HANDOFF_DELIVER_ABS#"$HANDOFF_WT_TOP"/}"
+
+    # Quarantine on ANY exit that did not deliver: a non-empty out dir is renamed aside as
+    # evidence (never delivered), an empty one is removed — the same path is fresh next time.
+    HANDOFF_DONE=0
+    _handoff_exit() {
+        local rc=$?
+        if [ "$HANDOFF_DONE" != 1 ] && [ -d "$HANDOFF_OUT_ABS" ]; then
+            if [ -n "$(find "$HANDOFF_OUT_ABS" -mindepth 1 -print -quit 2>/dev/null)" ]; then
+                local q
+                q="${HANDOFF_OUT_ABS}.rejected-$(date +%s)-$$"
+                mv "$HANDOFF_OUT_ABS" "$q" && echo "wolfpack: seat out dir quarantined: $q" >&2
+            else
+                rmdir "$HANDOFF_OUT_ABS" 2>/dev/null || true
+            fi
+        fi
+        exit "$rc"
+    }
+    trap _handoff_exit EXIT
+fi
 
 # ─── tmpfs sizes (AC10) ────────────────────────────────────────
 # ENOSPC root cause (2026-10): a long agentic review's vibe.log outgrew the old 10 MB logs
@@ -347,6 +481,14 @@ if [ "$VIBE_MODE" != "implement" ]; then
             fi
             MOUNT_ARGS+=(-v "${_mh}:${_mc}:ro,z")
         done
+
+        # Seat handoff: exactly ONE read-write bind — the per-seat out dir — at the container
+        # path matching its worktree-relative path, so it lies inside the seat's --workdir for
+        # both families (GLM: host path; Mistral: /workspace/<rel>). The worktree bind above
+        # stays :ro,z; the secrets guard below covers this source like every other bind.
+        if [ "$HANDOFF" = 1 ]; then
+            MOUNT_ARGS+=(-v "${HANDOFF_OUT_ABS}:${CWORK}/${HANDOFF_OUT_REL}:rw,z")
+        fi
     fi
 fi
 
@@ -486,15 +628,21 @@ done
 # dev_cortex_file_outline). There is NO search_replace.
 # Review/certify seats get bash INSIDE the sandbox (doc 06; read-only worktree + git dir,
 # no prod credentials): a reviewer that cannot run `git diff` or the test command is a
-# file-reading audit, not a review. --implement stays shell-free: the calling wrapper
-# commits and the Tracker runs the tests. The DROP lists are enforced even against an
-# operator override (WOLFPACK_GLM_TOOLS / WOLFPACK_GLM_IMPLEMENT_TOOLS); `task` is dropped
-# in both modes (no self-orchestration). scripts/wolfpack-toolcheck.mjs asserts these
-# lists against the seat profiles — keep them in sync.
+# file-reading audit, not a review. They also get `write_file` (seat-handoff-writes) so they
+# write their OWN handoff file: it is confined by MOUNT, not by a tool fence — the worktree is
+# read-only and only the per-seat out dir (--out-dir) is bind-mounted read-write; the shim then
+# moves exactly the expected artifact and fails the round (exit 78) on anything else.
+# write_file only CREATES (it refuses an existing file): one call per file, complete content.
+# `edit` is dropped for review/certify seats (edit-denied by role). --implement stays
+# shell-free: the calling wrapper commits and the Tracker runs the tests. The DROP lists are
+# enforced even against an operator override (WOLFPACK_GLM_TOOLS /
+# WOLFPACK_GLM_IMPLEMENT_TOOLS); `task` is dropped in both modes (no self-orchestration).
+# scripts/wolfpack-toolcheck.mjs asserts these lists against the seat profiles — keep them
+# in sync.
 # Space-separated, one --enabled-tools flag per tool (same rule as above).
-GLM_REVIEW_TOOLS_DEFAULT="read_file grep bash dev_cortex_repo_map dev_cortex_file_outline"
+GLM_REVIEW_TOOLS_DEFAULT="read_file grep bash write_file dev_cortex_repo_map dev_cortex_file_outline"
 GLM_IMPLEMENT_TOOLS_DEFAULT="read_file grep write_file edit dev_cortex_repo_map dev_cortex_file_outline"
-GLM_REVIEW_DROP="task"
+GLM_REVIEW_DROP="task edit"
 GLM_IMPLEMENT_DROP="bash task"
 APPROVE_CLAUSE=""
 if [ "$VIBE_FAMILY" = "glm" ]; then
@@ -606,6 +754,158 @@ run_vibe_glm() {
     fi
 }
 
+# ─── Seat handoff: source snapshot + verify/deliver (seat-handoff-writes) ───
+# "Touches source" = tracked or would-be-tracked worktree state (P5): HEAD plus every
+# `git status --porcelain=v1 -z --untracked-files=all` entry with the sha256 of its content,
+# taken on the host before the run and compared after it. Deliberately NOT snapshotted:
+#   - refs other than HEAD: they live in the git common dir shared by every worktree, so a
+#     parallel hunt's commit, a fetch or operator activity would move them mid-run and
+#     false-fail a compliant seat. A seat commit moves HEAD and IS caught; on the podman path
+#     the common dir is mounted :ro,z, so a seat cannot touch refs at all.
+#   - gitignored paths (plan dirs, test caches: in WOLFPACK_SANDBOX=1 mode a seat runs the
+#     test command against a writable worktree, so __pycache__/.pytest_cache churn is legit);
+#   - HANDOFF_WT_EXCLUDE (the shim agent rewrites its heartbeat while the seat runs);
+#   - the deliver-to dir, which gets its own narrower check: each top-level entry + its sha256,
+#     except HANDOFF_PLAN_EXEMPT (names that really change WHILE a seat runs). metadata.json and
+#     every artifact name are sha-pinned. That is safe because every tier runs SINGLE_LENS, so
+#     no sibling lens writes the plan dir during this seat's run. A future multi-lens tier would
+#     trip source-touched (loud exit 78, never a silent pass) — the hunt enabling lenses must
+#     revisit this pin.
+# KNOWN GAP (WOLFPACK_SANDBOX=1 only, writable worktree + gitdir): writes INSIDE seat-notes/
+# (a dir prints "dir", not a content hash) and a new/moved non-HEAD ref without a HEAD move are
+# not caught. On the podman path the read-only mounts make both impossible; the orchestrator's
+# diff-catch stays the second net.
+HANDOFF_WT_EXCLUDE=".wolfpack/heartbeats"
+HANDOFF_PLAN_EXEMPT="rate-limits.jsonl timing.jsonl seat-notes .seat-out"
+
+_hf_sha() {
+    if [ -L "$1" ]; then printf 'symlink:%s' "$(readlink "$1")"
+    elif [ -f "$1" ]; then sha256sum < "$1" | cut -d' ' -f1
+    elif [ -d "$1" ]; then printf 'dir'
+    else printf -- '-'
+    fi
+}
+
+_wt_snapshot() {
+    local head entry xy path tmp name
+    head=$(GIT_OPTIONAL_LOCKS=0 git -C "$WORKTREE_ABS" rev-parse -q --verify HEAD 2>/dev/null) || head=none
+    printf 'HEAD\t%s\n' "$head"
+    tmp=$(mktemp "${TMPDIR:-/tmp}/wolfpack-snap.XXXXXX")
+    if ! GIT_OPTIONAL_LOCKS=0 git -C "$WORKTREE_ABS" status --porcelain=v1 -z --untracked-files=all >"$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    {
+        while IFS= read -r -d '' entry; do
+            xy="${entry:0:2}"; path="${entry:3}"
+            # Renames/copies carry a second NUL-terminated (original) path: consume it.
+            case "$xy" in *R*|*C*) IFS= read -r -d '' _ || true ;; esac
+            case "$path" in
+                "$HANDOFF_WT_EXCLUDE"|"$HANDOFF_WT_EXCLUDE"/*) continue ;;
+                "$HANDOFF_DELIVER_REL"|"$HANDOFF_DELIVER_REL"/*) continue ;;
+            esac
+            printf 'ST\t%s\t%s\t%s\n' "$xy" "$path" "$(_hf_sha "$HANDOFF_WT_TOP/$path")"
+        done <"$tmp"
+        while IFS= read -r -d '' entry; do
+            name="${entry##*/}"
+            case " $HANDOFF_PLAN_EXEMPT " in *" $name "*) continue ;; esac
+            printf 'PD\t%s\t%s\n' "$name" "$(_hf_sha "$entry")"
+        done < <(find "$HANDOFF_DELIVER_ABS" -mindepth 1 -maxdepth 1 -print0)
+    } | LC_ALL=C sort
+    rm -f "$tmp"
+}
+
+# Snapshot line → the path it names (HEAD / worktree path / deliver-dir entry).
+_snap_paths() {
+    awk -F'\t' -v pd="$HANDOFF_DELIVER_REL" '
+        $1 == "HEAD" { print "HEAD"; next }
+        $1 == "ST"   { print $3; next }
+        $1 == "PD"   { print pd "/" $2; next }'
+}
+
+_in_expect() {
+    local e
+    for e in "${HANDOFF_EXPECT[@]}"; do [ "$e" = "$1" ] && return 0; done
+    return 1
+}
+
+# Each retry_with_backoff attempt starts with an EMPTY out dir: write_file refuses to overwrite,
+# so a retried attempt would otherwise fail on the previous attempt's partial artifact. Without
+# handoff it is a pure pass-through.
+_seat_attempt() {
+    if [ "$HANDOFF" = 1 ]; then
+        find "$HANDOFF_OUT_ABS" -mindepth 1 -delete || return 1
+    fi
+    "$@"
+}
+
+# All checks first, then the moves. Every failure prints its marker; any failure returns 1
+# with nothing (more) delivered, and the EXIT trap quarantines the out dir.
+_handoff_deliver() {
+    local errs=0 snap_after p f name sub e
+    if ! snap_after=$(_wt_snapshot); then
+        echo "WOLFPACK_ARTIFACT_ERROR: source-touched <git status failed after the seat run>" >&2
+        errs=1
+    elif [ "$snap_after" != "$SNAP_BEFORE" ]; then
+        while IFS= read -r p; do
+            [ -n "$p" ] && echo "WOLFPACK_ARTIFACT_ERROR: source-touched $p" >&2
+        done < <(diff <(printf '%s\n' "$SNAP_BEFORE") <(printf '%s\n' "$snap_after") \
+                    | sed -n 's/^[<>] //p' | _snap_paths | LC_ALL=C sort -u)
+        errs=1
+    fi
+    local seen=" "
+    while IFS= read -r -d '' f; do
+        name="${f##*/}"
+        if _in_expect "$name"; then
+            seen="${seen}${name} "
+            if [ -L "$f" ] || [ ! -f "$f" ]; then
+                echo "WOLFPACK_ARTIFACT_ERROR: not-a-regular-file $name" >&2
+                errs=1
+            fi
+        else
+            echo "WOLFPACK_ARTIFACT_ERROR: unexpected ${HANDOFF_OUT_REL}/${name}" >&2
+            errs=1
+            if [ -d "$f" ] && [ ! -L "$f" ]; then
+                while IFS= read -r -d '' sub; do
+                    echo "WOLFPACK_ARTIFACT_ERROR: unexpected ${HANDOFF_OUT_REL}/${sub#"$HANDOFF_OUT_ABS"/}" >&2
+                done < <(find "$f" -mindepth 1 -print0)
+            fi
+        fi
+    done < <(find "$HANDOFF_OUT_ABS" -mindepth 1 -maxdepth 1 -print0)
+    for e in "${HANDOFF_EXPECT[@]}"; do
+        case "$seen" in *" $e "*) : ;; *) echo "WOLFPACK_ARTIFACT_ERROR: missing $e" >&2; errs=1 ;; esac
+    done
+    [ "$errs" = 0 ] || return 1
+
+    # Moves: same-filesystem rename (the out dir is pinned under the deliver-to dir) — atomic
+    # and byte-identical; the sha is recomputed on the destination to prove it.
+    local -A sha=() size=()
+    for e in "${HANDOFF_EXPECT[@]}"; do
+        sha[$e]=$(sha256sum < "$HANDOFF_OUT_ABS/$e" | cut -d' ' -f1)
+        size[$e]=$(stat -c %s "$HANDOFF_OUT_ABS/$e")
+    done
+    for e in "${HANDOFF_EXPECT[@]}"; do
+        if ! mv -f "$HANDOFF_OUT_ABS/$e" "$HANDOFF_DELIVER_ABS/$e" \
+           || [ "$(sha256sum < "$HANDOFF_DELIVER_ABS/$e" | cut -d' ' -f1)" != "${sha[$e]}" ]; then
+            echo "WOLFPACK_ARTIFACT_ERROR: move-failed $e" >&2
+            return 1
+        fi
+        echo "WOLFPACK_ARTIFACT_DELIVERED: $e sha256=${sha[$e]} bytes=${size[$e]}" >&2
+    done
+    if ! rmdir "$HANDOFF_OUT_ABS" 2>/dev/null; then
+        echo "WOLFPACK_ARTIFACT_ERROR: unexpected ${HANDOFF_OUT_REL}/ (out dir not empty after delivery)" >&2
+        return 1
+    fi
+    HANDOFF_DONE=1
+    return 0
+}
+
+if [ "$HANDOFF" = 1 ]; then
+    if ! SNAP_BEFORE=$(_wt_snapshot); then
+        echo "ERROR: handoff mode could not snapshot the worktree (git status failed): $WORKTREE_ABS" >&2
+        exit 2
+    fi
+fi
+
 # ─── [05] Part B dispatch ──────────────────────────────────────
 # 1. Circuit-breaker pre-check: if Mistral is cooling down (tripped earlier in this
 #    batch), fast-exit 75 with the WOLFPACK_RATE_LIMITED sentinel WITHOUT taking a sem
@@ -616,28 +916,36 @@ rl_guard_or_exit "$RL_MODEL"
 # 2. retry_with_backoff wraps the actual call (exponential backoff + jitter on transient
 #    errors only; permanent errors bail immediately; ≥N transient fails trips the breaker
 #    and returns 75). sem_run holds the flock slot for the whole retry sequence.
+# Both families end in ONE place so a handoff seat's artifact is verified + delivered only
+# when the seat itself exited 0; a non-zero seat keeps its own exit code (75/76/77/rc) and
+# the EXIT trap quarantines its out dir.
+SEAT_RC=0
 if [ "$VIBE_FAMILY" = "glm" ]; then
     # GLM: a transient failure that exhausted its attempts (without tripping the breaker)
     # is still "GLM is napping" — surface it as exit 75 + sentinel so the orchestrator
     # moves to the next examiner / the Claude Shepherd instead of grading GLM down.
     rc=0
     RL_NO_RETRY_RC="124 137"
-    sem_run retry_with_backoff "$RL_MODEL" run_vibe_glm || rc=$?
+    sem_run retry_with_backoff "$RL_MODEL" _seat_attempt run_vibe_glm || rc=$?
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
         # Wall clock ran out: NOT a quota signal (no breaker trip, no cooldown). The
         # orchestrator moves on to the next family and logs reason "timeout".
         echo "WOLFPACK_TIMEOUT:glm wall-clock limit ${GLM_TIMEOUT}s hit (rc=${rc})" >&2
-        exit 76
-    fi
-    if [ "$rc" -eq "$RL_EXIT_INFRA" ]; then
+        SEAT_RC=76
+    elif [ "$rc" -eq "$RL_EXIT_INFRA" ]; then
         # INFRA (exit 77): the sandbox broke (e.g. disk full). Keep it DISTINCT from 75/76 —
         # never fold it into the rate-limit branch below, or ENOSPC becomes model_quota again.
-        exit "$RL_EXIT_INFRA"
-    fi
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne "$RL_EXIT_COOLDOWN" ] && [ "${RL_LAST_TRANSIENT:-0}" = "1" ]; then
+        SEAT_RC="$RL_EXIT_INFRA"
+    elif [ "$rc" -ne 0 ] && [ "$rc" -ne "$RL_EXIT_COOLDOWN" ] && [ "${RL_LAST_TRANSIENT:-0}" = "1" ]; then
         echo "WOLFPACK_RATE_LIMITED:glm transient failures exhausted attempts (rc=${rc})" >&2
-        exit "$RL_EXIT_COOLDOWN"
+        SEAT_RC="$RL_EXIT_COOLDOWN"
+    else
+        SEAT_RC="$rc"
     fi
-    exit "$rc"
+else
+    sem_run retry_with_backoff "$RL_MODEL" _seat_attempt run_vibe || SEAT_RC=$?
 fi
-sem_run retry_with_backoff "$RL_MODEL" run_vibe
+if [ "$HANDOFF" = 1 ] && [ "$SEAT_RC" -eq 0 ]; then
+    _handoff_deliver || exit "$HANDOFF_EXIT_ARTIFACT"
+fi
+exit "$SEAT_RC"

@@ -44,6 +44,9 @@ const VERDICT_SCHEMA = {
         denied_tools: { type: 'array', items: { type: 'string' } },
       },
     },
+    // seat-handoff-writes: the artifact(s) the shim delivered for the accepted link
+    // (WOLFPACK_ARTIFACT_DELIVERED lines); [] when the claude link wrote them itself.
+    artifacts: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, sha256: { type: 'string' } } } },
   },
   required: ['verdict'],
 }
@@ -79,6 +82,9 @@ const REVIEW_SCHEMA = {
       },
     },
     grounded: { type: 'number' },   // file-bearing findings that grounded out (file exists)
+    // seat-handoff-writes: the artifact(s) the shim delivered for the accepted link
+    // (WOLFPACK_ARTIFACT_DELIVERED lines); [] when the claude link wrote them itself.
+    artifacts: { type: 'array', items: { type: 'object', properties: { file: { type: 'string' }, sha256: { type: 'string' } } } },
     dropped: {                       // findings dropped as ungrounded (file not found)
       type: 'array',
       items: {
@@ -1203,9 +1209,9 @@ const GLM_IMPLEMENT_TURNS = _env('WOLFPACK_GLM_IMPLEMENT_TURNS') || '150'
 
 // Read-only review command for a given examiner family. `vibeAgent` is the Vibe agent
 // base name used for the Vibe families: Mistral runs it as-is; GLM runs the "-glm"
-// variant (wolfpack-<role>-glm: active_model glm-5.3, read-only tools), which the shim
+// variant (wolfpack-<role>-glm: active_model glm-5.3, edit-denied tools), which the shim
 // resolves to the glm family (own rate-limit key + semaphore, --auto-approve, strict
-// read-only allow-list).
+// allow-list; write_file only into the seat's own out dir in handoff mode).
 //
 // The `claude` link is NOT a shim (there is no podman-claude.sh): the agent that walks the
 // chain already IS Claude, so the "command" is an instruction to perform the review itself.
@@ -1218,12 +1224,64 @@ const CLAUDE_SELF_REVIEW_STEP = (promptFile, role) => `(no shim — YOU are Clau
        "claude_fallback_reviews" array (create it if absent; preserve every other field).
        This link exists ONLY because every cross-family examiner was unavailable; it is never
        your first choice.`
-const reviewCmd = (who, vibeAgent, promptFile, role = 'reviewer') =>
-  who === 'mistral'
-    ? `${shq(shimPath)} ${shq(vibeAgent)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(MISTRAL_REVIEW_TURNS)}`
+// `handoff` ({dir, expect}, seat-handoff-writes): when set, the Vibe commands run the shim in
+// handoff mode (the seat writes its own artifact into <planDir>/.seat-out/<dir>/ and the shim
+// delivers it). The claude branch ignores it (its text is unchanged).
+const reviewCmd = (who, vibeAgent, promptFile, role = 'reviewer', handoff = null) => {
+  const ho = handoff ? ` ${handoffArgs(handoff)}` : ''
+  return who === 'mistral'
+    ? `${shq(shimPath)}${ho} ${shq(vibeAgent)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(MISTRAL_REVIEW_TURNS)}`
     : who === 'glm'
-    ? `${shq(shimPath)} ${shq(`${vibeAgent}-glm`)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(GLM_REVIEW_TURNS)}`
+    ? `${shq(shimPath)}${ho} ${shq(`${vibeAgent}-glm`)} ${shq(worktreePath)} ${shq(promptFile)} ${shq(GLM_REVIEW_TURNS)}`
     : CLAUDE_SELF_REVIEW_STEP(promptFile, role)
+}
+
+// ─── seat-handoff-writes: the seat writes its OWN handoff file ───────────────────────────
+// Per-seat out dir (one per seat, round and lens — chain links and retries share it; the shim
+// guarantees it starts empty and leaves nothing behind), the worktree-relative path the seat
+// writes to (valid in both families' containers: Mistral mounts the worktree at /workspace,
+// GLM at its host path), and the shim args. planDir must lie inside the worktree — the shim
+// pins the out dir there — so a plan dir outside it fails LOUD at the first seat call.
+const SEAT_OUT = (name) => `${planDir}/.seat-out/${name}`
+const relToWorktree = (p) => (p.startsWith(`${worktreePath}/`) ? p.slice(worktreePath.length + 1) : null)
+const seatOutRel = (h) => {
+  const rel = relToWorktree(SEAT_OUT(h.dir))
+  if (rel == null) {
+    throw new Error(`seat-handoff-writes: the plan dir (${planDir}) is not inside the worktree (${worktreePath}) — a review/certify seat cannot run in handoff mode (the shim pins its out dir to <plan dir>/.seat-out/<seat>). Fix the hunt's worktree/plan-dir layout.`)
+  }
+  return rel
+}
+const handoffArgs = (h) => {
+  seatOutRel(h)
+  return `--deliver-to ${shq(planDir)} --out-dir ${shq(SEAT_OUT(h.dir))} ${h.expect.map(e => `--expect ${shq(e)}`).join(' ')}`
+}
+// Seat-facing paragraph, appended to the SEAT prompt text (after the verdict instruction).
+const HANDOFF_NOTE = (h) => {
+  const rel = seatOutRel(h)
+  const files = h.expect.map(e => `${rel}/${e}`).join(' and ')
+  const isCert = h.expect.includes('certification.md')
+  return `
+
+SANDBOXED SEAT HANDOFF (mandatory for the Vibe seat): your handoff is a FILE, not your reply. Write ${files} with the write_file tool — ${h.expect.length > 1 ? 'those paths are' : 'that path is'} relative to your working directory (the worktree root). ONE write_file call per file, with the COMPLETE content (write_file cannot overwrite or append). The ${isCert ? 'certification' : 'review'} file must contain your whole ${isCert ? 'certification' : 'review'} AND end with the <verdict> block; still end your final reply with the same <verdict> block. Write NOTHING else anywhere: no other file in ${rel}/, no file outside it, no metadata.json, no commits. Any extra file or any change to the worktree fails this round. This overrides any output file name or location in your system prompt or a role skill.${isCert ? ' Do NOT append to .wolfpack/pedigree/index.md, run scripts, commit or update metadata.json — the pipeline does that after you.' : ''}`
+}
+// Shim-agent-facing rules, appended to the review/certify shim-agent prompts.
+const HANDOFF_SIGNAL_NOTE = `
+HANDOFF SIGNAL: a Vibe shim run with --out-dir delivers its artifact ITSELF. Exit 0 plus one
+"WOLFPACK_ARTIFACT_DELIVERED: <name> sha256=<hex> bytes=<n>" line per file in <base>.err means
+the file is in the plan dir, byte-identical to what the seat wrote — NEVER write, rewrite,
+prepend to or re-create it from stdout. Exit 78 or any "WOLFPACK_ARTIFACT_ERROR:" line means the
+seat broke its write contract (missing artifact, extra file, source touched): that link FAILED.
+A failed link can still have delivered a file (a two-file delivery whose second move fails,
+or a "move-failed <name>" whose file landed): move every file named by a DELIVERED or
+"move-failed" line of that link aside per the step's REJECTED delivered link rule (above) BEFORE the
+next link, so no artifact of a failed link stays in the plan dir.
+Print "WOLFPACK_HANDOFF_VIOLATION: <role> r<round> <provider> <the ARTIFACT_ERROR lines>",
+append {role, round, provider, link, errors: [<lines>]} to metadata.json's
+"handoff_violations" array (create it if absent; preserve every other field), log the
+fallback with reason "tool_starved" when the TOOL-DENIAL grep shows write_file denied, else
+"capability", and move to the next link. It never counts toward model_quota. If every link
+failed and at least one was a handoff violation, return status "handoff_violation".
+Exit 2 with "seat out dir is not empty" is plumbing (reason "error").`
 
 // Prompt fragment: how a shim agent runs ONE non-Claude shim command and waits for it.
 // A GLM/Mistral review or certification can outlast one shell call (10 min max), and an
@@ -1243,14 +1301,15 @@ const SHIM_WAIT_RULE = `   WAITING ON A SHIM (hard rule): a shim stays alive onl
    shim's task, and NEVER end your turn or reply with a "waiting…" message while a shim runs —
    ending your turn kills the shim and the round is lost as an ERROR.`
 const shimBase = (tmpFile, i) => `${tmpFile.replace(/\.txt$/, '')}-l${i + 1}`
-const linkCmd = (who, vibeAgent, tmpFile, role, i) => who === 'claude'
+const linkCmd = (who, vibeAgent, tmpFile, role, i, handoff = null) => who === 'claude'
   ? reviewCmd(who, vibeAgent, tmpFile, role)
-  : shimRun(reviewCmd(who, vibeAgent, tmpFile, role), shimBase(tmpFile, i))
+  : shimRun(reviewCmd(who, vibeAgent, tmpFile, role, handoff), shimBase(tmpFile, i))
 
-// Prompt fragment: the ordered examiner-chain steps for a review shim agent.
-const chainSteps = (chain, vibeAgent, tmpFile, role = 'reviewer') => chain.map((who, i) => i === 0
-  ? `   [1] PRIMARY ${EXAMINER_LABEL[who]} (provider "${who}") — on a NON-rate-limit failure wait 5s and retry ONCE:\n       ${linkCmd(who, vibeAgent, tmpFile, role, i)}`
-  : `   [${i + 1}] FALLBACK ${EXAMINER_LABEL[who]} (provider "${who}") — one attempt:\n       ${linkCmd(who, vibeAgent, tmpFile, role, i)}`).join('\n')
+// Prompt fragment: the ordered examiner-chain steps for a review shim agent. Every Vibe link
+// shares the same `handoff` out dir (seat-handoff-writes P3).
+const chainSteps = (chain, vibeAgent, tmpFile, role = 'reviewer', handoff = null) => chain.map((who, i) => i === 0
+  ? `   [1] PRIMARY ${EXAMINER_LABEL[who]} (provider "${who}") — on a NON-rate-limit failure wait 5s and retry ONCE:\n       ${linkCmd(who, vibeAgent, tmpFile, role, i, handoff)}`
+  : `   [${i + 1}] FALLBACK ${EXAMINER_LABEL[who]} (provider "${who}") — one attempt:\n       ${linkCmd(who, vibeAgent, tmpFile, role, i, handoff)}`).join('\n')
   + (chain.some(w => w !== 'claude') ? `\n${SHIM_WAIT_RULE}` : '')
 
 // Prompt fragment: the hard cross-family boundary for a review shim agent.
@@ -1283,7 +1342,8 @@ Do NOT alter any other file. Do NOT commit. Return recorded: true when the row i
 
 // seat-profiles-into-pack (AC6) — DURABLE record of an AUDIT-ONLY review/certification (a seat
 // whose shell or tools were denied). Mirrors noteClaudeFallbackReview: the PIPELINE writes the
-// row (metadata.audit_only_seats) and stamps the artifact header itself, after a LOUD log, so
+// row (metadata.audit_only_seats) and a note in the seat-notes/ sidecar itself (never inside the
+// seat's byte-identical artifact — seat-handoff-writes), after a LOUD log, so
 // an audit never looks like a review that ran git diff and the tests. Evidence comes from
 // auditEvidence (certAuditEvidence for the Watchdog: on Orange/Red/unknown tiers a missing
 // tool_access IS audit-only). A Vibe review — or a Green/Blue/Yellow certification — that
@@ -1302,7 +1362,10 @@ const noteAuditOnly = async (role, round, result, artifactPath, phaseLabel) => {
     const schema = { type: 'object', properties: { recorded: { type: 'boolean' } }, required: ['recorded'] }
     if (ev.length) {
       const shown = ev.slice(0, 3).join('; ')
-      log(`⚠ ${slug}: ${role} r${r} (${prov}) was audit_only — it ran without a working shell (${shown}). Recording metadata.audit_only_seats and marking ${artifactPath}.`)
+      // seat-handoff-writes: the note goes to a pipeline-written SIDECAR, never into the seat's
+      // byte-identical handoff artifact.
+      const notesPath = `${planDir}/seat-notes/${artifactPath.split('/').pop()}`
+      log(`⚠ ${slug}: ${role} r${r} (${prov}) was audit_only — it ran without a working shell (${shown}). Recording metadata.audit_only_seats and noting it in ${notesPath}.`)
       const header = `> audit_only: true — ${role} r${r} (${prov}) ran without a working shell: ${shown}`
       await agent(`
 You are a minimal RECORD writer. Do exactly these two things, then return.
@@ -1310,8 +1373,9 @@ You are a minimal RECORD writer. Do exactly these two things, then return.
 1. Append one row to the "audit_only_seats" array in ${planDir}/metadata.json (create the array
    if absent; PRESERVE every other field — read, modify, write back):
      {"role": ${JSON.stringify(role)}, "round": ${r}, "provider": ${JSON.stringify(prov)}, "audit_only": true, "evidence": ${JSON.stringify(ev.slice(0, 10))}}
-2. Make this the FIRST line of ${artifactPath} (create the file if absent), ONCE — if the file
-   already starts with a line beginning "> audit_only: true — ${role} r${r} ", leave it as is:
+2. Append this line to ${notesPath} (mkdir -p ${planDir}/seat-notes; create the file if absent)
+   unless the file already contains a line beginning "> audit_only: true — ${role} r${r} ".
+   Do NOT modify ${artifactPath} — it is the seat's byte-identical handoff:
      ${header}
 Do NOT alter any other file. Do NOT commit. Return recorded: true when both are done.
 `, { label: `audit-only-record:${slug}:${role}:r${r}`, phase: phaseLabel, schema, model: 'sonnet' })
@@ -1331,6 +1395,15 @@ Do NOT alter any other file. Do NOT commit. Return recorded: true when the row i
   } catch (e) {
     log(`⚠ ${slug}: could not record the ${role} r${round || 0} tool-access row (${e && e.message ? e.message : e}) — the review stands; see the log line above.`)
   }
+}
+
+// seat-handoff-writes: one log line per accepted review/certification naming the artifacts the
+// shim delivered (file + sha256 prefix), so the orchestrator log shows the seat's own bytes landed.
+const logSeatArtifacts = (role, n, result) => {
+  const arts = (result && Array.isArray(result.artifacts)) ? result.artifacts.filter(a => a && a.file) : []
+  log(`✓ ${slug}: ${role} r${n || 0} artifacts delivered by the shim: ${arts.length
+    ? arts.map(a => `${a.file} ${String(a.sha256 || '?').slice(0, 12)}`).join(', ')
+    : (result && result.provider === 'claude' ? '(claude link wrote them)' : '(artifacts not reported by the shim agent)')}`)
 }
 
 // usage-limit-gate (AC6): metadata step for the Claude FINAL review round (usage offload on a
@@ -1474,10 +1547,12 @@ const isQuotaStatus = (s) => /model_quota|quota|rate[_\s-]?limit|both.*(rate|thr
 // harness test asserts it; this workflow body cannot import).
 const TOOL_DENIAL_PATTERN =
   "Tool '[^']+' is permanently disabled|Unknown tool '[^']+'|Tool execution denied by (the )?approval policy|Tool '[^']+' was denied by hook|fatal: not a git repository"
-// Tools every review/certify seat profile denies BY ROLE (vibe-agents/*.toml: read-only seats,
+// Tools every review/certify seat profile denies BY ROLE (vibe-agents/*.toml: edit-denied seats,
 // no self-orchestration). A seat that self-reports one of these as denied is describing its
-// profile, not a missing shell, so it is not audit-only evidence.
-const ROLE_DENIED_TOOLS = ['edit', 'write_file', 'task', 'skill']
+// profile, not a missing shell, so it is not audit-only evidence. write_file is NOT here
+// (seat-handoff-writes): it is ALLOWED, confined by mount to the seat's own out dir, so a seat
+// that self-reports write_file denied IS audit-only evidence (profile drift).
+const ROLE_DENIED_TOOLS = ['edit', 'task', 'skill']
 const auditEvidence = (r) => {
   const ev = []
   for (const l of (Array.isArray(r && r.deniedTools) ? r.deniedTools : [])) if (String(l).trim()) ev.push(String(l).trim())
@@ -1838,6 +1913,8 @@ async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
     // Every accepted lens's provider (falling back to its status) — the cross-family
     // runtime invariant checks ALL of them, not just the first.
     providers: done.map(d => d.r.provider || d.r.status || null),
+    // seat-handoff-writes: every accepted lens's shim-delivered artifacts.
+    artifacts: done.flatMap(d => (Array.isArray(d.r.artifacts) ? d.r.artifacts : [])),
     status: (done.find(d => d.r.provider) || {}).r?.provider || null,
     // seat-profiles-into-pack: tool-access evidence across every accepted lens (audit_only
     // is any lens's evidence; the JS records it via noteAuditOnly).
@@ -2410,6 +2487,8 @@ if (at('Review')) {
     const buildBloodhoundPrompt = (unit, nudge) => {
       const rawFile = unit.key === 'full' ? `review-${round}.md` : `review-${round}-${unit.key}.md`
       const tmpFile = unit.key === 'full' ? `/tmp/bloodhound-${slug}-r${round}.txt` : `/tmp/bloodhound-${slug}-r${round}-${unit.key}.txt`
+      // seat-handoff-writes: ONE out dir per seat, round and lens (every Vibe link shares it).
+      const handoff = { dir: unit.key === 'full' ? `bloodhound-r${round}` : `bloodhound-r${round}-${unit.key}`, expect: [rawFile] }
       return `
 You are a shim agent orchestrating a Bloodhound review${unit.focus ? ` (FOCUS LENS: ${unit.key})` : ''}. This hunt's examiner
 chain for the plan review is ${chainLabel(bhChain)} — try each link in order, moving to the
@@ -2427,10 +2506,10 @@ Steps:
 
 2. Write the review prompt to a temp file (avoids shell escaping issues):
    Write to ${tmpFile}:
-   "You are reviewing Wolfpack hunt '${slug}', round ${round}, tier ${tier}. Read the plan at ${planDir}/${planFile}. Also read TODO.md, CLAUDE.md, and .wolfpack/pedigree/index.md for context. Read metadata.json at ${planDir}/metadata.json for tier and scope. Read .agents/skills/bloodhound/SKILL.md and follow it. Produce your adversarial review following your system prompt instructions. PLAN-REVIEW SCOPE (mandatory): you are reviewing the PLAN DOCUMENT's design — NOT whether it has been implemented. The code is NOT written yet (Shepherd implements in a LATER phase). Findings of the form 'not implemented / missing from the codebase / absent from the file / helper missing / code remains unchanged / pre-implementation state' are INVALID and MUST NOT be reported — that state is EXPECTED at plan-review time and reporting it is a misfire that falsely trips non-convergence. Use the code ONLY to verify the plan's factual claims about the CURRENT codebase are accurate; judge the plan's correctness, completeness, and compliance, never its implementation status.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): do NOT read whole large files — grep for the relevant symbols/lines first, then read only those ranges with a line offset/limit. Scope every grep to the relevant app directory (e.g. src/app/, lib/module/), never the repo root, or it times out. Reading entire 1000+ line files (models.py, views.py) bloats context and can crash the request mid-review.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive adversarial review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. The headless cross-model roster fan-out is disabled — the pipeline handles orchestration, not you.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
+   "You are reviewing Wolfpack hunt '${slug}', round ${round}, tier ${tier}. Read the plan at ${planDir}/${planFile}. Also read TODO.md, CLAUDE.md, and .wolfpack/pedigree/index.md for context. Read metadata.json at ${planDir}/metadata.json for tier and scope. Read .agents/skills/bloodhound/SKILL.md and follow it. Produce your adversarial review following your system prompt instructions. PLAN-REVIEW SCOPE (mandatory): you are reviewing the PLAN DOCUMENT's design — NOT whether it has been implemented. The code is NOT written yet (Shepherd implements in a LATER phase). Findings of the form 'not implemented / missing from the codebase / absent from the file / helper missing / code remains unchanged / pre-implementation state' are INVALID and MUST NOT be reported — that state is EXPECTED at plan-review time and reporting it is a misfire that falsely trips non-convergence. Use the code ONLY to verify the plan's factual claims about the CURRENT codebase are accurate; judge the plan's correctness, completeness, and compliance, never its implementation status.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): do NOT read whole large files — grep for the relevant symbols/lines first, then read only those ranges with a line offset/limit. Scope every grep to the relevant app directory (e.g. src/app/, lib/module/), never the repo root, or it times out. Reading entire 1000+ line files (models.py, views.py) bloats context and can crash the request mid-review.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive adversarial review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. The headless cross-model roster fan-out is disabled — the pipeline handles orchestration, not you.' : ''}${VERDICT_CONTRACT}${HANDOFF_NOTE(handoff)}${nudge || ''}"
 
 3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
-${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound')}
+${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound', handoff)}
    Each wrapper enforces a read-only adversarial review and caps concurrent
    calls on its model (flock) to avoid rate limits. Run each EXACTLY as
    given — do not add flags or spawn it multiple times in parallel.
@@ -2438,14 +2517,22 @@ ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound')}
    <verdict> block (step 6), or — for an ISSUES_FOUND verdict — every
    file-bearing finding fails the grounding check (step 7, the blind/hallucinating
    reviewer signal). A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) skips
-   straight to the next link — no retry.
+   straight to the next link — no retry. A Vibe link's exit 0 is checked by the HANDOFF
+   SIGNAL rules below (exit 78 / any WOLFPACK_ARTIFACT_ERROR line = that link FAILED).
    ${chainBoundary(bhChain, PLAN_WRITER_FAMILIES)}
 
 4. When a link FAILS, move to the NEXT link of the chain (log the fallback — see below).
    Strip ANSI escape codes from the output.
 
-5. Write the raw output (from whichever CLI ran) to ${planDir}/${rawFile}.
-6. EXTRACT THE VERDICT — strict extract-and-validate, NO prose-rescue. The
+5. THE ARTIFACT. Vibe link: the shim delivered ${planDir}/${rawFile} itself (HANDOFF SIGNAL) —
+   do not write or modify it. claude link: save your review to ${planDir}/${rawFile}. (The
+   SANDBOXED SEAT HANDOFF note in the review prompt applies only to Vibe links.)
+   REJECTED delivered link (exit 0 but step 6/7 fails it, OR a FAILED handoff — exit 78 / any
+   WOLFPACK_ARTIFACT_ERROR line — whose .err names ${rawFile} in a WOLFPACK_ARTIFACT_DELIVERED or
+   "move-failed" line and the file exists): before the next link run exactly
+     mkdir -p ${planDir}/seat-notes && mv -f ${planDir}/${rawFile} ${planDir}/seat-notes/${rawFile}.rejected-l<N>
+6. EXTRACT THE VERDICT from ${planDir}/${rawFile} (the delivered artifact) for a Vibe link, or
+   from your own review for the claude link — strict extract-and-validate, NO prose-rescue. The
    reviewer was instructed to end with exactly one <verdict>{...}</verdict> block:
    - NO <verdict> block in the output → this attempt FAILED. Do NOT scrape a
      "## Status:" line or any prose for a verdict — that fallback ladder is REMOVED
@@ -2476,9 +2563,10 @@ ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound')}
       file-bearing finding was dropped (0 grounded) → the whole review is suspect.
       This attempt FAILED: go to the NEXT link of the chain. If every remaining link is
       ALSO 0/N grounded, return "ERROR", status "ungrounded_review".
-   e. Prepend a grounding line to the ${planDir}/${rawFile} header:
-      "grounded: <G>/<N> findings, <D> dropped" (N = file-bearing findings seen,
-      G = grounded, D = dropped). List the dropped findings beneath it.
+   e. Write the grounding line "grounded: <G>/<N> findings, <D> dropped" (N = file-bearing
+      findings seen, G = grounded, D = dropped), with the dropped findings beneath it, to
+      ${planDir}/seat-notes/${rawFile} (mkdir -p ${planDir}/seat-notes; overwrite). NEVER add it
+      to ${planDir}/${rawFile} — that file is the seat's byte-identical handoff.
 6.5 FINGERPRINT — for every GROUNDED finding compute a coarse \`fingerprint\`:
    <normalized repo-relative file path, or "plan" if the finding has no file> + ":" +
    <defect-class>. The defect-class is a 2-4 word lowercase-kebab slug naming the
@@ -2493,14 +2581,18 @@ ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound')}
 8. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: review_round=${round}, status="reviewed",
    phase="review-${round}", and record grounded/dropped counts. Do NOT write
    review_fingerprints or convergence here — the orchestrator records those once per
-   round (concurrent shim writes would race).
+   round (concurrent shim writes would race). Also append
+   {"role": "bloodhound", "round": ${round}, "file": "${rawFile}", "sha256": "<hex>", "provider": "<family>"}
+   to the "seat_artifacts" array (create it if absent) — sha256 from the WOLFPACK_ARTIFACT_DELIVERED
+   line (Vibe link), or \`sha256sum ${planDir}/${rawFile}\` of the file the claude link wrote.
 9. Clean up temp files: rm -f ${tmpFile}
 10. Return: verdict, findings (count of GROUNDED findingsList items), findingsList
     (grounded only, each with id/severity/title/file/line/claim/evidence/FINGERPRINT),
     grounded (count), dropped (the array from step 7), and the provider FAMILY that produced
     the ACCEPTED review as \`provider\` (exactly one of ${bhChain.map(f => `"${f}"`).join(', ')}). Also set
     \`status\` to that provider. Also return \`deniedTools\` and (when the block had it) \`toolAccess\`
-    from step 7.5.
+    from step 7.5. Also return \`artifacts\`: [{file, sha256}] from the accepted link's
+    WOLFPACK_ARTIFACT_DELIVERED lines, or [] for the claude link.
 
 If NO link produced an acceptable review — every CLI in the chain failed to run, OR every run
 lacked a parseable <verdict> block / was malformed / was an empty-findings
@@ -2509,6 +2601,7 @@ above (missing_verdict_block | malformed_verdict | empty_findings_contradiction 
 ungrounded_review). There is NO path that turns a block-less or ungrounded review
 into APPROVED.
 ${RATE_LIMIT_SIGNAL_NOTE}
+${HANDOFF_SIGNAL_NOTE}
 ${FALLBACK_LOG_NOTE}
 ${DIFF_CATCH_NOTE}
 ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + unit.key : ''}`)}
@@ -2536,6 +2629,7 @@ ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + un
       }
       await noteClaudeFallbackReview('bloodhound', round, reviewResult, bhChain, 'Review')
       await noteAuditOnly('bloodhound', round, reviewResult, `${planDir}/review-${round}.md`, 'Review')
+      logSeatArtifacts('bloodhound', round, reviewResult)
     }
 
     // Stickiness: pin whichever examiner actually answered so later rounds try it
@@ -2663,6 +2757,7 @@ cd to ${worktreePath} before doing any work.
 
 Read:
 - ${planDir}/review-${round}.md (Bloodhound findings for this round)
+- ${planDir}/seat-notes/review-${round}.md (pipeline notes on that review: grounding, dropped findings, audit-only — if present)
 - ${planDir}/${planFile} (the current plan)
 
 MANDATORY: Address EVERY finding below. For each, mark ACCEPTED (explain what you changed in
@@ -2830,6 +2925,7 @@ plan items. After fixing, re-run your self-check (git diff ${BASE}..HEAD) and co
   rewriteDirective = `
 REWRITE ENTRY — Pointer round ${n} (NOT a fresh build): the code is already implemented and
 committed on feat/${slug}; the Pointer bounced it back. Read ${planDir}/pointer-review-${n}.md
+(pipeline notes, if any: ${planDir}/seat-notes/pointer-review-${n}.md)
 and fix EVERY finding it lists (all severities) — do not re-scaffold or re-implement settled
 plan items. After fixing, re-run your self-check (git diff ${BASE}..HEAD) and commit on feat/${slug}.
 `
@@ -2984,6 +3080,8 @@ if (at('Code Review') && pointerRounds > 0) {
     const buildPointerPrompt = (unit, nudge) => {
       const rawFile = unit.key === 'full' ? `pointer-review-${pRound}.md` : `pointer-review-${pRound}-${unit.key}.md`
       const tmpFile = unit.key === 'full' ? `/tmp/pointer-${slug}-r${pRound}.txt` : `/tmp/pointer-${slug}-r${pRound}-${unit.key}.txt`
+      // seat-handoff-writes: ONE out dir per seat, round and lens (every Vibe link shares it).
+      const handoff = { dir: unit.key === 'full' ? `pointer-r${pRound}` : `pointer-r${pRound}-${unit.key}`, expect: [rawFile] }
       const finalBanner = claudeFinalRound ? `
 CLAUDE FINAL REVIEW (usage offload, Red/compliance) — not a fallback. The cross-family chain
 already APPROVED this diff; this is the mandated judgment-tier pass on GLM-written code. Review
@@ -3008,23 +3106,32 @@ Steps:
 
 2. Write the review prompt to a temp file:
    Write to ${tmpFile}:
-   "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff ${BASE}..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${nudge || ''}"
+   "You are reviewing code for Wolfpack hunt '${slug}', Pointer round ${pRound}, tier ${tier}. Read plan-final.md at ${planDir}/plan-final.md and shepherd-log.md at ${planDir}/shepherd-log.md. Run 'git diff ${BASE}..HEAD' to see the code changes. Read .agents/skills/pointer/SKILL.md and follow it. Produce your adversarial code review following your system prompt instructions.${unit.focus ? ` ${unit.focus}` : ''} EFFICIENCY (mandatory): work from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant line range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the request.${tier === 'Red' ? ' SINGLE-PASS REVIEW (mandatory, all models): do NOT spawn sub-agents or use the task tool. Produce ONE comprehensive code review covering every lens (correctness, compliance, multi-tenancy, security, edge-case/repro) in a single response, then emit the verdict block. Cross-model sub-agent fan-out is disabled — the pipeline handles orchestration.' : ''}${VERDICT_CONTRACT}${HANDOFF_NOTE(handoff)}${nudge || ''}"
 
 3. Walk the EXAMINER CHAIN in order until one link yields an acceptable review:
-${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChain, 'wolfpack-pointer', tmpFile, 'pointer')}
+${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChain, 'wolfpack-pointer', tmpFile, 'pointer', handoff)}
    Each wrapper enforces a read-only review and caps concurrent calls on its
    model (flock). Run each EXACTLY as given — no extra flags, no parallel spawns.
    An attempt FAILS if ANY of: non-zero exit, empty output, no parseable
    <verdict> block (step 6), or — for an ISSUES_FOUND verdict — every file-bearing
    finding fails the grounding check (step 7). A rate-limit signal (exit 75 /
-   WOLFPACK_RATE_LIMITED) skips straight to the next link — no retry.
+   WOLFPACK_RATE_LIMITED) skips straight to the next link — no retry. A Vibe link's exit 0
+   is checked by the HANDOFF SIGNAL rules below (exit 78 / any WOLFPACK_ARTIFACT_ERROR line =
+   that link FAILED).
    ${chainBoundary(ptrChain, codeWriterFamilies)}
 
 4. When a link FAILS, move to the NEXT link of the chain (log the fallback — see below).
 
-5. Write the raw output (from whichever CLI ran) to ${planDir}/${rawFile}.
-6. EXTRACT THE VERDICT — strict extract-and-validate, NO prose-rescue. The reviewer
-   was instructed to end with exactly one <verdict>{...}</verdict> block:
+5. THE ARTIFACT. Vibe link: the shim delivered ${planDir}/${rawFile} itself (HANDOFF SIGNAL) —
+   do not write or modify it. claude link: save your review to ${planDir}/${rawFile}. (The
+   SANDBOXED SEAT HANDOFF note in the review prompt applies only to Vibe links.)
+   REJECTED delivered link (exit 0 but step 6/7 fails it, OR a FAILED handoff — exit 78 / any
+   WOLFPACK_ARTIFACT_ERROR line — whose .err names ${rawFile} in a WOLFPACK_ARTIFACT_DELIVERED or
+   "move-failed" line and the file exists): before the next link run exactly
+     mkdir -p ${planDir}/seat-notes && mv -f ${planDir}/${rawFile} ${planDir}/seat-notes/${rawFile}.rejected-l<N>
+6. EXTRACT THE VERDICT from ${planDir}/${rawFile} (the delivered artifact) for a Vibe link, or
+   from your own review for the claude link — strict extract-and-validate, NO prose-rescue. The
+   reviewer was instructed to end with exactly one <verdict>{...}</verdict> block:
    - NO <verdict> block → attempt FAILED. Do NOT scrape a "## Status:" line or prose
      (that fallback ladder is REMOVED). Retry/fallback; if none ever yields a block,
      return verdict "ERROR", status "missing_verdict_block".
@@ -3047,8 +3154,10 @@ ${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChai
       finding was dropped (0 grounded) → review is suspect: this attempt FAILED, go to
       the NEXT link. If every remaining link is also 0/N grounded, "ERROR", status
       "ungrounded_review".
-   e. Prepend a grounding line to the ${planDir}/${rawFile} header:
-      "grounded: <G>/<N> findings, <D> dropped"; list the dropped findings beneath it.
+   e. Write the grounding line "grounded: <G>/<N> findings, <D> dropped", with the dropped
+      findings beneath it, to ${planDir}/seat-notes/${rawFile} (mkdir -p ${planDir}/seat-notes;
+      overwrite). NEVER add it to ${planDir}/${rawFile} — that file is the seat's
+      byte-identical handoff.
 6.5 FINGERPRINT — for every GROUNDED finding compute a coarse \`fingerprint\`:
    <normalized repo-relative file path, or "plan" if no file> + ":" + <defect-class>.
    The defect-class is a 2-4 word lowercase-kebab slug naming the UNDERLYING defect
@@ -3060,13 +3169,18 @@ ${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChai
 7.5 ${toolDenialCheck(`${tmpFile.replace(/\.txt$/, '')}-l<N>, N = that link's number in step 3`)}
 8. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: pointer_round=${pRound}, status per verdict, record
    grounded/dropped counts. Do NOT write review_fingerprints or convergence here — the
-   orchestrator records those once per round (concurrent shim writes would race).${claudeFinalRound ? CLAUDE_FINAL_REVIEW_STEP(pRound) : ''}
+   orchestrator records those once per round (concurrent shim writes would race). Also append
+   {"role": "pointer", "round": ${pRound}, "file": "${rawFile}", "sha256": "<hex>", "provider": "<family>"}
+   to the "seat_artifacts" array (create it if absent) — sha256 from the WOLFPACK_ARTIFACT_DELIVERED
+   line (Vibe link), or \`sha256sum ${planDir}/${rawFile}\` of the file the claude link wrote.${claudeFinalRound ? CLAUDE_FINAL_REVIEW_STEP(pRound) : ''}
 9. Clean up temp files: rm -f ${tmpFile}
 10. Return: verdict, findings (count of GROUNDED items), findingsList (grounded only,
     each with id/severity/title/file/line/claim/evidence/FINGERPRINT), grounded (count),
     dropped (array), and the provider FAMILY that produced the accepted review as
     \`provider\` (exactly one of ${ptrChain.map(f => `"${f}"`).join(', ')}). Also return \`deniedTools\`
-    and (when the block had it) \`toolAccess\` from step 7.5.
+    and (when the block had it) \`toolAccess\` from step 7.5. Also return \`artifacts\`:
+    [{file, sha256}] from the accepted link's WOLFPACK_ARTIFACT_DELIVERED lines, or [] for the
+    claude link.
 
 If NO link produced an acceptable review — every CLI in the chain failed, OR every run lacked a
 parseable <verdict> block / was malformed / was an empty-findings contradiction /
@@ -3074,6 +3188,7 @@ grounded 0/N — return verdict "ERROR" with the MOST SPECIFIC status
 (missing_verdict_block | malformed_verdict | empty_findings_contradiction |
 ungrounded_review). No block-less or ungrounded review becomes APPROVED.
 ${RATE_LIMIT_SIGNAL_NOTE}
+${HANDOFF_SIGNAL_NOTE}
 ${FALLBACK_LOG_NOTE}
 ${DIFF_CATCH_NOTE}
 ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' + unit.key : ''}`)}
@@ -3103,6 +3218,7 @@ ${heartbeat('Code Review', `Pointer round ${pRound}${unit.key !== 'full' ? ' ' +
       // metadata.claude_final_reviews (CLAUDE_FINAL_REVIEW_STEP), not claude_fallback_reviews.
       if (!claudeFinalRound) await noteClaudeFallbackReview('pointer', pRound, pointerResult, ptrChain, 'Code Review')
       await noteAuditOnly('pointer', pRound, pointerResult, `${planDir}/pointer-review-${pRound}.md`, 'Code Review')
+      logSeatArtifacts('pointer', pRound, pointerResult)
     }
 
     if (!claudeFinalRound) setExaminer(pointerResult.provider, `sticky: answered pointer round ${pRound}`)
@@ -3253,7 +3369,7 @@ You have NO shell (no git, no tests, no commands). Tools: read_file, grep, write
 only — it refuses an existing file), edit (modify EXISTING files), dev_cortex_repo_map,
 dev_cortex_file_outline. Worktree root: ${worktreePath} (absolute paths under it).
 Read ${worktreePath}/.agents/skills/shepherd/SKILL.md (skip shell steps) and the full review at
-${planDir}/pointer-review-${pRound}.md.
+${planDir}/pointer-review-${pRound}.md (pipeline notes, if any: ${planDir}/seat-notes/pointer-review-${pRound}.md).
 MANDATORY: address EVERY finding below — ACCEPTED (change the code, say what changed) or
 REJECTED (say specifically why the finding is wrong). Skipping a finding is NOT allowed.
 --- FINDINGS CHECKLIST (from Pointer round ${pRound}) ---
@@ -3290,7 +3406,8 @@ Plan dir: ${planDir}
 ${rewriteFallbackNote}
 cd to ${worktreePath}.
 
-Read ${planDir}/pointer-review-${pRound}.md for full context on each finding.
+Read ${planDir}/pointer-review-${pRound}.md for full context on each finding
+(pipeline notes, if any: ${planDir}/seat-notes/pointer-review-${pRound}.md).
 
 MANDATORY: Address EVERY finding below. For each, mark ACCEPTED (explain what code you changed)
 or REJECTED (explain specifically why the finding is incorrect). Skipping a finding is NOT allowed.
@@ -3429,9 +3546,10 @@ if (at('Certify')) {
 phase('Certify')
 log(`Watchdog certifying: ${slug}`)
 
-// Certification writes files (certification.md, pedigree.json). Every remaining link is
-// either read-only (both Vibe families — the shim writes the files from its stdout) or is
-// the shim itself (the claude last-resort link, which writes them directly). The old
+// Certification writes files (certification.md, pedigree.json). A Vibe link (both families)
+// writes them ITSELF into its shim-mounted out dir and the shim delivers them byte-for-byte
+// (seat-handoff-writes); the claude last-resort link (the shim agent itself) writes them
+// directly. The old
 // Agy "writes the files directly" branch is gone with the shim, and with it the
 // print-mode fabrication surface documented in .wolfpack/cross-cutting-debt.md.
 // The certifier walks the same cross-family chain as the Pointer: enabled examiners
@@ -3443,7 +3561,10 @@ log(`Watchdog certifying: ${slug}`)
 const MISTRAL_CERTIFY_TURNS = (typeof process !== 'undefined' && process.env && process.env.WOLFPACK_MISTRAL_CERTIFY_TURNS) || GLM_REVIEW_TURNS
 // AC13: the Mistral certifier runs the REAL wolfpack-watchdog agent. It used to borrow
 // wolfpack-pointer, which handed the certifier the Pointer system prompt (known_traps #6).
-const vibeCertifyStep = `${shq(shimPath)} wolfpack-watchdog ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(MISTRAL_CERTIFY_TURNS)}`
+// seat-handoff-writes: the certifier's out dir (round 0, as noteAuditOnly records it) and
+// the two artifacts the shim delivers.
+const wdHandoff = { dir: 'watchdog-r0', expect: ['certification.md', 'pedigree.json'] }
+const vibeCertifyStep = `${shq(shimPath)} ${handoffArgs(wdHandoff)} wolfpack-watchdog ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(MISTRAL_CERTIFY_TURNS)}`
 // The claude last-resort CERTIFY link — prose, not a command (there is no podman-claude.sh:
 // the shim agent walking this chain already IS Claude). Watchdog is the highest-stakes seat,
 // so this is spelled out in full rather than abbreviated.
@@ -3461,7 +3582,7 @@ const CLAUDE_SELF_CERTIFY_STEP = `(no shim — YOU are Claude.) Read the certify
        the code-writer families, examinerChain has already removed this link and reaching it at
        all is a bug, not a fallback.`
 // GLM certifier: its own read-only Watchdog agent (wolfpack-watchdog-glm, glm-5.3), ≥80 turns.
-const glmCertifyStep = `${shq(shimPath)} wolfpack-watchdog-glm ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(GLM_REVIEW_TURNS)}`
+const glmCertifyStep = `${shq(shimPath)} ${handoffArgs(wdHandoff)} wolfpack-watchdog-glm ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(GLM_REVIEW_TURNS)}`
 const certifyStep = (who) => (who === 'glm' ? glmCertifyStep : who === 'mistral' ? vibeCertifyStep : CLAUDE_SELF_CERTIFY_STEP)
 ensureCodeWriterRecord()
 ensureTestWriterRecord()
@@ -3480,16 +3601,27 @@ const certifySteps = wdChain.map((who, i) => `   [${i + 1}] ${i === 0 ? 'PRIMARY
        ${who === 'claude' ? certifyStep(who) : shimRun(certifyStep(who), `/tmp/watchdog-${slug}-l${i + 1}`)}
        ${who === 'claude'
           ? 'This link IS you — follow the step above and write certification.md / pedigree.json yourself.'
-          : `${EXAMINER_LABEL[who]} is read-only — capture its stdout and YOU write certification.md / pedigree.json from it.`}`).join('\n')
+          : `${EXAMINER_LABEL[who]} writes certification.md + pedigree.json itself; the shim delivers them byte-for-byte (HANDOFF SIGNAL). Do NOT write, edit or re-create either file for this link.`}`).join('\n')
   + (wdChain.some(w => w !== 'claude') ? `\n${SHIM_WAIT_RULE}` : '')
+// seat-handoff-writes (review-6 #1): the certify prompt carries only the Vibe out-dir HANDOFF
+// note, so the claude last-resort link gets its own explicit plan-dir write location here (the
+// CLAUDE_SELF_CERTIFY_STEP / "This link IS you" texts stay unchanged).
+const certifyClaudeBranch = wdChain.includes('claude') ? `
+   claude link: the SANDBOXED SEAT HANDOFF note in the certify prompt does NOT apply to you —
+   write certification.md + pedigree.json directly to ${planDir}/certification.md and
+   ${planDir}/pedigree.json. The .seat-out/ path applies only to Vibe links (a shim delivers
+   those); it does not exist for you.
+
+` : ''
 
 watchdogResult = await agent(`
 You are a shim agent orchestrating Watchdog certification. The certifier chain for this
 hunt is ${chainLabel(wdChain)} — try each link in order. No link shares a family with the
 code's writer(s) (${[...codeWriterFamilies].join(', ')}) — certification must be cross-family.
 Watchdog must produce certification.md and pedigree.json:
- - If the running link is a Vibe family (Vibe/GLM or Vibe/Mistral Large 4), it is read-only
-   (--enabled-tools), so YOU (the shim) must write the files from its stdout output.
+ - If the running link is a Vibe family (Vibe/GLM or Vibe/Mistral Large 4), the SEAT writes both
+   files itself with write_file into its out dir and the shim delivers them into the plan dir
+   byte-for-byte (HANDOFF SIGNAL) — YOU never write, edit or re-create them for that link.
  - If the running link is "claude" (the FINAL, last-resort link), there is no shim: YOU
    perform the certification yourself per that step and write the files directly.
 
@@ -3509,12 +3641,50 @@ Steps:
    shepherd-log.md, debrief.md, metadata.json. Run git diff ${BASE}..HEAD for the code diff.
    Read .wolfpack/known-broken-tests.md and .wolfpack/cross-cutting-debt.md.
    EFFICIENCY (mandatory): certify from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the certification request.
-   Write certification.md to ${planDir}/certification.md.
-   Write pedigree.json to ${planDir}/pedigree.json.
-   If PASS: append to .wolfpack/pedigree/index.md, run ./scripts/wolfpack-lessons.sh,
-   then commit the wolfpack learning-loop artifacts. STRICT staging rules (a past bug
-   force-committed gitignored worktree plan files into main at .agents/worktrees/<slug>/…
-   paths — these rules prevent that recurrence):
+   SAFETY: No git push. No deploy commands. No \`git add -f\` — ever.
+   You MUST run git diff ${BASE}..HEAD and the project's test command yourself. End your response with a <verdict> block: {verdict, plan_adherence, code_quality, test_result, tool_access: {shell: ok|denied|unused, denied_tools: []}} — tool_access is MANDATORY: report honestly whether your shell ran; list every denied or unknown tool call in denied_tools; never present a file-reading audit as a verified certification.${HANDOFF_NOTE(wdHandoff)}"
+
+3. Walk the CERTIFIER CHAIN in order. Each wrapper caps concurrent calls on its model
+   (flock). Run each EXACTLY as given, capture stdout for verdict parsing:
+${certifySteps}
+${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) skips straight to the next link.
+   A Vibe link's exit 0 is checked by the HANDOFF SIGNAL rules below (exit 78 / any
+   WOLFPACK_ARTIFACT_ERROR line = that link FAILED).
+   ${chainBoundary(wdChain, codeWriterFamilies)}
+
+4. Extract the verdict from the link that ran, in PRIORITY ORDER:
+   - If ${planDir}/certification.md exists (the shim delivered it, or the claude link wrote it), read the verdict from the file
+   - Else if stdout has a <verdict> block, parse it
+   - Else if stdout has a "## Status: <VERDICT>" line or a clear PASS / REWORK / FLAWED_PLAN statement, use that
+   - If none of these are present, that link failed — go to step 5
+   REJECTED delivered link (exit 0 but this step or 4.5 fails it, OR a FAILED handoff — exit 78 /
+   any WOLFPACK_ARTIFACT_ERROR line — after a partial delivery: the .err has a
+   WOLFPACK_ARTIFACT_DELIVERED or "move-failed" line): before the next link, move EVERY one of
+   the two files that exists in ${planDir} aside, so no artifact of a failed link survives
+   there (step 4's file-first read and the resume probe would take it as this round's verdict):
+     mkdir -p ${planDir}/seat-notes; for f in certification.md pedigree.json; do [ ! -e ${planDir}/$f ] || mv -f ${planDir}/$f ${planDir}/seat-notes/$f.rejected-l<N>; done
+
+4a. ${toolDenialCheck(`/tmp/watchdog-${slug}-l<N>, N = that link's number in step 3`)}
+
+4.5 AUDIT-ONLY GATE (tier ${tier}): ${HEAVY(tier)
+  ? `this tier cannot certify on audit alone. If the TOOL-DENIAL CHECK found ANY line, OR the verdict's
+   tool_access shows shell as anything other than "ok" ("denied" or "unused") or lists any denied tool
+   other than the read-only-by-role ${ROLE_DENIED_TOOLS.join('/')},
+   OR the verdict has NO tool_access you can copy — do NOT perform the PASS-only actions: do not stamp status "certified" (step 7), do not run
+   step 8/8b, do not append to .wolfpack/pedigree/index.md, do not commit. Still write
+   certification.md if the claude link produced the verdict — a delivered Vibe link's
+   certification.md / pedigree.json stay byte-identical (do NOT write, edit or re-create
+   them) — and return the verdict with \`deniedTools\` / \`toolAccess\` — the pipeline parks it.`
+  : `an audit-only certification is allowed on this tier but recorded; proceed normally and return
+   \`deniedTools\` / \`toolAccess\`.`}
+
+4.6 PASS-ONLY ACTIONS (YOU, the shim agent — never the certifier seat). On PASS, and only if
+   4.5 allows it, perform these AFTER step 8 below has run (so the index row carries the
+   DURATION value and the committed pedigree.json carries the timing block): append to
+   .wolfpack/pedigree/index.md, run ./scripts/wolfpack-lessons.sh, then commit the wolfpack
+   learning-loop artifacts. STRICT staging rules (a past bug force-committed gitignored
+   worktree plan files into main at .agents/worktrees/<slug>/… paths — these rules prevent
+   that recurrence):
      - FIRST \`cd ${worktreePath}\` so every path you stage is WORKTREE-RELATIVE. NEVER
        stage a path that begins with \`.agents/worktrees/\` (that path only exists from the
        MAIN repo and force-commits the worktree's files into main).
@@ -3525,33 +3695,6 @@ Steps:
        metadata.json — they are GITIGNORED plan artifacts that ride the worktree and are
        copied back by /merge; force-adding them is the leak.
    Then \`git commit\`.
-   Update ${planDir}/metadata.json with verdict ${META_PRESERVE_NOTE}.
-   SAFETY: No git push. No deploy commands. No \`git add -f\` — ever.
-   You MUST run git diff ${BASE}..HEAD and the project's test command yourself. End your response with a <verdict> block: {verdict, plan_adherence, code_quality, test_result, tool_access: {shell: ok|denied|unused, denied_tools: []}} — tool_access is MANDATORY: report honestly whether your shell ran; list every denied or unknown tool call in denied_tools; never present a file-reading audit as a verified certification."
-
-3. Walk the CERTIFIER CHAIN in order. Each wrapper caps concurrent calls on its model
-   (flock). Run each EXACTLY as given, capture stdout for verdict parsing:
-${certifySteps}
-   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) skips straight to the next link.
-   ${chainBoundary(wdChain, codeWriterFamilies)}
-
-4. Extract the verdict from the link that ran, in PRIORITY ORDER:
-   - If ${planDir}/certification.md exists (the model wrote it), read the verdict from the file
-   - Else if stdout has a <verdict> block, parse it
-   - Else if stdout has a "## Status: <VERDICT>" line or a clear PASS / REWORK / FLAWED_PLAN statement, use that
-   - If none of these are present, that link failed — go to step 5
-
-4a. ${toolDenialCheck(`/tmp/watchdog-${slug}-l<N>, N = that link's number in step 3`)}
-
-4.5 AUDIT-ONLY GATE (tier ${tier}): ${HEAVY(tier)
-  ? `this tier cannot certify on audit alone. If the TOOL-DENIAL CHECK found ANY line, OR the verdict's
-   tool_access shows shell as anything other than "ok" ("denied" or "unused") or lists any denied tool
-   other than the read-only-by-role ${ROLE_DENIED_TOOLS.join('/')},
-   OR the verdict has NO tool_access you can copy — do NOT perform the PASS-only actions: do not stamp status "certified" (step 7), do not run
-   step 8/8b, do not append to .wolfpack/pedigree/index.md, do not commit. Still write
-   certification.md, and return the verdict with \`deniedTools\` / \`toolAccess\` — the pipeline parks it.`
-  : `an audit-only certification is allowed on this tier but recorded; proceed normally and return
-   \`deniedTools\` / \`toolAccess\`.`}
 
 5. If a link failed, move to the NEXT link of the chain (step 3 list) and repeat step 4.
 
@@ -3561,6 +3704,10 @@ ${certifySteps}
    PASS: phase="done", status="certified", completed_at=$(date -Iseconds) (the REAL clock — the t_end marker; "created" is t0)
    REWORK: phase="implement", status="rework_needed"
    FLAWED_PLAN: phase="plan", status="flawed_plan"
+   Also append one row per file to the "seat_artifacts" array (create it if absent):
+     {"role": "watchdog", "round": 0, "file": "certification.md" | "pedigree.json", "sha256": "<hex>", "provider": "<family>"}
+   — sha256 from the WOLFPACK_ARTIFACT_DELIVERED lines (Vibe link), or \`sha256sum\` of the files
+   the claude link wrote.
 
 8. On PASS only — fold timing into the scorecard (non-blocking, like the lessons
    aggregator). Run this YOURSELF on the host AFTER the certifier returns (node is
@@ -3587,11 +3734,13 @@ ${certifySteps}
 
 Return the verdict, and the provider FAMILY that produced the accepted certification in
 BOTH \`provider\` and \`status\` (exactly one of ${wdChain.map(f => `"${f}"`).join(', ')}), plus \`deniedTools\`
-and (when the verdict block had it) \`toolAccess\` from step 4a. If EVERY link was
-rate-limited, return verdict "ERROR" with status "model_quota".
+and (when the verdict block had it) \`toolAccess\` from step 4a. Also return \`artifacts\`:
+[{file, sha256}] from the accepted link's WOLFPACK_ARTIFACT_DELIVERED lines, or [] for the
+claude link. If EVERY link was rate-limited, return verdict "ERROR" with status "model_quota".
 
 SAFETY: No git push, no deploy.
 ${RATE_LIMIT_SIGNAL_NOTE}
+${HANDOFF_SIGNAL_NOTE}
 ${FALLBACK_LOG_NOTE}
 ${heartbeat('Certify', 'Watchdog certification')}
 `, { label: `watchdog:${slug}`, phase: 'Certify', schema: VERDICT_SCHEMA })
@@ -3614,6 +3763,7 @@ if (watchdogResult && watchdogResult.verdict && watchdogResult.verdict !== 'ERRO
   }
   await noteClaudeFallbackReview('watchdog', 0, watchdogResult, wdChain, 'Certify')
   await noteAuditOnly('watchdog', 0, watchdogResult, `${planDir}/certification.md`, 'Certify')
+  logSeatArtifacts('watchdog', 0, watchdogResult)
 }
 
 // seat-profiles-into-pack (AC6b/c) — an Orange/Red (or unknown-tier) certification that was

@@ -1,7 +1,7 @@
 # Tracked template — install with scripts/wolfpack-install-vibe-agents.mjs; do not hand-edit the installed copy.
 # Wolfpack GLM seat (pointer). Run ONLY via the pack's podman-vibe.sh shim, which passes
 # --auto-approve + a strict --enabled-tools allow-list
-# (read_file grep bash dev_cortex_repo_map dev_cortex_file_outline).
+# (read_file grep bash write_file dev_cortex_repo_map dev_cortex_file_outline).
 # vibe -p hangs forever on any tool call needing approval, so nothing here is "ask".
 active_model = "glm-5.3"  # zai-glm-5-3 via the Mistral API
 agent_type = "agent"
@@ -31,13 +31,17 @@ permission = "always"
 [tools.git_bash]
 permission = "always"
 
-# edit/write_file stay never: read-only by role. task stays never: no self-orchestration
-# (the pipeline owns fan-out).
+# write_file is allowed ONLY for the seat's own handoff file (seat-handoff-writes): the shim
+# mounts ONE per-seat out dir read-write (<plan dir>/.seat-out/<seat>-r<N>/); the worktree
+# stays read-only, the shim moves only the expected artifact into the plan dir, and anything
+# else (an extra file, a source change) fails the round. edit stays never: edit-denied by role
+# (the shim also drops it from the allow-list). task stays never: no self-orchestration (the
+# pipeline owns fan-out).
 [tools.edit]
 permission = "never"
 
 [tools.write_file]
-permission = "never"
+permission = "always"
 
 [tools.task]
 permission = "never"

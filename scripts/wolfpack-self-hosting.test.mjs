@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // scripts/wolfpack-self-hosting.test.mjs — the repo wiring that lets wolfpack host its own
 // hunts: synced skills ignored (AC9), the tracked .claude/workflows link (A-3), the plans dir,
-// an empty public pedigree (AC2), and a CHANGELOG whose entries carry hunt attribution.
+// a well-formed public pedigree (AC2), and a CHANGELOG whose entries carry hunt attribution.
 // Run: node --test scripts/wolfpack-self-hosting.test.mjs
 
 import { test } from 'node:test'
@@ -36,11 +36,52 @@ test('A-3: .claude/workflows is a TRACKED symlink to ../.agents/workflows (mode 
   }
 })
 
-test('AC2: plans dir exists (tracked .gitkeep); pedigree index tracked with header rows only', () => {
+// seat-handoff-writes (human-directed): the pedigree index starts header-only, but every
+// certified wolfpack-hosted hunt appends a row — so the check is on SHAPE, never on the row count.
+// Returns the list of problems ([] = well-formed).
+function pedigreeIndexProblems(text) {
+  const rows = text.split('\n').filter(l => l.startsWith('|'))
+  if (rows.length < 2) return [`expected a header and a separator row, found ${rows.length} table row(s)`]
+  const cells = (l) => l.split('|')
+  const problems = []
+  if (!rows[0].startsWith('| Date | Feature |')) problems.push(`row 0 is not the header: ${rows[0]}`)
+  const sep = cells(rows[1]).slice(1, -1)
+  if (!sep.length || !sep.every(c => /^-+$/.test(c.trim()))) problems.push(`row 1 is not the separator: ${rows[1]}`)
+  const width = cells(rows[0]).length
+  for (const [i, l] of rows.entries()) {
+    if (!l.trimEnd().endsWith('|')) problems.push(`row ${i} does not end with |: ${l}`)
+    if (cells(l.trimEnd()).length !== width) problems.push(`row ${i} has ${cells(l.trimEnd()).length - 2} cells, the header has ${width - 2}: ${l}`)
+  }
+  return problems
+}
+
+test('AC2: plans dir exists (tracked .gitkeep); pedigree index tracked with a header, a separator and only well-formed data rows', () => {
   assert.equal(git('ls-files', '--error-unmatch', '.wolfpack/plans/.gitkeep').status, 0)
+  assert.equal(git('ls-files', '--error-unmatch', '.wolfpack/pedigree/index.md').status, 0, 'the pedigree index is tracked')
   const idx = readFileSync(join(ROOT, '.wolfpack', 'pedigree', 'index.md'), 'utf8')
-  assert.equal(idx.split('\n').filter(l => l.startsWith('|')).length, 2, 'header + separator only — a fresh public pedigree')
+  assert.deepEqual(pedigreeIndexProblems(idx), [])
   assert.equal(git('ls-files', '.wolfpack/campaigns').stdout.trim(), '', 'campaign state is not tracked yet (wave 3)')
+})
+
+test('AC2 (shape check): header-only passes, an appended well-formed row passes, a wrong cell count or a broken header/separator fails', () => {
+  const header = '| Date | Feature | Tier | Verdict |'
+  const sep = '|------|---------|------|---------|'
+  const base = `# Wolfpack Pedigree Index\n\n${header}\n${sep}\n`
+  assert.deepEqual(pedigreeIndexProblems(base), [], 'header-only (a fresh public pedigree)')
+  assert.deepEqual(pedigreeIndexProblems(`${base}| 2026-10-20 | seat-handoff-writes | Orange | PASS |\n`), [], 'one certified row')
+  assert.deepEqual(pedigreeIndexProblems(`${base}| a | b | c | d |\n| e | f | g | h |\n`), [], 'several rows')
+  assert.equal(pedigreeIndexProblems(`${base}| 2026-10-20 | x | Orange |\n`).length, 1, 'a short row fails')
+  assert.equal(pedigreeIndexProblems(`${base}| 2026-10-20 | x | Orange | PASS | extra |\n`).length, 1, 'a long row fails')
+  assert.ok(pedigreeIndexProblems(`${base}| 2026-10-20 | x | Orange | PASS\n`).length >= 1, 'a row without the closing | fails')
+  assert.ok(pedigreeIndexProblems(`${header}\n`).length >= 1, 'no separator fails')
+  assert.ok(pedigreeIndexProblems(`| Foo | Bar | Tier | Verdict |\n${sep}\n`).some(p => /not the header/.test(p)))
+  assert.ok(pedigreeIndexProblems(`${header}\n| a | b | c | d |\n`).some(p => /not the separator/.test(p)))
+  // the REAL index with a well-formed row appended (as this hunt's own certification will do) passes
+  const real = readFileSync(join(ROOT, '.wolfpack', 'pedigree', 'index.md'), 'utf8')
+  const width = real.split('\n').find(l => l.startsWith('| Date |')).split('|').length - 2
+  const row = `| ${Array.from({ length: width }, (_, i) => (i === 0 ? '2026-10-20' : 'x')).join(' | ')} |`
+  assert.deepEqual(pedigreeIndexProblems(`${real.trimEnd()}\n${row}\n`), [])
+  assert.equal(pedigreeIndexProblems(`${real.trimEnd()}\n| 2026-10-20 | x |\n`).length, 1)
 })
 
 test('AC2: CHANGELOG has an [Unreleased] section and every entry carries a hunt attribution', () => {

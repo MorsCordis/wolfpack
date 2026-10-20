@@ -23,6 +23,13 @@ const SRC = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const WT = '/repo/.agents/worktrees/h'
 const PD = `${WT}/.wolfpack/plans/h`
+// seat-handoff-writes: a review/certify Vibe command carries the handoff args BETWEEN the shim
+// and the agent, so "shim then agent" is asserted on one line: the shim prefix followed by
+// " --deliver-to ", then the agent token later on that same line.
+const hasHandoffCall = (text, shimPrefix, agentTok) => text.split('\n').some(l => {
+  const i = l.indexOf(`${shimPrefix} --deliver-to `)
+  return i >= 0 && l.indexOf(agentTok, i) > i
+})
 
 // Default happy-path answers; a scenario overrides by label prefix (value or fn(prompt, opts, n)).
 // wolfpack-self-hosting (AC10): the project-config probe relays the reader's JSON. The default
@@ -61,7 +68,7 @@ const BASE = {
   park: {},
 }
 
-async function runHunt({ env = {}, answers = {}, args = {}, rawArgs } = {}) {
+async function runHunt({ env = {}, answers = {}, args = {}, rawArgs, src = SRC } = {}) {
   const calls = []
   const logs = []
   const table = { ...BASE, ...answers }
@@ -78,7 +85,7 @@ async function runHunt({ env = {}, answers = {}, args = {}, rawArgs } = {}) {
     return typeof v === 'function' ? v(prompt, opts, counts[key]) : JSON.parse(JSON.stringify(v))
   }
   const parallel = async (fns) => Promise.all(fns.map(f => f()))
-  const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'process', SRC)
+  const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'process', src)
   const result = await fn(
     rawArgs !== undefined ? rawArgs : { slug: 'h', description: 'd', ...args }, agent, parallel,
     (m) => logs.push(String(m)), () => {}, { total: 1e12, remaining: () => 1e12 }, { env })
@@ -90,13 +97,13 @@ test('default gates: Claude Shepherd; Bloodhound/Pointer chain = glm → mistral
   assert.notEqual(result.status, 'parked:cross_family_violation')
   const bh = find('bloodhound:')[0].prompt
   assert.match(bh, /Vibe\/GLM → Vibe\/Mistral Large 4/)
-  assert.match(bh, /podman-vibe\.sh' 'wolfpack-bloodhound-glm'/)
-  assert.match(bh, /podman-vibe\.sh' 'wolfpack-bloodhound'/)   // mistral is default-ON now
+  assert.match(bh, /podman-vibe\.sh' --deliver-to [^\n]*'wolfpack-bloodhound-glm'/)
+  assert.match(bh, /podman-vibe\.sh' --deliver-to [^\n]*'wolfpack-bloodhound'/)   // mistral is default-ON now
   // Alpha (Claude) wrote the plan, so the claude last-resort link is filtered out
   assert.doesNotMatch(bh, /Claude \(last resort\)/)
   const ptr = find('pointer:')[0].prompt
   assert.doesNotMatch(ptr, /Claude \(last resort\)/)   // a Claude Shepherd wrote the code
-  assert.match(ptr, /podman-vibe\.sh' 'wolfpack-pointer-glm'/)
+  assert.match(ptr, /podman-vibe\.sh' --deliver-to [^\n]*'wolfpack-pointer-glm'/)
   assert.equal(find('shepherd-glm').length, 0)
   assert.equal(find('shepherd:')[0].opts.model, 'sonnet')
 })
@@ -110,12 +117,12 @@ test('glm Shepherd pin (Yellow): GLM implements via --implement; glm is REMOVED 
   assert.equal(find('shepherd:').length + find('shepherd-fallback').length, 0, 'no Claude Shepherd when GLM succeeds')
   const ptr = find('pointer:')[0].prompt
   assert.doesNotMatch(ptr, /-glm'/, 'Pointer must not offer a GLM link for GLM-written code')
-  assert.match(ptr, /podman-vibe\.sh' 'wolfpack-pointer'/)
+  assert.match(ptr, /podman-vibe\.sh' --deliver-to [^\n]*'wolfpack-pointer'/)
   // no Claude has written yet, so the last-resort link IS live for Pointer round 1
   assert.match(ptr, /Claude \(last resort\)/)
   const wd = find('watchdog:')[0].prompt
   assert.doesNotMatch(wd, /wolfpack-watchdog-glm/)
-  assert.match(wd, /podman-vibe\.sh' wolfpack-watchdog /)
+  assert.match(wd, /podman-vibe\.sh' --deliver-to [^\n]* wolfpack-watchdog /)
   // the Claude Tracker wrote tests before Certify, so the Watchdog loses the claude link
   assert.doesNotMatch(wd, /Claude \(last resort\)/)
   assert.ok(logs.some(l => /Code-writer families after Implement: glm \(last writer: glm\)/.test(l)))
@@ -194,7 +201,7 @@ test('glm Shepherd: code-review chain = mistral → claude(last resort) (never g
     answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })
   const ptr = find('pointer:')[0].prompt
   assert.match(ptr, /Vibe\/Mistral Large 4 → Claude \(last resort\)/)
-  assert.match(ptr, /podman-vibe\.sh' 'wolfpack-pointer'/)
+  assert.match(ptr, /podman-vibe\.sh' --deliver-to [^\n]*'wolfpack-pointer'/)
   assert.doesNotMatch(ptr, /-glm'/)
 })
 
@@ -638,7 +645,7 @@ test('offload AC6: Red + usage offload ⇒ GLM Shepherd (judgment override suspe
   assert.equal(ptr.length, 2, 'one cross-family round + one Claude final round')
   assert.equal(isFinalPrompt(ptr[0].prompt), false)
   assert.doesNotMatch(ptr[0].prompt, /-glm'/, 'golden rule: glm never reviews GLM-written code')
-  assert.match(ptr[0].prompt, /podman-vibe\.sh' 'wolfpack-pointer'/)
+  assert.match(ptr[0].prompt, /podman-vibe\.sh' --deliver-to [^\n]*'wolfpack-pointer'/)
   assert.ok(isFinalPrompt(ptr[1].prompt))
   assert.match(ptr[1].prompt, /claude_final_reviews/)
   assert.doesNotMatch(ptr[1].prompt, /podman-vibe\.sh/, 'the final round forces the claude link only')
@@ -1139,9 +1146,9 @@ VIBE_TOOL_FLAGS=()
 for _t in \${WOLFPACK_VIBE_TOOLS:-$VIBE_TOOLS_DEFAULT}; do
     VIBE_TOOL_FLAGS+=(--enabled-tools "$_t")
 done
-GLM_REVIEW_TOOLS_DEFAULT="read_file grep bash dev_cortex_repo_map dev_cortex_file_outline"
+GLM_REVIEW_TOOLS_DEFAULT="read_file grep bash write_file dev_cortex_repo_map dev_cortex_file_outline"
 GLM_IMPLEMENT_TOOLS_DEFAULT="read_file grep write_file edit dev_cortex_repo_map dev_cortex_file_outline"
-GLM_REVIEW_DROP="task"
+GLM_REVIEW_DROP="task edit"
 GLM_IMPLEMENT_DROP="bash task"
 `
 const TOOLCHECK = join(here, 'wolfpack-toolcheck.mjs')
@@ -1405,7 +1412,9 @@ test('AC6b: Orange + a self-reported denied shell (no denial lines) also parks',
 test('Orange + a shell-ok PASS that lists only read-only-by-role tools as denied certifies (not audit-only)', async () => {
   const { result, find } = await runHunt({ answers: {
     alpha: { ...BASE.alpha, tier: 'Orange' },
-    watchdog: { verdict: 'PASS', provider: 'glm', deniedTools: [], toolAccess: { shell: 'ok', denied_tools: ['write_file', 'edit', 'skill', 'task'] } },
+    // seat-handoff-writes: write_file is no longer read-only-by-role (the seat writes its handoff
+    // file), so the role-denied set is edit/skill/task only.
+    watchdog: { verdict: 'PASS', provider: 'glm', deniedTools: [], toolAccess: { shell: 'ok', denied_tools: ['edit', 'skill', 'task'] } },
   } })
   assert.notEqual(result.status, 'parked:audit_only_certification', JSON.stringify(result))
   assert.equal(find('park:h:audit_only_certification').length, 0)
@@ -1420,12 +1429,23 @@ test('Orange + a shell-ok PASS that also lists a non-role tool (bash) as denied 
   assert.equal(result.status, 'parked:audit_only_certification', JSON.stringify(result))
   const ev = find('park:h:audit_only_certification')[0].prompt
   assert.match(ev, /seat reported denied tool: bash/)
-  assert.doesNotMatch(ev, /seat reported denied tool: write_file/)
+  // seat-handoff-writes: write_file is now audit-only evidence too (A7: profile drift)
+  assert.match(ev, /seat reported denied tool: write_file/)
 })
 
-test('a review seat that lists only write_file as denied is not recorded audit_only', async () => {
+test('seat-handoff-writes AC12: a review seat that lists only write_file as denied IS recorded audit_only', async () => {
   const { find } = await runHunt({ answers: {
     bloodhound: { ...BASE.bloodhound, deniedTools: [], toolAccess: { shell: 'ok', denied_tools: ['write_file'] } },
+  } })
+  const rec = auditRecords(find, 'bloodhound')
+  assert.equal(rec.length, 1)
+  assert.match(rec[0].prompt, /"audit_only": true/)
+  assert.match(rec[0].prompt, /write_file/)
+})
+
+test('seat-handoff-writes AC12: a review seat that lists only edit/task/skill as denied is NOT recorded audit_only', async () => {
+  const { find } = await runHunt({ answers: {
+    bloodhound: { ...BASE.bloodhound, deniedTools: [], toolAccess: { shell: 'ok', denied_tools: ['edit', 'task', 'skill'] } },
   } })
   assert.equal(auditRecords(find, 'bloodhound').length, 0)
 })
@@ -1607,7 +1627,7 @@ test('AC10 (b): the scaffold uses .agents/worktrees/h; shim + toolcheck resolve 
   assert.ok(logs.some(l => l === 'Repo root: /x/wolfpack'), logs.join('\n'))
   assert.ok(logs.some(l => l === `Pack home (WOLFPACK_HOME): ${packHome} — from wolfpack-config.md → Project Identity → Wolfpack home; seat shim ${packHome}/scripts/podman-vibe.sh`), logs.join('\n'))
   assert.ok(find('toolcheck-preflight:')[0].prompt.includes(`'/x/wolfpack/scripts/wolfpack-toolcheck.mjs' --shim '${packHome}/scripts/podman-vibe.sh'`))
-  assert.ok(find('pointer:')[0].prompt.includes(`'${packHome}/scripts/podman-vibe.sh' 'wolfpack-pointer-glm'`))
+  assert.ok(hasHandoffCall(find('pointer:')[0].prompt, `'${packHome}/scripts/podman-vibe.sh'`, ` 'wolfpack-pointer-glm' `))
   assert.ok(logs.some(l => /^Project config: wolfpack .* — tests: bash scripts\/test-all\.sh; deploy: none; risk surfaces: 0$/.test(l)), logs.join('\n'))
 })
 
@@ -1771,11 +1791,11 @@ test('AC3 (a) / AC4: env WOLFPACK_HOME wins over the key — EVERY shim command 
   const a = await runHunt({ env: { WOLFPACK_HOME: '/envpack' } })
   for (const p of SHIM_SEATS) assert.ok(a.find(p).length >= 1, `${p} ran`)
   const wd = a.find('watchdog:')[0].prompt
-  assert.ok(wd.includes(`'/envpack/scripts/podman-vibe.sh' wolfpack-watchdog-glm `), 'GLM certify step')
-  assert.ok(wd.includes(`'/envpack/scripts/podman-vibe.sh' wolfpack-watchdog `), 'Mistral certify step')
+  assert.ok(hasHandoffCall(wd, `'/envpack/scripts/podman-vibe.sh'`, ` wolfpack-watchdog-glm `), 'GLM certify step')
+  assert.ok(hasHandoffCall(wd, `'/envpack/scripts/podman-vibe.sh'`, ` wolfpack-watchdog `), 'Mistral certify step')
   const bh = a.find('bloodhound:')[0].prompt
-  assert.ok(bh.includes(`'/envpack/scripts/podman-vibe.sh' 'wolfpack-bloodhound-glm'`), 'GLM review')
-  assert.ok(bh.includes(`'/envpack/scripts/podman-vibe.sh' 'wolfpack-bloodhound'`), 'Mistral review')
+  assert.ok(hasHandoffCall(bh, `'/envpack/scripts/podman-vibe.sh'`, ` 'wolfpack-bloodhound-glm' `), 'GLM review')
+  assert.ok(hasHandoffCall(bh, `'/envpack/scripts/podman-vibe.sh'`, ` 'wolfpack-bloodhound' `), 'Mistral review')
   assert.ok(a.find('toolcheck-preflight:')[0].prompt.includes(`--shim '/envpack/scripts/podman-vibe.sh'`), 'toolcheck --shim')
   // GLM Shepherd (--implement) run
   const g = await runHunt({ env: { WOLFPACK_HOME: '/envpack' }, answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })
@@ -1905,4 +1925,293 @@ test('AC4 (g): source guard — no shim path is built from repoRoot in either wo
   const iResolve = SRC.indexOf('const wolfpackHome = resolveWolfpackHome(')
   const iResume = SRC.indexOf('const resumeProbe = await agent(')
   assert.ok(iProbe > 0 && iProbe < iResolve && iResolve < iResume, `${iProbe} < ${iResolve} < ${iResume}`)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// seat-handoff-writes: review/certify seats write their OWN handoff file into a shim-mounted
+// per-seat out dir; the shim delivers it byte-for-byte; the shim agent never re-transcribes it.
+// ════════════════════════════════════════════════════════════════════════════
+
+// Evaluate a claude-link constant from the deployed SRC with this harness's planDir, so the
+// prompt can be checked to carry it BYTE-EQUAL (the Out list: those texts are unchanged).
+const claudeConst = (name, ...callArgs) => {
+  const m = SRC.match(new RegExp(`\\nconst ${name} = ([\\s\\S]*?\`)\\n`))
+  assert.ok(m, `${name} found in hunt-pipeline.js`)
+  return new Function('planDir', `const v = ${m[1]}; return typeof v === 'function' ? v(...arguments[1]) : v`)(PD, callArgs)
+}
+const ORANGE = { ...BASE.alpha, tier: 'Orange' }
+const SHELL_OK = { shell: 'ok', denied_tools: [] }
+const GLM_PASS = { verdict: 'PASS', provider: 'glm', status: 'glm', deniedTools: [], toolAccess: SHELL_OK }
+
+test('seat-handoff-writes AC12: ROLE_DENIED_TOOLS = edit/task/skill (no write_file); auditEvidence follows', () => {
+  const m = SRC.match(/const ROLE_DENIED_TOOLS = (\[[^\]]*\])/)
+  assert.ok(m)
+  assert.deepEqual(JSON.parse(m[1].replace(/'/g, '"')), ['edit', 'task', 'skill'])
+  const body = SRC.match(/const SINGLE_LENS = .*\n/)[0] + SRC.match(/const TIER_CONFIG = \{[\s\S]*?\n\}\n/)[0]
+  const helpers = SRC.match(/const ROLE_DENIED_TOOLS = [\s\S]*?\nconst certAuditEvidence = [\s\S]*?\n\}\n/)[0]
+  const { auditEvidence, isAuditOnly } = new Function(`${body}\n${helpers}\nreturn { auditEvidence, isAuditOnly }`)()
+  assert.deepEqual(auditEvidence({ toolAccess: { shell: 'ok', denied_tools: ['edit', 'task', 'skill'] } }), [])
+  const ev = auditEvidence({ toolAccess: { shell: 'ok', denied_tools: ['write_file'] } })
+  assert.equal(ev.length, 1)
+  assert.match(ev[0], /write_file/)
+  assert.equal(isAuditOnly({ toolAccess: { shell: 'ok', denied_tools: ['write_file'] } }), true)
+})
+
+test('seat-handoff-writes AC12: the Orange Watchdog gate lists edit/task/skill as the read-only-by-role set', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE, watchdog: GLM_PASS } })
+  const wd = find('watchdog:')[0].prompt
+  assert.match(wd, /lists any denied tool\s+other than the read-only-by-role edit\/task\/skill/)
+  assert.doesNotMatch(wd, /edit\/write_file/)
+})
+
+test('seat-handoff-writes AC13: Bloodhound — every Vibe link runs in handoff mode; the seat is told the relative out-dir path', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE } })
+  const bh = find('bloodhound:')[0].prompt
+  const cmds = bh.split('\n').filter(l => /podman-vibe\.sh'/.test(l))
+  assert.equal(cmds.length, 2, 'glm + mistral links')
+  for (const c of cmds) {
+    assert.ok(c.includes(`--deliver-to '${PD}' --out-dir '${PD}/.seat-out/bloodhound-r1' --expect 'review-1.md' 'wolfpack-bloodhound`), c)
+  }
+  // seat prompt: write_file + the worktree-RELATIVE path (valid in both families' containers)
+  assert.match(bh, /SANDBOXED SEAT HANDOFF \(mandatory for the Vibe seat\)/)
+  assert.ok(bh.includes('Write .wolfpack/plans/h/.seat-out/bloodhound-r1/review-1.md with the write_file tool'))
+  assert.match(bh, /no metadata\.json, no commits/)
+  assert.match(bh, /This overrides any output file name or location in your system prompt or a role skill/)
+  // the HANDOFF note rides INSIDE the seat prompt file (step 2), after the verdict contract
+  const step2 = bh.slice(bh.indexOf('2. Write the review prompt'), bh.indexOf('3. Walk the EXAMINER CHAIN'))
+  assert.ok(step2.indexOf('MANDATORY VERDICT CONTRACT') < step2.indexOf('SANDBOXED SEAT HANDOFF'), 'after VERDICT_CONTRACT')
+  // the shim agent never re-transcribes; it reads the verdict from the DELIVERED artifact
+  assert.doesNotMatch(bh, /Write the raw output/)
+  assert.ok(bh.includes(`Vibe link: the shim delivered ${PD}/review-1.md itself (HANDOFF SIGNAL)`))
+  assert.ok(bh.includes(`EXTRACT THE VERDICT from ${PD}/review-1.md (the delivered artifact) for a Vibe link`))
+  // HANDOFF SIGNAL: exit 78 = FAILED, record handoff_violations
+  assert.match(bh, /HANDOFF SIGNAL: a Vibe shim run with --out-dir delivers its artifact ITSELF/)
+  assert.match(bh, /Exit 78 or any "WOLFPACK_ARTIFACT_ERROR:" line means the\s+seat broke its write contract[^]*that link FAILED/)
+  assert.match(bh, /"handoff_violations" array/)
+  assert.match(bh, /return status "handoff_violation"/)
+  // rejected delivered link → moved aside, never left looking like the round's review
+  assert.ok(bh.includes(`mkdir -p ${PD}/seat-notes && mv -f ${PD}/review-1.md ${PD}/seat-notes/review-1.md.rejected-l<N>`))
+  // seat_artifacts row + artifacts return
+  assert.match(bh, /\{"role": "bloodhound", "round": 1, "file": "review-1\.md", "sha256": "<hex>", "provider": "<family>"\}/)
+  assert.match(bh, /"seat_artifacts" array/)
+  assert.match(bh, /Also return `artifacts`: \[\{file, sha256\}\]/)
+})
+
+test('seat-handoff-writes AC14: the Bloodhound grounding line goes to the seat-notes sidecar, never into review-N.md', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE } })
+  const bh = find('bloodhound:')[0].prompt
+  const e = bh.slice(bh.indexOf('e. Write the grounding line'), bh.indexOf('6.5 FINGERPRINT'))
+  assert.ok(e.length > 0)
+  assert.ok(e.includes(`to\n      ${PD}/seat-notes/review-1.md (mkdir -p ${PD}/seat-notes; overwrite)`), e)
+  assert.ok(e.includes(`NEVER add it\n      to ${PD}/review-1.md`), e)
+  assert.doesNotMatch(bh, /(prepend|FIRST line)[^\n]*review-1\.md/i)
+})
+
+test('seat-handoff-writes AC13: Pointer — handoff args on every Vibe link, out dir pointer-r<N>, relative seat path', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE, pointer: issuesThenApprove,
+    'shepherd-rewrite': { findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true } } })
+  const ptrs = find('pointer:')
+  assert.equal(ptrs.length, 2)
+  for (const [i, c] of ptrs.entries()) {
+    const n = i + 1
+    const cmds = c.prompt.split('\n').filter(l => /podman-vibe\.sh'/.test(l))
+    assert.equal(cmds.length, 2, `r${n}: glm + mistral`)
+    for (const l of cmds) assert.ok(l.includes(`--deliver-to '${PD}' --out-dir '${PD}/.seat-out/pointer-r${n}' --expect 'pointer-review-${n}.md' 'wolfpack-pointer`), l)
+    assert.ok(c.prompt.includes(`Write .wolfpack/plans/h/.seat-out/pointer-r${n}/pointer-review-${n}.md with the write_file tool`))
+    assert.doesNotMatch(c.prompt, /Write the raw output/)
+    assert.match(c.prompt, /HANDOFF SIGNAL:/)
+    assert.ok(c.prompt.includes(`${PD}/seat-notes/pointer-review-${n}.md`), 'grounding sidecar')
+  }
+  // AC14 / 4i: the Shepherd rework prompt points at the sidecar
+  const rw = find('shepherd-rewrite')[0].prompt
+  assert.ok(rw.includes(`Read ${PD}/pointer-review-1.md for full context on each finding\n(pipeline notes, if any: ${PD}/seat-notes/pointer-review-1.md).`), rw)
+})
+
+test('seat-handoff-writes 4i: the Alpha revise prompt lists the Bloodhound sidecar next to review-N.md', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE,
+    bloodhound: (_p, _o, n) => (n === 1
+      ? { verdict: 'ISSUES_FOUND', findings: 1, findingsList: [FINDING], provider: 'glm', status: 'glm' }
+      : { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'glm', status: 'glm' }),
+    'alpha-revise': { findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true } } })
+  const rv = find('alpha-revise')
+  assert.ok(rv.length >= 1, 'a revise ran')
+  assert.ok(rv[0].prompt.includes(`- ${PD}/review-1.md (Bloodhound findings for this round)\n- ${PD}/seat-notes/review-1.md (pipeline notes on that review: grounding, dropped findings, audit-only — if present)`), rv[0].prompt)
+})
+
+test('seat-handoff-writes 4i: the GLM Shepherd rework prompt also points at the Pointer sidecar', async () => {
+  const { find } = await runHunt({ answers: { 'shepherd-seat': GLM_SEAT, pointer: issuesThenApprove,
+    'shepherd-glm': (p) => (/addressing Pointer code-review round/.test(p)
+      ? { outcome: 'done', exitCode: 0, changedFiles: ['app/x.py'], committed: true, findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true }
+      : { outcome: 'done', exitCode: 0, changedFiles: ['app/x.py'], committed: true }) } })
+  const rw = find('shepherd-glm').map(c => c.prompt).find(p => /addressing Pointer code-review round 1/.test(p))
+  assert.ok(rw, 'the GLM rework ran')
+  assert.ok(rw.includes(`${PD}/pointer-review-1.md (pipeline notes, if any: ${PD}/seat-notes/pointer-review-1.md).`))
+})
+
+test('seat-handoff-writes AC13: the claude last-resort review texts are byte-equal to their constants', async () => {
+  // GLM Shepherd → Pointer chain = mistral → claude (last resort)
+  const { find } = await runHunt({ answers: { 'shepherd-seat': GLM_SEAT } })
+  const ptr = find('pointer:')[0].prompt
+  assert.ok(ptr.includes(claudeConst('CLAUDE_SELF_REVIEW_STEP', '/tmp/pointer-h-r1.txt', 'pointer')), 'CLAUDE_SELF_REVIEW_STEP verbatim')
+  // the claude link line carries no handoff args (it is not a shim)
+  const claudeLine = ptr.split('\n').find(l => /CLAUDE|Claude \(last resort\)/.test(l) && /\[\d\]/.test(l))
+  assert.ok(claudeLine && !/--deliver-to/.test(claudeLine), claudeLine)
+  // only the mistral link is a shim call, and it carries the handoff args
+  const cmds = ptr.split('\n').filter(l => /podman-vibe\.sh'/.test(l))
+  assert.equal(cmds.length, 1)
+  assert.match(cmds[0], /--deliver-to [^\n]*'wolfpack-pointer' /)
+  // claude-link step 5 governs its own save, and the HANDOFF note is scoped to Vibe links
+  assert.ok(ptr.includes(`claude link: save your review to ${PD}/pointer-review-1.md.`))
+  assert.match(ptr, /SANDBOXED SEAT HANDOFF note in the review prompt applies only to Vibe links/)
+})
+
+test('seat-handoff-writes AC13: the claude FINAL review round keeps CLAUDE_FINAL_SELF_REVIEW_STEP byte-equal and runs no shim', async () => {
+  const { find } = await runHunt({ answers: { alpha: { ...BASE.alpha, tier: 'Red', pointerRounds: 3 }, 'shepherd-seat': OFFLOAD_SEAT, pointer: pointerBy() } })
+  const fin = find('pointer:')[1].prompt
+  assert.ok(fin.includes(claudeConst('CLAUDE_FINAL_SELF_REVIEW_STEP', '/tmp/pointer-h-r2.txt')), 'CLAUDE_FINAL_SELF_REVIEW_STEP verbatim')
+  assert.doesNotMatch(fin, /podman-vibe\.sh/)
+  assert.doesNotMatch(fin, /--deliver-to/)
+})
+
+test('seat-handoff-writes AC13: Watchdog — both Vibe certify commands deliver certification.md + pedigree.json from watchdog-r0', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE, watchdog: GLM_PASS } })
+  const wd = find('watchdog:')[0].prompt
+  const cmds = wd.split('\n').filter(l => /podman-vibe\.sh'/.test(l))
+  assert.equal(cmds.length, 2)
+  for (const l of cmds) {
+    assert.ok(l.includes(`--deliver-to '${PD}' --out-dir '${PD}/.seat-out/watchdog-r0' --expect 'certification.md' --expect 'pedigree.json' wolfpack-watchdog`), l)
+  }
+  assert.ok(wd.includes('Write .wolfpack/plans/h/.seat-out/watchdog-r0/certification.md and .wolfpack/plans/h/.seat-out/watchdog-r0/pedigree.json with the write_file tool'))
+  assert.match(wd, /Do NOT append to \.wolfpack\/pedigree\/index\.md, run scripts, commit or update metadata\.json — the pipeline does that after you\./)
+  // the shim agent no longer authors the files from stdout
+  assert.doesNotMatch(wd, /YOU write certification\.md \/ pedigree\.json from it/)
+  assert.doesNotMatch(wd, /is read-only \(--enabled-tools\), so YOU/)
+  assert.match(wd, /writes certification\.md \+ pedigree\.json itself; the shim delivers them byte-for-byte \(HANDOFF SIGNAL\)\. Do NOT write, edit or re-create either file for this link\./)
+  assert.match(wd, /HANDOFF SIGNAL:/)
+  // step 4 reads the verdict from the delivered file; a rejected / partially-delivered link is moved aside (both files)
+  assert.ok(wd.includes(`If ${PD}/certification.md exists (the shim delivered it, or the claude link wrote it), read the verdict from the file`))
+  assert.ok(wd.includes(`for f in certification.md pedigree.json; do [ ! -e ${PD}/$f ] || mv -f ${PD}/$f ${PD}/seat-notes/$f.rejected-l<N>; done`))
+  // seat_artifacts rows for both files + artifacts return
+  assert.match(wd, /\{"role": "watchdog", "round": 0, "file": "certification\.md" \| "pedigree\.json", "sha256": "<hex>", "provider": "<family>"\}/)
+  assert.match(wd, /Also return `artifacts`:/)
+})
+
+test('seat-handoff-writes P10: the Watchdog SEAT prompt no longer commits or appends the pedigree index; step 4.6 (the shim agent) does', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE, watchdog: GLM_PASS } })
+  const wd = find('watchdog:')[0].prompt
+  const seat = wd.slice(wd.indexOf('2. Write the Watchdog prompt'), wd.indexOf('3. Walk the CERTIFIER CHAIN'))
+  assert.ok(seat.length > 0)
+  assert.doesNotMatch(seat, /git commit/)
+  assert.doesNotMatch(seat, /If PASS: append/)
+  assert.doesNotMatch(seat, /Write certification\.md to /)
+  assert.doesNotMatch(seat, /Update [^\n]*metadata\.json with verdict/)
+  assert.match(seat, /SAFETY: No git push\. No deploy commands\./, 'the SAFETY line stays')
+  const s46 = wd.slice(wd.indexOf('4.6 PASS-ONLY ACTIONS'), wd.indexOf('5. If a link failed'))
+  assert.match(s46, /YOU, the shim agent — never the certifier seat/)
+  assert.match(s46, /append to\s+\.wolfpack\/pedigree\/index\.md, run \.\/scripts\/wolfpack-lessons\.sh, then commit/)
+  assert.ok(s46.includes('FIRST `cd /repo/.agents/worktrees/h`'))
+  assert.match(s46, /NEVER `git add \.` \/ `git add -A` \/ `git add -f`\. NEVER stage certification\.md or\s+metadata\.json/)
+  assert.match(s46, /only if\s+4\.5 allows it/)
+  // 4.6 sits after the 4.5 gate
+  assert.ok(wd.indexOf('4.5 AUDIT-ONLY GATE') < wd.indexOf('4.6 PASS-ONLY ACTIONS'))
+})
+
+test('seat-handoff-writes 4f: the HEAVY 4.5 gate keeps delivered Vibe files byte-identical (no unconditional "Still write certification.md")', async () => {
+  for (const tier of ['Orange', 'Red']) {
+    const { find } = await runHunt({ answers: { alpha: { ...BASE.alpha, tier }, watchdog: GLM_PASS } })
+    const wd = find('watchdog:')[0].prompt
+    assert.doesNotMatch(wd, /Still write\s+certification\.md, and return/, tier)
+    assert.match(wd, /a delivered Vibe link's\s+certification\.md \/ pedigree\.json stay byte-identical/, tier)
+    assert.match(wd, /Still write\s+certification\.md if the claude link produced the verdict/, tier)
+  }
+})
+
+test('seat-handoff-writes [debrief]: a Watchdog chain WITH a claude link tells it to write straight to the plan dir; CLAUDE_SELF_CERTIFY_STEP stays byte-equal', async () => {
+  const { find } = await runHunt({ answers: {
+    alpha: ORANGE, 'shepherd-seat': OFFLOAD_SEAT,
+    tracker: { verdict: 'TESTS_PASS', provider: 'mistral' },
+    pointer: { ...BASE.pointer, provider: 'mistral' },
+    watchdog: { verdict: 'PASS', provider: 'claude', deniedTools: [], toolAccess: SHELL_OK },
+  } })
+  const wd = find('watchdog:')[0].prompt
+  assert.match(wd, /Claude \(last resort\)/)
+  const at = wd.indexOf('claude link: the SANDBOXED SEAT HANDOFF note')
+  assert.ok(at >= 0, 'the claude-link branch sentence is present')
+  const slice = wd.slice(at, wd.indexOf('\n\n', at))
+  assert.match(slice, /does NOT apply to you/)
+  assert.ok(slice.includes(`${PD}/certification.md`) && slice.includes(`${PD}/pedigree.json`), slice)
+  assert.doesNotMatch(slice, /\.seat-out\/watchdog-r0/)
+  assert.ok(wd.includes(claudeConst('CLAUDE_SELF_CERTIFY_STEP')), 'CLAUDE_SELF_CERTIFY_STEP verbatim')
+  assert.ok(wd.includes('This link IS you — follow the step above and write certification.md / pedigree.json yourself.'))
+  // claude-only chain → no shim command at all
+  assert.doesNotMatch(wd, /podman-vibe\.sh'/)
+})
+
+test('seat-handoff-writes [debrief]: a Vibe-only Watchdog chain carries NO claude-link branch sentence', async () => {
+  const { find } = await runHunt({ answers: { alpha: ORANGE, watchdog: GLM_PASS } })
+  assert.doesNotMatch(find('watchdog:')[0].prompt, /claude link: the SANDBOXED SEAT HANDOFF note/)
+})
+
+test('seat-handoff-writes AC14: noteAuditOnly writes the seat-notes sidecar and never touches the artifact', async () => {
+  const { find, logs } = await runHunt({ answers: {
+    pointer: { ...BASE.pointer, deniedTools: [], toolAccess: { shell: 'denied', denied_tools: ['bash'] } } } })
+  const rec = auditRecords(find, 'pointer')
+  assert.equal(rec.length, 1)
+  const p = rec[0].prompt
+  assert.ok(p.includes(`Append this line to ${PD}/seat-notes/pointer-review-1.md (mkdir -p ${PD}/seat-notes; create the file if absent)`), p)
+  assert.ok(p.includes(`Do NOT modify ${PD}/pointer-review-1.md — it is the seat's byte-identical handoff`))
+  assert.doesNotMatch(p, /FIRST line of/)
+  assert.match(p, /> audit_only: true — pointer r1 \(mistral\) ran without a working shell/)
+  assert.ok(logs.some(l => l.includes(`noting it in ${PD}/seat-notes/pointer-review-1.md`)), logs.join('\n'))
+  // Watchdog: the sidecar is seat-notes/certification.md
+  const w = await runHunt({ answers: { watchdog: AUDIT_PASS } })
+  const wr = auditRecords(w.find, 'watchdog')[0].prompt
+  assert.ok(wr.includes(`${PD}/seat-notes/certification.md`))
+  assert.doesNotMatch(wr, /FIRST line of/)
+})
+
+test('seat-handoff-writes 4h: the accepted results log the artifacts the shim delivered (or why none were reported)', async () => {
+  const arts = (f) => [{ file: f, sha256: 'abcdef0123456789abcdef' }]
+  const { logs } = await runHunt({ answers: {
+    bloodhound: { ...BASE.bloodhound, artifacts: arts('review-1.md') },
+    pointer: { ...BASE.pointer, artifacts: [] },
+    watchdog: { ...BASE.watchdog, artifacts: [...arts('certification.md'), { file: 'pedigree.json', sha256: '0011223344556677' }] },
+  } })
+  assert.ok(logs.includes('✓ h: bloodhound r1 artifacts delivered by the shim: review-1.md abcdef012345'), logs.join('\n'))
+  assert.ok(logs.includes('✓ h: pointer r1 artifacts delivered by the shim: (artifacts not reported by the shim agent)'), logs.join('\n'))
+  assert.ok(logs.includes('✓ h: watchdog r0 artifacts delivered by the shim: certification.md abcdef012345, pedigree.json 001122334455'), logs.join('\n'))
+  // a claude-provider result with no artifacts says the claude link wrote them
+  const c = await runHunt({ answers: { 'shepherd-seat': GLM_SEAT, pointer: { ...BASE.pointer, provider: 'claude', artifacts: [] } } })
+  assert.ok(c.logs.includes('✓ h: pointer r1 artifacts delivered by the shim: (claude link wrote them)'), c.logs.join('\n'))
+})
+
+test('seat-handoff-writes 4h: REVIEW_SCHEMA and VERDICT_SCHEMA carry the artifacts array', () => {
+  for (const name of ['REVIEW_SCHEMA', 'VERDICT_SCHEMA']) {
+    const m = SRC.match(new RegExp(`const ${name} = \\{[\\s\\S]*?\\n\\}\\n`))
+    assert.ok(m, name)
+    assert.match(m[0], /artifacts: \{ type: 'array', items: \{ type: 'object', properties: \{ file: \{ type: 'string' \}, sha256: \{ type: 'string' \} \} \} \}/, name)
+  }
+})
+
+test('seat-handoff-writes: a plan dir OUTSIDE the worktree fails loud at the first seat call (no silent non-handoff run)', async () => {
+  await assert.rejects(
+    runHunt({ answers: { scaffold: { worktreePath: WT, planDir: '/elsewhere/.wolfpack/plans/h' } } }),
+    (e) => /seat-handoff-writes: the plan dir \(\/elsewhere\/\.wolfpack\/plans\/h\) is not inside the worktree \(\/repo\/\.agents\/worktrees\/h\)/.test(e.message))
+})
+
+test('seat-handoff-writes AC13 (lens): a two-lens review gives each lens its own out dir and artifact name', async () => {
+  const lensSrc = SRC.replace("const SINGLE_LENS = [{ key: 'full', focus: '' }]",
+    "const SINGLE_LENS = [{ key: 'sec', focus: 'security' }, { key: 'perf', focus: 'performance' }]")
+  assert.notEqual(lensSrc, SRC, 'the lens substitution applied')
+  const { find } = await runHunt({ src: lensSrc, answers: { alpha: ORANGE } })
+  const bh = find('bloodhound:')
+  assert.equal(bh.length, 2, 'one shim agent per lens')
+  for (const key of ['sec', 'perf']) {
+    const p = bh.find(c => c.label.includes(`:${key}`)).prompt
+    for (const l of p.split('\n').filter(x => /podman-vibe\.sh'/.test(x))) {
+      assert.ok(l.includes(`--out-dir '${PD}/.seat-out/bloodhound-r1-${key}' --expect 'review-1-${key}.md'`), l)
+    }
+    assert.ok(p.includes(`Write .wolfpack/plans/h/.seat-out/bloodhound-r1-${key}/review-1-${key}.md with the write_file tool`))
+    assert.ok(p.includes(`${PD}/seat-notes/review-1-${key}.md`))
+  }
 })

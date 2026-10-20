@@ -307,6 +307,8 @@ FLAWED_PLAN is rare. Use it when Shepherd-level rework cannot produce a correct 
 
 After deciding the exit path, write `$PLAN_DIR/pedigree.json` AND append one line to `.wolfpack/pedigree/index.md`.
 
+**Headless Vibe seat:** `write_file` is allowed ONLY for your two handoff files (`certification.md` and `pedigree.json`), at the out-dir path the pipeline prompt names; never `metadata.json`, never anything else (the shim fails the round). In a headless seat the pipeline performs the PASS-only actions after you (the `.wolfpack/pedigree/index.md` append, `wolfpack-lessons.sh`, the timing fold, the commit and the metadata update) — do not attempt them. Interactive runs are unchanged.
+
 ### Scoring rubric (anchored to objective criteria)
 
 ### Execution scores

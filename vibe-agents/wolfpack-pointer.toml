@@ -27,13 +27,16 @@ permission = "always"
 [tools.git_bash]
 permission = "always"
 
-# edit/write_file stay never: read-only by role (the shim enables them; the read-only
-# mount and this profile keep the seat off source).
+# write_file is allowed ONLY for the seat's own handoff file (seat-handoff-writes): the shim
+# mounts ONE per-seat out dir read-write (<plan dir>/.seat-out/<seat>-r<N>/); the worktree
+# stays read-only, the shim moves only the expected artifact into the plan dir, and anything
+# else (an extra file, a source change) fails the round. edit stays never: edit-denied by role
+# (the shim enables it; this profile keeps the seat off it).
 [tools.edit]
 permission = "never"
 
 [tools.write_file]
-permission = "never"
+permission = "always"
 
 # The shim never enables task or skill for a Mistral seat, so both stay never (an
 # "always" here would be dead config the toolcheck flags). Seats read SKILL.md files

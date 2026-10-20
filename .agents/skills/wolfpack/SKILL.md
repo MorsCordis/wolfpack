@@ -110,6 +110,10 @@ and emits its verdict; it does **not** spawn sub-agents:
   The read-only worktree mount + sandbox are the real guardrail; reviewer-writes-to-source are
   read-only-by-ROLE (caught by diff-catch), not by a tool fence. `scripts/wolfpack-toolcheck.mjs`
   is the preflight that FAILS LOUD if the set ever silently re-boxes (the `read,grep` comma bug).
+  Review/certify seats write their handoff file (`review-N.md`, `pointer-review-N.md`,
+  `certification.md` + `pedigree.json`) themselves with `write_file` into a shim-mounted
+  per-seat out dir (`<plan dir>/.seat-out/<seat>-r<N>/`, the only read-write bind; `edit` stays
+  denied), and the shim moves it into the plan dir byte-for-byte or fails the round with exit 78.
 - The old `review_strategy: parallel_specialized | ultra` **self-orchestration is dead** —
   cross-models proved too fragile as orchestrators (roster fan-out timed out / hit turn limits /
   never emitted a verdict on v1-push-3 Reds). Each reviewer skill enforces this with its
