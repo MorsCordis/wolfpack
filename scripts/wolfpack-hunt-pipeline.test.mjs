@@ -16,10 +16,12 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
 import { TOOL_DENIAL_PATTERN as TOOLCHECK_DENIAL_PATTERN } from './wolfpack-toolcheck.mjs'
+import { stripMeta, splitMeta, runtimeMetaRefs } from './lib/workflow-source.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const SRC = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8')
-  .replace(/^export const meta/m, 'const meta')
+// workflow-meta-runtime: load the way the Workflow runtime does — the `export const meta` block is
+// REMOVED, not rewritten to `const meta` (which kept `meta` defined and hid a ReferenceError).
+const SRC = stripMeta(readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8'))
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 const RETIRED_SYNC = ['wolfpack', 'sync', 'runtime'].join('-')   // built, so AC7's literal git grep stays empty
 const WT = '/repo/.agents/worktrees/h'
@@ -45,20 +47,20 @@ const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/tes
   worktreeRoot: '.agents/worktrees',
   exec: { sandboxImage: 'fx-sandbox:latest', glmImage: 'fx-sandbox-glm:latest', projectLayer: null, seatExtraMounts: [],
     sandboxExtraMounts: [], secretsPaths: [], vibeAgentDir: '/agents', seatTestEnv: [], missing: [], problems: [] } }
-const configAnswer = (cfg = FIXTURE_CONFIG) => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2) })
+const configAnswer = (cfg = FIXTURE_CONFIG, cwd = '/repo') => ({ exitCode: 0, output: JSON.stringify(cfg, null, 2), cwd })
 // pack-install-model (AC5): the run-start stamp probe relays `wolfpack-workflows.mjs check --json`.
 // Default: both workflows are the pack's own canonical files (wolfpack's layout), which is what
 // the UNSTAMPED canonical SRC expects. A scenario passes per-file states / extra fields.
 const PACK_COMMIT = 'a'.repeat(40)
-const stampResult = ({ hunt = 'canonical', runner = 'canonical', huntExtra = {}, runnerExtra = {}, canonicalSource = `sha256:${'c'.repeat(64)}` } = {}) => {
+const stampResult = ({ hunt = 'canonical', runner = 'canonical', huntExtra = {}, runnerExtra = {}, canonicalSource = `sha256:${'c'.repeat(64)}`, consumer = '/repo' } = {}) => {
   const w = (name, state, extra) => ({ name, file: `/repo/.claude/workflows/${name}`, state, stamp: null, canonicalSource,
     fix: ['current', 'canonical'].includes(state) ? null : "bash '/pack/install.sh' --consumer '/repo'", ...extra })
   const workflows = [w('campaign-runner.js', runner, runnerExtra), w('hunt-pipeline.js', hunt, huntExtra)]
-  return { ok: workflows.every(x => ['current', 'canonical'].includes(x.state)), pack: '/pack', packVersion: 'v0.2.0-1-gaaaaaaa', packCommit: PACK_COMMIT, consumer: '/repo', workflows }
+  return { ok: workflows.every(x => ['current', 'canonical'].includes(x.state)), pack: '/pack', packVersion: 'v0.2.0-1-gaaaaaaa', packCommit: PACK_COMMIT, consumer, workflows }
 }
-const stampAnswer = (opts = {}, exitCode) => {
+const stampAnswer = (opts = {}, exitCode, cwd = '/repo') => {
   const r = stampResult(opts)
-  return { exitCode: exitCode ?? (r.ok ? 0 : 1), output: JSON.stringify(r) }
+  return { exitCode: exitCode ?? (r.ok ? 0 : 1), output: JSON.stringify(r), cwd }
 }
 
 const BASE = {
@@ -102,7 +104,9 @@ async function runHunt({ env = {}, answers = {}, args = {}, rawArgs, src = SRC }
     const v = table[key]
     return typeof v === 'function' ? v(prompt, opts, counts[key]) : JSON.parse(JSON.stringify(v))
   }
-  const parallel = async (fns) => Promise.all(fns.map(f => f()))
+  // workflow-meta-runtime: the real runtime's parallel() turns a throwing unit into `null`; a
+  // harness that propagated the throw hid a pipeline error behind a different symptom.
+  const parallel = async (fns) => Promise.all(fns.map(async f => { try { return await f() } catch { return null } }))
   const fn = new AsyncFunction('args', 'agent', 'parallel', 'log', 'phase', 'budget', 'process', src)
   const result = await fn(
     rawArgs !== undefined ? rawArgs : { slug: 'h', description: 'd', ...args }, agent, parallel,
@@ -375,8 +379,7 @@ test('resume: a Tracker-bounce re-entry goes back to GLM when GLM was the last w
 })
 
 // ─── campaign-runner: stale runtime pipeline guard ──────────────────────────
-const RUNNER = readFileSync(join(here, '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8')
-  .replace(/^export const meta/m, 'const meta')
+const RUNNER = stripMeta(readFileSync(join(here, '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8'))
 async function runRunner({ env = {}, protocol }) {
   const calls = []
   const agent = async (_p, opts = {}) => {
@@ -827,8 +830,13 @@ test('AC10: review prompts carry the INFRA SIGNAL note; infra_error is NOT a quo
 })
 
 test('AC10: a Pointer that fails with status infra_error parks review_error — never model_quota', async () => {
-  const { result } = await runHunt({ answers: { pointer: { verdict: 'ERROR', status: 'infra_error', findingsList: [] } } })
+  const { result, find } = await runHunt({ answers: { pointer: { verdict: 'ERROR', status: 'infra_error', findingsList: [] } } })
   assert.equal(result.verdict, 'PARKED')
+  // workflow-meta-runtime (4): when seats DID run and fail, the outage guess stays and no error line is added
+  const parks = find('park:')
+  assert.equal(parks.length, 1)
+  assert.match(parks[0].prompt, /likely a model outage or quota exhaustion/)
+  assert.doesNotMatch(parks[0].prompt, /- error:/)
   assert.notEqual(result.reason, 'model_quota')
   assert.notEqual(result.status, 'parked:model_quota')
 })
@@ -1620,9 +1628,9 @@ const PD_PACK = `${WT_PACK}/.wolfpack/plans/h`
 const realConfig = (cfgPath = join(PACK_ROOT, 'wolfpack-config.md')) => () => {
   try {
     const out = execFileSync(process.execPath, [join(here, 'wolfpack-config.mjs'), '--json', cfgPath], { encoding: 'utf8', stdio: 'pipe' })
-    return { exitCode: 0, output: out }
+    return { exitCode: 0, output: out, cwd: '/repo' }
   } catch (e) {
-    return { exitCode: e.status, output: `${e.stdout || ''}${e.stderr || ''}` }
+    return { exitCode: e.status, output: `${e.stdout || ''}${e.stderr || ''}`, cwd: '/repo' }
   }
 }
 const PACK_ANSWERS = { 'project-config': realConfig(), scaffold: { worktreePath: WT_PACK, planDir: PD_PACK } }
@@ -1671,7 +1679,7 @@ test('AC10 (b): the project-config probe runs FIRST — read-only sonnet, the ex
   assert.equal(calls[2].label, 'resume-probe:h')
   assert.equal(calls[0].opts.model, 'sonnet')
   assert.equal(calls[0].opts.phase, 'Scaffold')
-  assert.deepEqual(calls[0].opts.schema.required, ['exitCode', 'output'])
+  assert.deepEqual(calls[0].opts.schema.required, ['exitCode', 'output', 'cwd'])
   assert.match(calls[0].prompt, /node scripts\/wolfpack-config\.mjs --json wolfpack-config\.md 2>&1; echo "CONFIG_RC=\$\?"/)
   assert.match(calls[0].prompt, /modify nothing/)
 })
@@ -1754,7 +1762,7 @@ test('AC10 (e): a failing / garbled / empty project-config probe THROWS naming w
 
 test('AC10 (e): a relayed output with a leading banner and nested braces in strings still parses (brace-balanced, string-aware)', async () => {
   const tricky = { ...FIXTURE_CONFIG, name: 'odd } name { "quoted"', testCommand: 'make test ARGS="{a}"' }
-  const { logs, find } = await runHunt({ answers: { 'project-config': { exitCode: 0, output: `note: relayed\n${JSON.stringify(tricky, null, 2)}\ntrailing {junk}` } } })
+  const { logs, find } = await runHunt({ answers: { 'project-config': { exitCode: 0, output: `note: relayed\n${JSON.stringify(tricky, null, 2)}\ntrailing {junk}`, cwd: '/repo' } } })
   assert.ok(logs.some(l => l.startsWith('Project config: odd } name { "quoted" — tests: make test ARGS="{a}"')), logs.join('\n'))
   assert.match(find('tracker:')[0].prompt, /Run tests using: make test ARGS="\{a\}"/)
 })
@@ -2228,10 +2236,36 @@ test('seat-handoff-writes 4h: REVIEW_SCHEMA and VERDICT_SCHEMA carry the artifac
   }
 })
 
-test('seat-handoff-writes: a plan dir OUTSIDE the worktree fails loud at the first seat call (no silent non-handoff run)', async () => {
-  await assert.rejects(
-    runHunt({ answers: { scaffold: { worktreePath: WT, planDir: '/elsewhere/.wolfpack/plans/h' } } }),
-    (e) => /seat-handoff-writes: the plan dir \(\/elsewhere\/\.wolfpack\/plans\/h\) is not inside the worktree \(\/repo\/\.agents\/worktrees\/h\)/.test(e.message))
+test('workflow-meta-runtime (3): an agent-reported plan dir that differs is WARNED and IGNORED (the computed one is used)', async () => {
+  const { find, logs, calls } = await runHunt({ answers: { scaffold: { worktreePath: WT, planDir: '/elsewhere/.wolfpack/plans/h' } } })
+  assert.ok(logs.some(l => /WARNING[\s\S]*\/elsewhere\/\.wolfpack\/plans\/h[\s\S]*\/repo\/\.agents\/worktrees\/h\/\.wolfpack\/plans\/h/.test(l)), logs.join('\n'))
+  const bh = find('bloodhound:')
+  assert.ok(bh.length > 0)
+  for (const c of bh) assert.ok(c.prompt.includes(`--deliver-to '${PD}'`), c.label)
+  // nothing the pipeline sent to any seat or writer names the reported (wrong) dir
+  for (const c of calls) assert.ok(!c.prompt.includes('/elsewhere'), `${c.label} leaked the reported plan dir`)
+})
+
+test('workflow-meta-runtime (3): the resume path computes the plan dir too (a differing reported value is WARNED and IGNORED)', async () => {
+  const probe = { fresh: false, status: 'test_rewrite_needed', resumePhase: 'Implement', tier: 'Yellow',
+    worktreePath: WT, planDir: '/elsewhere/.wolfpack/plans/h', worktreeExists: true, branchExists: true, trackerRounds: 1, pointerRounds: 1, bloodhoundRounds: 1 }
+  const { logs, calls, find } = await runHunt({ answers: { 'resume-probe': probe } })
+  assert.ok(logs.some(l => /WARNING[\s\S]*resume probe[\s\S]*\/elsewhere\/\.wolfpack\/plans\/h[\s\S]*\/repo\/\.agents\/worktrees\/h\/\.wolfpack\/plans\/h/.test(l)), logs.join('\n'))
+  for (const c of calls) assert.ok(!c.prompt.includes('/elsewhere'), `${c.label} leaked the reported plan dir`)
+  assert.ok(find('pointer:')[0].prompt.includes(PD), 'the computed plan dir reaches the seat prompt')
+})
+
+test('workflow-meta-runtime (3): a matching (or omitted) reported plan dir logs no WARNING and the computed dir is used', async () => {
+  for (const planDir of [PD, `${PD}/`, undefined]) {
+    const { logs, find } = await runHunt({ answers: { scaffold: { worktreePath: WT, ...(planDir === undefined ? {} : { planDir }) } } })
+    assert.equal(logs.some(l => /reported plan dir/.test(l)), false, `${planDir}: ${logs.join('\n')}`)
+    assert.ok(find('bloodhound:')[0].prompt.includes(`--deliver-to '${PD}'`), String(planDir))
+  }
+})
+
+test('workflow-meta-runtime (3): the source never adopts an agent-reported plan dir', () => {
+  assert.doesNotMatch(SRC, /scaffold\.planDir \|\|/)
+  assert.doesNotMatch(SRC, /resumeProbe\.planDir \|\|/)
 })
 
 test('seat-handoff-writes AC13 (lens): a two-lens review gives each lens its own out dir and artifact name', async () => {
@@ -2259,7 +2293,7 @@ test('seat-handoff-writes AC13 (lens): a two-lens review gives each lens its own
 import { render as renderWorkflow } from './wolfpack-workflows.mjs'
 const CANON_HP = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8')
 const SRC_STAMP = { workflow: 'hunt-pipeline.js', commit: 'b'.repeat(40), version: 'v0.2.0-1-gbbbbbbb', source: `sha256:${'5'.repeat(64)}` }
-const stampedSrc = (stamp = SRC_STAMP) => renderWorkflow(CANON_HP, stamp).replace(/^export const meta/m, 'const meta')
+const stampedSrc = (stamp = SRC_STAMP) => stripMeta(renderWorkflow(CANON_HP, stamp))
 // The default FIXTURE_CONFIG has a deploy step, so a run that gets all the way through ends
 // awaiting_user_deploy (Verify surfaces the deploy).
 const NO_STATE = () => {
@@ -2277,7 +2311,7 @@ test('AC5 stamped-current: a stamped run whose source equals the pack\'s logs th
   const probe = find('workflow-stamp:')[0]
   assert.equal(probe.opts.model, 'sonnet')
   assert.equal(probe.opts.phase, 'Scaffold')
-  assert.deepEqual(probe.opts.schema.required, ['exitCode', 'output'])
+  assert.deepEqual(probe.opts.schema.required, ['exitCode', 'output', 'cwd'])
   assert.match(probe.prompt, /READ-ONLY workflow stamp probe — modify nothing/)
   assert.ok(probe.prompt.includes(`node '/pack/scripts/wolfpack-workflows.mjs' check --pack '/pack' --consumer "$(pwd)" --json 2>&1; echo "STAMP_RC=$?"`))
 })
@@ -2345,7 +2379,7 @@ test('AC5 fail closed: a null / exit-2 / garbled / workflows-less / self-less pr
     assert.deepEqual(ran, [], JSON.stringify(ans))
   }
   // a banner before the JSON and exit 1 (some OTHER workflow drifted) still parses and proceeds
-  const { result } = await runHunt({ answers: { 'workflow-stamp': { exitCode: 1, output: `relayed:\n${JSON.stringify(stampResult({ runner: 'stale' }))}\n` } } })
+  const { result } = await runHunt({ answers: { 'workflow-stamp': { exitCode: 1, output: `relayed:\n${JSON.stringify(stampResult({ runner: 'stale' }))}\n`, cwd: '/repo' } } })
   assert.equal(result.status, 'awaiting_user_deploy', 'only THIS script\'s own entry decides the hunt')
 })
 
@@ -2508,4 +2542,151 @@ test('rebase hunk 4: CLAUDE_SELF_CERTIFY_STEP resolves PACK_SKILLS from Wolfpack
   assert.doesNotMatch(wd, /undefined\/\.agents\/skills/)
   // and the source declares PACK_SKILLS before the top-level constant that reads it (no TDZ at load)
   assert.ok(SRC.indexOf('const PACK_SKILLS = ') > 0 && SRC.indexOf('const PACK_SKILLS = ') < SRC.indexOf('const CLAUDE_SELF_CERTIFY_STEP = '))
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// workflow-meta-runtime: the Workflow runtime STRIPS the `export const meta` block, so runtime
+// code must not reference `meta`; the run-start probes must agree on one host repo; pipeline
+// (config) errors in the review fan-out park with their text verbatim.
+// ════════════════════════════════════════════════════════════════════════════
+const checkFnText = (src) => {
+  const a = src.indexOf('const checkWorkflowStamp = async')
+  assert.ok(a >= 0, 'checkWorkflowStamp present')
+  return src.slice(a, src.indexOf('\n}\n', a) + 3)
+}
+
+test('workflow-meta-runtime AC1/AC5: the stripped script launches and reaches the resume probe (no ReferenceError)', async () => {
+  const { find } = await runHunt()
+  assert.equal(find('resume-probe:').length, 1)
+})
+
+test('workflow-meta-runtime AC5: no runtime code references `meta`, and the guard goes red when one does', async () => {
+  assert.deepEqual(runtimeMetaRefs(stripMeta(CANON_HP)), [])
+  const bad = CANON_HP.replace('`${WORKFLOW_NAME}.js`', '`${meta.name}.js`')
+  assert.notEqual(bad, CANON_HP, 'the mutation applied')
+  assert.ok(runtimeMetaRefs(stripMeta(bad)).length > 0, 'the guard flags the mutated source')
+  await assert.rejects(runHunt({ src: stripMeta(bad) }), /meta is not defined/)
+})
+
+test('workflow-meta-runtime AC2: WORKFLOW_NAME equals the meta block name; no meta.name access in the body', () => {
+  const { meta, body } = splitMeta(CANON_HP)
+  assert.equal(meta.name, 'hunt-pipeline')
+  assert.match(body, /^const WORKFLOW_NAME = 'hunt-pipeline'$/m)
+  assert.doesNotMatch(body, /\bmeta\.name\b/)
+})
+
+test('workflow-meta-runtime AC3: checkWorkflowStamp and the probe helpers are byte-identical in both workflows', () => {
+  const runnerSrc = readFileSync(join(here, '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8')
+  assert.equal(checkFnText(CANON_HP), checkFnText(runnerSrc))
+  for (const re of [/^const PROBE_NO_CD = .*$/m, /^const probeRoot = .*$/m, /^let hostRepoRoot = .*$/m]) {
+    assert.equal(CANON_HP.match(re)[0], runnerSrc.match(re)[0], String(re))
+  }
+})
+
+test('workflow-meta-runtime AC6: both probes run with no cd, print PROBE_PWD, and require cwd', async () => {
+  const { find } = await runHunt()
+  for (const label of ['project-config:h', 'workflow-stamp:h']) {
+    const c = find(label)[0]
+    assert.ok(c.prompt.includes('do NOT cd anywhere'), label)
+    assert.ok(c.prompt.includes('echo "PROBE_PWD=$(pwd)";'), label)
+    assert.ok(!c.prompt.includes('From the repo root (your starting directory)'), label)
+    assert.ok(c.opts.schema.required.includes('cwd'), label)
+  }
+})
+
+test('workflow-meta-runtime AC7: probes that disagree on the host repo THROW naming both paths; nothing is scaffolded', async () => {
+  const cases = [
+    ['stamp probe cwd and checker consumer both elsewhere', { 'workflow-stamp': stampAnswer({ consumer: '/other' }, undefined, '/other') }],
+    ['stamp probe cwd elsewhere, consumer matches', { 'workflow-stamp': stampAnswer({}, undefined, '/other') }],
+    ['checker consumer elsewhere, stamp cwd matches', { 'workflow-stamp': stampAnswer({ consumer: '/other' }) }],
+    ['config probe elsewhere', { 'project-config': configAnswer(FIXTURE_CONFIG, '/other') }],
+  ]
+  for (const [why, ans] of cases) {
+    const { ran, answers } = NO_STATE()
+    await assert.rejects(runHunt({ answers: { ...answers, ...ans } }), (e) => {
+      assert.match(e.message, /HOST REPO DRIFTED/, why)
+      assert.match(e.message, /\/repo[\s\S]*\/other|\/other[\s\S]*\/repo/, why)
+      return true
+    })
+    assert.deepEqual(ran, [], why)
+  }
+})
+
+test('workflow-meta-runtime AC7: trailing slashes are normalized (no realpath) and the run proceeds', async () => {
+  const { result } = await runHunt({ answers: { 'project-config': configAnswer(FIXTURE_CONFIG, '/repo/'), 'workflow-stamp': stampAnswer({ consumer: '/repo/' }, undefined, '/repo//') } })
+  assert.equal(result.status, 'awaiting_user_deploy')
+})
+
+test('workflow-meta-runtime AC8: a missing / relative cwd fails closed', async () => {
+  {
+    const { ran, answers } = NO_STATE()
+    const { cwd, ...noCwd } = configAnswer()
+    await assert.rejects(runHunt({ answers: { ...answers, 'project-config': noCwd, 'workflow-stamp': () => { ran.push('workflow-stamp'); return stampAnswer() } } }),
+      /project-config probe did not report the directory it ran in/)
+    assert.deepEqual(ran, [], 'no stamp probe, no scaffold')
+  }
+  for (const stampCwd of [undefined, 'repo', '']) {
+    const { ran, answers } = NO_STATE()
+    const { cwd, ...noCwd } = stampAnswer()
+    await assert.rejects(runHunt({ answers: { ...answers, 'workflow-stamp': stampCwd === undefined ? noCwd : stampAnswer({}, undefined, stampCwd) } }),
+      /HOST REPO DRIFTED[\s\S]*\(not reported\)/, String(stampCwd))
+    assert.deepEqual(ran, [], String(stampCwd))
+  }
+  {
+    const { ran, answers } = NO_STATE()
+    await assert.rejects(runHunt({ answers: { ...answers, 'project-config': configAnswer(FIXTURE_CONFIG, 'repo') } }),
+      /project-config probe did not report the directory it ran in/)
+    assert.deepEqual(ran, [])
+  }
+})
+
+test('workflow-meta-runtime (4): a Bloodhound prompt-build throw parks review_error with the error VERBATIM — no seat ran, no outage guess', async () => {
+  const msg = 'cfg-boom: plan dir (/x) is not inside the worktree (/y)'
+  const mutated = SRC.replace('buildPrompt: buildBloodhoundPrompt,', `buildPrompt: () => { throw new Error('${msg}') },`)
+  assert.notEqual(mutated, SRC, 'the mutation applied')
+  const { result, find } = await runHunt({ src: mutated })
+  assert.equal(result.status, 'parked:review_error')
+  assert.equal(result.pipelineError, msg)
+  assert.equal(find('bloodhound:').length, 0, 'no seat ran')
+  const parks = find('park:')
+  assert.equal(parks.length, 1)
+  const pp = parks[0].prompt
+  assert.ok(pp.includes(msg), 'verbatim error text')
+  assert.ok(pp.includes('- error: "cfg-boom'), 'parked.md error bullet')
+  assert.ok(pp.includes('"error": "cfg-boom'), 'metadata park.error')
+  assert.doesNotMatch(pp, /likely a model outage or quota exhaustion/)
+  assert.match(pp, /plan review could not start/)
+})
+
+test('workflow-meta-runtime (4): a Pointer prompt-build throw parks review_error with the error VERBATIM — no seat ran', async () => {
+  const msg = 'cfg-boom: plan dir (/x) is not inside the worktree (/y)'
+  const mutated = SRC.replace('buildPrompt: buildPointerPrompt,', `buildPrompt: () => { throw new Error('${msg}') },`)
+  assert.notEqual(mutated, SRC, 'the mutation applied')
+  const { result, find } = await runHunt({ src: mutated })
+  assert.equal(result.status, 'parked:review_error')
+  assert.equal(result.pipelineError, msg)
+  assert.equal(find('pointer:').length, 0, 'no seat ran')
+  const parks = find('park:')
+  assert.equal(parks.length, 1)
+  const pp = parks[0].prompt
+  assert.ok(pp.includes(msg))
+  assert.ok(pp.includes('- error: "cfg-boom'))
+  assert.ok(pp.includes('"error": "cfg-boom'))
+  assert.doesNotMatch(pp, /likely a model outage or quota exhaustion/)
+  assert.match(pp, /code review could not start/)
+})
+
+test('workflow-meta-runtime (4): a REAL seat-handoff guard throw (plan dir outside the worktree) parks with its own text', async () => {
+  const mutated = SRC.replace('const SEAT_OUT = (name) => `${planDir}/.seat-out/${name}`', 'const SEAT_OUT = (name) => `/elsewhere/.seat-out/${name}`')
+  assert.notEqual(mutated, SRC, 'the mutation applied')
+  const { result, find } = await runHunt({ src: mutated })
+  assert.equal(result.status, 'parked:review_error')
+  assert.equal(find('bloodhound:').length, 0)
+  assert.ok(find('park:')[0].prompt.includes('seat-handoff-writes: the plan dir'))
+})
+
+test('workflow-meta-runtime: the harness parallel() nulls a throwing unit like the runtime — a throwing seat parks review_error, it does not reject', async () => {
+  const { result } = await runHunt({ answers: { bloodhound: () => { throw new Error('seat died') } } })
+  assert.equal(result.verdict, 'PARKED')
+  assert.equal(result.reason, 'review_error')
 })
