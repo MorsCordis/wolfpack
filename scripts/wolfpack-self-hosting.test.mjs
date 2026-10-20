@@ -6,7 +6,8 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, readlinkSync, lstatSync, existsSync } from 'node:fs'
+import { readFileSync, readlinkSync, lstatSync, existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync, execFileSync } from 'node:child_process'
@@ -131,10 +132,48 @@ test('install.sh is tracked with mode 100755; the retired sync-runtime script an
   assert.equal(git('ls-files', '-s', 'scripts/wolfpack-workflows.mjs').stdout.split(' ')[0], '100755')
 })
 
-test('AC7: no tracked file outside CHANGELOG.md names the retired sync-runtime script', () => {
-  const r = git('grep', '-n', RETIRED_SYNC, '--', ':!CHANGELOG.md')
-  assert.equal(r.stdout.trim(), '', r.stdout)
+// AC7's scan. CHANGELOG.md and the append-only pedigree history under .wolfpack/pedigree/ are
+// exempt: a certify commit's own pedigree row may name the retired script, and that history is
+// never rewritten, so it must not turn a suite red that was green at Tracker's HEAD.
+const AC7_EXCLUDES = [':!CHANGELOG.md', ':!.wolfpack/pedigree/']
+function retiredSyncHits(root) {
+  const r = spawnSync('git', ['-C', root, 'grep', '-n', RETIRED_SYNC, '--', ...AC7_EXCLUDES], { encoding: 'utf8' })
+  // git grep: 0 = matches, 1 = none; anything else is a real error, not an empty scan
+  assert.ok(r.status === 0 || r.status === 1, `git grep failed (${r.status}): ${r.stderr}`)
+  return r.stdout.trim()
+}
+
+test('AC7: no tracked file outside CHANGELOG.md / .wolfpack/pedigree/ names the retired sync-runtime script', () => {
+  const hits = retiredSyncHits(ROOT)
+  assert.equal(hits, '', hits)
   assert.match(readFileSync(join(ROOT, 'CHANGELOG.md'), 'utf8'), new RegExp(`${RETIRED_SYNC}[\\s\\S]*<!-- hunt:pack-install-model -->`))
+})
+
+test('AC7 scan: a tracked pedigree row naming the retired script does not fail it; the same name elsewhere still does', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wp-ac7-'))
+  try {
+    const g = (...a) => execFileSync('git', ['-C', dir, ...a], { encoding: 'utf8' })
+    g('init', '-q')
+    mkdirSync(join(dir, '.wolfpack', 'pedigree'), { recursive: true })
+    writeFileSync(join(dir, '.wolfpack', 'pedigree', 'index.md'), `| 2026-10-20 | x | Orange | PASS |\n| note | dropped ${RETIRED_SYNC}.sh | - | - |\n`)
+    writeFileSync(join(dir, '.wolfpack', 'pedigree', 'x.json'), `{"note":"${RETIRED_SYNC}"}\n`)
+    writeFileSync(join(dir, 'CHANGELOG.md'), `- removed ${RETIRED_SYNC}.sh\n`)
+    writeFileSync(join(dir, 'README.md'), 'clean\n')
+    g('add', '--', '.wolfpack/pedigree/index.md', '.wolfpack/pedigree/x.json', 'CHANGELOG.md', 'README.md')
+    assert.equal(retiredSyncHits(dir), '', 'pedigree history + CHANGELOG are exempt')
+    // a pedigree-lookalike path outside the exempt dir is NOT exempt
+    mkdirSync(join(dir, 'docs', 'pedigree'), { recursive: true })
+    writeFileSync(join(dir, 'docs', 'pedigree', 'index.md'), `${RETIRED_SYNC}\n`)
+    writeFileSync(join(dir, '.wolfpack', 'notes.md'), `run ${RETIRED_SYNC}.sh\n`)
+    g('add', '--', 'docs/pedigree/index.md', '.wolfpack/notes.md')
+    const hits = retiredSyncHits(dir)
+    assert.match(hits, /^docs\/pedigree\/index\.md:1:/m)
+    assert.match(hits, /^\.wolfpack\/notes\.md:1:/m)
+    assert.doesNotMatch(hits, /^\.wolfpack\/pedigree\//m)
+    assert.doesNotMatch(hits, /^CHANGELOG\.md/m)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('AC9: no canonical command/skill/workflow instructs re-making the alias links; no tracked .agents alias links', () => {

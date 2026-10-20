@@ -37,6 +37,17 @@
 //   worktreeRoot     Project Identity → Worktree root (code)     optional; null when absent; the
 //                    workflows require it. Repo-relative (e.g. `.agents/worktrees`), trailing `/`
 //                    stripped; a malformed value is a problem (see validWorktreeRoot).
+//   projectCommands  Project Identity → Project commands (list)  optional, [] for none/absent: the
+//                    project-only slash commands a consuming repo may track (the no-copies
+//                    guard's allow-list). Each name must match ^[a-z0-9][a-z0-9-]*$ (else a problem, []).
+//   smokeLoginHook   Deployment Notes → Smoke login hook          optional; null for none/absent. The
+//                    first backticked span is the command template; it must contain {host} and may
+//                    contain {account}. Notes after the first ` — ` are dropped before parsing.
+//   smokeLoginAccounts  the backticked names after the word `accounts` (and before the first ` — `)
+//                    in the same value; the first is the default; [] when there is no `accounts` word.
+//                    Problems: no backticked template, no {host}, {account} with no account listed,
+//                    an account outside [A-Za-z0-9_.@-]+, a TAB or newline in the template (both
+//                    values null/[] on a problem).
 //   exec             ## Execution Layer (see execLayer below) — the execution-layer keys the
 //                    seat shim / sandbox launcher need. NOT part of the top-level `missing`
 //                    (a project with no Vibe seats needs none of them): exec.missing lists the
@@ -285,6 +296,28 @@ export function validWorktreeRoot(p) {
   return segs.every((seg) => /^\.?[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(seg))
 }
 
+// Deployment Notes → Smoke login hook: `<template>` accounts `<default>` `<other>`… — notes.
+// Returns { hook, accounts }; pushes each defect onto problems (and then returns null/[]).
+export function smokeLoginHookValue(v, problems = []) {
+  if (isNone(v)) return { hook: null, accounts: [] }
+  const P = (msg) => { problems.push(`Deployment Notes → Smoke login hook ${msg}`); return { hook: null, accounts: [] } }
+  const raw = String(v)
+  const cut = raw.indexOf(' — ')
+  const head = cut === -1 ? raw : raw.slice(0, cut)
+  const m = /`([^`]*)`/.exec(head)
+  if (!m) return P('must start with a backticked command template, e.g. `./scripts/smoke-login --host {host}`')
+  const hook = m[1].trim()
+  if (/[\t\n\r]/.test(m[1])) return P('template contains a TAB or newline')
+  if (!hook.includes('{host}')) return P(`template '${hook}' must contain {host}`)
+  const rest = head.slice(m.index + m[0].length)
+  const w = /\baccounts\b/.exec(rest)
+  const accounts = w ? list(rest.slice(w.index + w[0].length)) : []
+  const bad = accounts.filter((a) => !/^[A-Za-z0-9_.@-]+$/.test(a))
+  if (bad.length) return P(`account name(s) ${bad.map((a) => `'${a}'`).join(', ')} must match [A-Za-z0-9_.@-]+`)
+  if (hook.includes('{account}') && accounts.length === 0) return P(`template '${hook}' uses {account} but lists no accounts (add: accounts \`<default>\`)`)
+  return { hook, accounts }
+}
+
 export function readConfig(text, { configDir = process.cwd() } = {}) {
   const secs = parseSections(text)
   const byKey = {}
@@ -333,6 +366,15 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
       worktreeRoot = null
     }
   }
+  // pack-commands-canonical: the project-only slash commands (no-copies guard allow-list).
+  let projectCommands = list(field(sec('Project Identity'), 'Project commands'))
+  const badCommands = projectCommands.filter((n) => !/^[a-z0-9][a-z0-9-]*$/.test(n))
+  if (badCommands.length) {
+    problems.push(`Project Identity → Project commands: invalid name(s) ${badCommands.map((n) => `'${n}'`).join(', ')} (lowercase letters, digits and -, e.g. \`doc-reviewer\`)`)
+    projectCommands = []
+  }
+  const { hook: smokeLoginHook, accounts: smokeLoginAccounts } = smokeLoginHookValue(
+    field(sec('Deployment Notes'), 'Smoke login hook'), problems)
   const exec = execLayer(sec('Execution Layer'), configDir)
   if (sec('Execution Layer') !== undefined) problems.push(...exec.problems)
 
@@ -348,6 +390,9 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     backlogFile: optionalCode('Deployment Notes', 'Backlog file'),
     wolfpackHome,
     worktreeRoot,
+    projectCommands,
+    smokeLoginHook,
+    smokeLoginAccounts,
     exec,
     pool,
     models,
@@ -380,6 +425,7 @@ function summary(cfg) {
     `devDeployCommand: ${cfg.devDeployCommand ?? 'none'}`,
     `wolfpackHome: ${cfg.wolfpackHome ?? 'none'}`,
     `worktreeRoot: ${cfg.worktreeRoot ?? 'none'}`,
+    `smokeLoginHook: ${cfg.smokeLoginHook ?? 'none'}`,
     cfg.exec && cfg.exec.missing.length
       ? `exec: missing ${cfg.exec.missing.join(', ')}`
       : `exec: sandbox ${cfg.exec?.sandboxImage} · glm ${cfg.exec?.glmImage} · layer ${cfg.exec?.projectLayer ?? 'none'}`,

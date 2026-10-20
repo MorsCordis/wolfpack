@@ -18,7 +18,7 @@
 //   sign-off       --campaign C --hunt H --by NAME [--at ISO]         record a Red/compliance sign-off
 //   check          --campaign C [--checkpoint]                        release preflight {ok, refusals, hunts}
 //   summary        --campaign C [--checkpoint]                        readable release summary (text)
-//   deploy         --campaign C --deploy-cmd CMD --migrate-cmd CMD    deploy campaign/C to dev, always back on the prior checkout
+//   deploy         --campaign C --deploy-cmd CMD (--migrate-cmd CMD | --no-migrate)   deploy campaign/C to dev, always back on the prior checkout
 //   changelog      --campaign C --version V [--apply] [--at ISO]      stamp included hunts' CHANGELOG lines under one heading
 //   merge-commands --campaign C --version V                           print the main merge (+ tag) commands (text)
 //   stamp-released --campaign C --version V [--at ISO]                stamp included hunts merged after the main merge
@@ -430,11 +430,13 @@ export function cmdRevert(root, { campaign, hunt, reason, at }) {
   }
 }
 
-export function cmdDeploy(root, { campaign, deployCmd, migrateCmd }) {
-  if (typeof deployCmd !== 'string' || !deployCmd.trim() || typeof migrateCmd !== 'string' || !migrateCmd.trim()) {
-    throw new ChainError('--deploy-cmd and --migrate-cmd are both required')
-  }
-  if (/prod/i.test(deployCmd) || /prod/i.test(migrateCmd)) throw new ChainError('refusing: a deploy/migrate command mentions prod — this command deploys dev only')
+export function cmdDeploy(root, { campaign, deployCmd, migrateCmd, noMigrate }) {
+  if (typeof deployCmd !== 'string' || !deployCmd.trim()) throw new ChainError('--deploy-cmd is required')
+  // Exactly one of a migration command or an explicit --no-migrate (a project with no migration step):
+  // omitting both stays an error, so a forgotten migration never silently skips.
+  const hasMigrate = typeof migrateCmd === 'string' && migrateCmd.trim() !== ''
+  if (hasMigrate === (noMigrate === true)) throw new ChainError('--migrate-cmd or --no-migrate is required (not both)')
+  if (/prod/i.test(deployCmd) || (hasMigrate && /prod/i.test(migrateCmd))) throw new ChainError('refusing: a deploy/migrate command mentions prod — this command deploys dev only')
   const { branch } = loadCampaign(root, campaign)
   if (!branchExists(root, branch)) throw new ChainError(`${branch} does not exist`)
   const dirty = dirtyPaths(root, { includeWolfpack: true })
@@ -453,10 +455,11 @@ export function cmdDeploy(root, { campaign, deployCmd, migrateCmd }) {
   let restored = false
   try {
     deployExit = run(deployCmd)
-    if (deployExit === 0) migrateExit = run(migrateCmd)
+    if (deployExit === 0 && hasMigrate) migrateExit = run(migrateCmd)
   } finally {
     restored = git(['checkout', '--quiet', original], { cwd: root, allowFail: true }).code === 0
   }
+  if (!hasMigrate) return { deployExit, migrateExit: null, migrate: 'skipped', restored, restored_to: original, branch }
   return { deployExit, migrateExit, restored, restored_to: original, branch }
 }
 
@@ -540,8 +543,9 @@ function chainMain(cmd, rest) {
     if (cmd === 'check') { const r = releaseCheck(root, { campaign: f.campaign, checkpoint }); return emit(r, r.ok ? 0 : 2) }
     if (cmd === 'summary') { console.log(releaseSummary(root, { campaign: f.campaign, checkpoint })); return 0 }
     if (cmd === 'deploy') {
-      const r = cmdDeploy(root, { campaign: f.campaign, deployCmd: f['deploy-cmd'], migrateCmd: f['migrate-cmd'] })
-      return emit(r, (r.restored && r.deployExit === 0 && r.migrateExit === 0) ? 0 : 1)
+      const r = cmdDeploy(root, { campaign: f.campaign, deployCmd: f['deploy-cmd'], migrateCmd: f['migrate-cmd'], noMigrate: f['no-migrate'] === true })
+      const migrated = r.migrate === 'skipped' || r.migrateExit === 0
+      return emit(r, (r.restored && r.deployExit === 0 && migrated) ? 0 : 1)
     }
     if (cmd === 'changelog') return emit(cmdChangelog(root, { campaign: f.campaign, version, apply: f.apply === true, at: f.at }))
     if (cmd === 'merge-commands') { console.log(cmdMergeCommands(root, { campaign: f.campaign, version }).join('\n')); return 0 }

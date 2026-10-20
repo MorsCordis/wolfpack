@@ -13,8 +13,12 @@ Your final response MUST end with the exact block in "## Finishing message" belo
 
 Before reading any plan files:
 
+**Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
+
+**Worktree root (`WT_ROOT`).** In the main checkout run `node "$PACK/scripts/wolfpack-config.mjs" --json` and take `worktreeRoot` (wolfpack-config.md → Project Identity → Worktree root, repo-relative). If the reader exits 2 or `worktreeRoot` is null, STOP with the fix: "add ``- **Worktree root:** `<repo-relative dir, e.g. .agents/worktrees>` `` under ## Project Identity in wolfpack-config.md". Never assume a default location.
+
 1. **Find `metadata.json`** for the slug. Check these paths, first hit wins:
-   - `.agents/worktrees/$ARGUMENTS/.wolfpack/plans/$ARGUMENTS/metadata.json` (worktree — check first)
+   - `$WT_ROOT/$ARGUMENTS/.wolfpack/plans/$ARGUMENTS/metadata.json` (worktree — check first)
    - `./.wolfpack/plans/$ARGUMENTS/metadata.json`
    - `$(git rev-parse --show-toplevel)/.wolfpack/plans/$ARGUMENTS/metadata.json`
    - Fallback: `git worktree list` and grep for `feat/$ARGUMENTS`, then check `<that-path>/.wolfpack/plans/$ARGUMENTS/metadata.json`
@@ -25,6 +29,10 @@ Before reading any plan files:
      - `cd "$MAIN_REPO"`
    - Otherwise → `cd "$(git rev-parse --show-toplevel)"`.
 4. **Verify** `.wolfpack/plans/$ARGUMENTS/` exists. For worktree hunts, the plan dir lives in the worktree — use the `worktree_path` to read plan files even though CWD is the main repo. Store `PLAN_DIR="$worktree_path/.wolfpack/plans/$ARGUMENTS"` for subsequent reads.
+5. **Chain-mode refusal.** If `metadata.base_branch` is set, **or** `metadata.campaign` is set and
+   `.wolfpack/campaigns/<metadata.campaign>/metadata.json` has `chain.mode == "chain"` (the same campaign-level key
+   `/merge-wave` uses; it also catches a barrier-era hunt certified before its campaign switched to chain, which has
+   no `base_branch`) → STOP: "chain-mode campaign hunt — it ships with `/release-campaign <campaign>`."
 
 ## Setup
 1. Feature slug: `$ARGUMENTS`

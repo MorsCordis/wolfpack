@@ -14,6 +14,7 @@ The pipeline itself (router, `hunt-pipeline`, `campaign-runner`) reads the machi
 - **Test command:** `./scripts/run_tests.sh` or `npm test` or `go test ./...` — REQUIRED; the first backticked span is the command the pipeline runs (Tracker) and forbids Shepherd from running. Follow it with any notes on narrowing.
 - **Worktree links:** (optional; backticked main-repo paths symlinked into each worktree, e.g. `.env`, or none)
 - **Worktree root:** `.agents/worktrees` — REQUIRED by the workflows: the repo-relative directory hunt worktrees live in (where your /hunt creates them). Keep it gitignored.
+- **Project commands:** none — project-only slash commands this repo tracks in .claude/commands (backticked names, e.g. `doc-reviewer`); the no-copies guard fails on any other tracked command file.
 - **Deploy command (dev):** `deploy-dev` or `npm run deploy:staging` or `kubectl apply -f ...`
 - **Deploy command (prod):** USER ONLY — describe the process here so agents know not to run it
 - **Vault root:** `~/Vault` — absolute path to the Obsidian vault that holds `project-notes/<project>/` (session notes, `/memory` project/lesson/reference notes, `/recall` search). Must NOT be inside the code repo or its parent workspace.
@@ -155,10 +156,37 @@ simply omits that step from the finishing message.
 - Backlog file: (e.g., `TODO.md`, or blank)
 - Tag pattern: (e.g. `v[0-9]*`)
 - Dev URL / Prod URL / Never-smoke hosts: (e.g. `staging.myapp.example` / `myapp.example` / `myapp-marketing.example`; `/smoke-wave` smokes only the Dev URL, never Prod or a never-smoke host; `none` when nothing is deployed)
+- Smoke login hook: none — or a backticked command template with {host} (and optional {account}), then the account names in backticks, the first one is the default; see "Smoke login hook" below.
 ```
 
 `Dev deploy command: none` tells the pipeline there is no deploy step: Verify reports the hunt
 certified (next step `/merge`) and the wave-close commands skip deploy and `/smoke-wave`.
+
+### Smoke login hook
+
+Optional. How `/smoke` and `/smoke-wave` sign the smoke browser in to the Dev URL. The value is
+`none` (or the key is absent), or a backticked command template followed by the word `accounts`
+and the account names in backticks; the first account is the default. Anything after the first
+` — ` is a note and is never parsed (backticked flags in the note are not accounts). For example,
+the value `` `./scripts/smoke-login --host {host} --account {account}` accounts `smoke-user` ``.
+
+- The template MUST contain `{host}` (the resolved Dev host) and MAY contain `{account}` (the
+  criterion's account, else the default). `{account}` with no account listed, an account name
+  outside `[A-Za-z0-9_.@-]+`, or a TAB in the template is a config problem (the reader exits 2).
+- **Sign in:** the commands run the template with the substitutions. Exit 0 means signed in. Any
+  other exit means STOP, and the command prints the hook's one-line output verbatim.
+- **Probe:** the same command with ` --check` appended prints one line that starts with
+  `SIGNED_IN` (exit 0) or `SIGNED_OUT` (exit 1). Any other exit or first word is a probe error and
+  the command stops with that line. The smoke commands probe once right after the deploy (recorded
+  as `session_after_deploy`) and again when a page lands on the sign-in form.
+- The hook owns its own environment checks (for example a smoke browser that is not reachable):
+  it exits non-zero with its reason. It owns its secrets too: the agent never types a password
+  and never reads the hook's secret files.
+- `none` (or absent): both smoke commands say visibly "No smoke login hook configured — using
+  your own browser session" and continue in the operator's session.
+
+`node scripts/wolfpack-config.mjs --json` exposes it as `smokeLoginHook` (the template, or `null`)
+and `smokeLoginAccounts` (the names, `[]` when none).
 
 ### Feature-branch deploy (Verify)
 

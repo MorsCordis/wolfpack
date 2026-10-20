@@ -69,3 +69,16 @@ test('AC8: least-privilege token and podman tests skipped visibly in CI', () => 
   assert.equal(perms.some(l => /:\s*write\b/.test(l)), false, 'no write permission')
   assert.ok(lines.some(l => /WOLFPACK_TEST_NO_PODMAN:\s*['"]?1['"]?/.test(l)))
 })
+
+// pack-commands-canonical AC9: the ONE entry point CI runs carries both public-safety gates —
+// the leak grep and the no-copies guard — and fails on a missing one (never skips it).
+test('AC9: scripts/test-all.sh runs the leak grep and the no-copies guard, each a FAIL when missing', () => {
+  const TA = readFileSync(join(here, 'test-all.sh'), 'utf8')
+  assert.match(TA, /^LEAK=scripts\/wolfpack-leak-grep\.sh$/m)
+  assert.match(TA, /^\s*bash "\$LEAK" "\$ROOT"$/m, 'the leak-grep invocation')
+  assert.match(TA, /^GUARD=scripts\/wolfpack-no-copies\.mjs$/m)
+  assert.match(TA, /^\s*node "\$GUARD" "\$ROOT"$/m, 'the no-copies guard invocation (pack mode on this checkout)')
+  assert.match(TA, /FAIL \$GUARD \(missing\)/)
+  assert.match(TA, /FAIL \$LEAK \(missing\)/)
+  assert.ok(TA.indexOf('node "$GUARD"') > TA.indexOf('bash "$LEAK"'), 'the guard runs after the leak grep')
+})

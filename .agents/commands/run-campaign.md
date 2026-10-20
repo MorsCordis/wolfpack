@@ -10,11 +10,17 @@ Parse `$ARGUMENTS` as: `<campaign-slug> [max-parallel]`. Default max-parallel is
 
 ## Steps
 
+0. **Resolve the pack and the worktree root first** (from the main checkout):
+
+   **Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
+
+   **Worktree root (`WT_ROOT`).** In the main checkout run `node "$PACK/scripts/wolfpack-config.mjs" --json` and take `worktreeRoot` (wolfpack-config.md → Project Identity → Worktree root, repo-relative). If the reader exits 2 or `worktreeRoot` is null, STOP with the fix: "add ``- **Worktree root:** `<repo-relative dir, e.g. .agents/worktrees>` `` under ## Project Identity in wolfpack-config.md". Never assume a default location.
+
 1. Verify the campaign exists: check `.wolfpack/campaigns/$SLUG/campaign.md` exists. If not, stop and tell the user to run `/expedition` first.
 
 2. **Build the RESUME PLAN and confirm — READ-ONLY, before any launch.** The point of this step
    is that you (and the user) see *exactly* which wave and hunts will run — or what's blocking —
-   before kicking off. It must mirror the runner's selection logic (`.agents/workflows/campaign-runner.js`)
+   before kicking off. It must mirror the runner's selection logic (`"$PACK/.agents/workflows/campaign-runner.js"`)
    exactly; a divergence here would mislead. Never `exec` blind.
 
    **2a. Parse the campaign.** Read `.wolfpack/campaigns/$SLUG/campaign.md`. From "## Proposed Hunts"
@@ -24,7 +30,7 @@ Parse `$ARGUMENTS` as: `<campaign-slug> [max-parallel]`. Default max-parallel is
    **2b. Resolve each hunt's LIVE status (dual-path, worktree first — main metadata is frozen until
    /merge).** For each hunt:
    ```bash
-   WT=".agents/worktrees/$slug/.wolfpack/plans/$slug/metadata.json"
+   WT="$WT_ROOT/$slug/.wolfpack/plans/$slug/metadata.json"
    MAIN=".wolfpack/plans/$slug/metadata.json"
    F=$([ -f "$WT" ] && echo "$WT" || echo "$MAIN")
    if [ -f "$F" ]; then jq -r '[.status, (.park.reason // ""), (.park.compliance_signed_off // false)] | @tsv' "$F"; else echo $'not_scaffolded\t\tfalse'; fi
@@ -91,14 +97,8 @@ Parse `$ARGUMENTS` as: `<campaign-slug> [max-parallel]`. Default max-parallel is
    on its OWN line (no prefix on the command line, so it copies cleanly), then exec. Do NOT
    auto-run the watcher (an in-process `--loop` just creates an endless scroll):
 
-   **Resolve the pack home first** (the launcher is the PACK's, never a copy in this repo):
-   `PACK="$WOLFPACK_HOME"`; if that is empty, use the `Wolfpack home` value from
-   `node <any pack checkout>/scripts/wolfpack-config.mjs --json` (its `wolfpackHome`
-   field), or read it by eye from `wolfpack-config.md` → Project Identity →
-   Wolfpack home if the reader is not at hand (expand a leading `~`). If neither is set, or
-   `"$PACK/scripts/run-pipeline-sandbox.sh"` does not exist, STOP and give the user the fix:
-   "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add
-   a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md".
+   The launcher is the PACK's (`PACK` from Step 0), never a copy in this repo. If
+   `"$PACK/scripts/run-pipeline-sandbox.sh"` does not exist, STOP with Step 0's fix.
    Never run a `./scripts/run-pipeline-sandbox.sh` from the consuming repo.
 
    ```bash

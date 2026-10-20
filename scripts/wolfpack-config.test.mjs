@@ -15,7 +15,7 @@ import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import {
   parseSections, field, code, list, isNone, modelPool, readConfig, loadConfig, problemLine,
-  expandHome, execLayer, execLines, imageHasTag, EXEC_KEYS, validWorktreeRoot,
+  expandHome, execLayer, execLines, imageHasTag, EXEC_KEYS, validWorktreeRoot, smokeLoginHookValue,
 } from './wolfpack-config.mjs'
 import { homedir } from 'node:os'
 
@@ -636,4 +636,123 @@ test('AC8 parity: both workflows inline the reader\'s validWorktreeRoot rule (sa
     assert.ok(w.includes("segs[0] !== '.git'"), n)
     assert.ok(w.includes("!value.startsWith('~')"), n)
   }
+})
+
+// ─── pack-commands-canonical: Smoke login hook (D3/AC4) + Project commands (D4) ───────────
+const withHook = (v) => FULL.replace('- Backlog file:', `- Smoke login hook: ${v}\n- Backlog file:`)
+const withCommands = (v) => FULL.replace('- **Worktree links:**', `- **Project commands:** ${v}\n- **Worktree links:**`)
+const hookProblems = (c) => c.problems.filter(p => p.startsWith('Deployment Notes → Smoke login hook'))
+
+test('D3: a set Smoke login hook → the template and the accounts (first is the default), no problem', () => {
+  const c = readConfig(withHook('`./scripts/smoke-login --host {host} --account {account}` accounts `smoke-user` `smoke-other`'))
+  assert.equal(c.smokeLoginHook, './scripts/smoke-login --host {host} --account {account}')
+  assert.deepEqual(c.smokeLoginAccounts, ['smoke-user', 'smoke-other'])
+  assert.deepEqual(c.problems, [])
+  assert.deepEqual(c.missing, [])
+  // a template with {host} only needs no accounts
+  const h = readConfig(withHook('`./login {host}`'))
+  assert.equal(h.smokeLoginHook, './login {host}')
+  assert.deepEqual(h.smokeLoginAccounts, [])
+  assert.deepEqual(h.problems, [])
+})
+
+test('D3: Smoke login hook `none` / absent → null and [] with no problem and nothing missing', () => {
+  for (const text of [withHook('none'), withHook('none — nothing is deployed.'), withHook('`none`'), FULL]) {
+    const c = readConfig(text)
+    assert.equal(c.smokeLoginHook, null)
+    assert.deepEqual(c.smokeLoginAccounts, [])
+    assert.deepEqual(c.problems, [])
+    assert.deepEqual(c.missing, [], 'optional key')
+  }
+})
+
+test('D3 (Bloodhound r1 #1): the consumer-shaped line — notes after ` — ` with backticked flags are never accounts', () => {
+  const c = readConfig(withHook('`venv/bin/python scripts/smoke/login.py --host {host} --account {account}` accounts `smoke-a` `smoke-b` — signs the smoke browser in; `--check` probes; exit 3 = `browser not reachable`.'))
+  assert.equal(c.smokeLoginHook, 'venv/bin/python scripts/smoke/login.py --host {host} --account {account}')
+  assert.deepEqual(c.smokeLoginAccounts, ['smoke-a', 'smoke-b'])
+  assert.deepEqual(c.problems, [])
+  // backticked spans BEFORE the word `accounts` (after the template) are not accounts either
+  const d = smokeLoginHookValue('`./l {host} {account}` (see `docs/x.md`) accounts `u1`')
+  assert.deepEqual(d, { hook: './l {host} {account}', accounts: ['u1'] })
+})
+
+test('D3: every Smoke login hook defect is a problem and nulls both values', () => {
+  const cases = [
+    ['`./scripts/smoke-login --account {account}` accounts `u`', /must contain \{host\}/],
+    ['`./scripts/smoke-login --host {host} --account {account}`', /uses \{account\} but lists no accounts/],
+    ['`./scripts/smoke-login --host {host} --account {account}` accounts', /uses \{account\} but lists no accounts/],
+    ['`./l --host {host}` accounts `ok` `bad name!`', /account name\(s\) 'bad name!' must match/],
+    ['`./l --host {host}` accounts `x;rm`', /account name\(s\) 'x;rm'/],
+    ['`./l\t--host {host}`', /TAB or newline/],
+    // an unbackticked template: the first backticked span (`u`) is read as the template → no {host} → a problem
+    ['./scripts/smoke-login --host {host} accounts `u`', /template 'u' must contain \{host\}/],
+    ['./scripts/smoke-login --host {host}', /must start with a backticked command template/],
+    ['just words — `./l {host}` in the notes only', /must start with a backticked command template/],
+  ]
+  for (const [v, re] of cases) {
+    const c = readConfig(withHook(v))
+    assert.equal(c.smokeLoginHook, null, v)
+    assert.deepEqual(c.smokeLoginAccounts, [], v)
+    const ps = hookProblems(c)
+    assert.equal(ps.length, 1, `${v}: ${c.problems}`)
+    assert.match(ps[0], re, v)
+  }
+  // the pure helper: pushes onto the given array, returns null/[]
+  const problems = []
+  assert.deepEqual(smokeLoginHookValue('`./l`', problems), { hook: null, accounts: [] })
+  assert.equal(problems.length, 1)
+  assert.deepEqual(smokeLoginHookValue(undefined), { hook: null, accounts: [] })
+})
+
+test('D3: a Smoke login hook problem makes the CLI exit 2; a set hook shows in --json and the summary', () => {
+  withTemp((dir) => {
+    const bad = runCli(['--json', writeCfg(dir, withHook('`./l --account {account}`'), 'bad.md')])
+    assert.equal(bad.status, 2, bad.stdout + bad.stderr)
+    const p = writeCfg(dir, withHook('`./l --host {host}` accounts `u`'))
+    const j = runCli(['--json', p])
+    assert.equal(j.status, 0, j.stderr)
+    const o = JSON.parse(j.stdout)
+    assert.equal(o.smokeLoginHook, './l --host {host}')
+    assert.deepEqual(o.smokeLoginAccounts, ['u'])
+    const s = runCli([p])
+    assert.equal(s.status, 0)
+    assert.match(s.stdout, /^smokeLoginHook: \.\/l --host \{host\}$/m)
+    assert.match(runCli([writeCfg(dir, FULL, 'none.md')]).stdout, /^smokeLoginHook: none$/m)
+  })
+})
+
+test('D4: Project commands set / none / absent / bad name', () => {
+  const set = readConfig(withCommands('`doc-reviewer`, `structural-audit`, `test` — thin entry points to project skills.'))
+  assert.deepEqual(set.projectCommands, ['doc-reviewer', 'structural-audit', 'test'])
+  assert.deepEqual(set.problems, [])
+  assert.deepEqual(readConfig(withCommands('doc-reviewer, test2')).projectCommands, ['doc-reviewer', 'test2'], 'comma list without backticks')
+  for (const text of [withCommands('none'), withCommands('none — project-only commands (e.g. `doc-reviewer`)'), FULL]) {
+    const c = readConfig(text)
+    assert.deepEqual(c.projectCommands, [])
+    assert.deepEqual(c.problems, [])
+    assert.deepEqual(c.missing, [])
+  }
+  for (const badName of ['Doc-Reviewer', '-x', 'sub/foo', 'a b', 'x.md', 'README', '_x']) {
+    const c = readConfig(withCommands(`\`ok\`, \`${badName}\``))
+    assert.deepEqual(c.projectCommands, [], badName)
+    assert.ok(c.problems.some(p => p.startsWith('Project Identity → Project commands: invalid name(s)') && p.includes(`'${badName}'`)), `${badName}: ${c.problems}`)
+  }
+  withTemp((dir) => {
+    assert.equal(runCli(['--json', writeCfg(dir, withCommands('`Bad`'))]).status, 2)
+    const j = runCli(['--json', writeCfg(dir, withCommands('`a`, `b`'), 'ok.md')])
+    assert.equal(j.status, 0, j.stderr)
+    assert.deepEqual(JSON.parse(j.stdout).projectCommands, ['a', 'b'])
+  })
+})
+
+test('D3/D4: the REAL wolfpack-config.md and the example → smokeLoginHook null, accounts [], projectCommands [], no problems; --exec unchanged', () => {
+  for (const p of [REAL, join(ROOT, 'wolfpack-config.example.md')]) {
+    const c = loadConfig(p)
+    assert.equal(c.smokeLoginHook, null, p)
+    assert.deepEqual(c.smokeLoginAccounts, [], p)
+    assert.deepEqual(c.projectCommands, [], p)
+    assert.deepEqual(c.problems, [], p)
+  }
+  const e = runCli(['--exec', REAL])
+  assert.doesNotMatch(e.stdout, /smoke|projectCommands|Project commands/i, '--exec output carries only the execution-layer keys')
 })

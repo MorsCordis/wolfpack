@@ -1,12 +1,12 @@
 ---
 name: smoke-wave
 description: Post-deploy smoke for a whole released Wolfpack WAVE, batched BY HUNT — runs each hunt's acceptance criteria as its own block with an explicit per-hunt pass/fail verdict + observed console/network anomalies, surfaces [manual] as a blocking checklist. Usage: /smoke-wave <campaign> <wave>
-allowed-tools: Bash, Read, Write, Edit, Glob, Grep, mcp__plugin_chrome-devtools-mcp_chrome-devtools__navigate_page, mcp__plugin_chrome-devtools-mcp_chrome-devtools__new_page, mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_snapshot, mcp__plugin_chrome-devtools-mcp_chrome-devtools__click, mcp__plugin_chrome-devtools-mcp_chrome-devtools__fill, mcp__plugin_chrome-devtools-mcp_chrome-devtools__fill_form, mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script, mcp__plugin_chrome-devtools-mcp_chrome-devtools__list_network_requests, mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_network_request, mcp__plugin_chrome-devtools-mcp_chrome-devtools__list_console_messages, mcp__plugin_chrome-devtools-mcp_chrome-devtools__wait_for
+allowed-tools: Bash, Read, Write, Edit, Glob, Grep, mcp__plugin_chrome-devtools-mcp_chrome-devtools__navigate_page, mcp__plugin_chrome-devtools-mcp_chrome-devtools__new_page, mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_snapshot, mcp__plugin_chrome-devtools-mcp_chrome-devtools__click, mcp__plugin_chrome-devtools-mcp_chrome-devtools__fill, mcp__plugin_chrome-devtools-mcp_chrome-devtools__fill_form, mcp__plugin_chrome-devtools-mcp_chrome-devtools__evaluate_script, mcp__plugin_chrome-devtools-mcp_chrome-devtools__list_network_requests, mcp__plugin_chrome-devtools-mcp_chrome-devtools__get_network_request, mcp__plugin_chrome-devtools-mcp_chrome-devtools__list_console_messages, mcp__plugin_chrome-devtools-mcp_chrome-devtools__wait_for, mcp__plugin_chrome-devtools-mcp_chrome-devtools__take_screenshot, mcp__chrome-devtools__navigate_page, mcp__chrome-devtools__new_page, mcp__chrome-devtools__take_snapshot, mcp__chrome-devtools__click, mcp__chrome-devtools__fill, mcp__chrome-devtools__fill_form, mcp__chrome-devtools__evaluate_script, mcp__chrome-devtools__list_network_requests, mcp__chrome-devtools__get_network_request, mcp__chrome-devtools__list_console_messages, mcp__chrome-devtools__wait_for, mcp__chrome-devtools__take_screenshot
 ---
 
 Run the **consolidated wave smoke** for wave **$ARGUMENTS** (`<campaign> <wave>`).
 
-The wave is already `/merge-wave`'d and `deploy-dev`'d. This is the automation-first
+The wave is already `/merge-wave`'d and deployed with the configured Dev deploy command. This is the automation-first
 consolidated smoke from `docs/autonomy/04-batch-merge-smoke.md`. The keystone is
 `acceptance.md`: every released hunt's acceptance criteria are run **batched by owning hunt** —
 one self-contained block per hunt, each closing with an explicit pass/fail verdict — so a real
@@ -41,17 +41,26 @@ of genuine failures on v1-push-3 wave 2 — per-hunt batching is the fix.)
    Dev = the host in wolfpack-config.md → Deployment Notes → **Dev URL**; prod = **Prod URL**
    (never smoke prod); never any host listed in **Never-smoke hosts**. If the project's Dev URL
    is `none`, nothing is deployed: stop and say so. Never relay an Alpha-authored URL verbatim.
+6. **Re-login on a sign-in redirect.** After any navigation, if the page is the app's sign-in page (a login
+   form where the criterion expected another page) and the criterion is not about sign-in, run the hook's
+   `--check`; on `SIGNED_OUT` sign in once through the hook (same account, Step 2a), then re-navigate. A second
+   redirect in the same criterion = `auto_fail`, `session lost after re-login`. Log every re-login in that
+   hunt's anomalies (`kind: session`). No hook configured → `needs_human_run` with 'signed out; no smoke login hook'.
+7. **Public pages run logged out.** Criteria about public (logged-out) pages open with `new_page` and
+   `isolatedContext: "public"`; never sign in inside that context.
 
 ## Step 1 — Build the release queue + criteria union
 
+0. **Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
 1. `cd "$(git rev-parse --show-toplevel)"` (main repo — the wave is merged; worktrees may be gone).
 2. Read `.wolfpack/campaigns/$1/campaign.md` → hunts with `**Wave:** $2`. For each, read its
-   `metadata.json`. **Released = `status: certified`/`done` and NOT `parked:compliance_review`**
+   `metadata.json`. **Released = `status: merged` (legacy: `certified`/`done`) and NOT
+   `parked:compliance_review`**
    (AC4 — a compliance-held hunt was excluded from `/merge-wave`, so it is not in this smoke).
 3. For each released hunt, read `.wolfpack/plans/<slug>/acceptance.md` (copied back by
    `/merge-wave`). Parse its criteria deterministically:
    ```bash
-   node scripts/wolfpack-release.mjs criteria .wolfpack/plans/<slug>/acceptance.md <slug>
+   node "$PACK/scripts/wolfpack-release.mjs" criteria .wolfpack/plans/<slug>/acceptance.md <slug>
    ```
    Each criterion carries `{slug, id, tag, text, ref}` where `ref` = `<slug>/<n>` — the
    **owning-hunt attribution** that makes a failure map to exactly one merge commit (AC3).
@@ -75,6 +84,25 @@ of genuine failures on v1-push-3 wave 2 — per-hunt batching is the fix.)
 Resolve the dev URL from the router/settings, not from memory. The deployed surface is the
 config's **Dev URL** host. Confirm host+path against the real env before navigating. State the URL you
 resolved and how, in one line, before the first MCP call.
+
+## Step 2a — Sign in (before any MCP navigation)
+
+1. If wolfpack-config.md → Deployment Notes → **Smoke test access** names project smoke steps (a skill or
+   doc), read them now and run their steps at the points they name (e.g. a report dir before Step 3, a
+   report at close).
+2. Read `smokeLoginHook` / `smokeLoginAccounts` from `node "$PACK/scripts/wolfpack-config.mjs" --json`. If
+   `smokeLoginHook` is null → print `No smoke login hook configured — using your own browser session` and skip
+   to Step 3 (the operator's own signed-in browser is used; record `session_after_deploy: not_checked`).
+3. **Post-deploy session probe first:** run the template with `{host}` = the Step 2 host and `{account}` = the
+   default account (the first of `smokeLoginAccounts`), with ` --check` appended. Record its first word as
+   `session_after_deploy` (`SIGNED_IN` / `SIGNED_OUT`). Any other result (another first word, or an exit other
+   than 0/1) → STOP with its line. (Run it before the sign-in. A probe after the sign-in always says SIGNED_IN.)
+4. **Sign in:** run the template (`{host}` = the Step 2 host, `{account}` = the default). Exit 0 is required.
+   Otherwise STOP and print the hook's line verbatim. Use another listed account for criteria that need that
+   role.
+5. Never type a password into a page, and never read the hook's secrets. The hook is the only sign-in path.
+6. Record a sign-in block in the report: the hook command run (template with substitutions), the
+   `session_after_deploy` value, the hook exit code, and the first navigated page URL.
 
 ## Step 3 — Run every `[auto]` criterion via Chrome DevTools MCP, ONE HUNT AT A TIME
 
@@ -136,13 +164,17 @@ them ONE AT A TIME; collect pass/fail, then restate the affected hunt's updated 
 
 **The wave does not close with un-run criteria.** If any `needs_human_run` is still unanswered,
 the wave **parks** `smoke_pending_human` (see [02]) — surface what remains and stop. It does
-NOT silently shelve them.
+NOT silently shelve them. If the project smoke steps (Step 2a.1) define a report step, run it before parking
+too (pending items show as `needs_human_run`) and print its `Report:` line.
 
 ## Step 5 — Disposition the failures
 
 Tally `auto_pass` / `auto_fail` / manual-pass / manual-fail. For each FAILURE, decide with the
 user **per owning hunt** (attribution from `ref`):
 
+- **Chain campaign:** never revert on `main`; revert from the campaign branch
+  with `node "$PACK/scripts/wolfpack-release.mjs" revert --campaign <c> --hunt <slug> --reason "<smoke failure>"`
+  (it also reverts dependents and re-arms the hunt for a fix).
 - **Clean revert** — the hunt is wrong end-to-end / not salvageable in-cycle. **main is
   merge-only** (`git-workflow` SKILL — never commit directly to main, hook-enforced), so the
   revert + CHANGELOG fixup happen on a branch and merge back `--no-ff`:
@@ -170,7 +202,7 @@ user **per owning hunt** (attribution from `ref`):
      ```bash
      git tag -d <wave-tag> && git tag -a <wave-tag> -m "<msg>" HEAD && git push -f origin <wave-tag>
      ```
-  6. Redeploy (`deploy-dev`), re-smoke that hunt's criteria only. The rest of the wave stays
+  6. Redeploy (the configured Dev deploy command), re-smoke that hunt's criteria only. The rest of the wave stays
      intact + deployable (AC3).
 - **Fix-forward** — the failure is a fixable bug in an otherwise-good hunt: § Fix-forward.
 
@@ -180,8 +212,10 @@ A smoke failure that needs a *fix* re-enters as a mini-cycle on a **fresh short-
 worktree off main** (the originating worktree may be cleaned up — this is the defined git home
 from doc 04):
 
+**Worktree root (`WT_ROOT`).** In the main checkout run `node "$PACK/scripts/wolfpack-config.mjs" --json` and take `worktreeRoot` (wolfpack-config.md → Project Identity → Worktree root, repo-relative). If the reader exits 2 or `worktreeRoot` is null, STOP with the fix: "add ``- **Worktree root:** `<repo-relative dir, e.g. .agents/worktrees>` `` under ## Project Identity in wolfpack-config.md". Never assume a default location.
+
 ```
-git worktree add .agents/worktrees/fix-<slug>-smoke-<N> -b fix/<slug>-smoke-<N> main
+git worktree add "$WT_ROOT/fix-<slug>-smoke-<N>" -b fix/<slug>-smoke-<N> main
 ```
 
 Then:
@@ -195,7 +229,7 @@ Then:
    `<worktree>/.wolfpack/plans/fix-<slug>-smoke-<N>/metadata.json` — **the plan-dir slug MUST
    match the branch/worktree name** (`fix-<slug>-smoke-<N>`) so Pointer's preflight resolves it.
    Because this runs in a worktree, the metadata MUST set
-   `"is_worktree": true` and `"worktree_path": "<absolute path to .agents/worktrees/fix-<slug>-smoke-<N>>"`
+   `"is_worktree": true` and `"worktree_path": "<absolute path of $WT_ROOT/fix-<slug>-smoke-<N>>"`
    — without them the downstream roles' preflight reads `is_worktree:false` and writes to the
    main repo root instead of the isolated worktree. No unreviewed patch lands post-merge.
 3. **Merge the fix branch** `--no-ff` to main, push. Then **re-lay the wave tag** on the new
@@ -204,12 +238,14 @@ Then:
    ```bash
    git tag -d <wave-tag> && git tag -a <wave-tag> -m "<msg> (with smoke fixes)" HEAD && git push -f origin <wave-tag>
    ```
-   Redeploy, **re-smoke that hunt's criteria only**.
+   Redeploy (the configured Dev deploy command), **re-smoke that hunt's criteria only**.
 
 The anti-waffling guard applies: if a re-smoke fails again, STOP and present options — do not
 auto-start a second fix round.
 
 ## Step 6 — Close
+
+If the project smoke steps (Step 2a.1) define a close/report step, run it and add its `Report:` line to the close block.
 
 Only when **every** criterion is `auto_pass` or manual-pass (no open `needs_human_run`, no open
 failure):
@@ -218,6 +254,7 @@ failure):
   per hunt:  invoice-bundle ✅   scheduling ✅   address-audit ✅
   auto: <P> pass / <F> fail (fixed)   manual: <P> pass / <F> fail (fixed)
   reverted: <list or none>   fix-forward: <list or none>
+  Report: <url, when the project smoke steps produce one>
 
 Next: /clear → /summary
 ```
@@ -237,5 +274,7 @@ mirrors the per-hunt batching and nothing is implicitly "fine."
 - Do NOT write un-runnable criteria into `TODO.md`.
 - Do NOT leave the wave tag ahead of a reverted state — always re-lay it.
 - Do NOT relay an unverified URL.
+- Do NOT sign in except through the configured smoke login hook.
+- Do NOT read the hook's secrets.
 
 Begin. Build the release queue + criteria union, resolve the dev URL, then run the `[auto]` set.

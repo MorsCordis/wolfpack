@@ -18,10 +18,16 @@ paraphrase, reformat, or drop `/clear`. It is the user's copy-paste handoff.
 - `$1` = campaign slug, `$2` = wave number. If either is missing, STOP and emit usage.
 
 ## Preflight: CWD + campaign
+**Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
+
+**Worktree root (`WT_ROOT`).** In the main checkout run `node "$PACK/scripts/wolfpack-config.mjs" --json` and take `worktreeRoot` (wolfpack-config.md → Project Identity → Worktree root, repo-relative). If the reader exits 2 or `worktreeRoot` is null, STOP with the fix: "add ``- **Worktree root:** `<repo-relative dir, e.g. .agents/worktrees>` `` under ## Project Identity in wolfpack-config.md". Never assume a default location.
+
 1. `cd "$(git rev-parse --show-toplevel)"` — wave merges run from the main repo. If you're in
-   a worktree (`pwd` ends in `/.agents/worktrees/*`), the `--show-toplevel` of the *common*
+   a worktree (the cwd is inside `$WT_ROOT`), the `--show-toplevel` of the *common*
    dir is the main repo: `cd "$(dirname "$(git rev-parse --git-common-dir)")"`.
 2. Verify `.wolfpack/campaigns/$1/campaign.md` exists. If not: STOP — "No campaign `$1` (run /expedition first)."
+3. If `.wolfpack/campaigns/$1/metadata.json` has `chain.mode == "chain"` → STOP: *"`$1` is a
+   chain campaign — release it with `/release-campaign $1` (one merge, one tag). `/merge-wave` never merges a chain campaign."*
 
 ## Step 1 — Build the release queue (AC4)
 
@@ -52,6 +58,8 @@ paraphrase, reformat, or drop `/clear`. It is the user's copy-paste handoff.
      `parked:compliance_review`; this clause catches any that slip through.)
    - **Already released** — `status: "merged"` → skip silently; it shipped in a prior
      `/merge-wave` run (its `merge_commit`/`released_version` are recorded). Makes a re-run idempotent.
+     (exactly `merged` — `merged_to_campaign*` is NOT released; it can only appear on a chain campaign,
+     which Preflight already stopped)
    - **Not ready** — any other status (rework_needed, other parked:*, failed, in-progress).
      Surface and skip.
 4. Display the queue, then STOP for confirmation before merging anything:
@@ -100,7 +108,7 @@ abort leaves them recoverable.
 1. **Aggregate the bump** across the merged hunts' recorded bumps and compute the wave version:
    ```bash
    LAST_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo "v0.0.0")
-   eval "$(node scripts/wolfpack-release.mjs version "$LAST_TAG" <bump1> <bump2> ...)"
+   eval "$(node "$PACK/scripts/wolfpack-release.mjs" version "$LAST_TAG" <bump1> <bump2> ...)"
    # exports BUMP=<level|none> and VERSION=<next|"">
    ```
    - Highest step wins (minor beats patch); tooling-only hunts contribute nothing
@@ -159,8 +167,8 @@ abort leaves them recoverable.
 
 ## Step 4 — Worktree cleanup
 
-For each merged hunt that ran in a worktree, present the cleanup prompt (same verbatim block
-as `/merge` step 8) and wait for `y` before `git worktree remove`. Plans are already copied
+For each merged hunt that ran in a worktree (`$WT_ROOT/<slug>`), present the cleanup prompt (same verbatim block
+as `/merge` step 8, `"$PACK/.agents/commands/merge.md"`) and wait for `y` before `git worktree remove "$WT_ROOT/<slug>"`. Plans are already copied
 back, so declining is safe.
 
 ## Tag reversion note (for the smoke step)

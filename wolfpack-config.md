@@ -9,6 +9,7 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 - **Test command:** `bash scripts/test-all.sh` — the single entry point: every `scripts/**/*.test.mjs`, every `scripts/**/*.test.sh`, and the leak grep. Narrow while iterating with `node --test scripts/<file>.test.mjs`. Podman-dependent tests print `SKIP: needs podman` when podman is absent or `WOLFPACK_TEST_NO_PODMAN=1`.
 - **Worktree links:** none
 - **Worktree root:** `.agents/worktrees` — where /hunt and the pipeline create hunt worktrees (repo-relative).
+- **Project commands:** none — the pack itself (its .claude/commands is the link to .agents/commands).
 - **Deploy command (dev):** none — the pack is not deployed; consumers install it.
 - **Deploy command (prod):** none.
 - **Vault root:** `~/Vault`
@@ -79,6 +80,7 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 - Backlog file: `TODO.md`
 - Tag pattern: `v[0-9]*` (semver per campaign wave; `/merge-wave` stamps `## [Unreleased]` → `## [vX.Y.Z]`)
 - Dev URL: none · Prod URL: none · Never-smoke hosts: none — nothing is deployed; `/smoke-wave` does not apply.
+- Smoke login hook: none — nothing is deployed.
 
 ## Execution Layer
 - **Sandbox image:** `wolfpack-pack-sandbox:latest` — the pack's own seat image (project-neutral base, no layer), named apart from any consuming project's image because podman tags are host-global.
