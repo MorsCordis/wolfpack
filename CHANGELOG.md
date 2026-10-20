@@ -4,6 +4,8 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+## [v0.3.0] - 2026-10-20
+
 ### Added
 - Review and certify seats (Bloodhound, Pointer, Watchdog; GLM and Mistral) write their own handoff file with `write_file` into one shim-mounted read-write out dir (`<plan dir>/.seat-out/<seat>-r<N>[-<lens>]/`); the worktree stays read-only and `edit` stays denied. <!-- hunt:seat-handoff-writes -->
 - `podman-vibe.sh --deliver-to <plan dir> --out-dir <dir> --expect <artifact>…`: after the seat exits the shim moves exactly the expected artifact(s) byte-for-byte into the plan dir and prints `WOLFPACK_ARTIFACT_DELIVERED: <name> sha256=…`; a missing artifact, any extra file, a symlink or any change to tracked/untracked source fails with exit 78 and `WOLFPACK_ARTIFACT_ERROR:` markers, and the out dir is quarantined, never delivered. A non-empty out dir at start is refused (exit 2). <!-- hunt:seat-handoff-writes -->
