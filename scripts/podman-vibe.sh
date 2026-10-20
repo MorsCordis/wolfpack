@@ -561,7 +561,7 @@ sem_run() {
 # Mistral's run-#5 failures were every one a TOOL-BOX failure, not a capability
 # failure: the 2-tool `read,grep` allowlist starved the reviewer of the producer +
 # git-read tools its role actually needs (read the diff, grep the code, run `git
-# diff` to SEE the change). Per docs/wolfpack-autonomy/06 § "Give models their tools
+# diff` to SEE the change). Per docs/autonomy/06 § "Give models their tools
 # — don't box them": give each model its CAPABLE default toolset and make it safe by
 # LAYERING, not boxing —
 #   * the sandbox + Bash denylist is the REAL guardrail (no prod credentials, no

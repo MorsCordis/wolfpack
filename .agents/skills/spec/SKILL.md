@@ -16,7 +16,7 @@ solved the wrong problem and the whole pack validated the wrong problem flawless
 Every role downstream of Alpha is structurally blind to that one error. You are the
 checkpoint that catches it — before a single planning token is spent.
 
-See `docs/wolfpack-autonomy/01-spec-driven-hunts.md` for the full design.
+See `docs/autonomy/01-spec-driven-hunts.md` for the full design.
 
 ## Preflight: locate the hunt and `cd`
 

@@ -6,7 +6,7 @@ allowed-tools: Bash, Read, Edit
 
 Batch-merge wave **$ARGUMENTS** (`<campaign> <wave>`).
 
-This is the **autonomous/batch release path** from `docs/wolfpack-autonomy/04-batch-merge-smoke.md`.
+This is the **autonomous/batch release path** from `docs/autonomy/04-batch-merge-smoke.md`.
 On the batch path **the wave — not the individual hunt — owns the version tag.** A manually
 run single hunt is a wave-of-one and should still use plain `/merge` (tags as today).
 

@@ -4,6 +4,13 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+### Added
+- `docs/autonomy/` (README + 01–07): the autonomy design set — spec-driven hunts, park/resolve/resume, convergence and verdict, batch merge and smoke, limits and timing, model tiers and routing, cross-model execution — now lives in the pack, project-neutral (project specifics are labelled examples or `wolfpack-config.md` references). <!-- hunt:autonomy-docs-into-pack -->
+- `docs/user-guide.md`: the operator's guide (phase walkthrough, tier and mode tables, artifacts, slash commands, usage limits, troubleshooting), moved from the first consuming project's pipeline guide and genericized. <!-- hunt:autonomy-docs-into-pack -->
+
+### Changed
+- Every skill, command, workflow and script citation of the design docs now points at the pack's own `docs/autonomy/` (and `docs/user-guide.md`); README and SETUP link the docs. <!-- hunt:autonomy-docs-into-pack -->
+
 ### Fixed
 - `hunt-pipeline.js` and `campaign-runner.js` no longer die at launch with `ReferenceError: meta is not defined`: the Workflow runtime strips the `export const meta` block, so the run-start stamp check now names its own file from a plain `WORKFLOW_NAME` constant (kept equal to `meta.name`, guarded by a test). The test harnesses now REMOVE the meta block the way the runtime does instead of rewriting it to `const meta`, which hid the bug. <!-- hunt:workflow-meta-runtime -->
 - The run-start project-config and workflow-stamp probes run in their starting directory with no `cd`, and each reports the `pwd` it ran in. The run stops with a "host repo drifted between probes" error naming both paths when the stamp probe's directory or the checker's consumer differs from the config probe's directory, or when either probe omits it. A probe can no longer wander into another repo and check the wrong consumer. <!-- hunt:workflow-meta-runtime -->

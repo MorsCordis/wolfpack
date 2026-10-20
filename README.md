@@ -127,6 +127,8 @@ Review roles MUST use a different model family from the role they review:
 - Pointer ≠ Shepherd
 - Watchdog ≠ Shepherd
 
+Watchdog also ≠ Tracker's family (tests are code on the branch). Each review seat walks the configured examiner chain (`wolfpack-config.md` → Model Pool) with every writer family removed.
+
 This prevents blind spots — a model reviewing its own work catches less than a different model reviewing it. The router enforces this as a fail-loud invariant (`scripts/wolfpack-routing.mjs`).
 
 ### Pedigree
@@ -150,6 +152,10 @@ wolfpack/
 ├── README.md                       # This file
 ├── SETUP.md                        # Per-project setup guide
 ├── HOOKS.md                        # Hook reference
+├── PEDIGREE.md                     # Pedigree v2 reward-signal schema
+├── docs/
+│   ├── user-guide.md               # Operator's guide: phases, artifacts, commands, usage limits
+│   └── autonomy/                   # Normative design set: README + 01–07 (spec, park, convergence, …)
 ├── wolfpack-config.example.md      # Config template (copy into your project)
 ├── .agents/                        # CANONICAL home for the framework
 │   ├── skills/
@@ -207,6 +213,11 @@ In **your** project you only add `wolfpack-config.md` (project root) and a `.wol
 6. **No test shortcuts** — tests must exercise actual behavior, not work around it
 7. **Actionable findings only** — every review finding must include a concrete fix
 8. **Proportional ceremony** — Green is fast, Red is thorough, tiers scale automatically
+
+## Design docs
+
+- [docs/user-guide.md](docs/user-guide.md) — the operator's guide: phases, tiers, artifacts, slash commands, usage limits.
+- [docs/autonomy/README.md](docs/autonomy/README.md) — the normative design behind the unattended pipeline; skills and scripts cite these files.
 
 ## License
 

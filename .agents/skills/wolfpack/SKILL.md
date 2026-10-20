@@ -20,7 +20,7 @@ Wolfpack is a multi-agent pipeline for planning, reviewing, implementing, and ce
 
 **The golden rule: no family examines its own work.** Bloodhound ≠ Alpha. Pointer ≠ Shepherd. Watchdog ≠ Shepherd (and ≠ Tracker — tests are code). Each review seat walks an ordered **examiner chain** — `GLM → Mistral → Claude (last resort)`, with `WOLFPACK_ENABLE_GLM=0` / `WOLFPACK_ENABLE_MISTRAL_AUTO=0` as kill switches and **every family that wrote code or tests on the branch removed**. Claude is the LAST link and never the first: it is admitted only when no cross-family shim link (GLM or Mistral) is both enabled and cross-family, and it is filtered out entirely whenever Claude wrote any of the code or tests under review (so the common Claude-Shepherd hunt never reaches it). A Claude reviewing Claude's own work is not adversarial review, and that — not "Claude is ineligible" — is the invariant. A rate limit moves to the next link; chain exhausted → park `model_quota`; a review that cannot be proven cross-family parks `cross_family_violation`. Alpha is ALWAYS the judgment family (unchanged).
 
-**Multi-Model Pool:** Four model families are available: Opus, Sonnet, GLM (GLM 5.3 via Vibe), Mistral (Large 4). The concrete mapping lives in `wolfpack-config.md` → Model Pool (reviewer-a/b/c, coder-alt). Alpha selects models for each role during the Debrief based on pedigree scores from past hunts. Only Alpha is fixed (= Opus). The rest are pedigree-driven with cross-model constraints — including Tracker, which is **metered-with-fallback** (routable across the whole pool, gated on pedigree metrics plus a capability fallback; see `docs/wolfpack-autonomy/06-model-tiers-and-routing.md`), no longer pinned to Opus.
+**Multi-Model Pool:** Four model families are available: Opus, Sonnet, GLM (GLM 5.3 via Vibe), Mistral (Large 4). The concrete mapping lives in `wolfpack-config.md` → Model Pool (reviewer-a/b/c, coder-alt). Alpha selects models for each role during the Debrief based on pedigree scores from past hunts. Only Alpha is fixed (= Opus). The rest are pedigree-driven with cross-model constraints — including Tracker, which is **metered-with-fallback** (routable across the whole pool, gated on pedigree metrics plus a capability fallback; see `docs/autonomy/06-model-tiers-and-routing.md`), no longer pinned to Opus.
 
 Mistral and GLM read `.agents/skills/` directly.
 
@@ -73,7 +73,7 @@ No path proceeds past an open real CRITICAL/HIGH — it parks. The old
 `CRIT_CEILING`/`HIGH_CEILING`/`roundCap++` math and the Bloodhound "proceed-anyway-at-cap"
 branch are gone. Finding fingerprints + per-round ledger land in `metadata.review_fingerprints`
 + `metadata.convergence` (the [06] model-grading substrate). See
-`docs/wolfpack-autonomy/03-convergence-and-verdict.md` § Part B.
+`docs/autonomy/03-convergence-and-verdict.md` § Part B.
 
 ### Rewrite cycles
 
@@ -96,7 +96,7 @@ spawning its own sub-agents. The `.js` fans out N **capped, single-pass, cross-m
 agents via `parallel()`, surfaces a failed shim as a `null` (so one dead reviewer doesn't abort
 the wave), and degrades concurrency `n → n-1` on flock contention rather than dropping coverage.
 This is **one level of fan-out**, held by the orchestrator — see
-`docs/wolfpack-autonomy/03-convergence-and-verdict.md` § Capped parallel review fan-out.
+`docs/autonomy/03-convergence-and-verdict.md` § Capped parallel review fan-out.
 
 **Cross-model CLI self-orchestration is disabled.** A headless reviewer — Vibe/Mistral and
 Vibe/GLM via `podman-vibe.sh` — runs **one comprehensive single-pass review**
@@ -180,7 +180,7 @@ status to the resume rung. **You resolve; the next runner pass resumes** — you
 re-drive the pipeline by hand. The runner skips `parked:*`/`needs_spec` hunts as
 non-actionable. Park reasons, the clarify-vs-redirect distinction, the compliance-review
 sign-off, and the redirect-loop guard live in `.agents/skills/parked/SKILL.md` and
-`docs/wolfpack-autonomy/02-park-resolve-resume.md`.
+`docs/autonomy/02-park-resolve-resume.md`.
 
 **Documentation phase (Shepherd):** After implementation, Shepherd assesses whether user-facing docs are needed and drafts/updates them before committing. Watchdog verifies doc coverage during certification. See `.agents/skills/shepherd/SKILL.md` § Documentation Phase and `.agents/skills/watchdog/SKILL.md` § Documentation coverage.
 
