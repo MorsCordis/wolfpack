@@ -16,6 +16,7 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 - `wolfpack-version.mjs set --tag` rejects anything but `vMAJOR.MINOR.PATCH[-prerelease]` or `none`. <!-- hunt:consolidation-acceptance -->
 - The merge-and-state-hygiene pedigree row carries scores (re-scored after the fact by a cross-family seat). <!-- hunt:consolidation-acceptance -->
 - The wolfpack skill and `/merge` no longer claim a `.gitattributes` `union` merge driver on the shared append-only files; none was ever committed. <!-- hunt:consolidation-acceptance -->
+- The Watchdog skill's Index append format section now says the pedigree index-row writer falls back to the `metadata.json` `pointer_round` / `tracker_round` counters for PtrRnd/TrkRnd and refuses only when both are absent. <!-- hunt:acceptance-green-wolfpack -->
 
 ## [v0.5.0] - 2026-10-21
 
