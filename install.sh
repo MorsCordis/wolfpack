@@ -60,7 +60,7 @@ command -v node >/dev/null 2>&1 || { echo "✗ install.sh: node is not on PATH �
 
 # ── Version line (first output line, both modes) ──
 if ! VERSION="$(git -C "$PACK" describe --tags --match 'v[0-9]*' 2>/dev/null)"; then
-  echo "✗ cannot read the pack version (no tags reachable) — fix: git -C '$PACK' fetch --tags" >&2
+  echo "✗ cannot read the pack version (no v* release tag reachable) — fix: git -C '$PACK' fetch --tags" >&2
   exit 2
 fi
 COMMIT="$(git -C "$PACK" rev-parse HEAD)"

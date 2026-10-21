@@ -255,6 +255,35 @@ test('ensure: a FAILING record is re-taken once the hunt is re-armed after it (h
   assert.equal(runs(g2), 1)
 })
 
+test('ensure: one re-arm buys ONE re-run (a still-failing re-take is reused next time); no finished_at → reused; --fresh always re-takes; gate prints --fresh after a failure', () => {
+  const f = fixture({ exitCode: 1 })
+  f.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  const recPath = join(f.recordDir, 'test-record-tracker.json')
+  const done = Date.parse(JSON.parse(readFileSync(recPath, 'utf8')).finished_at)
+  const notes = join(f.recordDir, 'human-notes.md')
+  writeFileSync(notes, 'human re-arm\n')
+  utimesSync(notes, new Date(done + 1), new Date(done + 1))
+  assert.equal(f.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir]).json.reused, false)
+  assert.equal(runs(f), 2)
+  assert.equal(f.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir]).json.reused, true, 'the re-taken record finished after the notes')
+  assert.equal(runs(f), 2)
+  // a record without a parseable finished_at keeps the old reuse rule
+  const rec = JSON.parse(readFileSync(recPath, 'utf8'))
+  delete rec.finished_at
+  writeFileSync(recPath, JSON.stringify(rec))
+  utimesSync(notes, new Date(Date.now() + 60_000), new Date(Date.now() + 60_000))
+  const noTime = f.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  assert.equal(noTime.json.reused, true)
+  assert.equal(runs(f), 2)
+  // --fresh
+  assert.equal(f.run(['ensure', '--fresh', '--json', '--stage', 'tracker', '--record-dir', f.recordDir]).json.reused, false)
+  assert.equal(runs(f), 3)
+  // gate refusal on a FAILED record names --fresh
+  const g = f.run(['gate', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  assert.equal(g.code, 2)
+  assert.match(g.json.fix, / ensure --fresh --stage tracker /)
+})
+
 test('ensure: a record whose command differs from the configured one is stale → re-run; a corrupt record → re-run', () => {
   const f = fixture()
   f.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
@@ -301,7 +330,7 @@ test('AC11 check: SHA mismatch → stale refuse; failing → refuse; passing + m
   const refused = bad.run(['check', '--json', '--stage', 'final', '--record-dir', bad.recordDir])
   assert.equal(refused.code, 2)
   assert.equal(refused.json.state, 'fail')
-  assert.match(refused.json.fix, /ensure --stage final/)
+  assert.match(refused.json.fix, /ensure --fresh --stage final/, "a failed record needs --fresh: plain ensure would reuse it")
   // a record of ANOTHER stage never satisfies this one
   const other = fixture()
   other.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', other.recordDir])

@@ -304,7 +304,7 @@ test('packInfo: a pack with no reachable tag fails loud with the fetch --tags fi
     mkdirSync(join(dir, '.agents', 'workflows'), { recursive: true })
     copyFileSync(join(REAL_PACK, '.agents', 'workflows', 'hunt-pipeline.js'), join(dir, '.agents', 'workflows', 'hunt-pipeline.js'))
     git(dir, 'init', '-q', '-b', 'main'); git(dir, 'add', '.'); git(dir, 'commit', '-q', '-m', 'x')
-    assert.throws(() => packInfo(dir), new RegExp(`no tags reachable\\) — fix: git -C '${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}' fetch --tags`))
+    assert.throws(() => packInfo(dir), new RegExp(`no v\\* release tag reachable\\) — fix: git -C '${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}' fetch --tags`))
     const consumer = consumerDir()
     const r = cli('check', '--pack', dir, '--consumer', consumer)
     assert.equal(r.status, 2)

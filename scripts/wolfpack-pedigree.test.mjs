@@ -196,6 +196,15 @@ test('index-row: counters at the TOP level of pedigree.json (the GLM Watchdog la
   assert.equal(indexRow({ pedigree: both, meta: META, date: '2026-10-21' }).row, a.row);
 });
 
+test('index-row: an invalid top-level counter (a string) with no nested value is refused, never written', () => {
+  const ped = deep(canonical());
+  delete ped.execution_scores.human_interventions;
+  ped.human_interventions = 'none';
+  const r = indexRow({ pedigree: ped, meta: META, date: '2026-10-21' });
+  assert.equal(r.ok, false);
+  assert.ok(r.missing.includes('Human (execution_scores.human_interventions)'), String(r.missing));
+});
+
 test('consolidation-acceptance AC10: the run-observability-shaped pedigree (scores:{…}) is refused', () => {
   const ped = { certifier_verdict: 'pass', scores: { plan_adherence: 5, code_quality: 4, rework: 0 } };
   const r = indexRow({ pedigree: ped, meta: META, date: '2026-10-21' });

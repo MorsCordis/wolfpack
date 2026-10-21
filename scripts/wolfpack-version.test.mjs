@@ -6,7 +6,7 @@
 
 import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -72,6 +72,20 @@ test('AC7: the note is APPENDED after existing human blocks (never rewriting the
   assert.match(n.slice(prior.length), /^\n## 2026-10-21 — SEAT NOTE \(not human direction\): watchdog disagrees/)
   run('set', '--plan-dir', d, '--bump', 'minor', '--tag', 'v1.3.0', '--by', 'debrief', '--reason', 'r2', '--at', '2026-10-22T00:00:00Z')
   assert.equal((notes(d).match(/SEAT NOTE/g) || []).length, 2)
+})
+
+test('a SEAT NOTE never moves human-notes.md mtime (test-record ensure reads it as the last HUMAN write); a file it creates is back-dated', () => {
+  const d = planDir(HUMAN, '## 2026-10-20 — human\nre-armed\n')
+  const np = join(d, 'human-notes.md')
+  const t = new Date('2026-10-20T12:00:00Z')
+  utimesSync(np, t, t)
+  assert.equal(run('set', '--plan-dir', d, '--bump', 'minor', '--tag', 'v1.3.0', '--by', 'watchdog', '--reason', 'r').code, 0)
+  assert.match(notes(d), /SEAT NOTE/)
+  assert.equal(statSync(np).mtimeMs, t.getTime())
+  const fresh = planDir(HUMAN)
+  assert.equal(run('set', '--plan-dir', fresh, '--bump', 'minor', '--tag', 'v1.3.0', '--by', 'alpha', '--reason', 'r').code, 0)
+  assert.match(notes(fresh), /SEAT NOTE/)
+  assert.equal(statSync(join(fresh, 'human-notes.md')).mtimeMs, 0)
 })
 
 test('AC7: a seat proposing the SAME version as the human → no note, metadata unchanged', () => {

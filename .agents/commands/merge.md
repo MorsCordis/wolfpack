@@ -114,7 +114,7 @@ Before reading any plan files:
    ```bash
    node "$PACK/scripts/wolfpack-merge-state.mjs" copy-back --slug "$SLUG" --from "$worktree_path/.wolfpack/plans/$SLUG"
    ```
-   It copies the worktree plan dir's CONTENTS into the main checkout's `.wolfpack/plans/<slug>/` (created if missing; the worktree's files win; never a nested `<slug>/<slug>/`; a tracked `pedigree.json` is overwritten in place, never archived or deleted; files only the target has are left alone). Print its `overwritten` list to the user. Do NOT copy the directory yourself with a recursive shell copy and do NOT archive an existing target.
+   It copies the worktree plan dir's CONTENTS into the main checkout's `.wolfpack/plans/<slug>/` (created if missing; the worktree's files win; never a nested `<slug>/<slug>/`; a `pedigree.json` tracked in the TARGET is overwritten in place, never archived or deleted; files the hunt branch tracks are skipped and listed in `skipped_tracked`, since they arrived with the merge; files only the target has are left alone). Print its `overwritten` and `skipped_tracked` lists to the user. Do NOT copy the directory yourself with a recursive shell copy and do NOT archive an existing target.
    - The pedigree scorecard rides the merge (tracked on the feature branch); this step handles the gitignored artifacts only (plan.md, review-N.md, debrief.md, shepherd-log.md, certification.md, observations.md, pointer-review-N.md, tracker-log.md).
 7a. **Stamp MERGED (ALWAYS — worktree hunt or `--no-worktree` hunt; not conditioned on `worktree_path`).** Run, from the main checkout:
    ```bash
