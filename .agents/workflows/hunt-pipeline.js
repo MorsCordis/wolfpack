@@ -3977,7 +3977,7 @@ Execute ALL Tracker instructions:
   (wolfpack-config.md → Project Identity → Test command — follow its notes on narrowing and on which test backend the sandbox uses)
 - PIPELINE TEST RECORD: after you return TESTS_PASS the pipeline itself runs ${cfg().testCommand} at the committed HEAD and writes ${planDir}/test-record-tracker.json + .log — that record, not your report, gates Certify. Run targeted tests while you write them; commit EVERY test file before returning (uncommitted tracked changes are not in the commit the record tests). Never write or edit test-record-*.json.
 - Classify failures (baseline/transient/pre-existing/legitimate)
-- This is Tracker round ${windowRound} of at most ${trackerRounds + 1}. Write ${planDir}/tracker-log.md and ${planDir}/tracker-report-${trackerRound}.md if needed
+- This is Tracker round ${windowRound} of at most ${trackerRounds + 1} in this budget window (absolute round ${trackerRound}). Write ${planDir}/tracker-log.md and ${planDir}/tracker-report-${trackerRound}.md if needed, and set metadata tracker_round = ${trackerRound} (the absolute round, not the window number)
 - Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}
 - Commit test files on feat/${slug}. WRITER RECORD: end every commit message with the git
   trailer "${WRITER_TRAILER}: ${trackerFamily}"
