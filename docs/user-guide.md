@@ -210,8 +210,10 @@ Details: the wolfpack skill (`.agents/skills/wolfpack/SKILL.md` § Chain mode).
 ## Usage limits (5-hour window and weekly cap)
 
 Unattended pipeline runs stop starting work they cannot finish. Before the campaign runner
-claims each **new** hunt (never between phases) it asks `scripts/wolfpack-window-gate.mjs` for
-a decision based on Claude Code's **real** account usage.
+claims each **new** hunt it asks `scripts/wolfpack-window-gate.mjs` for a decision based on Claude
+Code's **real** account usage (the START gate). Between the phases of a running hunt,
+`hunt-pipeline.js` asks again in `--boundary` mode with near-exhaustion ceilings, and parks
+`model_quota` cleanly at that phase (auto-resuming there) instead of dying mid-agent.
 
 **The snapshot.** Claude Code sends `rate_limits.five_hour` and `rate_limits.seven_day`
 (`used_percentage`, `resets_at`) to the status line on every render. The status-line wrapper
@@ -228,6 +230,8 @@ and writes only those figures plus `captured_at` to `~/.cache/wolfpack/claude-us
 | `WOLFPACK_WEEKLY_DEFER_PCT` | 90 | 7d at/above ⇒ defer **all** new hunts |
 | `WOLFPACK_WEEKLY_PACE_POINTS` | 15 | weekly pace above ⇒ usage offload |
 | `WOLFPACK_USAGE_STALE_MINUTES` | 10 | snapshot older ⇒ degraded fallback |
+| `WOLFPACK_5H_BOUNDARY_MAX_PCT` | 95 | boundary mode: 5h at/above ⇒ park `model_quota` before the next phase (every tier) |
+| `WOLFPACK_WEEKLY_BOUNDARY_PCT` | 98 | boundary mode: 7d at/above ⇒ park `model_quota` before the next phase |
 
 A defer stops scaffolding: in-flight hunts finish, the rest are deferred, and the runner returns
 `WAVE_PAUSED_QUOTA` with `resetAt`. The overnight driver re-gates and sleeps until the reset.
@@ -253,6 +257,10 @@ transcript estimate (`WOLFPACK_CLAUDE_WINDOW_LIMIT`). The output says
 `source:"transcript_estimate", degraded:true`, a warning goes to stderr in every mode, and the
 runner logs `USAGE GATE DEGRADED`. With no limit configured it proceeds, loudly.
 
+**Boundary records.** Every boundary decision is appended to `<plan dir>/usage-gate.jsonl`. A gate
+that cannot be read proceeds loudly (`USAGE GATE UNAVAILABLE`, recorded there and on the hunt
+result); a gate that errors (an invalid threshold) parks `usage_gate_error`.
+
 **Unattended runs.** Only an *interactive* Claude Code session renders the status line, so only
 it writes the snapshot. For overnight or unattended runs, keep an interactive session open on the
 host that runs the pipeline, or set `WOLFPACK_CLAUDE_WINDOW_LIMIT` as the degraded backstop. Otherwise the gate
@@ -264,6 +272,41 @@ fault, not a rate limit: it skips the breaker and never parks a hunt as `model_q
 `~/.vibe/logs` tmpfs is now 256 MB (`WOLFPACK_VIBE_LOGS_TMPFS_SIZE`).
 
 **Install.** The status-line wrapper and the meter are set up in `SETUP.md` § Optional: usage snapshot (Claude Code); that section is the single source for the install steps.
+
+## Test record
+
+The pipeline does not take an agent's word for the test result. After the Tracker returns
+TESTS_PASS, the pipeline runs the project's **Test command** once at the committed HEAD through
+`scripts/wolfpack-test-record.mjs` (a relay agent only runs the script and returns its output) and
+writes two files to the plan dir:
+
+- `test-record-<stage>.json`: the commit, the raw exit code, the suite's own summary line, the
+  `pass` verdict, the test command, timing, and where it ran (`repo`, or a scratch worktree when
+  the checkout was dirty or at another commit);
+- `test-record-<stage>.log`: the full raw output.
+
+**Stages.** `tracker` (after the Tracker; at Certify entry when a resume skipped Test), `final`
+(at the final HEAD after the certify commit) and `release` (the `campaign/<slug>` tip, in
+`/release-campaign`).
+
+**Reuse rule.** `ensure` reuses a record whose commit (and test command) equals the target and
+re-runs only when HEAD moved. Watchdog cites the record when its commit equals HEAD instead of
+re-running the suite.
+
+**Gates.** A failing `tracker` record bounces the hunt to Implement before Certify. A failing
+`final` record parks `final_test_record_failed` (not mergeable). `/merge` and `/merge-wave` run
+`gate --stage final` and refuse without a passing record at the exact tip being merged (re-taking it
+once when the tip moved, e.g. after the auto-rebase); `/release-campaign` requires a passing
+`release` record. A refusal prints the exact `ensure` line that re-takes the record. A record the
+pipeline cannot trust (script error, SHA or command mismatch) parks `test_record_error`.
+
+**Trust anchor.** The test command is read from the MAIN checkout's `wolfpack-config.md`, never
+the hunt branch's, and the workflow cross-checks the recorded command against its own config.
+
+**`Test verdict command`.** Some suites exit non-zero by design on documented baseline failures.
+Set Project Identity → **Test verdict command** to a command that decides pass/fail from the log
+instead (placeholders `{log}`, `{exit}`, `{main}`; exit 0 = pass). The record keeps the raw exit
+either way. `none` (the default) means the suite's exit code is the verdict.
 
 ## Troubleshooting
 

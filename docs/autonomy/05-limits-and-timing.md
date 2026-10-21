@@ -73,9 +73,36 @@ before launching hunt:
       defer; ScheduleWakeup(after window reset)
 ```
 
-**Critical rule: gate between hunts, never mid-pipeline.** Halting mid-Shepherd leaves a
-half-built worktree. The resume probe recovers it, but graceful > recoverable. The wave
-structure gives natural boundaries; check there.
+**Critical rule: gate at clean boundaries, never mid-agent.** Halting mid-Shepherd leaves a
+half-built worktree. The resume probe recovers it, but graceful > recoverable. The START gate
+runs between hunts (the wave structure gives natural boundaries); the boundary gate below runs
+between the phases of a running hunt.
+
+### A2b. Boundary gate (between phases)
+
+A long Orange hunt that STARTED at 79% can still hit the wall mid-agent and die as a confusing
+failure. So `hunt-pipeline.js` re-checks the window before every agent phase after Scaffold
+(Spec, Plan, Review, Debrief, Implement, Code Review, Test, Certify; not per review round, not at
+Verify) with `scripts/wolfpack-window-gate.mjs --json --boundary --phase <P> --record <plan dir>/usage-gate.jsonl`.
+
+- **Mode and ceilings.** Boundary mode has its OWN tier-independent ceilings:
+  `WOLFPACK_5H_BOUNDARY_MAX_PCT` (default 95) and `WOLFPACK_WEEKLY_BOUNDARY_PCT` (default 98).
+  They are higher than the start ceilings on purpose: the start gate decides whether a whole hunt
+  fits, the boundary gate only whether ONE more phase does. Parking at the start ceiling between
+  phases would strand most long hunts half-built. Boundary mode never offloads.
+- **Park shape.** A `defer` parks `model_quota` with `resume_phase` = that phase (clarify): the
+  ordinary auto-resumable quota park, so the next pass resumes exactly there after the reset.
+- **Degraded / error.** A stale snapshot falls back to the transcript estimate exactly as the
+  start gate does (the decision is followed, labelled `degraded:true`, and the run logs
+  `USAGE GATE DEGRADED`). A gate that FAILS (exit 1 or `decision:"error"`, e.g. an invalid
+  threshold env) parks `usage_gate_error` (redirect). A gate whose answer cannot be READ (the
+  relay agent died, garbled output, decision/exit mismatch) proceeds UNGATED but loudly:
+  `USAGE GATE UNAVAILABLE` in the log, the event on the hunt result (`usageGateEvents`), and a
+  `pipeline_note` line in `usage-gate.jsonl` (written by the next gate run or by the park /
+  metadata agent that ends the run).
+- **`usage-gate.jsonl`.** Append-only, one line per decision
+  (`{at, mode, phase, decision, source, degraded, degraded_reason, reason, five_hour_pct, seven_day_pct, reset_at}`)
+  plus `{at, kind:"pipeline_note", note}` lines. A write failure warns and never changes the decision.
 
 ### A3. Reset-aware self-resume (the useful part)
 

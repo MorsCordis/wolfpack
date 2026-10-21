@@ -83,6 +83,14 @@ deliberate omissions — **do not lay a tag and do not stamp a version heading p
 2. `git checkout main`, then **auto-rebase** the feature branch onto main if main moved
    (same rebase+abort-on-conflict handling as `/merge` step 6). Sequential merges mean main
    moves under each subsequent hunt — the rebase is load-bearing here.
+2a. **Test-record gate** (run-observability). The merge requires a PASSING full-suite record at the exact tip
+   being merged (the gate re-runs once when the tip moved since the record, e.g. after the rebase above):
+   ```bash
+   node "$PACK/scripts/wolfpack-test-record.mjs" gate --stage final --record-dir "<that hunt's plan dir>" --rev "<branch>" ${worktree_path:+--repo "$worktree_path"}
+   ```
+   On refusal (exit ≠ 0) STOP the wave at this hunt: the earlier hunts stay merged. Report the fix line it
+   printed and say that re-running `/merge-wave` resumes (released hunts are skipped). Never hand-edit
+   `test-record-*.json`.
 3. `git merge --no-ff <branch> -m "Merge branch '<branch>'"` then `git push origin main`.
    `--no-ff` keeps each hunt a single cleanly-revertible merge commit — this is what makes a
    smoke failure revert exactly one hunt (AC3).
