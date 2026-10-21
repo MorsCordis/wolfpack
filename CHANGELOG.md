@@ -4,6 +4,8 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+## [v1.0.0] - 2026-10-21
+
 ### Added
 - `scripts/wolfpack-human-patches.mjs check`: the human-patch gate's deterministic probe. A patch under `human-patches/consumer/` targets the consumer worktree recorded in `metadata.consumer_worktree`; it is checked there and the park prints that repo's apply/add/commit commands and branch. <!-- hunt:consolidation-acceptance -->
 - `wolfpack-pedigree.mjs index-row`: writes the pedigree index row from `pedigree.json` and refuses (naming the missing fields) a scorecard without execution scores; Certify parks `pedigree_incomplete` instead of writing a dashed row. <!-- hunt:consolidation-acceptance -->
