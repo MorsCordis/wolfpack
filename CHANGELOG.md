@@ -4,6 +4,8 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+## [v1.0.1] - 2026-10-21
+
 ### Fixed
 - `wolfpack-test-record.mjs ensure` re-takes a FAILING record when the hunt was re-armed after it (`human-notes.md` modified after the record's `finished_at`). Before, a hunt re-armed after an environment fix (expired credentials, a shared test-DB deadlock) reused the stale failure at the same commit and bounced to Implement in minutes. <!-- hunt:pack-close-bugs -->
 - `wolfpack-pedigree.mjs index-row` reads `rework_rounds` / `pointer_rounds` / `tracker_rounds` / `human_interventions` from the top level of `pedigree.json` when they are missing from `execution_scores` (the GLM Watchdog's layout), instead of refusing and parking the hunt `pedigree_incomplete`. <!-- hunt:pack-close-bugs -->
