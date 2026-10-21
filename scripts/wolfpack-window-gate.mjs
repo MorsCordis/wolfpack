@@ -67,6 +67,10 @@
 // is a HARD error, exit 1 — never a silent default):
 //   WOLFPACK_USAGE_SNAPSHOT        snapshot path (default ~/.cache/wolfpack/claude-usage.json)
 //   WOLFPACK_USAGE_STALE_MINUTES   snapshot older than this ⇒ degraded fallback (default 10)
+//   WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES  BOUNDARY mode only: a snapshot older than STALE but no
+//                                  older than this still decides, on its last-known figures, labelled
+//                                  source:"last_known" degraded:true (default 120). Beyond it the
+//                                  transcript estimate runs as before. The start gate stays strict.
 //   WOLFPACK_5H_START_MAX_PCT      5h start ceiling, non-Red tiers (default 80)
 //   WOLFPACK_5H_START_MAX_PCT_RED  5h start ceiling, Red / unknown tier (default 70)
 //   WOLFPACK_WEEKLY_PACE_POINTS    weekly pace above this ⇒ offload (default 15)
@@ -287,6 +291,7 @@ export function thresholdsFromEnv(env = process.env) {
   const read = (name, def, opts) => readNumEnv(env, name, def, opts)
   return {
     staleMinutes: read('WOLFPACK_USAGE_STALE_MINUTES', 10, { pct: false }),
+    lastKnownMaxMinutes: read('WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES', 120, { pct: false }),
     fiveHourMaxPct: read('WOLFPACK_5H_START_MAX_PCT', 80),
     fiveHourMaxPctRed: read('WOLFPACK_5H_START_MAX_PCT_RED', 70),
     weeklyPacePoints: read('WOLFPACK_WEEKLY_PACE_POINTS', 15),
@@ -336,6 +341,22 @@ export function snapshotUnusableReason(snapshot, nowMs, thresholds, snapshotErro
   return null
 }
 
+// True iff the snapshot is merely STALE: captured_at valid and not in the future, older than
+// staleMinutes but no older than lastKnownMaxMinutes, and a valid five_hour window. Such a
+// snapshot cannot be refreshed by any script (Claude Code pushes it on each status-line render,
+// and nothing renders during a long headless phase), so the BOUNDARY gate may decide on its
+// last-known figures — labelled degraded — instead of reporting "window gate DISABLED".
+export function snapshotStaleOnly(snapshot, nowMs, thresholds) {
+  if (!snapshot || typeof snapshot !== 'object') return false
+  if (typeof snapshot.captured_at !== 'string') return false
+  const capMs = Date.parse(snapshot.captured_at)
+  if (!Number.isFinite(capMs) || capMs > nowMs + 60 * 1000) return false
+  const ageMin = (nowMs - capMs) / 60000
+  if (!(ageMin > thresholds.staleMinutes)) return false
+  if (ageMin > thresholds.lastKnownMaxMinutes) return false
+  return isValidWindow(snapshot.rate_limits?.five_hour)
+}
+
 // The ONE place the flat mirrors are derived from the nested objects (output contract).
 export function flatten(d) {
   const out = { ...d }
@@ -362,7 +383,113 @@ export function computeUsageDecision({ snapshot, snapshotError, nowMs, tier, thr
   const t = normTier(tier)
   const boundary = mode === 'boundary'
   const unusable = snapshotUnusableReason(snapshot, nowMs, thresholds, snapshotError)
+  const liveDecision = (snapshot) => {
+    const fhRaw = snapshot.rate_limits.five_hour
+    const fhReset = fhRaw.resets_at * 1000 <= nowMs
+    const five_hour = {
+      used_pct: fhReset ? 0 : fhRaw.used_percentage,
+      resets_at: fhRaw.resets_at,
+      reset_since_capture: fhReset,
+    }
+    if (fhReset) five_hour.captured_used_pct = fhRaw.used_percentage
+
+    const sdRaw = snapshot.rate_limits.seven_day
+    let seven_day = null
+    if (isValidWindow(sdRaw)) {
+      const sdReset = sdRaw.resets_at * 1000 <= nowMs
+      const used = sdReset ? 0 : sdRaw.used_percentage
+      const elapsed = sdReset ? 0 : clamp01((nowMs - (sdRaw.resets_at * 1000 - WEEK_MS)) / WEEK_MS)
+      seven_day = {
+        used_pct: used, resets_at: sdRaw.resets_at,
+        elapsed_share: Math.round(elapsed * 1000) / 1000,
+        pace: sdReset ? 0 : round1(used - elapsed * 100),
+        reset_since_capture: sdReset,
+      }
+      if (sdReset) seven_day.captured_used_pct = sdRaw.used_percentage
+    }
+
+    const base = {
+      source: 'live', degraded: false, gateEnabled: true,
+      captured_at: snapshot.captured_at, tier: t, five_hour, seven_day, offload: false,
+      mode: boundary ? 'boundary' : 'start',
+    }
+    if (!seven_day) base.weekly_note = WEEKLY_UNAVAILABLE_NOTE
+
+    // BOUNDARY mode: the near-exhaustion ceilings, tier-independent, never an offload.
+    if (boundary) {
+      if (seven_day && seven_day.used_pct >= thresholds.weeklyBoundaryPct) {
+        return flatten({
+          ...base, decision: 'defer', exit: DEFER,
+          reason: `boundary: 7d ${seven_day.used_pct}% ≥ ${thresholds.weeklyBoundaryPct}% — park before the next agent`,
+          reset_at: isoFromEpochSec(seven_day.resets_at),
+        })
+      }
+      if (five_hour.used_pct >= thresholds.fiveHourBoundaryPct) {
+        return flatten({
+          ...base, decision: 'defer', exit: DEFER,
+          reason: `boundary: 5h ${five_hour.used_pct}% ≥ ${thresholds.fiveHourBoundaryPct}% — park before the next agent until the 5h window resets`,
+          reset_at: isoFromEpochSec(five_hour.resets_at),
+        })
+      }
+      const wk = seven_day ? `; week ${seven_day.used_pct}% < ${thresholds.weeklyBoundaryPct}%` : '; week n/a'
+      return flatten({
+        ...base, decision: 'proceed', exit: PROCEED,
+        reason: `boundary: 5h ${five_hour.used_pct}% < ${thresholds.fiveHourBoundaryPct}%${wk}`,
+        reset_at: five_hour.reset_since_capture ? null : isoFromEpochSec(five_hour.resets_at),
+      })
+    }
+
+    // Rule 2: weekly cap.
+    if (seven_day && seven_day.used_pct >= thresholds.weeklyDeferPct) {
+      return flatten({
+        ...base, decision: 'defer', exit: DEFER,
+        reason: `weekly cap: 7d ${seven_day.used_pct}% ≥ ${thresholds.weeklyDeferPct}% — defer all new hunts`,
+        reset_at: isoFromEpochSec(seven_day.resets_at),
+      })
+    }
+    // Rule 3: 5h start ceiling (tier-dependent).
+    const ceiling = t === 'Red' ? thresholds.fiveHourMaxPctRed : thresholds.fiveHourMaxPct
+    if (five_hour.used_pct >= ceiling) {
+      return flatten({
+        ...base, decision: 'defer', exit: DEFER,
+        reason: `5h window: ${five_hour.used_pct}% ≥ ${ceiling}% start ceiling (${t}) — defer until the 5h window resets`,
+        reset_at: isoFromEpochSec(five_hour.resets_at),
+      })
+    }
+    // Rule 4: proceed (+ weekly pacing offload).
+    const weekTxt = seven_day ? `; week ${seven_day.used_pct}% (pace ${signed(seven_day.pace)})` : '; week n/a'
+    const out = {
+      ...base, decision: 'proceed', exit: PROCEED,
+      reason: `5h ${five_hour.used_pct}% < ${ceiling}% start ceiling (${t})${weekTxt}`,
+      reset_at: five_hour.reset_since_capture ? null : isoFromEpochSec(five_hour.resets_at),
+    }
+    if (seven_day && seven_day.pace > thresholds.weeklyPacePoints) {
+      out.offload = true
+      out.offload_reason = `weekly pace ${signed(seven_day.pace)} points ahead of the week's elapsed share (> ${thresholds.weeklyPacePoints}) — offload the Shepherd to GLM`
+    }
+    return flatten(out)
+  }
+
   if (unusable) {
+    if (boundary && snapshotStaleOnly(snapshot, nowMs, thresholds)) {
+      const live = liveDecision(snapshot)
+      const est = typeof estimate === 'function' ? estimate() : null
+      // Conservative combine: a configured backstop that says stop still wins (this also keeps a
+      // configured-but-unreadable estimate fail-closed).
+      if (est && est.gateEnabled === true && est.decision === 'defer') {
+        return flatten({
+          ...est, tier: t, source: 'transcript_estimate', degraded: true, degraded_reason: unusable,
+          captured_at: typeof snapshot.captured_at === 'string' ? snapshot.captured_at : null,
+          five_hour: null, seven_day: null, offload: false, mode: 'boundary',
+        })
+      }
+      const ageMin = Math.round((nowMs - Date.parse(snapshot.captured_at)) / 60000)
+      return flatten({
+        ...live, source: 'last_known', degraded: true,
+        degraded_reason: `${unusable} — deciding on the last-known live figures`,
+        reason: `boundary (last-known, ${ageMin} min old): ${live.reason.replace(/^boundary: /, '')}`,
+      })
+    }
     const est = typeof estimate === 'function' ? estimate()
       : computeDecision({ events: [], nowMs, limit: null, headroomPct: 15, windowMs: 5 * HOUR_MS, readOk: false })
     return flatten({
@@ -372,90 +499,8 @@ export function computeUsageDecision({ snapshot, snapshotError, nowMs, tier, thr
     })
   }
 
-  const fhRaw = snapshot.rate_limits.five_hour
-  const fhReset = fhRaw.resets_at * 1000 <= nowMs
-  const five_hour = {
-    used_pct: fhReset ? 0 : fhRaw.used_percentage,
-    resets_at: fhRaw.resets_at,
-    reset_since_capture: fhReset,
-  }
-  if (fhReset) five_hour.captured_used_pct = fhRaw.used_percentage
 
-  const sdRaw = snapshot.rate_limits.seven_day
-  let seven_day = null
-  if (isValidWindow(sdRaw)) {
-    const sdReset = sdRaw.resets_at * 1000 <= nowMs
-    const used = sdReset ? 0 : sdRaw.used_percentage
-    const elapsed = sdReset ? 0 : clamp01((nowMs - (sdRaw.resets_at * 1000 - WEEK_MS)) / WEEK_MS)
-    seven_day = {
-      used_pct: used, resets_at: sdRaw.resets_at,
-      elapsed_share: Math.round(elapsed * 1000) / 1000,
-      pace: sdReset ? 0 : round1(used - elapsed * 100),
-      reset_since_capture: sdReset,
-    }
-    if (sdReset) seven_day.captured_used_pct = sdRaw.used_percentage
-  }
-
-  const base = {
-    source: 'live', degraded: false, gateEnabled: true,
-    captured_at: snapshot.captured_at, tier: t, five_hour, seven_day, offload: false,
-    mode: boundary ? 'boundary' : 'start',
-  }
-  if (!seven_day) base.weekly_note = WEEKLY_UNAVAILABLE_NOTE
-
-  // BOUNDARY mode: the near-exhaustion ceilings, tier-independent, never an offload.
-  if (boundary) {
-    if (seven_day && seven_day.used_pct >= thresholds.weeklyBoundaryPct) {
-      return flatten({
-        ...base, decision: 'defer', exit: DEFER,
-        reason: `boundary: 7d ${seven_day.used_pct}% ≥ ${thresholds.weeklyBoundaryPct}% — park before the next agent`,
-        reset_at: isoFromEpochSec(seven_day.resets_at),
-      })
-    }
-    if (five_hour.used_pct >= thresholds.fiveHourBoundaryPct) {
-      return flatten({
-        ...base, decision: 'defer', exit: DEFER,
-        reason: `boundary: 5h ${five_hour.used_pct}% ≥ ${thresholds.fiveHourBoundaryPct}% — park before the next agent until the 5h window resets`,
-        reset_at: isoFromEpochSec(five_hour.resets_at),
-      })
-    }
-    const wk = seven_day ? `; week ${seven_day.used_pct}% < ${thresholds.weeklyBoundaryPct}%` : '; week n/a'
-    return flatten({
-      ...base, decision: 'proceed', exit: PROCEED,
-      reason: `boundary: 5h ${five_hour.used_pct}% < ${thresholds.fiveHourBoundaryPct}%${wk}`,
-      reset_at: five_hour.reset_since_capture ? null : isoFromEpochSec(five_hour.resets_at),
-    })
-  }
-
-  // Rule 2: weekly cap.
-  if (seven_day && seven_day.used_pct >= thresholds.weeklyDeferPct) {
-    return flatten({
-      ...base, decision: 'defer', exit: DEFER,
-      reason: `weekly cap: 7d ${seven_day.used_pct}% ≥ ${thresholds.weeklyDeferPct}% — defer all new hunts`,
-      reset_at: isoFromEpochSec(seven_day.resets_at),
-    })
-  }
-  // Rule 3: 5h start ceiling (tier-dependent).
-  const ceiling = t === 'Red' ? thresholds.fiveHourMaxPctRed : thresholds.fiveHourMaxPct
-  if (five_hour.used_pct >= ceiling) {
-    return flatten({
-      ...base, decision: 'defer', exit: DEFER,
-      reason: `5h window: ${five_hour.used_pct}% ≥ ${ceiling}% start ceiling (${t}) — defer until the 5h window resets`,
-      reset_at: isoFromEpochSec(five_hour.resets_at),
-    })
-  }
-  // Rule 4: proceed (+ weekly pacing offload).
-  const weekTxt = seven_day ? `; week ${seven_day.used_pct}% (pace ${signed(seven_day.pace)})` : '; week n/a'
-  const out = {
-    ...base, decision: 'proceed', exit: PROCEED,
-    reason: `5h ${five_hour.used_pct}% < ${ceiling}% start ceiling (${t})${weekTxt}`,
-    reset_at: five_hour.reset_since_capture ? null : isoFromEpochSec(five_hour.resets_at),
-  }
-  if (seven_day && seven_day.pace > thresholds.weeklyPacePoints) {
-    out.offload = true
-    out.offload_reason = `weekly pace ${signed(seven_day.pace)} points ahead of the week's elapsed share (> ${thresholds.weeklyPacePoints}) — offload the Shepherd to GLM`
-  }
-  return flatten(out)
+  return liveDecision(snapshot)
 }
 
 // The degraded-fallback ESTIMATE, configured from env exactly as the original gate was.
@@ -602,7 +647,10 @@ function main() {
 
   // Warnings go to stderr in EVERY mode (--json included): a degraded reading, an
   // unenforced weekly cap, or an offload is never silent (AC3, A-7).
-  if (decision.degraded) {
+  if (decision.degraded && decision.source === 'last_known') {
+    process.stderr.write(`⚠ wolfpack-window-gate: DEGRADED — ${decision.degraded_reason}; boundary decided on last-known live figures ` +
+      `(5h ${decision.five_hour_pct}%, 7d ${decision.seven_day_pct == null ? 'n/a' : decision.seven_day_pct + '%'}).\n`)
+  } else if (decision.degraded) {
     process.stderr.write(`⚠ wolfpack-window-gate: DEGRADED — ${decision.degraded_reason}; ` +
       `falling back to the transcript estimate (${decision.gateEnabled ? 'enabled' : 'NOT configured — proceeding ungated; set WOLFPACK_AGENT_WINDOW_LIMIT as the backstop'}). ` +
       `Live 5h/weekly gating and offload are INACTIVE.\n`)
