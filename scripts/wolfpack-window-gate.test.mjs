@@ -230,8 +230,10 @@ test('usage AC2: thresholds env-overridable; invalid values THROW (fail loud, ne
     WOLFPACK_USAGE_STALE_MINUTES: '30', WOLFPACK_5H_START_MAX_PCT: '85', WOLFPACK_5H_START_MAX_PCT_RED: '60',
     WOLFPACK_WEEKLY_PACE_POINTS: '5', WOLFPACK_WEEKLY_DEFER_PCT: '95',
   })
-  assert.deepEqual(all, { staleMinutes: 30, fiveHourMaxPct: 85, fiveHourMaxPctRed: 60, weeklyPacePoints: 5, weeklyDeferPct: 95 })
-  assert.deepEqual(thresholdsFromEnv({}), { staleMinutes: 10, fiveHourMaxPct: 80, fiveHourMaxPctRed: 70, weeklyPacePoints: 15, weeklyDeferPct: 90 })
+  assert.deepEqual(all, { staleMinutes: 30, fiveHourMaxPct: 85, fiveHourMaxPctRed: 60, weeklyPacePoints: 5, weeklyDeferPct: 95,
+    fiveHourBoundaryPct: 95, weeklyBoundaryPct: 98 })   // run-observability: boundary ceilings keep their defaults
+  assert.deepEqual(thresholdsFromEnv({}), { staleMinutes: 10, fiveHourMaxPct: 80, fiveHourMaxPctRed: 70, weeklyPacePoints: 15, weeklyDeferPct: 90,
+    fiveHourBoundaryPct: 95, weeklyBoundaryPct: 98 })
   for (const [k, v] of [['WOLFPACK_5H_START_MAX_PCT', 'abc'], ['WOLFPACK_5H_START_MAX_PCT', '101'],
     ['WOLFPACK_5H_START_MAX_PCT_RED', '-1'], ['WOLFPACK_WEEKLY_PACE_POINTS', 'NaN'],
     ['WOLFPACK_WEEKLY_DEFER_PCT', 'Infinity'], ['WOLFPACK_USAGE_STALE_MINUTES', '0'],
@@ -715,4 +717,167 @@ test('defaultTranscriptDir (real fs, HOME overridden): a home with only .claude/
     mkdirSync(join(home, '.agents', 'projects'), { recursive: true })
     assert.equal(run().stdout, join(home, '.agents', 'projects'))
   } finally { rmSync(home, { recursive: true, force: true }) }
+})
+
+// ─── run-observability AC4/AC5: the BOUNDARY mode (between phases of a running hunt) ───
+import { parseRecordNotes, recordLines, appendRecord } from './wolfpack-window-gate.mjs'
+import { readFileSync as readFileSyncRO } from 'node:fs'
+const bdecide = (snapshot, tier = 'Yellow', thresholds = DEFAULT_THRESHOLDS) =>
+  computeUsageDecision({ snapshot, nowMs: NOW, tier, thresholds, mode: 'boundary' })
+
+test('run-observability AC4: boundary 5h ceiling 95 — 94 proceeds / 95 defers, for every tier (Red too), never offloads', () => {
+  for (const tier of ['Green', 'Blue', 'Yellow', 'Orange', 'Red', undefined]) {
+    const ok = bdecide(snap({ fh: 94, sd: 10 }), tier)
+    assert.equal(ok.decision, 'proceed', String(tier))
+    assert.equal(ok.exit, PROCEED)
+    assert.equal(ok.mode, 'boundary')
+    assert.match(ok.reason, /^boundary: 5h 94% < 95%; week 10% < 98%/)
+    const d = bdecide(snap({ fh: 95, sd: 10 }), tier)
+    assert.equal(d.decision, 'defer', String(tier))
+    assert.equal(d.exit, DEFER)
+    assert.equal(d.mode, 'boundary')
+    assert.equal(d.reset_at, new Date(NOW + 2 * HOUR).toISOString())
+    assert.match(d.reason, /boundary: 5h 95% ≥ 95% — park before the next agent until the 5h window resets/)
+    assert.equal(d.offload, false)
+  }
+  // the Red START ceiling (70) would have deferred at 75; the boundary does not.
+  assert.equal(decide(snap({ fh: 75, sd: 10 }), 'Red').decision, 'defer')
+  assert.equal(bdecide(snap({ fh: 75, sd: 10 }), 'Red').decision, 'proceed')
+})
+
+test('run-observability AC4: boundary weekly ceiling 98 — 97 proceeds / 98 defers with the 7d reset; weekly reason wins a tie', () => {
+  assert.equal(bdecide(snap({ fh: 10, sd: 97 })).decision, 'proceed')
+  const d = bdecide(snap({ fh: 10, sd: 98, sdDay: 3.5 }))
+  assert.equal(d.decision, 'defer')
+  assert.match(d.reason, /^boundary: 7d 98% ≥ 98% — park before the next agent/)
+  assert.equal(d.reset_at, new Date(NOW + 3.5 * DAY).toISOString())
+  const both = bdecide(snap({ fh: 99, sd: 99 }))
+  assert.match(both.reason, /7d 99%/)
+})
+
+test('run-observability AC4: boundary mode NEVER offloads even far ahead of weekly pace; start mode still does', () => {
+  const ahead = snap({ fh: 10, sd: 45, sdDay: 2 })
+  assert.equal(decide(ahead).offload, true)
+  const b = bdecide(ahead)
+  assert.equal(b.decision, 'proceed')
+  assert.equal(b.offload, false)
+  assert.equal('offload_reason' in b, false)
+})
+
+test('run-observability AC4: start mode is unchanged at the same numbers (80 defers Yellow) and is labelled mode start', () => {
+  const d = decide(snap({ fh: 80, sd: 10 }), 'Yellow')
+  assert.equal(d.decision, 'defer')
+  assert.equal(d.mode, 'start')
+  assert.match(d.reason, /start ceiling/)
+  assert.equal(bdecide(snap({ fh: 80, sd: 10 }), 'Yellow').decision, 'proceed')
+})
+
+test('run-observability AC4: boundary thresholds are env-overridable; invalid values THROW naming the variable', () => {
+  const th = thresholdsFromEnv({ WOLFPACK_5H_BOUNDARY_MAX_PCT: '90', WOLFPACK_WEEKLY_BOUNDARY_PCT: '92' })
+  assert.equal(th.fiveHourBoundaryPct, 90)
+  assert.equal(th.weeklyBoundaryPct, 92)
+  assert.equal(bdecide(snap({ fh: 90, sd: 10 }), 'Yellow', th).decision, 'defer')
+  assert.equal(bdecide(snap({ fh: 10, sd: 92 }), 'Yellow', th).decision, 'defer')
+  for (const [k, v] of [['WOLFPACK_5H_BOUNDARY_MAX_PCT', 'abc'], ['WOLFPACK_5H_BOUNDARY_MAX_PCT', '101'],
+    ['WOLFPACK_WEEKLY_BOUNDARY_PCT', '-1'], ['WOLFPACK_WEEKLY_BOUNDARY_PCT', 'NaN']]) {
+    assert.throws(() => thresholdsFromEnv({ [k]: v }), new RegExp(k), `${k}=${v}`)
+  }
+})
+
+test('run-observability AC5: a degraded snapshot in boundary mode follows the estimate, labelled mode boundary + degraded', () => {
+  const est = () => ({ decision: 'defer', exit: DEFER, reason: 'estimate: over headroom', reset_at: '2026-06-07T13:00:00.000Z', gateEnabled: true })
+  const d = computeUsageDecision({ snapshot: null, nowMs: NOW, tier: 'Yellow', estimate: est, mode: 'boundary' })
+  assert.equal(d.decision, 'defer')
+  assert.equal(d.degraded, true)
+  assert.equal(d.source, 'transcript_estimate')
+  assert.equal(d.mode, 'boundary')
+})
+
+test('run-observability AC5: parseRecordNotes / recordLines / appendRecord — notes first, then the decision; never throws', () => {
+  const warned = []
+  assert.deepEqual(parseRecordNotes(null), [])
+  assert.deepEqual(parseRecordNotes('{bad', (m) => warned.push(m)), [])
+  assert.match(warned[0], /--record-note is not JSON/)
+  assert.deepEqual(parseRecordNotes('{"a":1}'), [{ a: 1 }])
+  assert.deepEqual(parseRecordNotes('[{"a":1},{"b":2}]'), [{ a: 1 }, { b: 2 }])
+  const lines = recordLines({ at: 'T', notes: [{ k: 1 }], decision: { mode: 'boundary', phase: 'Plan', decision: 'proceed', source: 'live', degraded: false, reason: 'r', five_hour_pct: 5, seven_day_pct: 6, reset_at: null } })
+  assert.equal(lines.length, 2)
+  assert.deepEqual(lines[0], { at: 'T', kind: 'pipeline_note', note: { k: 1 } })
+  assert.equal(lines[1].phase, 'Plan')
+  assert.equal(lines[1].degraded_reason, null)
+  const dir = mkdtempSync(join(tmpdir(), 'wfrec-'))
+  try {
+    const f = join(dir, 'sub', 'usage-gate.jsonl')
+    assert.equal(appendRecord(f, lines), null)
+    assert.equal(appendRecord(f, lines.slice(1)), null)
+    assert.equal(readFileSyncRO(f, 'utf8').trim().split('\n').length, 3)   // append-only
+    assert.equal(appendRecord(null, lines), null)
+    assert.equal(appendRecord(f, []), null)
+    writeFileSync(join(dir, 'file'), 'x')
+    assert.equal(typeof appendRecord(join(dir, 'file', 'x.jsonl'), lines), 'string')   // ENOTDIR → error text, no throw
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('run-observability AC4/AC5 CLI: --boundary --phase --record appends ONE decision line (two with --record-note); exit = the decision', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wfbcli-'))
+  try {
+    const rec = join(dir, 'plan', 'usage-gate.jsonl')
+    const ok = runGate(['--json', '--boundary', '--phase', 'Implement', '--record', rec], { snapshot: liveSnap({ fh: 90 }) })
+    assert.equal(ok.code, 0, ok.stderr)
+    assert.equal(ok.json.mode, 'boundary')
+    assert.equal(ok.json.phase, 'Implement')
+    let lines = readFileSyncRO(rec, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+    assert.equal(lines.length, 1)
+    assert.equal(lines[0].phase, 'Implement')
+    assert.equal(lines[0].decision, 'proceed')
+    assert.equal(lines[0].mode, 'boundary')
+    const d = runGate(['--json', '--boundary', '--phase', 'Test', '--record', rec,
+      '--record-note', JSON.stringify([{ at_phase: 'Plan', kind: 'gate_unavailable', why: 'null result' }])], { snapshot: liveSnap({ fh: 96 }) })
+    assert.equal(d.code, 10)
+    assert.equal(d.json.decision, 'defer')
+    lines = readFileSyncRO(rec, 'utf8').trim().split('\n').map(l => JSON.parse(l))
+    assert.equal(lines.length, 3)
+    assert.equal(lines[1].kind, 'pipeline_note')
+    assert.equal(lines[1].note.kind, 'gate_unavailable')
+    assert.equal(lines[2].decision, 'defer')
+    assert.equal(lines[2].phase, 'Test')
+    // a garbage note is warned + ignored, the decision is still recorded
+    const g = runGate(['--json', '--boundary', '--record', rec, '--record-note', 'not-json'], { snapshot: liveSnap({ fh: 10 }) })
+    assert.equal(g.code, 0)
+    assert.match(g.stderr, /--record-note is not JSON/)
+    assert.equal(readFileSyncRO(rec, 'utf8').trim().split('\n').length, 4)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('run-observability AC5 CLI: an unwritable --record path warns + sets record_error but keeps the decision exit code', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wfbad-'))
+  try {
+    writeFileSync(join(dir, 'f'), 'x')
+    const bad = join(dir, 'f', 'usage-gate.jsonl')
+    const d = runGate(['--json', '--boundary', '--record', bad], { snapshot: liveSnap({ fh: 97 }) })
+    assert.equal(d.code, 10)
+    assert.equal(d.json.decision, 'defer')
+    assert.equal(typeof d.json.record_error, 'string')
+    assert.match(d.stderr, /could not record/)
+    const ok = runGate(['--json', '--boundary', '--record', bad], { snapshot: liveSnap({ fh: 10 }) })
+    assert.equal(ok.code, 0)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('run-observability AC5 CLI: an invalid boundary threshold in boundary mode → exit 1 with a decision:error JSON line, recorded', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wfberr-'))
+  try {
+    const rec = join(dir, 'usage-gate.jsonl')
+    const r = runGate(['--json', '--boundary', '--phase', 'Plan', '--record', rec], { snapshot: liveSnap(), env: { WOLFPACK_5H_BOUNDARY_MAX_PCT: 'abc' } })
+    assert.equal(r.code, 1)
+    assert.match(r.stderr, /WOLFPACK_5H_BOUNDARY_MAX_PCT/)
+    assert.equal(r.json.decision, 'error')
+    assert.equal(r.json.phase, 'Plan')
+    const line = JSON.parse(readFileSyncRO(rec, 'utf8').trim())
+    assert.equal(line.decision, 'error')
+    // START mode keeps its stdout-silent exit 1
+    const s = runGate(['--json'], { snapshot: liveSnap(), env: { WOLFPACK_5H_BOUNDARY_MAX_PCT: 'abc' } })
+    assert.equal(s.code, 1)
+    assert.equal(s.stdout, '')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })
