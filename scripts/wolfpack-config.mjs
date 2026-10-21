@@ -446,7 +446,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     devDeployCommand: optionalCode('Deployment Notes', 'Dev deploy command'),
     changelogFile: optionalCode('Deployment Notes', 'Changelog file'),
     tagPattern: optionalCode('Deployment Notes', 'Tag pattern'),
-    releaseTags: !(tagPatternRaw !== undefined && isNone(tagPatternRaw)),
+    releaseTags: !(typeof tagPatternRaw === 'string' && tagPatternRaw.trim() !== '' && isNone(tagPatternRaw)),
     backlogFile: optionalCode('Deployment Notes', 'Backlog file'),
     wolfpackHome,
     worktreeRoot,

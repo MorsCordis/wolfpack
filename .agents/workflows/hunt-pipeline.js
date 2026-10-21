@@ -4057,7 +4057,7 @@ ${heartbeat('Test', 'Tracker writing and running tests')}
     const tr = await takeTestRecord('tracker', 'Test')
     if (!tr.ok && tr.kind === 'fail') {
       log(`⛔ pipeline test record FAILED at ${tr.rec.commit}: ${tr.rec.summary} (Tracker reported TESTS_PASS) — bouncing at Test; Certify not entered`)
-      await recordTestRewriteNeeded({ phaseLabel: 'Test' })
+      await recordTestRewriteNeeded({ phaseLabel: 'Test', round: trackerRound })
       return { slug, verdict: 'TESTS_FAIL', tier, worktreePath, testRecord: testRecordSummary(tr.rec), usageGateEvents: [...usageGateEvents] }
     }
     if (!tr.ok) return await parkTestRecord(tr, { stage: 'tracker', resumePhase: 'Test', phaseLabel: 'Test' })
@@ -4080,7 +4080,7 @@ if (!testRecordTakenThisPass) {
   const tr = await takeTestRecord('tracker', 'Certify')
   if (!tr.ok && tr.kind === 'fail') {
     log(`⛔ pipeline test record FAILED at ${tr.rec.commit}: ${tr.rec.summary} — bouncing to Implement; Certify not entered`)
-    await recordTestRewriteNeeded({ phaseLabel: 'Certify' })
+    await recordTestRewriteNeeded({ phaseLabel: 'Certify', round: trackerRound })
     return { slug, verdict: 'TESTS_FAIL', tier, worktreePath, testRecord: testRecordSummary(tr.rec), usageGateEvents: [...usageGateEvents] }
   }
   if (!tr.ok) return await parkTestRecord(tr, { stage: 'tracker', resumePhase: 'Certify', phaseLabel: 'Certify' })
