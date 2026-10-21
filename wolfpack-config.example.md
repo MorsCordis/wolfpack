@@ -12,6 +12,7 @@ The pipeline itself (router, `hunt-pipeline`, `campaign-runner`) reads the machi
 - **Language/Framework:** Python/Django, TypeScript/Next.js, Go, etc.
 - **Repo root:** (auto-detected from git)
 - **Test command:** `./scripts/run_tests.sh` or `npm test` or `go test ./...` — REQUIRED; the first backticked span is the command the pipeline runs (Tracker) and forbids Shepherd from running. Follow it with any notes on narrowing.
+- **Test verdict command:** none — optional. A command that decides the pipeline test record's pass/fail from the run log instead of the raw exit code (for suites that exit non-zero on documented baseline failures). Placeholders: {log} (raw log path), {exit} (the test command's exit code), {main} (main checkout root). Exit 0 = pass.
 - **Worktree links:** (optional; backticked main-repo paths symlinked into each worktree, e.g. `.env`, or none)
 - **Worktree root:** `.agents/worktrees` — REQUIRED by the workflows: the repo-relative directory hunt worktrees live in (where your /hunt creates them). Keep it gitignored.
 - **Project commands:** none — project-only slash commands this repo tracks in .claude/commands (backticked names, e.g. `doc-reviewer`); the no-copies guard fails on any other tracked command file.

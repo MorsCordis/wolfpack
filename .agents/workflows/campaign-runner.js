@@ -313,8 +313,8 @@ const configProbeCommand = (envHome) => {
   const run = 'echo "PROBE_PWD=$(pwd)"; echo "PACK_HOME=$PACK"; node "$PACK/scripts/wolfpack-config.mjs" --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"'
   if (envHome) return `Run exactly:
   PACK=${shq(envHome)}; ${run}`
-  return `First read wolfpack-config.md (in your starting directory) → ## Project Identity → **Wolfpack home**: its backticked path, VERBATIM — do NOT expand \`~\`, resolve symlinks or substitute any other path (the workflow rejects a non-absolute or mismatched home itself). Substitute it for <home> below, inside the double quotes; if there is no such key, use an empty <home>. Then run exactly:
-  PACK="<home>"; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; ${run}`
+  return `First read wolfpack-config.md (in your starting directory) → ## Project Identity → **Wolfpack home**: its backticked path, VERBATIM — do NOT expand \`~\`, resolve symlinks or substitute any other path (the workflow rejects a non-absolute or mismatched home itself). Substitute it for <home> below, inside the single quotes (the config reader refuses a pack home that contains a single quote); if there is no such key, use an empty <home>. Then run exactly:
+  PACK='<home>'; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; ${run}`
 }
 const requireProbedPack = (who, home) => {
   if (probeRoot(probedPackHome) !== probeRoot(home.home)) throw new Error(`${who}: the config probe ran the reader from '${probedPackHome}' but the pack home resolves to '${home.home}' (${home.source}) — the config was not read by this pack's reader. Fix: make WOLFPACK_HOME and wolfpack-config.md → Wolfpack home name the same absolute path, then relaunch.`)

@@ -31,9 +31,10 @@
 // HOST-SIDE agent rate-limit gate. The precise account rate-limit (the rolling
 // 5-hour window / weekly Max caps) is NOT reachable inside a Workflow agent — but the
 // host DRIVER can estimate it the way ccusage / claude-hud do: token accounting from
-// the local transcript JSONL against a known plan limit. So the gate lives here and is
-// checked BETWEEN hunts (never mid-pipeline — halting mid-Shepherd leaves a half-built
-// worktree; the wave structure gives clean boundaries).
+// the local transcript JSONL against a known plan limit. So the gate lives here. The START
+// gate (default mode) is checked BETWEEN hunts; the BOUNDARY mode (--boundary, below) is
+// checked between PHASES of a running hunt, before each agent phase — never mid-agent
+// (halting mid-Shepherd leaves a half-built worktree; phase boundaries are clean).
 //
 // It answers ONE question and emits a decision the loop wrapper (wolfpack-overnight.sh)
 // acts on:
@@ -60,6 +61,7 @@
 //
 // Usage:
 //   node scripts/wolfpack-window-gate.mjs [--json] [--tier <T>] [--snapshot <path>] [--transcripts <dir>]
+//                                        [--boundary] [--phase <P>] [--record <file>] [--record-note <json>]
 //   --tier is case-insensitive; missing/unknown ⇒ Red (the conservative 70% ceiling).
 // Env (live snapshot — identical names in every fork; a non-numeric / out-of-range value
 // is a HARD error, exit 1 — never a silent default):
@@ -82,14 +84,28 @@
 //                                  (else ~/.agents/projects).
 // Exit codes: 0 = proceed, 10 = defer, 1 = internal error.
 //
+// BOUNDARY MODE (run-observability): `--boundary [--phase <P>] [--record <file>] [--record-note <json>]`.
+// hunt-pipeline.js runs it before every agent phase after Scaffold, so a long hunt that STARTED
+// under the start ceiling parks model_quota cleanly at a phase boundary (and auto-resumes at that
+// phase) instead of dying mid-agent at the wall. Its ceilings are its OWN and tier-independent:
+//   WOLFPACK_5H_BOUNDARY_MAX_PCT   5h boundary ceiling, every tier (default 95)
+//   WOLFPACK_WEEKLY_BOUNDARY_PCT   7d boundary ceiling (default 98)
+// They are higher than the start ceilings ON PURPOSE: the start gate decides whether a whole hunt
+// fits; the boundary gate only has to carry ONE more phase, and parking at the start ceiling
+// between phases would strand most long hunts half-built. Never an offload decision. Same
+// hard-error rule for invalid values; the degraded/estimate path is identical (labelled mode).
+// --phase is echoed as `phase`. --record appends one JSON line per decision (and one
+// {at, kind:"pipeline_note", note} line per --record-note entry, written first) — append-only;
+// a write failure warns on stderr and sets `record_error`, never changes the decision or exit.
+//
 // Gate protocol 1 = the usage-limit-gate output contract above (source / degraded / offload /
 // flat usage mirrors, --tier). campaign-runner.js greps this marker in its preflight: a gate
 // script WITHOUT it is the pre-usage-limit-gate transcript-only gate, which the runner drives
 // in a loud, labelled legacy-degraded mode instead of aborting every hunt claim.
 // WOLFPACK_GATE_PROTOCOL=1
 
-import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { readFileSync, readdirSync, existsSync, statSync, appendFileSync, mkdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 
 export const PROCEED = 0
@@ -275,6 +291,8 @@ export function thresholdsFromEnv(env = process.env) {
     fiveHourMaxPctRed: read('WOLFPACK_5H_START_MAX_PCT_RED', 70),
     weeklyPacePoints: read('WOLFPACK_WEEKLY_PACE_POINTS', 15),
     weeklyDeferPct: read('WOLFPACK_WEEKLY_DEFER_PCT', 90),
+    fiveHourBoundaryPct: read('WOLFPACK_5H_BOUNDARY_MAX_PCT', 95),
+    weeklyBoundaryPct: read('WOLFPACK_WEEKLY_BOUNDARY_PCT', 98),
   }
 }
 export const DEFAULT_THRESHOLDS = thresholdsFromEnv({})
@@ -338,8 +356,11 @@ export function flatten(d) {
 //   estimate      : () => computeDecision(...) result — the degraded fallback (lazy, so the
 //                   transcript tree is only walked when actually degraded). Omitted ⇒ the
 //                   disabled-estimate decision (proceed, gateEnabled:false).
-export function computeUsageDecision({ snapshot, snapshotError, nowMs, tier, thresholds = DEFAULT_THRESHOLDS, estimate }) {
+//   mode          : 'start' (default — the between-hunts start gate) | 'boundary' (between
+//                   phases: its own tier-independent ceilings, never an offload). Echoed as `mode`.
+export function computeUsageDecision({ snapshot, snapshotError, nowMs, tier, thresholds = DEFAULT_THRESHOLDS, estimate, mode = 'start' }) {
   const t = normTier(tier)
+  const boundary = mode === 'boundary'
   const unusable = snapshotUnusableReason(snapshot, nowMs, thresholds, snapshotError)
   if (unusable) {
     const est = typeof estimate === 'function' ? estimate()
@@ -347,7 +368,7 @@ export function computeUsageDecision({ snapshot, snapshotError, nowMs, tier, thr
     return flatten({
       ...est, tier: t, source: 'transcript_estimate', degraded: true, degraded_reason: unusable,
       captured_at: snapshot && typeof snapshot.captured_at === 'string' ? snapshot.captured_at : null,
-      five_hour: null, seven_day: null, offload: false,
+      five_hour: null, seven_day: null, offload: false, mode: boundary ? 'boundary' : 'start',
     })
   }
 
@@ -378,8 +399,33 @@ export function computeUsageDecision({ snapshot, snapshotError, nowMs, tier, thr
   const base = {
     source: 'live', degraded: false, gateEnabled: true,
     captured_at: snapshot.captured_at, tier: t, five_hour, seven_day, offload: false,
+    mode: boundary ? 'boundary' : 'start',
   }
   if (!seven_day) base.weekly_note = WEEKLY_UNAVAILABLE_NOTE
+
+  // BOUNDARY mode: the near-exhaustion ceilings, tier-independent, never an offload.
+  if (boundary) {
+    if (seven_day && seven_day.used_pct >= thresholds.weeklyBoundaryPct) {
+      return flatten({
+        ...base, decision: 'defer', exit: DEFER,
+        reason: `boundary: 7d ${seven_day.used_pct}% ≥ ${thresholds.weeklyBoundaryPct}% — park before the next agent`,
+        reset_at: isoFromEpochSec(seven_day.resets_at),
+      })
+    }
+    if (five_hour.used_pct >= thresholds.fiveHourBoundaryPct) {
+      return flatten({
+        ...base, decision: 'defer', exit: DEFER,
+        reason: `boundary: 5h ${five_hour.used_pct}% ≥ ${thresholds.fiveHourBoundaryPct}% — park before the next agent until the 5h window resets`,
+        reset_at: isoFromEpochSec(five_hour.resets_at),
+      })
+    }
+    const wk = seven_day ? `; week ${seven_day.used_pct}% < ${thresholds.weeklyBoundaryPct}%` : '; week n/a'
+    return flatten({
+      ...base, decision: 'proceed', exit: PROCEED,
+      reason: `boundary: 5h ${five_hour.used_pct}% < ${thresholds.fiveHourBoundaryPct}%${wk}`,
+      reset_at: five_hour.reset_since_capture ? null : isoFromEpochSec(five_hour.resets_at),
+    })
+  }
 
   // Rule 2: weekly cap.
   if (seven_day && seven_day.used_pct >= thresholds.weeklyDeferPct) {
@@ -469,9 +515,57 @@ function argValue(argv, flag) {
   return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : null
 }
 
+// --record-note value → array of notes ([] + a stderr warning when it is not JSON).
+export function parseRecordNotes(raw, warn = stderrWarn) {
+  if (raw == null) return []
+  let v
+  try { v = JSON.parse(raw) } catch {
+    warn(`--record-note is not JSON — ignored: ${String(raw).slice(0, 120)}`)
+    return []
+  }
+  return Array.isArray(v) ? v : [v]
+}
+
+// The append-only usage-gate.jsonl lines for one invocation: each note first, then the decision.
+export function recordLines({ at, notes = [], decision }) {
+  const lines = notes.map(note => ({ at, kind: 'pipeline_note', note }))
+  if (decision) {
+    lines.push({
+      at, mode: decision.mode ?? null, phase: decision.phase ?? null, decision: decision.decision ?? null,
+      source: decision.source ?? null, degraded: decision.degraded ?? null, degraded_reason: decision.degraded_reason ?? null,
+      reason: decision.reason ?? null, five_hour_pct: decision.five_hour_pct ?? null, seven_day_pct: decision.seven_day_pct ?? null,
+      reset_at: decision.reset_at ?? null,
+    })
+  }
+  return lines
+}
+
+// Append lines to the record file. Never throws: returns null on success, else the error text.
+export function appendRecord(path, lines) {
+  if (!path || !lines.length) return null
+  try {
+    mkdirSync(dirname(path), { recursive: true })
+    appendFileSync(path, lines.map(l => JSON.stringify(l)).join('\n') + '\n')
+    return null
+  } catch (e) {
+    return e.message
+  }
+}
+
 function main() {
   const argv = process.argv.slice(2)
   const jsonOnly = argv.includes('--json')
+  const mode = argv.includes('--boundary') ? 'boundary' : 'start'
+  const phase = argValue(argv, '--phase')
+  const recordPath = argValue(argv, '--record')
+  const notes = parseRecordNotes(argValue(argv, '--record-note'))
+  const record = (decision) => {
+    const err = appendRecord(recordPath, recordLines({ at: new Date().toISOString(), notes, decision }))
+    if (err) {
+      process.stderr.write(`⚠ wolfpack-window-gate: ${recordPath} — could not record (${err})\n`)
+      if (decision) decision.record_error = err
+    }
+  }
   const rootDir = argValue(argv, '--transcripts') || defaultTranscriptDir(process.env)
   const tier = normTier(argValue(argv, '--tier'))
   const snapPath = argValue(argv, '--snapshot') || snapshotPathFromEnv()
@@ -485,6 +579,12 @@ function main() {
     windowLimitFromEnv(process.env)   // conflicting legacy/current limits → exit 1; warns on the legacy name
   } catch (e) {
     process.stderr.write(`wolfpack-window-gate: ERROR — ${e.message}\n`)
+    if (mode === 'boundary') {
+      // The pipeline parks usage_gate_error on this; record it and say so on stdout too.
+      const err = { decision: 'error', exit: ERROR, reason: e.message, mode, phase }
+      record(err)
+      if (jsonOnly) process.stdout.write(JSON.stringify(err) + '\n')
+    }
     process.exit(ERROR)
   }
 
@@ -495,8 +595,10 @@ function main() {
   const snap = readSnapshot(snapPath)
   const decision = computeUsageDecision({
     snapshot: snap.ok ? snap.snapshot : null, snapshotError: snap.error,
-    nowMs, tier, thresholds, estimate,
+    nowMs, tier, thresholds, estimate, mode,
   })
+  if (phase) decision.phase = phase
+  record(decision)
 
   // Warnings go to stderr in EVERY mode (--json included): a degraded reading, an
   // unenforced weekly cap, or an offload is never silent (AC3, A-7).
