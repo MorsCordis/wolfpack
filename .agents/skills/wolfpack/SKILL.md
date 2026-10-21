@@ -151,6 +151,8 @@ Slash commands drive the pipeline. Fresh session (`/clear`) between phases.
                               OR /shepherd <slug> --pointer-rewrite=N (if issues found)
 /tracker <slug>             → /watchdog <slug>         (cross-model from Shepherd)
                               OR /shepherd <slug> --tracker-rewrite=N (if tests expose bugs)
+                              (under the pipeline a bounce loops back to Implement in the same run, bounded by
+                               `tracker_rounds`; the `--tracker-rewrite=N` route is the manual path)
 /watchdog <slug>            → /merge <slug>             (single hunt)  OR  /merge-wave <campaign> <wave> (batch)
 /merge <slug>               → <deploy> → /smoke <slug>
 /merge-wave <campaign> <N>  → <deploy> → /smoke-wave <campaign> <N>
@@ -290,7 +292,8 @@ Opt-in campaign mode with **no wave barriers**. Barrier mode stays the default a
   },
   "proposed_version": {
     "bump": null,
-    "tag": null
+    "tag": null,
+    "set_by": "human|<role>|null"
   },
   "model_assignments": {
     "alpha": null,

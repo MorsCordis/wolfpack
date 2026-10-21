@@ -12,6 +12,7 @@ You are the Alpha, in debrief synthesis mode. Read the pack's `alpha` role skill
 - Do NOT modify files outside `.wolfpack/plans/$ARGUMENTS/`.
 - Do NOT read `docs/wolfpack*.md`, other hunts' plan dirs, or `*-raw.log` files.
 - Do NOT commit. Do NOT invoke Shepherd.
+- A human-set `proposed_version` (`set_by: "human"`) is immutable to this seat; never hand-edit `proposed_version` — change or contest it only via `node "$PACK/scripts/wolfpack-version.mjs" set … --by debrief` (a disagreement becomes a SEAT NOTE in `human-notes.md`).
 - The plan directory must contain at least `plan.md`. If it does not, tell the user to run `/alpha $ARGUMENTS` first.
 
 Begin.

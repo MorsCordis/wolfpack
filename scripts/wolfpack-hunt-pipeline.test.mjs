@@ -3247,6 +3247,7 @@ test('run-observability AC7: the Test phase relays wolfpack-test-record.mjs ensu
   assert.equal(tr[0].opts.model, 'sonnet')
   assert.equal(tr[0].opts.phase, 'Test')
   assert.ok(p.includes(`node '/pack/scripts/wolfpack-test-record.mjs' ensure --json --stage tracker --record-dir '${PD}' --repo '${WT}'`), p)
+  assert.ok(p.includes(`--repo '${WT}' --timeout-min 55`), 'the record script must time out before the ~60-min shim relay')
   assert.ok(p.includes(`${PD}/.test-record-tracker.rc`), 'the rc-file wait')
   assert.match(p, /Do NOT run tests yourself, do NOT summarise, do NOT edit, stage or commit any file/)
   assert.equal(p.includes('bash scripts/test-all.sh'), false, 'the relay never runs the test command itself')

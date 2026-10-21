@@ -34,6 +34,7 @@ import {
   unmergedFiles, revertInProgress, readHuntMeta, writeHuntMeta, readCampaignMeta, campaignHunts,
   huntPlanDirs, parseFlags, ChainError,
 } from './wolfpack-chain.mjs'
+import { stampMerged, attributeUnreleased } from './wolfpack-merge-state.mjs'
 
 // ─── Version aggregation ──────────────────────────────────────────
 // Per 04 § "Sequential batch merge + per-wave version tag": the WAVE owns the
@@ -471,13 +472,16 @@ export function cmdChangelog(root, { campaign, version, apply, at }) {
   const show = git(['show', `refs/heads/${branch}:CHANGELOG.md`], { cwd: root, allowFail: true })
   if (show.code !== 0) throw new ChainError(`${branch} has no CHANGELOG.md`)
   const raw = spawnSync('git', ['show', `refs/heads/${branch}:CHANGELOG.md`], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).stdout
-  const res = stampChangelog(raw, slugs, V, today(at))
+  // Tag untagged [Unreleased] items from the merge that carried them (never deletes one), so an item
+  // attributed to an included hunt moves under the release heading with the rest.
+  const attr = attributeUnreleased(root, { text: raw, ref: `refs/heads/${branch}` })
+  const res = stampChangelog(attr.text, slugs, V, today(at))
   let committed = null
-  if (apply === true && res.moved.length) {
+  if (apply === true && (res.moved.length || attr.attributed.length)) {
     committed = withTempWorktree(root, branch, (dir) => {
       writeFileSync(join(dir, 'CHANGELOG.md'), res.text)
       git(['add', '--', 'CHANGELOG.md'], { cwd: dir })
-      git(['commit', '--quiet', '-m', `docs(changelog): stamp ${V} for campaign ${campaign}`], { cwd: dir })
+      git(['commit', '--quiet', '-m', res.moved.length ? `docs(changelog): stamp ${V} for campaign ${campaign}` : `docs(changelog): attribute untagged items for campaign ${campaign}`], { cwd: dir })
       return revParse(dir, 'HEAD')
     })
   }
@@ -513,13 +517,15 @@ export function cmdStampReleased(root, { campaign, version, at }) {
   const V = normVersion(version)
   const now = at || new Date().toISOString()
   const included = includedHunts(hunts)
+  // Every per-hunt stamp goes through the shared stampMerged() (status merged, phase done, merge_commit
+  // proven to be on main) — the same code /merge and /merge-wave call.
   for (const h of included) {
-    writeHuntMeta(root, h.slug, (meta) => {
-      meta.status = 'merged'
-      meta.merge_commit = meta.campaign_merge_commit || null
-      meta.release_merge_commit = releaseMerge
-      meta.released_version = V || null
-      meta.merged_at = now
+    const { meta } = readHuntMeta(root, h.slug)
+    stampMerged(root, h.slug, {
+      mergeCommit: (meta && meta.campaign_merge_commit) || releaseMerge,
+      releasedVersion: V || null,
+      at: now,
+      extra: { release_merge_commit: releaseMerge },
     })
   }
   return {

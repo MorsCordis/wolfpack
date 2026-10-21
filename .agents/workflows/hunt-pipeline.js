@@ -161,6 +161,12 @@ const RESUME_SCHEMA = {
     bloodhoundRounds: { type: 'number' },
     pointerRounds: { type: 'number' },
     trackerRounds: { type: 'number' },
+    // merge-and-state-hygiene: the rounds already DONE (never the caps above), so a resume prints the
+    // right report number and a bounce budget survives a crash. trackerCapParkRound = the tracker_round
+    // at which a Tracker-cap park was raised (0 when none): it opens the next budget window on resume.
+    pointerRoundDone: { type: 'number' },
+    trackerRoundDone: { type: 'number' },
+    trackerCapParkRound: { type: 'number' },
     worktreePath: { type: 'string' },
     planDir: { type: 'string' },
     worktreeExists: { type: 'boolean' },
@@ -969,6 +975,13 @@ const packScript = (name) => `${wolfpackHome.home}/scripts/${name}`
 usageCli = packScript('wolfpack-usage.mjs')
 const shimPath = `${wolfpackHome.home}/scripts/podman-vibe.sh`
 log(`Pack home (WOLFPACK_HOME): ${wolfpackHome.home} — from ${wolfpackHome.source}; seat shim ${shimPath}`)
+// merge-and-state-hygiene: the shim + the two libraries it `source`s. When THIS hunt's own diff
+// changes any of them, Certify must run the hunt worktree's shim (the pack's copy is the OLD one),
+// but only when the worktree actually holds a shim (true for wolfpack-hosted hunts only).
+const SHIM_SOURCES = ['scripts/podman-vibe.sh', 'scripts/lib/wolfpack-ratelimit.sh', 'scripts/lib/wolfpack-sandbox.sh']
+const certShimPath = ({ packShim, worktreePath, changed, worktreeShimExists }) =>
+  (Array.isArray(changed) && changed.some(f => SHIM_SOURCES.includes(f)) && worktreeShimExists === true)
+    ? `${worktreePath}/scripts/podman-vibe.sh` : packShim
 // pack-install-model: where hunt worktrees live (wolfpack-config.md → Project Identity →
 // Worktree root, repo-relative). Required — the pipeline never guesses it. Re-validated here
 // with the reader's validWorktreeRoot rule (fail closed on a garbled relay). Body identical in
@@ -1106,6 +1119,9 @@ Steps:
    - bloodhoundRounds: metadata.bloodhound_rounds (or 0)
    - pointerRounds: metadata.pointer_rounds (or 0)
    - trackerRounds: metadata.tracker_rounds (or 0)
+   - pointerRoundDone: metadata.pointer_round (or 0)   (the round number reached, NOT the cap above)
+   - trackerRoundDone: metadata.tracker_round (or 0)   (the round number reached, NOT the cap above)
+   - trackerCapParkRound: metadata.tracker_cap_park_round (or 0)
    - bloodhoundModel: metadata.model_assignments.bloodhound provider family ("glm" or "mistral"), or null if unset
    - trackerModel: metadata.model_assignments.tracker as a raw string if non-empty, else ""
      (the Tracker writes TESTS — code on the branch — so its family is a code-writer family)
@@ -1280,7 +1296,7 @@ Steps:
    - models: {} (Alpha will fill)
    - model_assignments: {} (Debrief will fill)
    - spec: { confidence: null, mode_for_build: null, ambiguity_open: false, compliance_critical: false, compliance_review_required: false } (the Spec phase will fill)
-   - proposed_version: { bump: null, tag: null }${baseBranch ? `
+   - proposed_version: { bump: null, tag: null, set_by: null }${baseBranch ? `
    - base_branch: "${baseBranch}"   (chain mode: the LOCAL campaign integration branch this hunt forks from, rebases onto and diffs against)` : ''}
 4. Create (or ADOPT) the git worktree — idempotent so a resumed/retried hunt never collides:
    - If ${worktreeRoot}/${slug} already EXISTS, do NOT recreate it — adopt it as-is and skip to step 5.
@@ -1910,8 +1926,20 @@ const HUMAN_NOTES_DIRECTIVE = `
 HUMAN DIRECTION CHANNEL: If ${planDir}/human-notes.md EXISTS, read it FIRST, before
 anything else. It contains authoritative human answers written by /resolve that
 OVERRIDE prior plan/spec assumptions wherever they conflict. It is append-only —
-the LAST dated block is the current direction. If it does NOT exist (a normal
-fresh run), ignore this and proceed; do NOT invent direction that was not given.`
+the LAST dated HUMAN block is the current direction (a block headed \`SEAT NOTE (not
+human direction)\` is a seat's note to the human — never direction). If it does NOT
+exist (a normal fresh run), ignore this and proceed; do NOT invent direction that
+was not given.`
+
+// merge-and-state-hygiene: a human-set proposed_version is immutable to seats. Seats that decide a
+// version write it through the one script (it records set_by and turns a disagreement with a
+// human-set version into a SEAT NOTE in human-notes.md); nobody hand-edits the field.
+const VERSION_PROVENANCE_RULE = `
+
+VERSION PROVENANCE (hard rule): never hand-edit metadata.proposed_version. Change it ONLY with
+  node ${shq(packScript('wolfpack-version.mjs'))} set --plan-dir ${shq(planDir)} --bump <PATCH|MINOR|MAJOR|none> --tag <vX.Y.Z|none> --by <your role> --reason '<why>'
+When proposed_version.set_by is "human" that command keeps the human's bump/tag and records your
+disagreement in human-notes.md as a SEAT NOTE — the only allowed way to disagree.`
 
 // [02] Park helper. The Workflow JS cannot touch the filesystem or read a clock,
 // so a tiny write-only agent stamps the park record: parked.md + the metadata
@@ -1998,17 +2026,18 @@ ${heartbeat(phaseLabel || 'Review', 'recording FLAWED_PLAN (plan smell)')}
 // the forward-biased artifact scan carry a failing hunt into Certify. Same tiny write-only
 // agent shape as recordFlawedPlan (the workflow JS has no fs). See the call site in the
 // Tracker gate for the incident this exists to prevent.
-async function recordTestRewriteNeeded({ phaseLabel }) {
+async function recordTestRewriteNeeded({ phaseLabel, round }) {
   return await agent(`
 You ONLY update metadata.json for Wolfpack hunt ${slug} — do NOT plan, review, fix, test, or commit. ${META_PRESERVE_NOTE}
 
 cd to ${worktreePath}. Use absolute paths.
 
 1. Edit ${planDir}/metadata.json: set top-level "status" = "test_rewrite_needed",
-   "phase" = "implement". Preserve every other field — in particular do NOT alter
-   tracker_round / tracker_rounds / pointer_round, and do NOT touch any park block.
+   "phase" = "implement", and "tracker_round" = ${round}. Preserve every other field — in
+   particular do NOT alter tracker_rounds / pointer_round, and do NOT touch any park block.
    (The worktree metadata is authoritative — do NOT mirror to any main-repo plan dir.)
-   If the status is ALREADY "test_rewrite_needed", leave the file unchanged and return ok.
+   If the status is ALREADY "test_rewrite_needed" AND tracker_round is already ${round}, leave the
+   file unchanged and return ok; otherwise set tracker_round = ${round} (and the status/phase above).
 ${gateNotesFlushStep()}
 Do NOT commit. Do NOT push. Do NOT git add.
 Return { ok: true }.
@@ -2115,7 +2144,9 @@ const TEST_RECORD_SCHEMA = { type: 'object', properties: { exitCode: { type: 'in
 // → { ok:true, rec } | { ok:false, kind:'fail'|'error'|'dead', rec?, why }
 async function takeTestRecord(stage, phaseLabel) {
   const base = `${planDir}/.test-record-${stage}`
-  const cmd = `node ${shq(packScript('wolfpack-test-record.mjs'))} ensure --json --stage ${stage} --record-dir ${shq(planDir)} --repo ${shq(worktreePath)}`
+  // --timeout-min 55: the shim relay gives up at ~60 min, so the script must time out first and write
+  // an honest timed_out record (a Test bounce) instead of being killed and parking model_quota in a loop.
+  const cmd = `node ${shq(packScript('wolfpack-test-record.mjs'))} ensure --json --stage ${stage} --record-dir ${shq(planDir)} --repo ${shq(worktreePath)} --timeout-min 55`
   let r = null
   for (let attempt = 1; attempt <= 3 && !r; attempt++) {
     if (attempt > 1) log(`↻ test-record:${slug}:${stage} dropped mid-response — retry ${attempt}/3`)
@@ -2507,7 +2538,7 @@ Execute Phase 1 (Initial Plan):
 
 Pick reasonable defaults for any ambiguity. Document assumptions in plan.md.
 Do NOT ask the user any questions — you are running autonomously.
-${heartbeat('Plan', 'Alpha writing plan.md')}${HUMAN_NOTES_DIRECTIVE}
+${heartbeat('Plan', 'Alpha writing plan.md')}${HUMAN_NOTES_DIRECTIVE}${VERSION_PROVENANCE_RULE}
 
 Return the tier, bloodhound_rounds, pointer_rounds, tracker_rounds, the chosen
 Bloodhound reviewer model family as bloodhoundModel (${EXAMINER_ORDER.map(f => `"${f}"`).join(' or ')} — never Claude),
@@ -3206,7 +3237,7 @@ Return the findingsAddressed array with disposition (ACCEPTED or REJECTED) and j
 Set allAddressed to true only if every finding has a disposition.
 
 Do NOT ask the user. Pick reasonable defaults.
-${heartbeat('Review', `Alpha revision round ${round}`)}${HUMAN_NOTES_DIRECTIVE}${convergenceMetaInstruction(planDir, bhEntry, verdictC.detail.startsWith('converging') ? 'converging' : 'continue', cumCrit)}
+${heartbeat('Review', `Alpha revision round ${round}`)}${HUMAN_NOTES_DIRECTIVE}${VERSION_PROVENANCE_RULE}${convergenceMetaInstruction(planDir, bhEntry, verdictC.detail.startsWith('converging') ? 'converging' : 'continue', cumCrit)}
 `, { label: `alpha-revise:${slug}:r${round}`, phase: 'Review', schema: REVISION_SCHEMA })
     }
     if (!revisionResult) {
@@ -3271,7 +3302,7 @@ a plan item can reach its goal without touching a protected path, prefer that.
 
 For model selection, use pedigree-driven algorithm from your skill.
 Do NOT ask the user.
-${heartbeat('Debrief', 'synthesizing plan-final')}${HUMAN_NOTES_DIRECTIVE}
+${heartbeat('Debrief', 'synthesizing plan-final')}${HUMAN_NOTES_DIRECTIVE}${VERSION_PROVENANCE_RULE}
 `, { label: `debrief:${slug}`, phase: 'Debrief' })
 }
 
@@ -3315,6 +3346,37 @@ Return { pending: [...] }.
   return { slug, verdict: 'PARKED', status: 'parked:human_patch', reason: 'human_patch', tier, worktreePath }
 }
 
+// ─── Bounce loop (merge-and-state-hygiene) ─────────────────────
+// A Tracker TESTS_FAIL / REWRITE_NEEDED used to RETURN from the workflow, so every test-rework round
+// needed a manual relaunch. It now loops back through Implement → Code Review → Test in this same
+// run, bounded by tracker_rounds (see the Test gate), then parks non_convergence. The loop wraps the
+// three existing top-level blocks unchanged: a `return` inside them still returns from the workflow.
+// (The Pointer half already reworks in-run: its own while-loop hands findings to the Shepherd.)
+const resumed = !!(resumeProbe && resumeProbe.fresh === false)
+const toN = (v) => Math.max(0, Math.floor(Number(v) || 0))
+// Persisted round numbers continue across a resume so report files are never overwritten.
+let trackerRound = resumed ? toN(resumeProbe.trackerRoundDone) : 0
+let pointerRoundBase = resumed ? toN(resumeProbe.pointerRoundDone) : 0
+// Tracker bounce BUDGET WINDOW: opens at hunt start, and again at each human resolution of a
+// Tracker-cap park (metadata tracker_cap_park_round = the tracker_round at which the cap was hit).
+// A crash/runner resume (no park in between) opens no window — tracker_round is persisted, so
+// relaunching never buys extra bounces. tracker_round itself is never reset (numbering stays continuous).
+const capParkRound = resumed ? toN(resumeProbe.trackerCapParkRound) : 0
+const trackerWindowBase = (capParkRound > 0 && trackerRound >= capParkRound) ? capParkRound : 0
+// A resolved Tracker-cap park with no Tracker run since (the human sent it back to the Shepherd).
+const capParkRework = capParkRound > 0 && trackerRound === capParkRound
+let bounceDirective = ''   // set by an in-run Tracker bounce; wins over the resume-derived directive
+
+// The Shepherd REWRITE ENTRY for a Tracker bounce — one template for the in-run bounce and both resume branches.
+const trackerRewriteDirective = (n) => `
+REWRITE ENTRY — Tracker round ${n} (NOT a fresh build): the code is already implemented and
+committed on feat/${slug}; the Tracker bounced it back. Read ${planDir}/tracker-report-${n}.md
+and fix EVERY finding it lists (all severities) — do not re-scaffold or re-implement settled
+plan items. After fixing, re-run your self-check (git diff ${BASE}..HEAD) and commit on feat/${slug}.
+If ${planDir}/test-record-tracker.json exists with "pass": false, the PIPELINE's full-suite run failed (Tracker may have reported a pass) — read ${planDir}/test-record-tracker.log first and fix what it shows.
+`
+
+bounce: for (;;) {
 // ─── Phase 4: Shepherd Implementation (skipped on resume) ──────
 if (at('Implement')) {
 const gateImplement = await boundaryGate('Implement'); if (gateImplement) return gateImplement
@@ -3326,26 +3388,29 @@ log(`Shepherd implementing: ${slug}`)
 // absent from the plan, so a generic "implement all plan items" pass would see the code
 // already present, change nothing, and re-fail the same test → loop. Point it at the
 // exact report for the round that bounced it. (Pairs with BACKWARD_AUTHORITATIVE routing.)
-const resumeStatus = (resumeProbe && resumeProbe.fresh === false) ? (resumeProbe.status || '') : ''
-let rewriteDirective = ''
-if (resumeStatus === 'test_rewrite_needed') {
-  const n = resumeProbe.trackerRounds || 1
-  rewriteDirective = `
-REWRITE ENTRY — Tracker round ${n} (NOT a fresh build): the code is already implemented and
-committed on feat/${slug}; the Tracker bounced it back. Read ${planDir}/tracker-report-${n}.md
-and fix EVERY finding it lists (all severities) — do not re-scaffold or re-implement settled
-plan items. After fixing, re-run your self-check (git diff ${BASE}..HEAD) and commit on feat/${slug}.
-If ${planDir}/test-record-tracker.json exists with "pass": false, the PIPELINE's full-suite run failed (Tracker may have reported a pass) — read ${planDir}/test-record-tracker.log first and fix what it shows.
-`
-} else if (resumeStatus === 'code_rewrite_needed') {
-  const n = resumeProbe.pointerRounds || 1
-  rewriteDirective = `
+const resumeStatus = resumed ? (resumeProbe.status || '') : ''
+let rewriteDirective = bounceDirective   // an in-run Tracker bounce wins over the resume-derived directive
+bounceDirective = ''
+if (!rewriteDirective) {
+  if (resumeStatus === 'test_rewrite_needed') {
+    rewriteDirective = trackerRewriteDirective(toN(resumeProbe.trackerRoundDone) || 1)
+  } else if (resumeStatus === 'code_rewrite_needed') {
+    const n = toN(resumeProbe.pointerRoundDone) || toN(resumeProbe.pointerRounds) || 1
+    rewriteDirective = `
 REWRITE ENTRY — Pointer round ${n} (NOT a fresh build): the code is already implemented and
 committed on feat/${slug}; the Pointer bounced it back. Read ${planDir}/pointer-review-${n}.md
 (pipeline notes, if any: ${planDir}/seat-notes/pointer-review-${n}.md)
 and fix EVERY finding it lists (all severities) — do not re-scaffold or re-implement settled
 plan items. After fixing, re-run your self-check (git diff ${BASE}..HEAD) and commit on feat/${slug}.
 `
+  } else if (resumeStatus === 'rework_needed' && capParkRework) {
+    // /resolve "fix it" on a Tracker-cap park sets rework_needed (parked skill, step 7): hand the
+    // Shepherd the failing report plus the human's direction. A Watchdog-REWORK rework_needed (no
+    // cap park, or a Tracker run since it) keeps today's fresh-build prompt — unchanged.
+    rewriteDirective = `${trackerRewriteDirective(trackerRound)}The human's direction in ${planDir}/human-notes.md (LAST dated HUMAN block) overrides the report where they
+conflict.
+`
+  }
 }
 
 // The Claude Shepherd (primary on non-glm hunts; fallback for a GLM miss). fallbackNote
@@ -3447,7 +3512,10 @@ if (at('Code Review') && pointerRounds > 0) {
   phase('Code Review')
 
   let pointerApproved = false
-  let pRound = 0
+  // Review files keep continuous numbering: pointer-review-<n>.md is never overwritten by a re-entry
+  // (a Tracker bounce re-enters this block). The convergence floor/breaker count THIS entry only.
+  let pRound = pointerRoundBase
+  const pEntryBase = pointerRoundBase
   // [03] Part B — CONVERGENCE-GATED code-review loop (same machinery as the Bloodhound
   // loop). pointerRounds is the FLOOR; convergence detection extends/parks past it.
   const pcfg = tierCfg(tier)
@@ -3718,7 +3786,7 @@ ${META_PRESERVE_NOTE}. Do NOT alter any other file. Do NOT commit. Return record
     // rework (an approval AT maxRounds would otherwise park without one). Bounded: the next
     // cross-family round is already ≥ maxRounds+1 and parks on ISSUES; a further Claude-final
     // ISSUES parks at ≥ maxRounds+1.
-    const effRound = pRound - claudeFinalRoundsRun
+    const effRound = pRound - pEntryBase - claudeFinalRoundsRun
     for (const s of suspectedSymbolDrift(pHistory, pFindings)) log(`⚠ suspected oscillation (symbol drift: ${s.was} vs ${s.now}) at ${s.file} [${s.claimClass}] — not parked on; exact-match fingerprints differ`)
     const pv = classifyConvergence({
       round: effRound, findings: pFindings, history: pHistory, floor: pFloor,
@@ -3870,6 +3938,7 @@ ${heartbeat('Code Review', `Shepherd rewrite round ${pRound}`)}${HUMAN_NOTES_DIR
     const reworkPatchPark = await humanPatchGate('Code Review')
     if (reworkPatchPark) return reworkPatchPark
   }
+  pointerRoundBase = pRound
 }
 
 // ─── Phase 6: Tracker Tests (skipped on resume) ───────────────
@@ -3878,6 +3947,8 @@ if (at('Test')) {
   const gateTest = await boundaryGate('Test'); if (gateTest) return gateTest
   phase('Test')
   log(`Tracker testing: ${slug}`)
+  trackerRound++
+  const windowRound = trackerRound - trackerWindowBase
 
   // [dropped-agent guard] Same lesson as alpha-revise and shepherd-rewrite above, which the Test
   // phase never got: agent() returns null when the subagent dies on a terminal error (quota
@@ -3906,7 +3977,7 @@ Execute ALL Tracker instructions:
   (wolfpack-config.md → Project Identity → Test command — follow its notes on narrowing and on which test backend the sandbox uses)
 - PIPELINE TEST RECORD: after you return TESTS_PASS the pipeline itself runs ${cfg().testCommand} at the committed HEAD and writes ${planDir}/test-record-tracker.json + .log — that record, not your report, gates Certify. Run targeted tests while you write them; commit EVERY test file before returning (uncommitted tracked changes are not in the commit the record tests). Never write or edit test-record-*.json.
 - Classify failures (baseline/transient/pre-existing/legitimate)
-- Write ${planDir}/tracker-log.md and ${planDir}/tracker-report-1.md if needed
+- This is Tracker round ${windowRound} of at most ${trackerRounds + 1}. Write ${planDir}/tracker-log.md and ${planDir}/tracker-report-${trackerRound}.md if needed
 - Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}
 - Commit test files on feat/${slug}. WRITER RECORD: end every commit message with the git
   trailer "${WRITER_TRAILER}: ${trackerFamily}"
@@ -3959,9 +4030,25 @@ ${heartbeat('Test', 'Tracker writing and running tests')}
     // tracker-report-N.md → it resumes at Certify and can certify a hunt that fails its
     // own acceptance criteria. `test_rewrite_needed` is BACKWARD_AUTHORITATIVE, so it
     // overrides the artifact scan and routes back to Shepherd. Idempotent — harmless when
-    // the Tracker already wrote the right status.
-    await recordTestRewriteNeeded({ phaseLabel: 'Test' })
-    return { slug, verdict: trackerResult.verdict, tier, findings: trackerResult.findings, worktreePath }
+    // the Tracker already wrote the right status. It also persists tracker_round, so a crash
+    // between bounces cannot buy extra bounces. The in-run loop below makes the status a
+    // crash-safety rung only: the same run normally continues straight back to Implement.
+    await recordTestRewriteNeeded({ phaseLabel: 'Test', round: trackerRound })
+    if (windowRound > trackerRounds) {
+      log(`⏸ ${slug}: tests still failing after ${windowRound - 1} Tracker bounce(s) (cap ${trackerRounds}). Parking non_convergence — never certifying past a known failure.`)
+      await parkHunt({
+        reason: 'non_convergence', resumePhase: 'Implement', resolutionTypeExpected: 'clarify', phaseLabel: 'Test',
+        needFromUser: `The Tracker failed ${windowRound} time(s) in a row; the bounce cap (tracker_rounds=${trackerRounds}) is spent. Resolving this park opens a fresh budget of ${trackerRounds} bounce(s). Decide: fix guidance for the Shepherd (clarify-rework → Implement), a test/env problem fixed outside the hunt (clarify-proceed → re-run Test), or the plan itself is wrong (redirect → re-plan).`,
+        context: `Latest report: ${planDir}/tracker-report-${trackerRound}.md`,
+        options: `- A (clarify, rework): send back to the Shepherd with your guidance — status rework_needed; the Shepherd gets a REWRITE ENTRY for tracker-report-${trackerRound}.md plus your note.\n- B (clarify, proceed): the failure was environmental and is fixed — status code_reviewed (re-run Test).\n- C (redirect): the plan is wrong — re-plan (ready_for_alpha).`,
+        extraMeta: `Also set top-level "tracker_cap_park_round" = ${trackerRound} (opens the next budget window; preserve tracker_round).`,
+      })
+      return { slug, verdict: 'PARKED', status: 'parked:non_convergence', reason: 'non_convergence', tier, worktreePath }
+    }
+    bounceDirective = trackerRewriteDirective(trackerRound)
+    log(`↻ ${slug}: Tracker ${trackerResult.verdict} (round ${windowRound}/${trackerRounds + 1}) — looping back to Implement in this run.`)
+    resumeFrom = 'Implement'   // at() re-admits Implement → Code Review → Test
+    continue bounce
   }
   log(`Tracker: ${trackerResult.verdict}`)
   // run-observability (AC7/AC8): the PIPELINE's own SHA-stamped full-suite run gates Certify,
@@ -3976,6 +4063,8 @@ ${heartbeat('Test', 'Tracker writing and running tests')}
     if (!tr.ok) return await parkTestRecord(tr, { stage: 'tracker', resumePhase: 'Test', phaseLabel: 'Test' })
     testRecordTakenThisPass = true
   }
+}
+break bounce
 }
 
 // ─── Phase 7: Watchdog Certification (skipped on resume) ──────
@@ -4000,6 +4089,37 @@ if (!testRecordTakenThisPass) {
 phase('Certify')
 log(`Watchdog certifying: ${slug}`)
 
+// Which seat shim certifies (merge-and-state-hygiene). The workflow JS has no filesystem, so a
+// read-only probe agent answers two questions: does the hunt's own diff change the shim or a file
+// it sources, and does the worktree hold a shim. A probe answer is VALID only when it has both
+// fields in the right types; an invalid one is retried ONCE, then the hunt PARKS — it never
+// certifies on the pack shim when the answer is unknown (fail closed).
+const certShimProbe = (label) => agent(`
+Read-only probe. Do NOT modify, create or delete anything.
+
+cd to ${worktreePath}. Run both and report:
+1. \`git -C ${shq(worktreePath)} diff --name-only ${BASE}..HEAD -- ${SHIM_SOURCES.map(shq).join(' ')}\`
+   → changed: the file paths it prints (an empty array when it prints nothing).
+2. \`test -f ${shq(`${worktreePath}/scripts/podman-vibe.sh`)} && echo yes || echo no\`
+   → worktreeShimExists: true when it printed yes, else false.
+Return ONLY { changed: string[], worktreeShimExists: boolean }.
+`, { label: `${label}:${slug}`, phase: 'Certify', model: 'sonnet',
+     schema: { type: 'object', properties: { changed: { type: 'array', items: { type: 'string' } }, worktreeShimExists: { type: 'boolean' } } } })
+const validShimProbe = (r) => !!r && Array.isArray(r.changed) && typeof r.worktreeShimExists === 'boolean'
+let shimProbe = await certShimProbe('cert-shim-probe')
+if (!validShimProbe(shimProbe)) shimProbe = await certShimProbe('cert-shim-probe-retry')
+if (!validShimProbe(shimProbe)) {
+  log(`⛔ ${slug}: could not determine whether this hunt changes the seat shim (probe invalid twice). Parking cert_shim_probe_failed — never certifying on a guessed shim.`)
+  await parkHunt({
+    reason: 'cert_shim_probe_failed', resumePhase: 'Certify', resolutionTypeExpected: 'clarify', phaseLabel: 'Certify',
+    needFromUser: 'The pipeline could not determine whether this hunt changes the seat shim, so it will not pick a Certify shim blind. Re-run Certify (clarify → status tested), or redirect if the shim itself is broken.',
+    context: `Shim sources checked: ${SHIM_SOURCES.join(', ')}; worktree: ${worktreePath}`,
+  })
+  return { slug, verdict: 'PARKED', status: 'parked:cert_shim_probe_failed', reason: 'cert_shim_probe_failed', tier, worktreePath }
+}
+const certShim = certShimPath({ packShim: shimPath, worktreePath, changed: shimProbe.changed, worktreeShimExists: shimProbe.worktreeShimExists })
+log(`Certify seat shim: ${certShim} (${certShim === shimPath ? 'the pack shim — this hunt does not change the shim sources, or the worktree holds no shim' : 'the hunt worktree shim — this hunt changes the shim or a library it sources'})`)
+
 // Certification writes files (certification.md, pedigree.json). A Vibe link (both families)
 // writes them ITSELF into its shim-mounted out dir and the shim delivers them byte-for-byte
 // (seat-handoff-writes); the claude last-resort link (the shim agent itself) writes them
@@ -4018,7 +4138,7 @@ const MISTRAL_CERTIFY_TURNS = (typeof process !== 'undefined' && process.env && 
 // seat-handoff-writes: the certifier's out dir (round 0, as noteAuditOnly records it) and
 // the two artifacts the shim delivers.
 const wdHandoff = { dir: 'watchdog-r0', expect: ['certification.md', 'pedigree.json'] }
-const vibeCertifyStep = `${shq(shimPath)} ${handoffArgs(wdHandoff)} wolfpack-watchdog ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(MISTRAL_CERTIFY_TURNS)}`
+const vibeCertifyStep = `${shq(certShim)} ${handoffArgs(wdHandoff)} wolfpack-watchdog ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(MISTRAL_CERTIFY_TURNS)}`
 // The claude last-resort CERTIFY link — prose, not a command (there is no podman-claude.sh:
 // the shim agent walking this chain already IS Claude). Watchdog is the highest-stakes seat,
 // so this is spelled out in full rather than abbreviated.
@@ -4036,7 +4156,7 @@ const CLAUDE_SELF_CERTIFY_STEP = `(no shim — YOU are Claude.) Read the certify
        the code-writer families, examinerChain has already removed this link and reaching it at
        all is a bug, not a fallback.`
 // GLM certifier: its own read-only Watchdog agent (wolfpack-watchdog-glm, glm-5.3), ≥80 turns.
-const glmCertifyStep = `${shq(shimPath)} ${handoffArgs(wdHandoff)} wolfpack-watchdog-glm ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(GLM_REVIEW_TURNS)}`
+const glmCertifyStep = `${shq(certShim)} ${handoffArgs(wdHandoff)} wolfpack-watchdog-glm ${shq(worktreePath)} ${shq(`/tmp/watchdog-${slug}.txt`)} ${shq(GLM_REVIEW_TURNS)}`
 const certifyStep = (who) => (who === 'glm' ? glmCertifyStep : who === 'mistral' ? vibeCertifyStep : CLAUDE_SELF_CERTIFY_STEP)
 ensureCodeWriterRecord()
 ensureTestWriterRecord()
@@ -4198,7 +4318,7 @@ SAFETY: No git push, no deploy.
 ${RATE_LIMIT_SIGNAL_NOTE}
 ${HANDOFF_SIGNAL_NOTE}
 ${FALLBACK_LOG_NOTE}
-${heartbeat('Certify', 'Watchdog certification')}
+${heartbeat('Certify', 'Watchdog certification')}${VERSION_PROVENANCE_RULE}
 `, { label: `watchdog:${slug}`, phase: 'Certify', schema: VERDICT_SCHEMA })
 
 log(`Watchdog verdict: ${watchdogResult.verdict}`)

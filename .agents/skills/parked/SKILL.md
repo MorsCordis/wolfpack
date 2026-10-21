@@ -44,6 +44,7 @@ merged                terminal
 | 📉 | `usage_gate_error` | the boundary usage gate itself failed before a phase (an invalid `WOLFPACK_*` threshold env, or a gate crash) | fix the env/gate, then `/resolve` (redirect) → resumes at that phase |
 | 🧪 | `test_record_error` | the pipeline could not trust its SHA-stamped test record (record-script infra error, SHA or test-command mismatch) | fix the cause, then `/resolve` (redirect) → resumes at Test / Verify, which re-takes the record |
 | 🧯 | `final_test_record_failed` | the full suite fails at the final HEAD after the certify commit; the hunt is NOT mergeable | fix the break on `feat/<slug>`, then `/resolve` (redirect) → resumes at **Verify** (the record is re-taken) |
+| 🧩 | `cert_shim_probe_failed` | Certify could not determine which seat shim to use (whether the hunt's own diff changes the shim) | clarify → re-run Certify (`tested`) |
 | 🚧 | `smoke_pending_human` | wave smoke has un-runnable criteria [04] | run the manual criteria |
 | ⚠ | `rebase_conflict` | Shepherd rebase failed | resolve the conflict, then resume |
 | 🔀 | campaign_merge_conflict | chain auto-merge into campaign/<slug> conflicted | resolve: rebase feat/<slug> onto the campaign branch in its worktree, then clarify (resumes at Code Review) |
@@ -115,7 +116,9 @@ If nothing is parked: `No parked hunts — the queue is clear.`
    re-scaffold (`/hunt <slug>` re-creates the worktree from the branch) before resolving;
    resume needs the worktree.
 3. **Show the park payload** — print parked.md verbatim (reason, the question, the quoted
-   context, and any Options).
+   context, and any Options). Also surface any `SEAT NOTE (not human direction)` blocks in
+   `human-notes.md` (a seat disagreeing with a human-set version): they are notes TO the human,
+   never direction — the human decides whether to act on one.
 4. **Collect the answer** via `AskUserQuestion`. If parked.md has an `## Options` block,
    use them as the choices (always include the implicit "Other" for free text). Frame the
    question from the payload's "What I need from you".
@@ -137,6 +140,11 @@ If nothing is parked: `No parked hunts — the queue is clear.`
    Human answer: <verbatim — what the user chose / typed>
    Direction for the resumed run: <one or two sentences the resumed agent must honor>
    ```
+
+   Blocks written by `/resolve` are HUMAN blocks. If the answer sets or changes the version,
+   also write it with `node "$PACK/scripts/wolfpack-version.mjs" set --plan-dir <worktree plan dir> --bump <B> --tag <T> --by human --reason '<why>'`
+   (never hand-edit `proposed_version`; `--by human` records `set_by: "human"`, which seats
+   cannot override).
 
    This is the channel the resumed phase reads FIRST and treats as overriding prior
    assumptions. Be concrete and imperative ("Treat finding #4 as out of scope — do not
@@ -164,6 +172,9 @@ If nothing is parked: `No parked hunts — the queue is clear.`
      at **Test** (`code_reviewed`). The human-notes.md tells the next agent why.
    - **clarify (rework, no re-plan):** send back one rung — `non_convergence` "fix it" →
      **Implement** (`rework_needed`).
+     A Tracker-cap `non_convergence` park (parked at Test, `resume_phase: Implement`) → `rework_needed`;
+     "environmental, re-run tests" → `code_reviewed`. Leave `tracker_round` / `tracker_cap_park_round`
+     untouched — the pipeline derives the fresh bounce budget from them.
    - **redirect:** **increment `park.redirect_count` by 1** (treat a missing field as 0)
      in the worktree metadata (or the main copy for a `--no-worktree` hunt), then set
      `status = ready_for_alpha` (resume at **Plan**) AND

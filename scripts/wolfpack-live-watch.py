@@ -18,6 +18,7 @@
 #                                   (default empty), ORed with "wolfpack".
 
 import os
+import shutil
 import sys
 import time
 import glob
@@ -80,7 +81,8 @@ def wt_glob(pattern):
     for r in WT_ROOTS:
         out += glob.glob(f"{r}/{pattern}")
     return out
-WM_BIN = Path.home() / "Projects" / "local-llm" / "bin" / "wolfpack-models"
+# The local-model manager CLI: WOLFPACK_MODELS_BIN, else `wolfpack-models` on PATH.
+WM_BIN = Path(os.environ.get("WOLFPACK_MODELS_BIN") or shutil.which("wolfpack-models") or "wolfpack-models")
 
 # ─── 1. Active Hunt Heartbeats ─────────────────────────────────
 PHASE_ROLE = {

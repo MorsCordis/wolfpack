@@ -95,8 +95,18 @@ fi
 
 # ── Links: ~/.claude/{commands,skills} → <pack>/.agents/{commands,skills} ──
 NAMES=(commands skills)
+# ~/.claude as a regular file can hold no links: refuse loudly (never replace it) instead of letting
+# `mkdir -p` / `ln` fail with an opaque error half way through. Install mode exits before ANY link or
+# Vibe profile write; --check reports it and skips the link checks (they would all fail the same way).
+SKIP_LINKS=0
+if [ -e "$HOME/.claude" ] && [ ! -d "$HOME/.claude" ]; then
+  MSG="✗ ~/.claude ($HOME/.claude) is a regular file, not a directory; install will not replace it — fix: mv ~/.claude ~/.claude.pre-wolfpack && bash '$PACK/install.sh'"
+  if [ "$CHECK" = 1 ]; then problem "$MSG"; else echo "$MSG" >&2; exit 2; fi
+  SKIP_LINKS=1
+fi
 # A real directory/file is never replaced: in install mode stop BEFORE touching anything.
 for n in "${NAMES[@]}"; do
+  [ "$SKIP_LINKS" = 1 ] && break
   L="$HOME/.claude/$n"
   if [ -e "$L" ] && [ ! -L "$L" ]; then
     MSG="✗ ~/.claude/$n is a real directory/file; install will not replace it — fix: mv ~/.claude/$n ~/.claude/$n.pre-wolfpack && bash '$PACK/install.sh'"
@@ -104,6 +114,7 @@ for n in "${NAMES[@]}"; do
   fi
 done
 for n in "${NAMES[@]}"; do
+  [ "$SKIP_LINKS" = 1 ] && break
   L="$HOME/.claude/$n"
   T="$PACK/.agents/$n"
   if [ -e "$L" ] && [ ! -L "$L" ]; then continue; fi   # already reported (check mode)
@@ -161,6 +172,26 @@ else
       problem "✗ $CONSUMER/wolfpack-config.md has no Worktree root — the workflows refuse to run without it — fix: add \"- **Worktree root:** \`<dir>\`\" under ## Project Identity, where <dir> is the repo-relative, gitignored directory this project's hunt worktrees live in (e.g. \`.agents/worktrees\` or \`.claude/worktrees\`)"
     else
       echo "worktree root: $WT_ROOT"
+    fi
+  fi
+
+  # The derived per-model meter is rebuilt by the pack and must never be tracked: gitignore it in the
+  # consumer (the pack ignores it in its own .gitignore).
+  MS_PATH=".wolfpack/pedigree/model-stats.json"
+  if git -C "$CONSUMER" rev-parse --git-dir >/dev/null 2>&1; then
+    set +e; git -C "$CONSUMER" check-ignore -q "$MS_PATH"; IGN=$?; set -e
+    if [ "$IGN" = 1 ]; then
+      if [ "$CHECK" = 1 ]; then
+        problem "✗ $CONSUMER does not gitignore $MS_PATH (a derived file the pack rewrites) — fix: bash '$PACK/install.sh' --consumer '$CONSUMER'"
+      else
+        GI="$CONSUMER/.gitignore"
+        if [ -s "$GI" ] && [ -n "$(tail -c1 "$GI")" ]; then printf '\n' >> "$GI"; fi
+        {
+          echo "# Wolfpack — derived per-model meter (rebuilt by the pack's model-stats; never tracked)"
+          echo "$MS_PATH"
+        } >> "$GI"
+        echo "gitignore: added $MS_PATH to $GI — commit it"
+      fi
     fi
   fi
 

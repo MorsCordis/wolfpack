@@ -113,8 +113,11 @@ const isLink = (p) => { try { return lstatSync(p).isSymbolicLink() } catch { ret
 const lexists = (p) => { try { lstatSync(p); return true } catch { return false } }
 const real = (p) => { try { return realpathSync(p) } catch { return null } }
 
+// Shell-quote one word ('…' with an embedded ' as '\'') so a path with a quote, space or $ round-trips
+// when the fix line is pasted. Byte-identical to the old output for a quote-free path.
+const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 export function installFix(pack, consumer) {
-  return `bash '${pack}/install.sh' --consumer '${consumer}'`
+  return `bash ${shq(`${pack}/install.sh`)} --consumer ${shq(consumer)}`
 }
 
 export function checkWorkflow({ pack, consumer, name }) {

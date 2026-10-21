@@ -13,6 +13,7 @@ Read the pack's `watchdog` role skill, `$PACK/.agents/skills/watchdog/SKILL.md` 
 - Do NOT certify PASS while transient infra failures (auth, network) mask real test results — PAUSE and tell the user.
 - Do NOT handle version tagging (`/merge` owns the tag).
 - Test evidence is the pipeline's SHA-stamped record `<plan dir>/test-record-tracker.json`. When its `commit` equals `git rev-parse HEAD`, cite it and audit its log; do NOT re-run the full suite. Re-run the project's test command only when the record is missing or its commit differs from HEAD.
+- A human-set `proposed_version` (`set_by: "human"`) is immutable to this seat; disagree only via `node "$PACK/scripts/wolfpack-version.mjs" set … --by watchdog`.
 - The pedigree index lives at the main checkout root (`$(dirname "$(git rev-parse --git-common-dir)")/.wolfpack/pedigree/index.md`), even from a worktree.
 
 Begin.
