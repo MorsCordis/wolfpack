@@ -581,6 +581,7 @@ test('AC14 (i) tooling-only campaign: no version, CHANGELOG untouched, one merge
     assert.equal(m.merge_commit, m.campaign_merge_commit)
     assert.equal(m.release_merge_commit, rsha(root, 'main'))
     assert.equal(m.merged_at, RAT)
+    assert.equal(m.phase, 'done', 'merge-and-state-hygiene AC3: the shared stampMerged() also sets phase done')
   }
   assert.equal(rg(root, 'tag', '-l'), '', 'no tag for a tooling-only campaign')
 })
@@ -824,4 +825,30 @@ test('deploy (D8): neither --migrate-cmd nor --no-migrate throws; both throws; w
   assert.notEqual(rCli(root, {}, 'deploy', '--campaign', 'c', '--deploy-cmd', deployCmd).code, 0)
   assert.equal(nfs.existsSync(marker), false)
   assert.equal(rg(root, 'branch', '--show-current'), 'main')
+})
+
+// ── merge-and-state-hygiene AC11 (chain path): cmdChangelog attributes untagged items first ──
+test('AC11 chain: an untagged item introduced by an included hunt is tagged and moves under the release heading; others stay', () => {
+  const root = rRepo({ graph: { a: { dependsOn: [] } }, tag: true })
+  rHunt(root, 'a', { edits: { 'a.txt': 'a\n', 'CHANGELOG.md': rcl('- a tagged <!-- hunt:a -->', '- a forgot its tag') }, meta: { proposed_version: { bump: 'patch' } } })
+  const cl = cmdChangelog(root, { campaign: 'c', version: 'v0.1.1', apply: true, at: RAT })
+  assert.equal(cl.moved, 2, JSON.stringify(cl))
+  assert.deepEqual(cl.unattributed, ['- base entry'], 'the pre-existing untagged item stays, loudly')
+  const text = rg(root, 'show', 'campaign/c:CHANGELOG.md')
+  const [unrel, rest] = text.split('## [v0.1.1]')
+  assert.match(rest, /- a forgot its tag <!-- hunt:a -->/)
+  assert.match(rest, /- a tagged <!-- hunt:a -->/)
+  assert.match(unrel, /- base entry/)
+  assert.doesNotMatch(unrel, /a forgot its tag/)
+})
+
+test('AC11 chain: attribution alone (no version heading) still commits the tag', () => {
+  const root = rRepo({ graph: { a: { dependsOn: [] } } })
+  rHunt(root, 'a', { edits: { 'a.txt': 'a\n', 'CHANGELOG.md': rcl('- a untagged') } })
+  const tip = rsha(root, 'campaign/c')
+  const cl = cmdChangelog(root, { campaign: 'c', version: '', apply: true, at: RAT })
+  assert.equal(cl.moved, 0)
+  assert.ok(cl.committed && cl.committed !== tip, JSON.stringify(cl))
+  assert.equal(rg(root, 'log', '-1', '--format=%s', 'campaign/c'), 'docs(changelog): attribute untagged items for campaign c')
+  assert.match(rg(root, 'show', 'campaign/c:CHANGELOG.md'), /- a untagged <!-- hunt:a -->/)
 })

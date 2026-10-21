@@ -14,7 +14,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   STAMP_RE, CANONICAL_STAMP_LINE, sourceHash, stampLine, render, parseStamp, packInfo,
-  workflowNames, checkWorkflow, checkAll, generate,
+  workflowNames, checkWorkflow, checkAll, generate, installFix,
 } from './wolfpack-workflows.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -363,4 +363,24 @@ test('CLI: exit codes 0 / 1 / 2 and the --json shape', () => {
   } finally {
     rmSync(pack, { recursive: true, force: true }); rmSync(consumer, { recursive: true, force: true })
   }
+})
+
+// ─── merge-and-state-hygiene AC22: installFix shell-quotes both paths ─────────────────────────
+test("AC22: installFix's line round-trips argv for paths with ', space and $ (bash -c)", () => {
+  const cases = [
+    ["/tmp/o'brien/pack", "/tmp/o b'x/repo"],
+    ['/tmp/a b/$HOME/pack', "/tmp/it's $(x)/r"],
+    ["/p'''q", "/c'"],
+  ]
+  for (const [pack, consumer] of cases) {
+    const cmd = installFix(pack, consumer).replace(/^bash /, "printf '%s\\n' ")
+    const r = spawnSync('bash', ['-c', cmd], { encoding: 'utf8' })
+    assert.equal(r.status, 0, `bash cannot run: ${cmd}\n${r.stderr}`)
+    assert.deepEqual(r.stdout.replace(/\n$/, '').split('\n'), [`${pack}/install.sh`, '--consumer', consumer], cmd)
+  }
+})
+
+test('AC22: a quote-free path keeps the exact old fix line (byte-identical)', () => {
+  assert.equal(installFix('/pack', '/repo'), "bash '/pack/install.sh' --consumer '/repo'")
+  assert.equal(installFix('/a b/pack', '/c d'), "bash '/a b/pack/install.sh' --consumer '/c d'")
 })

@@ -209,5 +209,47 @@ check "$RC" 0 "pack-as-consumer: install exits 0"
 has "$OUT" "canonical (pack itself) — nothing to generate" "pack-as-consumer: nothing generated"
 check "$(git -C "$PACK" status --porcelain -- .claude .agents/workflows)" "" "pack-as-consumer: no change in the pack's .claude / canonical workflows"
 
+check "$(git -C "$PACK" status --porcelain -- .gitignore)" "" "pack-as-consumer: the pack's .gitignore is not touched (it already ignores model-stats.json)"
+
+# ── merge-and-state-hygiene AC21: ~/.claude as a regular FILE → loud refusal, nothing written ──
+H=$(newhome); printf 'not a dir\n' > "$H/.claude"; SUM_BEFORE=$(sha256sum "$H/.claude")
+run "$H" "$NOGIT"
+[ "$RC" -ne 0 ] && ok "AC21: install exits non-zero when ~/.claude is a regular file (rc $RC)" || no "AC21: install exit 0 with ~/.claude a regular file"
+has "$OUT" "~/.claude ($H/.claude) is a regular file, not a directory; install will not replace it" "AC21: the refusal names ~/.claude and 'regular file'"
+has "$OUT" "fix: mv ~/.claude ~/.claude.pre-wolfpack && bash '$PACK/install.sh'" "AC21: the refusal prints the fix"
+check "$(sha256sum "$H/.claude")" "$SUM_BEFORE" "AC21: the ~/.claude file is byte-identical"
+check "$(listing "$H")" "$(printf '%s \n%s \n' "$H" "$H/.claude")" "AC21: nothing else under HOME (no links, no Vibe profiles)"
+run "$H" "$NOGIT" --check
+check "$RC" 1 "AC21: --check exits 1 with the problem"
+has "$OUT" "is a regular file, not a directory" "AC21: --check reports the regular-file problem"
+hasnt "$OUT" "~/.claude/commands" "AC21: --check skips the per-link checks (they would all fail the same way)"
+check "$(sha256sum "$H/.claude")" "$SUM_BEFORE" "AC21: --check leaves the file untouched"
+
+# ── merge-and-state-hygiene AC23: the derived model-stats meter is gitignored in the consumer ──
+MS=.wolfpack/pedigree/model-stats.json
+git -C "$PACK" check-ignore -q "$MS"; check "$?" 0 "AC23: the pack ignores $MS"
+check "$(grep -c 'model-stats\.json' "$PACK/.gitignore")" 1 "AC23: the pack .gitignore names it exactly once (the comment does not)"
+H=$(newhome); C=$(consumer c-gitignore)
+printf 'node_modules/' > "$C/.gitignore"   # no trailing newline: the append must not glue onto it
+run "$H" "$SCRATCH" --check --consumer "$C"
+[ "$RC" -ne 0 ] && ok "AC23: --check on an un-ignoring consumer reports a problem" || no "AC23: --check passed although $MS is not ignored"
+has "$OUT" "does not gitignore $MS" "AC23: --check names the path"
+check "$(cat "$C/.gitignore")" "node_modules/" "AC23: --check writes nothing"
+run "$H" "$SCRATCH" --consumer "$C"
+check "$RC" 0 "AC23: install --consumer exits 0"
+has "$OUT" "gitignore: added $MS to $C/.gitignore — commit it" "AC23: install says it added the ignore"
+git -C "$C" check-ignore -q "$MS"; check "$?" 0 "AC23: after install the consumer ignores $MS"
+check "$(head -n1 "$C/.gitignore")" "node_modules/" "AC23: the existing last line is kept intact (newline added first)"
+check "$(grep -c 'model-stats\.json' "$C/.gitignore")" 1 "AC23: one ignore line"
+run "$H" "$SCRATCH" --consumer "$C"
+check "$(grep -c 'model-stats\.json' "$C/.gitignore")" 1 "AC23: a second install adds nothing (idempotent)"
+hasnt "$OUT" "gitignore: added" "AC23: a second install does not report an add"
+run "$H" "$SCRATCH" --check --consumer "$C"
+hasnt "$OUT" "does not gitignore" "AC23: --check is clean after install"
+# a consumer that already ignores it another way (a broader pattern) is left alone
+H=$(newhome); C=$(consumer c-gitignore-broad); printf '.wolfpack/pedigree/*.json\n' > "$C/.gitignore"
+run "$H" "$SCRATCH" --consumer "$C"
+check "$(cat "$C/.gitignore")" ".wolfpack/pedigree/*.json" "AC23: an existing broader ignore is respected (no duplicate line)"
+
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

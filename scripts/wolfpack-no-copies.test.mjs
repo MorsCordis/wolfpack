@@ -136,6 +136,23 @@ test('(a3b) non-.md files and nested paths under a commands dir are offending ev
   assert.match(r.out, /2 offending path\(s\)/)
 })
 
+test('merge-and-state-hygiene AC19: a nested or non-.md command entry gets a delete/move fix, never the Project commands hint', () => {
+  const c = fixtureConsumer({ '.claude/commands/sub/x.md': 'x\n', '.claude/commands/x.txt': 'x\n', '.claude/commands/hunt.txt': 'x\n' })
+  const r = guard(c, PACK)
+  assert.equal(r.code, 1, r.out + r.err)
+  for (const p of ['.claude/commands/sub/x.md', '.claude/commands/x.txt', '.claude/commands/hunt.txt']) {
+    const line = r.out.split('\n').find(l => l.startsWith(`✗ ${p} — `))
+    assert.ok(line, `${p} reported:\n${r.out}`)
+    assert.doesNotMatch(line, /Project commands/, line)
+    assert.match(line, /delete/, line)
+    assert.ok(line.includes(`\`${p}\``), `the fix names the path: ${line}`)
+    assert.match(line, /only a plain <name>\.md directly under \.claude\/commands can be allow-listed/, line)
+  }
+  // a plain top-level <name>.md keeps today's fixes
+  const plain = guard(fixtureConsumer({ '.claude/commands/foo.md': 'x\n' }), PACK)
+  assert.match(plain.out, /^✗ \.claude\/commands\/foo\.md — delete it, or add `foo` to wolfpack-config\.md → Project Identity → Project commands$/m)
+})
+
 test('(a4) an allow-list naming a pack command (`hunt`) → exit 2, setup error on stderr', () => {
   const c = fixtureConsumer({ '.claude/commands/hunt.md': 'x\n' }, { commands: '`hunt`' })
   const r = guard(c, PACK)
