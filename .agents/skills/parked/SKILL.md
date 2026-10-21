@@ -44,6 +44,7 @@ merged                terminal
 | 📉 | `usage_gate_error` | the boundary usage gate itself failed before a phase (an invalid `WOLFPACK_*` threshold env, or a gate crash) | fix the env/gate, then `/resolve` (redirect) → resumes at that phase |
 | 🧪 | `test_record_error` | the pipeline could not trust its SHA-stamped test record (record-script infra error, SHA or test-command mismatch) | fix the cause, then `/resolve` (redirect) → resumes at Test / Verify, which re-takes the record |
 | 🧯 | `final_test_record_failed` | the full suite fails at the final HEAD after the certify commit; the hunt is NOT mergeable | fix the break on `feat/<slug>`, then `/resolve` (redirect) → resumes at **Verify** (the record is re-taken) |
+| 📋 | `pedigree_incomplete` | the certifier PASSED but its `pedigree.json` lacks the Watchdog scores or `certifier_verdict`, so `wolfpack-pedigree.mjs index-row` refused to write the index row (no dashed row is ever written) | clarify → re-run Certify (the seat rewrites a complete `pedigree.json`) |
 | 🧩 | `cert_shim_probe_failed` | Certify could not determine which seat shim to use (whether the hunt's own diff changes the shim) | clarify → re-run Certify (`tested`) |
 | 🚧 | `smoke_pending_human` | wave smoke has un-runnable criteria [04] | run the manual criteria |
 | ⚠ | `rebase_conflict` | Shepherd rebase failed | resolve the conflict, then resume |

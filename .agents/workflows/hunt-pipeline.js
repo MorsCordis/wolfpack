@@ -39,6 +39,9 @@ const VERDICT_SCHEMA = {
     // Watchdog: the examiner family that actually certified (glm | mistral | claude last-resort) —
     // checked against the code writer's family by the cross-family runtime invariant.
     provider: { type: 'string' },
+    // Certify: set when the pedigree index-row writer REFUSED the certifier's pedigree.json (missing scores);
+    // the pipeline parks pedigree_incomplete — a score-less scorecard never becomes a dashed row.
+    pedigreeRowError: { type: 'string' },
     // seat-profiles-into-pack: tool-access evidence for the accepted link. deniedTools = the
     // fixed TOOL_DENIAL_PATTERN grep over the shim's .out/.err (claude link: []); toolAccess =
     // the seat's own <verdict> "tool_access" self-report, passed through verbatim. The JS
@@ -1904,6 +1907,47 @@ const PROTECTED_AGENT_PATHS = [
   '.agents/hooks/',
 ]
 const HUMAN_PATCH_DIR = `${planDir}/human-patches`
+// ── BEGIN wolfpack-human-patch core (keep byte-identical: scripts/lib/human-patch.mjs ⇄ hunt-pipeline.js) ──
+const HUMAN_PATCH_TARGETS = ['hunt', 'consumer']
+// rel = the patch path relative to human-patches/ ("01-x.patch" | "consumer/01-x.patch")
+function humanPatchTarget(rel) {
+  const s = String(rel || '')
+  if (/^consumer\/[^/]+\.patch$/.test(s)) return 'consumer'
+  if (/^[^/]+\.patch$/.test(s)) return 'hunt'
+  throw new Error(`human patch ${JSON.stringify(s)}: not <name>.patch or consumer/<name>.patch`)
+}
+// The repo a target's patches are checked and applied in. Consumer without a recorded worktree → throw.
+function humanPatchRepo(target, { worktreePath, consumer }) {
+  if (target === 'hunt') return worktreePath
+  if (target === 'consumer') {
+    if (!consumer || typeof consumer.path !== 'string' || !consumer.path.startsWith('/'))
+      throw new Error('a consumer-targeted human patch needs metadata.consumer_worktree.path (absolute) — the Shepherd records it when it creates the consumer worktree')
+    return consumer.path
+  }
+  throw new Error(`unknown human-patch target ${JSON.stringify(target)}`)
+}
+// Park text: per-repo apply / add / commit lines, and the branch each repo's commit lands on.
+// pending = [{ patch, paths, applies, target }]; hunt patches first, then consumer patches.
+function humanPatchApplySteps(pending, { worktreePath, consumer, slug }) {
+  const lines = []
+  const branches = []
+  for (const target of HUMAN_PATCH_TARGETS) {
+    const group = pending.filter(x => x.target === target)
+    if (group.length === 0) continue
+    const repo = humanPatchRepo(target, { worktreePath, consumer })
+    for (const x of group) {
+      lines.push(`  git -C ${repo} apply ${x.patch}${x.applies ? '' : '   # does NOT apply cleanly: inspect it first'}`)
+    }
+    const files = [...new Set(group.flatMap(x => x.paths || []))]
+    lines.push(`  git -C ${repo} add ${files.join(' ')}`)
+    lines.push(`  git -C ${repo} commit -m "fix(hooks): apply the Shepherd's staged patch"`)
+    if (target === 'hunt') branches.push(`feat/${slug} (hunt worktree)`)
+    else branches.push(`${(consumer && consumer.branch) || `feat/${slug}`} (consumer worktree ${repo})`)
+  }
+  return { steps: lines.join('\n'), branches }
+}
+// ── END wolfpack-human-patch core ──
+
 const PROTECTED_PATCH_RULE = `
 PROTECTED AGENT-CONFIG PATHS (the permission classifier refuses agent edits to these):
 ${PROTECTED_AGENT_PATHS.map(p => `  - ${p}`).join('\n')}
@@ -1911,7 +1955,10 @@ NEVER edit or commit a file under these paths, and do not retry a refused edit. 
 the plan needs there, write a unified diff with worktree-relative a/ b/ paths (the format
 git diff prints) to ${HUMAN_PATCH_DIR}/<NN>-<short-name>.patch: copy the file to /tmp, edit the
 copy, then diff -u it against the original and fix the header paths. Confirm it applies with
-git apply --check <patch> from the worktree root. Commit everything else as usual, and list
+git apply --check <patch> from the worktree root. A change to the CONSUMER repo's protected path goes to ${HUMAN_PATCH_DIR}/consumer/<NN>-<short-name>.patch
+(a/ b/ paths relative to the consumer worktree), checked with: git -C <consumer worktree> apply --check <patch> ;
+record the consumer worktree in ${planDir}/metadata.json as "consumer_worktree": {"path": "<abs>", "branch": "<branch>"}
+(read-modify-write). Commit everything else as usual, and list
 each patch in shepherd-log.md under "## Human-Applied Patches". The pipeline parks the hunt so
 the human applies and commits them.`
 
@@ -3295,7 +3342,7 @@ PROTECTED-PATH CHECK (mandatory): agents cannot edit these paths (the permission
 classifier refuses them):
 ${PROTECTED_AGENT_PATHS.map(p => `  - ${p}`).join('\n')}
 If plan-final.md changes any file under them, add a "## Human-Applied Edits" section to
-debrief.md listing each such file and the exact change, and mark those plan-final items
+debrief.md listing each such file, its repo (hunt worktree or consumer), and the exact change, and mark those plan-final items
 "(human-applied patch)". The Shepherd stages them as patches in ${HUMAN_PATCH_DIR}/ and the
 hunt parks for the human to apply them. If none, write "## Human-Applied Edits\nNone." Where
 a plan item can reach its goal without touching a protected path, prefer that.
@@ -3314,33 +3361,59 @@ const HUMAN_PATCH_SCHEMA = {
   type: 'object',
   properties: {
     pending: { type: 'array', items: { type: 'object', properties: {
-      patch: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } }, applies: { type: 'boolean' },
-    }, required: ['patch', 'paths', 'applies'] } },
+      patch: { type: 'string' }, rel: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } }, applies: { type: 'boolean' },
+      target: { type: 'string', enum: HUMAN_PATCH_TARGETS }, repo: { type: 'string' },
+    }, required: ['patch', 'paths', 'applies', 'target', 'repo'] } },
+    consumer: { type: ['object', 'null'], properties: { path: { type: 'string' }, branch: { type: ['string', 'null'] } } },
+    error: { type: 'string' },
   },
   required: ['pending'],
 }
 async function humanPatchGate(phaseLabel) {
   const check = await agent(`
-You are a READ-ONLY probe. Do NOT modify, apply, stage or commit anything.
-cd to ${worktreePath}. If ${HUMAN_PATCH_DIR}/ does not exist or has no *.patch files, return { pending: [] }.
-For each ${HUMAN_PATCH_DIR}/*.patch, in name order:
-  - if \`git apply --check -R <patch>\` succeeds, it is already applied: skip it;
-  - otherwise add { patch: <absolute path>, paths: <the b/ paths it touches, without the b/>,
-    applies: <true if \`git apply --check <patch>\` succeeds, else false> }.
-Return { pending: [...] }.
+You ONLY run the deterministic human-patch check for hunt ${slug} — modify, apply, stage and commit nothing. Run exactly:
+  node ${shq(packScript('wolfpack-human-patches.mjs'))} check --plan-dir ${shq(planDir)} --worktree ${shq(worktreePath)}; echo "RC=$?"
+If RC=0, return the command's JSON stdout VERBATIM ({ pending, consumer }). If RC is not 0 (or the command could
+not run), return { pending: [], error: <the "reason" from its JSON, or the error text> }. Never fix, install or edit anything.
 `, { label: `human-patch-check:${slug}`, phase: phaseLabel, schema: HUMAN_PATCH_SCHEMA, model: 'sonnet' })
+  const consumer = (check && check.consumer) || null
   const pending = (check && Array.isArray(check.pending)) ? check.pending : []
+  // Fail closed (defence in depth behind the schema): an unreadable or inconsistent check is never "nothing pending".
+  let checkError = null
+  if (!check) checkError = 'the check returned nothing'
+  else if (check.error) checkError = String(check.error)
+  else {
+    for (const x of pending) {
+      if (!x || !HUMAN_PATCH_TARGETS.includes(x.target)) { checkError = `a pending patch has no valid target (${JSON.stringify(x && x.patch)})`; break }
+      let want
+      try { want = humanPatchRepo(x.target, { worktreePath, consumer }) } catch (e) { checkError = e.message; break }
+      if (!x.repo || x.repo !== want) { checkError = `a pending patch names repo ${JSON.stringify(x.repo)}, expected ${JSON.stringify(want)}`; break }
+    }
+  }
+  if (checkError) {
+    log(`⏸ ${slug}: the human-patch check could not run — parking human_patch`)
+    await parkHunt({
+      reason: 'human_patch',
+      resumePhase: 'Code Review',
+      resolutionTypeExpected: 'clarify',
+      phaseLabel,
+      needFromUser: `The human-patch check could not run: ${checkError}. Fix it (usually: record metadata.consumer_worktree), then /resolve (clarify).`,
+      context: `Check: node ${packScript('wolfpack-human-patches.mjs')} check --plan-dir ${planDir} --worktree ${worktreePath}`,
+      options: `- A (clarify): fixed — resume at Code Review.\n- B (redirect): the change is wrong — re-plan.`,
+    })
+    return { slug, verdict: 'PARKED', status: 'parked:human_patch', reason: 'human_patch', tier, worktreePath }
+  }
   if (pending.length === 0) return null
   log(`⏸ ${slug}: ${pending.length} protected-path patch(es) need the human — parking human_patch`)
   const files = [...new Set(pending.flatMap(x => x.paths || []))]
-  const steps = pending.map(x => `  git -C ${worktreePath} apply ${x.patch}${x.applies ? '' : '   # does NOT apply cleanly: inspect it first'}`).join('\n')
+  const { steps, branches } = humanPatchApplySteps(pending, { worktreePath, consumer, slug })
   await parkHunt({
     reason: 'human_patch',
     resumePhase: 'Code Review',
     resolutionTypeExpected: 'clarify',
     phaseLabel,
-    needFromUser: `The plan changes protected agent-config files that agents cannot edit (${files.join(', ')}). The Shepherd staged the change as ${pending.length} patch(es). Review, apply and commit them on feat/${slug}, then /resolve (clarify) to resume at Code Review.`,
-    context: `Apply (from any shell):\n${steps}\n  git -C ${worktreePath} add ${files.join(' ')}\n  git -C ${worktreePath} commit -m "fix(hooks): apply the Shepherd's staged patch"\nThe change is described in ${planDir}/shepherd-log.md under "## Human-Applied Patches".`,
+    needFromUser: `The plan changes protected agent-config files that agents cannot edit (${files.join(', ')}). The Shepherd staged the change as ${pending.length} patch(es). Review, apply and commit them on ${branches.join(' and ')}, then /resolve (clarify) to resume at Code Review.`,
+    context: `Apply (from any shell):\n${steps}\nThe change is described in ${planDir}/shepherd-log.md under "## Human-Applied Patches".`,
     options: `- A (clarify): applied and committed — resume at Code Review.\n- B (redirect): the change is wrong — re-plan.`,
   })
   return { slug, verdict: 'PARKED', status: 'parked:human_patch', reason: 'human_patch', tier, worktreePath }
@@ -3482,7 +3555,10 @@ ${rewriteDirective ? `${rewriteDirective}(A wrapper commits your changes after y
    NEVER edit a file under ${PROTECTED_AGENT_PATHS.join(', ')}: for each change the plan needs
    there, write_file a unified diff (worktree-relative a/ b/ paths) to
    ${HUMAN_PATCH_DIR}/<NN>-<short-name>.patch and list it in shepherd-log.md under
-   "## Human-Applied Patches". A human applies it.
+   "## Human-Applied Patches". A human applies it. A change to the CONSUMER repo's protected path
+   goes to ${HUMAN_PATCH_DIR}/consumer/<NN>-<short-name>.patch (a/ b/ paths relative to the consumer
+   worktree), checked with git -C <consumer worktree> apply --check <patch>; record the consumer
+   worktree in ${planDir}/metadata.json as "consumer_worktree": {"path": "<abs>", "branch": "<branch>"}.
 EFFICIENCY: start from dev_cortex_repo_map / dev_cortex_file_outline and grep; read only the
 line ranges you need — never whole 1000+ line files. Make ONE tool call at a time.
 End your response with a short list of every file you created or changed.`
@@ -4210,7 +4286,7 @@ Steps:
 2. Write the Watchdog prompt to /tmp/watchdog-${slug}.txt:
    Read ${PACK_SKILLS}/watchdog/SKILL.md for the full Watchdog instructions.
    Build the prompt: "You are the Watchdog certifier for hunt '${slug}', tier ${tier}.
-   Follow the Watchdog skill instructions.${tier === 'Red' ? ' SINGLE-PASS CERTIFICATION (mandatory, all models): do NOT spawn sub-agents or use the task tool. Run all certification lenses in ONE comprehensive pass, then emit the verdict block. Cross-model sub-agent fan-out is disabled.' : ''}
+   Follow the Watchdog skill instructions. pedigree.json MUST carry certifier_verdict (pass|rework|flawed_plan, matching your verdict), the Watchdog skill's execution_scores (plan_adherence, code_quality, implementation_judgment, test_result, code_review_quality, test_authoring_quality — each {score: 1-5, rationale, tags}; plus rework_rounds, pointer_rounds, tracker_rounds, human_interventions) and process_value_add (pointer_value_add, tracker_value_add, cycle_efficiency — each {score: 1-5, rationale}). A pedigree.json without them fails certification bookkeeping.${tier === 'Red' ? ' SINGLE-PASS CERTIFICATION (mandatory, all models): do NOT spawn sub-agents or use the task tool. Run all certification lenses in ONE comprehensive pass, then emit the verdict block. Cross-model sub-agent fan-out is disabled.' : ''}
    Read plan-final.md at ${planDir}/plan-final.md,
    shepherd-log.md, debrief.md, metadata.json. Run git diff ${BASE}..HEAD for the code diff.
    Read .wolfpack/known-broken-tests.md and .wolfpack/cross-cutting-debt.md.
@@ -4254,8 +4330,12 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
 
 4.6 PASS-ONLY ACTIONS (YOU, the shim agent — never the certifier seat). On PASS, and only if
    4.5 allows it, perform these AFTER step 8 below has run (so the index row carries the
-   DURATION value and the committed pedigree.json carries the timing block): append to
-   .wolfpack/pedigree/index.md, run \`bash ${shq(packScript('wolfpack-lessons.sh'))}\` (cwd = the worktree), then commit the wolfpack
+   DURATION value and the committed pedigree.json carries the timing block): write the
+   .wolfpack/pedigree/index.md row with the validating writer (cwd = the worktree) — NEVER by hand:
+     \`node ${shq(packScript('wolfpack-pedigree.mjs'))} index-row --plan-dir ${shq(planDir)} --index .wolfpack/pedigree/index.md --date "$(date -u +%F)" --duration "<DURATION from step 8>"\`
+   If it exits non-zero it REFUSED a pedigree.json without scores: do NOT edit index.md by hand, do NOT run
+   the lessons aggregator, do NOT commit, and return \`pedigreeRowError\` = its stderr. If it exits 0, run
+   \`bash ${shq(packScript('wolfpack-lessons.sh'))}\` (cwd = the worktree), then commit the wolfpack
    learning-loop artifacts. STRICT staging rules (a past bug force-committed gitignored
    worktree plan files into main at ${worktreeRoot}/<slug>/… paths — these rules prevent
    that recurrence):
@@ -4291,8 +4371,7 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
    It reads ${planDir}/timing.jsonl + metadata.json, writes a "timing" block into
    ${planDir}/pedigree.json, and prints a "DURATION=<…>" line plus an
    "INCOMPLETE" warning if any phase is missing a start/end. Capture the DURATION
-   value and put it in the Duration column of the .wolfpack/pedigree/index.md row
-   you append. If the script fails, log it and continue — timing is telemetry, not
+   value and pass it to the index-row writer (--duration) in step 4.6. If the script fails, log it and continue — timing is telemetry, not
    a gate.
 
 8b. On PASS only — refresh the [06] per-model routing meter (host-side, non-blocking,
@@ -4354,6 +4433,18 @@ if (watchdogResult && watchdogResult.verdict === 'PASS' && certEv.length && HEAV
     context: `certifier: ${watchdogResult.provider || watchdogResult.status || '(unknown)'}; evidence: ${certEv.join(' | ')}`,
   })
   return { slug, verdict: 'PARKED', status: 'parked:audit_only_certification', reason: 'audit_only_certification', tier, worktreePath }
+}
+
+// A PASS whose pedigree.json the index-row writer refused (no scores / no certifier_verdict): park,
+// never write a dashed row. Resume re-runs Certify so the seat can write a complete scorecard.
+if (watchdogResult && watchdogResult.verdict === 'PASS' && watchdogResult.pedigreeRowError) {
+  log(`⛔ ${slug}: certification PASSED but the pedigree row was refused — ${watchdogResult.pedigreeRowError}`)
+  await parkHunt({
+    reason: 'pedigree_incomplete', resumePhase: 'Certify', resolutionTypeExpected: 'clarify', phaseLabel: 'Certify',
+    needFromUser: `The certifier PASSED but its pedigree.json lacks scores, so no index row was written: ${watchdogResult.pedigreeRowError}. Resume to re-run certification (clarify), or redirect.`,
+    context: `pedigree.json: ${planDir}/pedigree.json; writer: wolfpack-pedigree.mjs index-row`,
+  })
+  return { slug, verdict: 'PARKED', status: 'parked:pedigree_incomplete', reason: 'pedigree_incomplete', tier, worktreePath }
 }
 
 // [05] AC3 — both certifiers rate-limited → PARK model_quota, NOT a non-PASS that
