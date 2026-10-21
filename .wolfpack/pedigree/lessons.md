@@ -2,7 +2,7 @@
 
 Aggregated patterns from the last 1 hunts (window: 10).
 Updated by `scripts/wolfpack-lessons.sh`, called at end of every Watchdog cert.
-Last regenerated: 2026-10-21T01:35:20Z
+Last regenerated: 2026-10-21T03:24:47Z
 
 ## Patterns That Work (count >= 3)
 
