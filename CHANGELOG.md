@@ -4,6 +4,8 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+## [v0.5.0] - 2026-10-21
+
 ### Added
 - `scripts/wolfpack-test-record.mjs`: the pipeline's SHA-stamped full-suite record (commit, exit code, the suite's own summary line, verdict, full raw log beside it), taken by a script with no agent in between, after Tracker (`tracker`), at the final HEAD after the certify commit (`final`) and at the campaign tip (`release`); `ensure` reuses a record whose commit equals the target and re-runs only when it moved. <!-- hunt:run-observability -->
 - Optional `Test verdict command` config key (Project Identity; `{log}`, `{exit}`, `{main}` placeholders) for suites that exit non-zero on documented baseline failures; `wolfpack-config.mjs --json` exposes it as `testVerdictCommand`. <!-- hunt:run-observability -->
