@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+PROJECT_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
 if [[ -z "$PROJECT_ROOT" ]]; then
   echo "Not in a git repo — cannot locate .wolfpack/ directory" >&2
   exit 1

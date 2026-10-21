@@ -937,3 +937,36 @@ test("run-observability AC12: a Wolfpack home containing a single quote is a con
   assert.equal(readConfig(withHome('- **Wolfpack home:** `/opt/my pack`')).wolfpackHome, '/opt/my pack')
   assert.equal(readConfig(withHome('- **Wolfpack home:** `/opt/$x/pack`')).wolfpackHome, '/opt/$x/pack')
 })
+
+// ─── merge-and-state-hygiene AC20: releaseTags (Deployment Notes → Tag pattern: none) ─────────
+test('AC20: releaseTags is false only for a PRESENT `none` / n/a Tag pattern; a pattern, an absent key or a blank key keep tagging', () => {
+  const withTag = (line) => FULL.replace('- Tag pattern: `v[0-9]*`\n', line)
+  const cases = [
+    ['- Tag pattern: `v[0-9]*`\n', true],
+    ['- Tag pattern: `release-*`\n', true],
+    ['- Tag pattern: none\n', false],
+    ['- Tag pattern: `none`\n', false],
+    ['- Tag pattern: NONE — this project does not tag releases\n', false],
+    ['- Tag pattern: n/a\n', false],
+    ['', true],                            // key absent → today's v[0-9]* default, unchanged
+    ['- Tag pattern:\n', true],            // present but blank → never silently turns tagging off
+  ]
+  for (const [line, want] of cases) {
+    const c = readConfig(withTag(line))
+    assert.equal(c.releaseTags, want, JSON.stringify(line))
+  }
+  assert.equal(loadConfig(REAL).releaseTags, true, 'the pack tags its releases')
+})
+
+test('AC20: releaseTags reaches --json and the summary', () => {
+  withTemp((dir) => {
+    const p = join(dir, 'wolfpack-config.md')
+    writeFileSync(p, FULL.replace('- Tag pattern: `v[0-9]*`\n', '- Tag pattern: none\n'))
+    const j = runCli(['--json', p])
+    assert.equal(JSON.parse(j.stdout).releaseTags, false, j.stdout + j.stderr)
+    const s = runCli([p])
+    assert.match(s.stdout + s.stderr, /releaseTags: false/)
+  })
+  const src = readFileSync(CLI, 'utf8')
+  assert.match(src.slice(0, src.indexOf('import ')), /\/\/\s+releaseTags\s+false when Deployment Notes → Tag pattern is PRESENT and `none`/, 'documented in the RESOLVED KEYS header')
+})

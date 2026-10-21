@@ -293,7 +293,7 @@ Minor issues only — things you can fix in < 30 minutes. Fix them yourself, the
 { "phase": "done", "status": "certified" }
 ```
 
-Tagging the release version is no longer handled by Watchdog. `/merge` and `/smoke` will manage applying the tag to the new merge commit on `main`.
+Tagging the release version is no longer handled by Watchdog. `/merge` and `/smoke` will manage applying the tag to the new merge commit on `main`. A human-set `proposed_version` (`set_by: "human"`) is immutable to this seat; never hand-edit `proposed_version` — disagree only via `node "$PACK/scripts/wolfpack-version.mjs" set … --by watchdog --reason '<why>'`, which records a SEAT NOTE for the human.
 
 ### REWORK
 The Shepherd got the code wrong. The plan is still valid — implementation just needs fixing. Write rework instructions in certification.md with specific file paths and what needs to change. Tell the user to re-launch the Shepherd. Update metadata:

@@ -129,7 +129,7 @@ Parse the hunt description (and campaign metadata if `--campaign` was used) to p
 
 When the campaign's `## Proposed Hunts` entry provides Tier, Mode, Description, and backlog items:
 - Pre-fill all 4 scope fields from the campaign metadata (target_surface from Description using the Module Map, mode_guess from Mode field, out_of_scope and known_traps as empty).
-- If the campaign entry includes a `Bump:` field (e.g., `Bump: PATCH`), pre-fill `proposed_version.bump` too.
+- If the campaign entry includes a `Bump:` field (e.g., `Bump: PATCH`), pre-fill `proposed_version.bump` too (with `set_by: null` — a campaign bump is not a human-set version, so seats may revise it).
 - **Skip all scope questions.** If bump was also pre-filled, skip Q5 (version tag) entirely — compute the tag from the bump type using the claimed-tag-aware logic from Q5. Only ask Q5 when the campaign doesn't include bump metadata.
 
 ### Asking remaining gaps
@@ -142,7 +142,7 @@ If ALL scope fields (Q1-Q4) are confidently pre-filled but no campaign bump, the
 
 If ZERO fields are confidently pre-filled (vague description like "improve the system"), ask all 5 questions.
 
-5. **Version tag.** (Asked unless pre-filled from campaign. Skip entirely if the project does not tag releases.) Before asking, scan for context:
+5. **Version tag.** (Asked unless pre-filled from campaign. Skip entirely when `node "$PACK/scripts/wolfpack-config.mjs" --json` → `releaseTags` is `false` — wolfpack-config.md → Deployment Notes → Tag pattern: `none`.) A version the human answers here is human-set (`set_by: "human"`) and immutable to seats; a seat that disagrees can only record a SEAT NOTE via `wolfpack-version.mjs set`. Before asking, scan for context:
    - Run `git fetch --tags --quiet` to ensure local tags are up to date with the remote.
    - Run `git describe --tags --abbrev=0 --match 'v[0-9]*'` to get the latest release tag on main. The `--match` matters: it skips non-release tags (rollback markers like `pre-hunt-*`), which otherwise win `--abbrev=0` and poison the bump math. Adjust the pattern if the project's release tags use a different prefix.
    - **Claimed-tag scan:** Scan BOTH `.wolfpack/plans/*/metadata.json` AND `$WT_ROOT/*/.wolfpack/plans/*/metadata.json` for `proposed_version.tag` values from hunts whose status is NOT `merged` — any hunt that hasn't landed yet holds a live claim on its tag.
@@ -242,7 +242,8 @@ Before scaffolding, verify main is clean. Uncommitted edits on main won't carry 
      },
      "proposed_version": {
        "bump": "<PATCH|MINOR|MAJOR|null — from user's Q5 answer>",
-       "tag": "<computed from bump + latest tag, or exact user input, or null if skipped>"
+       "tag": "<computed from bump + latest tag, or exact user input, or null if skipped>",
+       "set_by": "<\"human\" when the user answered Q5 with a bump or tag; null when Q5 was skipped or the bump was pre-filled from the campaign>"
      },
      "model_assignments": {
        "alpha": null,

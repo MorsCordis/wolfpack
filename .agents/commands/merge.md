@@ -105,17 +105,22 @@ Before reading any plan files:
      || { echo "⛔ No passing test record at $BRANCH's tip — not merging. Run the fix line printed above, then re-run /merge $SLUG."; git checkout main; exit 1; }
 
    git merge --no-ff $BRANCH -m "Merge branch '$BRANCH'"
+   MERGE_SHA=$(git rev-parse HEAD)
    git push origin main
    ```
 
    **Note on shared append-only files:** `.gitattributes` configures the `union` merge driver on `pedigree/index.md`, `known-broken-tests.md`, and `cross-cutting-debt.md`. This auto-resolves appends from concurrent hunts without conflicts.
-7. **Plan-copy-back (only if `worktree_path` was set):** Before removing the worktree, preserve the plan artifacts locally for post-hoc traceability. Plans are gitignored and ride the worktree filesystem — without this step they die with the worktree.
-   - Target path: `$(git rev-parse --show-toplevel)/.wolfpack/plans/<slug>/`
-   - Source path: `<worktree_path>/.wolfpack/plans/<slug>/`
-   - **Collision handling:** if the target already exists (e.g. an abandoned earlier in-place attempt), do NOT overwrite. Rename the existing target to `<slug>.prior-<YYYYMMDD-HHMMSS>/` and tell the user: "Archived existing `.wolfpack/plans/<slug>/` to `.wolfpack/plans/<slug>.prior-<ts>/` before copying worktree artifacts. Review/discard at your discretion."
-   - Then `cp -r <worktree_path>/.wolfpack/plans/<slug>/ <main>/.wolfpack/plans/<slug>/`.
-   - **Stamp metadata as MERGED (the authoritative on-disk status log).** After copying, update the main-repo copy's `metadata.json`: set `status: "merged"`, `phase: "done"`, and record `merged_at` (from `date -Iseconds`), `merge_commit` (the `--no-ff` merge SHA now on main, `git rev-parse HEAD`), and `released_version` (the tag laid in step 9, or `null` if deferred). `status: "merged"` is the durable, unambiguous done-marker that `/run-campaign`'s RESUME PLAN and `campaign-runner.js` read **directly** — so a shipped hunt is never re-derived from git and never reads as a re-runnable `certified`. Do NOT leave it at `certified` (that means "awaiting merge"). This also prevents `/hunt` from flagging completed hunts as in-progress.
+7. **Plan copy-back (only if `worktree_path` was set):** Before removing the worktree, preserve the plan artifacts locally for post-hoc traceability. Plans are gitignored and ride the worktree filesystem — without this step they die with the worktree. Run, from the main checkout:
+   ```bash
+   node "$PACK/scripts/wolfpack-merge-state.mjs" copy-back --slug "$SLUG" --from "$worktree_path/.wolfpack/plans/$SLUG"
+   ```
+   It copies the worktree plan dir's CONTENTS into the main checkout's `.wolfpack/plans/<slug>/` (created if missing; the worktree's files win; never a nested `<slug>/<slug>/`; a tracked `pedigree.json` is overwritten in place, never archived or deleted; files only the target has are left alone). Print its `overwritten` list to the user. Do NOT copy the directory yourself with a recursive shell copy and do NOT archive an existing target.
    - The pedigree scorecard rides the merge (tracked on the feature branch); this step handles the gitignored artifacts only (plan.md, review-N.md, debrief.md, shepherd-log.md, certification.md, observations.md, pointer-review-N.md, tracker-log.md).
+7a. **Stamp MERGED (ALWAYS — worktree hunt or `--no-worktree` hunt; not conditioned on `worktree_path`).** Run, from the main checkout:
+   ```bash
+   node "$PACK/scripts/wolfpack-merge-state.mjs" stamp-merged --slug "$SLUG" --merge-commit "$MERGE_SHA"
+   ```
+   It sets `status: "merged"`, `phase: "done"`, `merge_commit` and `merged_at` on every metadata copy (the main checkout's, and the worktree's while it still exists), and refuses a SHA that is not on `main`. `status: "merged"` is the durable, unambiguous done-marker that `/run-campaign`'s RESUME PLAN and `campaign-runner.js` read **directly** — so a shipped hunt is never re-derived from git and never reads as a re-runnable `certified`. Do NOT leave it at `certified` (that means "awaiting merge"). This also prevents `/hunt` from flagging completed hunts as in-progress.
 8. **Worktree cleanup (only if `worktree_path` was set):** After plan-copy-back, present the cleanup prompt as its OWN message block with visual separators so it cannot be missed in scroll. Output EXACTLY this format (substituting the real path):
    ```
    ──────────────────────────────────────
@@ -129,21 +134,16 @@ Before reading any plan files:
    ```
    **Wait for the user's answer before continuing.** If `y`, run `git worktree remove <worktree_path>`. If anything other than `y`, leave it — the user can clean up later. Plan artifacts are safe either way. Do NOT bury this prompt inside a paragraph of other output — it must be the last thing the user sees before the finishing message.
 8a. **Changelog version stamping.** Read the changelog filename from `wolfpack-config.md` → `## Deployment Notes` → "Changelog file". **If that field is blank, skip this entire step** — the project keeps no changelog. Otherwise read `proposed_version` from metadata.json.
+   - **Attribute untagged items (run this BEFORE the version-heading move below, so an item it attributes to this hunt moves with it):** `node "$PACK/scripts/wolfpack-merge-state.mjs" attribute-changelog --file "<changelog file>" --apply`. Print its stderr verbatim. It tags each untagged `[Unreleased]` item with the hunt whose merge carried it and places it with that hunt's other items; it never deletes an item, and an item it cannot attribute stays under `[Unreleased]`, listed loudly as `⚠ unattributed [Unreleased] item (left in place)`. It is informational — it doesn't block the merge.
    - **If `proposed_version.tag` is non-null (versioned hunt):**
      1. Grep the changelog for `<!-- hunt:$SLUG -->` under `## [Unreleased]`. These are the items Shepherd wrote for this hunt.
      2. If items found: create a new version section `## [<version>] — <YYYY-MM-DD>` immediately after `## [Unreleased]` (and its remaining content), and move the matching items there. Group by category (### Fixed, ### Added, ### Changed) preserving the original order. Leave unmatched items under `[Unreleased]`.
      3. If NO `<!-- hunt:$SLUG -->` items found under `[Unreleased]`: check whether a `## [<version>]` heading already exists (Shepherd may have created it). If neither exists, STOP — tell the user "No changelog entries found for hunt `$SLUG`. Was the changelog updated during Shepherd?" The user decides.
    - **If `proposed_version` is null (tooling-only):** verify entries exist under `[Unreleased]` with `<!-- hunt:$SLUG -->` tags. If missing, warn but don't block.
-   - **Unattributed item warning:** After stamping, scan remaining `[Unreleased]` items. Any line that starts with `- ` and does NOT contain `<!-- hunt:` is unattributed. If found, list them:
-     ```
-     ⚠ Unattributed items under [Unreleased] (no <!-- hunt:slug --> tag):
-     - <item text>
-     ```
-     This is informational — it doesn't block the merge. But it flags items that will be hard to attribute later.
    - **Backlog file:** read the backlog filename from `## Deployment Notes` → "Backlog file" (skip if blank). For each backlog line the plan listed for removal, run `grep -F "<exact text>" <backlog-file>`. If found, capture the matching line and warn: "Plan expected this backlog line to be removed: `<matched line>`. Still present — was it addressed?" The user decides.
    Neither check blocks the merge — they're warnings. But surfacing them here prevents housekeeping from accumulating across hunts.
    **Commit the changelog change** on a `fix/changelog-<slug>` branch, merge `--no-ff` to main, before proceeding to tagging.
-9. **Release tagging (ALWAYS — before deploy).** Skip entirely if the project does not tag releases. Otherwise read `proposed_version` from metadata.json and present a confirmation:
+9. **Release tagging (ALWAYS — before deploy).** Skip entirely when `node "$PACK/scripts/wolfpack-config.mjs" --json` → `releaseTags` is `false` (wolfpack-config.md → Deployment Notes → Tag pattern: `none`); say so visibly and stamp `--released-version ""` (below). Otherwise read `proposed_version` from metadata.json and present a confirmation:
    ```
    Tag release version?
    Last tag: <git describe --tags --abbrev=0 --match 'v[0-9]*'>
@@ -154,6 +154,7 @@ Before reading any plan files:
    - If `proposed_version` is null (tooling-only hunt or user skipped): ask the user for a version string or "skip". If skip, no tag — tooling hunts often have no version bump.
    - Before tagging: confirm the changelog has a `## [<version>]` heading (step 8a should have created it). Then `git tag -a <ver> -m "<ver>"` on HEAD (the merge commit on `main`), and push: `git push origin <ver>`.
    - Tell the user: "Tag `<ver>` created and pushed to origin."
+   - Record it: re-run `node "$PACK/scripts/wolfpack-merge-state.mjs" stamp-merged --slug "$SLUG" --merge-commit "$MERGE_SHA" --released-version "<ver>"`. When the tag was deferred, skipped or not applicable (`releaseTags` false), re-run it with `--released-version ""` (records `released_version: null`).
 10. **Migration detection (do NOT run yet).** Read "Migration file pattern" and "Deploy-before-migrate" from `wolfpack-config.md` → `## Deployment Notes`. **If no migration pattern is configured, skip this step.** Otherwise run `git diff HEAD~1..HEAD --name-only | grep '<migration-pattern>'`. If any migration files appear in the merged diff, set `HAS_MIGRATIONS=true` and note the files, but do NOT run them now.
    - If **Deploy-before-migrate is `yes`**, migrations must not run before the deploy: the migration runner is pinned to the deployed artifact, so migrating first applies the *previous* build's schema. Display:
      ```

@@ -16,7 +16,8 @@ compliance-review sign-off, and the redirect-loop guard.
 - Write ONLY `human-notes.md` + `metadata.json` (the **worktree** plan dir — the single
   source of truth; the main-repo copy ONLY for a `--no-worktree` hunt with no worktree),
   and `acceptance.md` on a redirect. Do NOT plan, implement, review, deploy, or commit.
-- `human-notes.md` is **append-only** — add a new dated block; never rewrite prior ones.
+- `human-notes.md` is **append-only** — add a new dated block; never rewrite prior ones. Blocks `/resolve` writes are HUMAN blocks; a block headed `SEAT NOTE (not human direction)` is a seat's note to the human — surface it in the park display, never treat it as direction.
+- If the human's answer sets or changes the version, write it with `node "$PACK/scripts/wolfpack-version.mjs" set --plan-dir <worktree plan dir> --bump <B> --tag <T> --by human --reason '<why>'` — never hand-edit `proposed_version`.
 - If the hunt is `needs_spec`, hand off to `/spec $ARGUMENTS` (do not resolve it here).
 - Never clear a `parked:compliance_review` to a build path without an explicit human
   sign-off recorded in human-notes.md (set `park.compliance_signed_off = true`).

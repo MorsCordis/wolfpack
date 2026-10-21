@@ -157,7 +157,7 @@ simply omits that step from the finishing message.
 - Deploy-before-migrate: (yes/no — yes if the migration runner must use the image built by the deploy)
 - Changelog file: (e.g., `CHANGELOG.md`, or blank if the project keeps no changelog)
 - Backlog file: (e.g., `TODO.md`, or blank)
-- Tag pattern: (e.g. `v[0-9]*`)
+- Tag pattern: (e.g. `v[0-9]*`; `none` = this project does not tag releases — `/merge`, `/merge-wave` and `/release-campaign` then lay no tag and record `released_version: null`)
 - Dev URL / Prod URL / Never-smoke hosts: (e.g. `staging.myapp.example` / `myapp.example` / `myapp-marketing.example`; `/smoke-wave` smokes only the Dev URL, never Prod or a never-smoke host; `none` when nothing is deployed)
 - Smoke login hook: none — or a backticked command template with {host} (and optional {account}), then the account names in backticks, the first one is the default; see "Smoke login hook" below.
 ```

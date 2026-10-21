@@ -30,3 +30,6 @@ Thumbs.db
 # the canonical .agents/workflows, so nothing is generated here; the lines keep the rule identical.
 .claude/workflows/hunt-pipeline.js
 .claude/workflows/campaign-runner.js
+
+# Wolfpack — derived per-model meter (rebuilt by the pack's model-stats; never tracked)
+.wolfpack/pedigree/model-stats.json

@@ -30,6 +30,10 @@
 //   devDeployCommand Deployment Notes → Dev deploy command (code) optional; null = no deploy step
 //   changelogFile    Deployment Notes → Changelog file (code)    optional
 //   tagPattern       Deployment Notes → Tag pattern (code)       optional
+//   releaseTags      false when Deployment Notes → Tag pattern is PRESENT and `none` (the project
+//                    does not tag releases: /merge, /merge-wave and /release-campaign lay no tag
+//                    and record released_version null); true otherwise — an ABSENT key keeps the
+//                    default `v[0-9]*` tagging, so an unset key never silently turns tagging off.
 //   backlogFile      Deployment Notes → Backlog file (code)      optional
 //   wolfpackHome     Project Identity → Wolfpack home (code)     optional; a leading `~` expands to
 //                    the home dir; a present, non-NONE, non-absolute value is a problem.
@@ -426,6 +430,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     problems.push(`Project Identity → Project commands: invalid name(s) ${badCommands.map((n) => `'${n}'`).join(', ')} (lowercase letters, digits and -, e.g. \`doc-reviewer\`)`)
     projectCommands = []
   }
+  const tagPatternRaw = field(sec('Deployment Notes'), 'Tag pattern')
   const { hook: smokeLoginHook, accounts: smokeLoginAccounts } = smokeLoginHookValue(
     field(sec('Deployment Notes'), 'Smoke login hook'), problems)
   const exec = execLayer(sec('Execution Layer'), configDir)
@@ -441,6 +446,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     devDeployCommand: optionalCode('Deployment Notes', 'Dev deploy command'),
     changelogFile: optionalCode('Deployment Notes', 'Changelog file'),
     tagPattern: optionalCode('Deployment Notes', 'Tag pattern'),
+    releaseTags: !(typeof tagPatternRaw === 'string' && tagPatternRaw.trim() !== '' && isNone(tagPatternRaw)),
     backlogFile: optionalCode('Deployment Notes', 'Backlog file'),
     wolfpackHome,
     worktreeRoot,
@@ -481,6 +487,7 @@ function summary(cfg) {
     `devDeployCommand: ${cfg.devDeployCommand ?? 'none'}`,
     `wolfpackHome: ${cfg.wolfpackHome ?? 'none'}`,
     `worktreeRoot: ${cfg.worktreeRoot ?? 'none'}`,
+    `releaseTags: ${cfg.releaseTags}`,
     `smokeLoginHook: ${cfg.smokeLoginHook ?? 'none'}`,
     cfg.exec && cfg.exec.missing.length
       ? `exec: missing ${cfg.exec.missing.join(', ')}`

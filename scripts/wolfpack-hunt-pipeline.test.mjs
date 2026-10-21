@@ -110,6 +110,9 @@ const BASE = {
   // and the pipeline's SHA-stamped test record passes at every stage (a fn of the prompt's stage).
   'usage-gate': { exitCode: 0, output: JSON.stringify({ decision: 'proceed', exit: 0, reason: '5h 10% < 95% boundary', source: 'live', degraded: false, mode: 'boundary' }) },
   'test-record': (prompt) => recordAnswer(stageOf(prompt)),
+  // merge-and-state-hygiene (AC16): the Certify shim probe — by default the hunt does not touch
+  // the seat shim, so Certify keeps the pack shim (an invalid answer correctly parks fail-closed).
+  'cert-shim-probe': { changed: [], worktreeShimExists: false },
 }
 
 async function runHunt({ env = {}, answers = {}, args = {}, rawArgs, src = SRC } = {}) {
@@ -1871,7 +1874,10 @@ test('the shim_missing park reason is registered in the parked skill reason tabl
 
 // ─── exec-layer-into-pack: WOLFPACK_HOME resolution (AC3 / AC4 / AC5) ───────────────────────
 // Every podman-vibe.sh occurrence in a recorded prompt, with the text that precedes it.
-const shimRefs = (calls) => calls.flatMap(c => [...c.prompt.matchAll(/(\S*)podman-vibe\.sh/g)].map(m => ({ label: c.label, ref: m[0] })))
+// merge-and-state-hygiene (AC16): the read-only cert-shim PROBE names the shim sources and the
+// worktree's shim to ask whether the hunt changes them — it runs no shim, so it is not a shim command.
+const shimRefs = (calls) => calls.filter(c => !c.label.startsWith('cert-shim-probe'))
+  .flatMap(c => [...c.prompt.matchAll(/(\S*)podman-vibe\.sh/g)].map(m => ({ label: c.label, ref: m[0] })))
 const SHIM_SEATS = ['bloodhound:', 'pointer:', 'watchdog:', 'toolcheck-preflight:']
 
 test('AC3 (a) / AC4: env WOLFPACK_HOME wins over the key — EVERY shim command (review, implement, certify, toolcheck) uses it', async () => {
@@ -2005,8 +2011,12 @@ test('AC4 (g): source guard — no shim path is built from repoRoot in either wo
   assert.doesNotMatch(runner, AC4)
   // the only place the shim FILE NAME is joined to a directory is the shimPath definition
   const joins = [...SRC.matchAll(/\$\{[^}]*\}\/scripts\/podman-vibe\.sh/g)].map(m => m[0])
-  assert.deepEqual(joins, ['${wolfpackHome.home}/scripts/podman-vibe.sh'])
-  assert.equal((SRC.match(/shq\(shimPath\)/g) || []).length, 5, 'review ×2, implement, certify ×2')
+  // merge-and-state-hygiene (AC16): besides shimPath, the only joins are the worktree shim that
+  // certShimPath may pick (a hunt changing the shim) and the probe's `test -f` of that same file.
+  assert.deepEqual(joins, ['${wolfpackHome.home}/scripts/podman-vibe.sh', '${worktreePath}/scripts/podman-vibe.sh', '${shq(`${worktreePath}/scripts/podman-vibe.sh'])
+  assert.equal((SRC.match(/shq\(shimPath\)/g) || []).length, 3, 'review ×2, implement')
+  assert.equal((SRC.match(/shq\(certShim\)/g) || []).length, 2, 'certify ×2 (certShimPath → the pack shim unless the hunt changes the shim)')
+  assert.match(SRC, /const certShim = certShimPath\(\{ packShim: shimPath,/, 'the certify shim defaults to shimPath')
   assert.match(SRC, /const tcShim = shimPath\n/, 'toolcheck --shim')
   // the resolver runs right after the pre-scaffold config probe and BEFORE the resume probe (H7 trust boundary)
   const iProbe = SRC.indexOf('projectConfig = await loadProjectConfig(')
@@ -3247,6 +3257,7 @@ test('run-observability AC7: the Test phase relays wolfpack-test-record.mjs ensu
   assert.equal(tr[0].opts.model, 'sonnet')
   assert.equal(tr[0].opts.phase, 'Test')
   assert.ok(p.includes(`node '/pack/scripts/wolfpack-test-record.mjs' ensure --json --stage tracker --record-dir '${PD}' --repo '${WT}'`), p)
+  assert.ok(p.includes(`--repo '${WT}' --timeout-min 55`), 'the record script must time out before the ~60-min shim relay')
   assert.ok(p.includes(`${PD}/.test-record-tracker.rc`), 'the rc-file wait')
   assert.match(p, /Do NOT run tests yourself, do NOT summarise, do NOT edit, stage or commit any file/)
   assert.equal(p.includes('bash scripts/test-all.sh'), false, 'the relay never runs the test command itself')
@@ -3424,4 +3435,267 @@ test('run-observability: the parked skill registers usage_gate_error, test_recor
   }
   const q = skill.split('\n').find(l => /^\|.*`model_quota`/.test(l))
   assert.match(q, /phase boundary/)
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// merge-and-state-hygiene AC13: a Tracker bounce loops back to Implement IN THIS RUN (bounded by
+// tracker_rounds per budget window, then parks non_convergence); round numbers persist/continue.
+// ════════════════════════════════════════════════════════════════════════════
+const failThenPass = (fails) => (_p, _o, n) => ({ verdict: n <= fails ? 'TESTS_FAIL' : 'TESTS_PASS' })
+const RESUME_BOUNCE = { fresh: false, resumePhase: 'Implement', tier: 'Yellow', worktreePath: WT, planDir: PD,
+  worktreeExists: true, branchExists: true, trackerRounds: 1, pointerRounds: 1, bloodhoundRounds: 1 }
+const trackerReports = (calls) => calls.map(c => (/tracker-report-(\d+)\.md/.exec(c.prompt) || [])[1])
+
+test('AC13: Tracker TESTS_FAIL then PASS → loops Implement → Code Review → Test in the same run, then certifies', async () => {
+  const { result, find, logs } = await runHunt({ answers: { tracker: failThenPass(1) } })
+  assert.notEqual(result.verdict, 'TESTS_FAIL', JSON.stringify(result))
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY', JSON.stringify(result))
+  const shep = find('shepherd:')
+  assert.equal(shep.length, 2, 'fresh build + one bounce re-entry')
+  assert.doesNotMatch(shep[0].prompt, /REWRITE ENTRY/)
+  assert.match(shep[1].prompt, /REWRITE ENTRY — Tracker round 1 \(NOT a fresh build\)/)
+  assert.ok(shep[1].prompt.includes(`${PD}/tracker-report-1.md`))
+  const trk = find('tracker:')
+  assert.equal(trk.length, 2)
+  assert.deepEqual(trackerReports(trk), ['1', '2'], 'Tracker report numbering continues across the bounce')
+  assert.match(trk[1].prompt, /This is Tracker round 2 of at most 2 in this budget window \(absolute round 2\)/)
+  const tr = find('test-rewrite')
+  assert.equal(tr.length, 1)
+  assert.match(tr[0].prompt, /"tracker_round" = 1\b/)
+  assert.equal(find('watchdog:').length, 1)
+  assert.ok(logs.some(l => /↻ h: Tracker TESTS_FAIL \(round 1\/2\) — looping back to Implement in this run\./.test(l)), logs.join('\n'))
+  // Pointer file numbering continues across the bounce: round 1 approved, the re-entry reviews as r2
+  assert.deepEqual(find('pointer:').map(c => c.opts.label), ['pointer:h:r1:full', 'pointer:h:r2:full'])
+  assert.ok(find('pointer:')[1].prompt.includes('pointer-review-2.md'))
+  assert.equal(find('pointer:')[1].prompt.includes('pointer-review-1.md'), false, 'the second entry never overwrites round 1')
+})
+
+test('AC13: REWRITE_NEEDED bounces exactly like TESTS_FAIL', async () => {
+  const { result, find } = await runHunt({ answers: { tracker: (_p, _o, n) => ({ verdict: n === 1 ? 'REWRITE_NEEDED' : 'TESTS_PASS' }) } })
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  assert.equal(find('shepherd:').length, 2)
+})
+
+test('AC13: the test-rewrite record persists tracker_round on EVERY bounce (the ALREADY clause is conditioned on the round)', async () => {
+  const { result, find } = await runHunt({ answers: { alpha: { ...BASE.alpha, trackerRounds: 2 }, tracker: failThenPass(2) } })
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY', JSON.stringify(result))
+  const tr = find('test-rewrite')
+  assert.equal(tr.length, 2)
+  assert.match(tr[0].prompt, /"tracker_round" = 1\b/)
+  assert.match(tr[1].prompt, /"tracker_round" = 2\b/, 'a stale test_rewrite_needed status still persists the new round')
+  for (const c of tr) {
+    const already = c.prompt.split('\n').filter(l => /ALREADY/.test(l))
+    assert.ok(already.length >= 1)
+    for (const l of already) assert.match(l, /tracker_round/, `ALREADY clause must name tracker_round: ${l}`)
+    assert.doesNotMatch(c.prompt, /ALREADY "test_rewrite_needed", leave the file unchanged/, 'no unconditional no-op')
+    assert.doesNotMatch(c.prompt, /do NOT alter tracker_round\b(?!s)/)
+  }
+  assert.deepEqual(trackerReports(find('tracker:')), ['1', '2', '3'])
+  assert.equal(find('shepherd:').length, 3)
+})
+
+test('AC13: Tracker always failing → bounces tracker_rounds times, then parks non_convergence (never certifies)', async () => {
+  const { result, find, logs } = await runHunt({ answers: { tracker: { verdict: 'TESTS_FAIL' } } })
+  assert.equal(result.status, 'parked:non_convergence', JSON.stringify(result))
+  assert.equal(result.verdict, 'PARKED')
+  assert.equal(find('tracker:').length, 2, 'trackerRounds 1 → at most 2 Tracker runs')
+  assert.equal(find('shepherd:').length, 2)
+  assert.equal(find('watchdog:').length, 0)
+  assert.equal(find('verify').length, 0)
+  const park = find('park:h:non_convergence')
+  assert.equal(park.length, 1)
+  assert.match(park[0].prompt, /"tracker_cap_park_round" = 2\b/)
+  assert.match(park[0].prompt, /resume_phase: Implement/)
+  assert.ok(park[0].prompt.includes(`${PD}/tracker-report-2.md`))
+  assert.ok(logs.some(l => /tests still failing after 1 Tracker bounce\(s\) \(cap 1\)\. Parking non_convergence/.test(l)), logs.join('\n'))
+})
+
+test('AC13 (A9): the Pointer half already reworks in-run — ISSUES_FOUND then APPROVED → one shepherd-rewrite, then Test + Certify', async () => {
+  const { result, find } = await runHunt({ answers: {
+    alpha: { ...BASE.alpha, pointerRounds: 2 },
+    pointer: issuesThenApprove,
+    'shepherd-rewrite': { findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true },
+  } })
+  assert.equal(find('shepherd-rewrite').length, 1)
+  assert.equal(find('tracker:').length, 1)
+  assert.equal(find('watchdog:').length, 1)
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+})
+
+test('AC13 resume: test_rewrite_needed names the round DONE (trackerRoundDone), not the cap; the next Tracker continues the numbering', async () => {
+  const { find } = await runHunt({ answers: {
+    'resume-probe': { ...RESUME_BOUNCE, status: 'test_rewrite_needed', trackerRounds: 3, trackerRoundDone: 2, trackerCapParkRound: 0 },
+  } })
+  const s = find('shepherd:')[0].prompt
+  assert.match(s, /REWRITE ENTRY — Tracker round 2 /)
+  assert.ok(s.includes(`${PD}/tracker-report-2.md`))
+  assert.equal(s.includes('tracker-report-3.md'), false, 'the cap (3) is not the round number')
+  assert.deepEqual(trackerReports(find('tracker:')), ['3'])
+})
+
+test('AC13 resume: code_rewrite_needed names pointerRoundDone (not the pointerRounds cap); falls back to the cap when absent', async () => {
+  const a = await runHunt({ answers: { 'resume-probe': { ...RESUME_BOUNCE, status: 'code_rewrite_needed', pointerRounds: 2, pointerRoundDone: 1 } } })
+  const sa = a.find('shepherd:')[0].prompt
+  assert.match(sa, /REWRITE ENTRY — Pointer round 1 /)
+  assert.ok(sa.includes(`${PD}/pointer-review-1.md`))
+  assert.equal(sa.includes('pointer-review-2.md'), false)
+  // the next Pointer entry continues the numbering after the round done
+  assert.equal(a.find('pointer:')[0].opts.label, 'pointer:h:r2:full')
+  const b = await runHunt({ answers: { 'resume-probe': { ...RESUME_BOUNCE, status: 'code_rewrite_needed', pointerRounds: 2 } } })
+  assert.match(b.find('shepherd:')[0].prompt, /REWRITE ENTRY — Pointer round 2 /)
+})
+
+test('AC13 cap-park rework: rework_needed after a Tracker-cap park → REWRITE ENTRY for that report + the human notes; a Watchdog REWORK stays a fresh build', async () => {
+  const cap = await runHunt({ answers: { 'resume-probe': { ...RESUME_BOUNCE, status: 'rework_needed', trackerRoundDone: 2, trackerCapParkRound: 2 } } })
+  const s = cap.find('shepherd:')[0].prompt
+  assert.match(s, /REWRITE ENTRY — Tracker round 2 /)
+  assert.ok(s.includes(`${PD}/tracker-report-2.md`))
+  assert.ok(s.includes(`${PD}/human-notes.md (LAST dated HUMAN block) overrides the report`))
+  for (const capRound of [0, 1]) {   // no cap park, or a Tracker run since it (trackerRoundDone 2 > 1)
+    const wd = await runHunt({ answers: { 'resume-probe': { ...RESUME_BOUNCE, status: 'rework_needed', trackerRoundDone: 2, trackerCapParkRound: capRound } } })
+    assert.doesNotMatch(wd.find('shepherd:')[0].prompt, /REWRITE ENTRY/, `capPark ${capRound}`)
+  }
+})
+
+test('AC13 budget window: resolving a Tracker-cap park opens a FRESH budget; numbering continues (3, 4)', async () => {
+  const probe = { ...RESUME_BOUNCE, status: 'rework_needed', trackerRounds: 1, trackerRoundDone: 2, trackerCapParkRound: 2 }
+  const ok = await runHunt({ answers: { 'resume-probe': probe, tracker: failThenPass(1) } })
+  assert.equal(ok.result.verdict, 'CERTIFIED_AWAITING_DEPLOY', JSON.stringify(ok.result))
+  assert.deepEqual(trackerReports(ok.find('tracker:')), ['3', '4'])
+  assert.match(ok.find('tracker:')[0].prompt, /This is Tracker round 1 of at most 2 in this budget window \(absolute round 3\)/)
+  assert.equal(ok.find('park:h:non_convergence').length, 0)
+  assert.equal(ok.find('watchdog:').length, 1)
+  const bad = await runHunt({ answers: { 'resume-probe': probe, tracker: { verdict: 'TESTS_FAIL' } } })
+  assert.equal(bad.result.status, 'parked:non_convergence')
+  assert.equal(bad.find('tracker:').length, 2, 'the fresh window allows exactly trackerRounds + 1 runs')
+  assert.match(bad.find('park:h:non_convergence')[0].prompt, /"tracker_cap_park_round" = 4\b/)
+})
+
+test('AC13 budget window: option B (code_reviewed → re-run Test) after a cap park also gets the fresh window', async () => {
+  const probe = { ...RESUME_BOUNCE, status: 'code_reviewed', resumePhase: 'Test', trackerRounds: 1, trackerRoundDone: 2, trackerCapParkRound: 2 }
+  const { result, find } = await runHunt({ answers: { 'resume-probe': probe, tracker: failThenPass(1) } })
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY', JSON.stringify(result))
+  assert.equal(find('shepherd:').length, 1, 'one in-run bounce to Implement')
+  assert.match(find('shepherd:')[0].prompt, /REWRITE ENTRY — Tracker round 3 /)
+})
+
+test('AC13 crash resume: no park in between opens NO fresh budget — a relaunch never buys extra bounces', async () => {
+  const probe = { ...RESUME_BOUNCE, status: 'test_rewrite_needed', trackerRounds: 1, trackerRoundDone: 1, trackerCapParkRound: 0 }
+  const { result, find } = await runHunt({ answers: { 'resume-probe': probe, tracker: { verdict: 'TESTS_FAIL' } } })
+  assert.equal(result.status, 'parked:non_convergence', JSON.stringify(result))
+  assert.equal(find('tracker:').length, 1, 'window round 2 > cap 1 on the first run after the relaunch')
+  assert.match(find('park:h:non_convergence')[0].prompt, /"tracker_cap_park_round" = 2\b/)
+})
+
+test('AC13: the resume probe reports pointerRoundDone / trackerRoundDone / trackerCapParkRound (prompt + schema)', async () => {
+  const { find } = await runHunt({})
+  const rp = find('resume-probe')[0]
+  for (const k of ['pointerRoundDone', 'trackerRoundDone', 'trackerCapParkRound']) {
+    assert.match(rp.prompt, new RegExp(`- ${k}: metadata\\.`), k)
+    assert.equal(rp.opts.schema.properties[k].type, 'number', k)
+  }
+})
+
+test('AC13: the parked skill routes a Tracker-cap non_convergence park (rework_needed / code_reviewed, counters untouched)', () => {
+  const s = readFileSync(join(PACK_ROOT, '.agents', 'skills', 'parked', 'SKILL.md'), 'utf8')
+  assert.match(s, /A Tracker-cap `non_convergence` park \(parked at Test, `resume_phase: Implement`\) → `rework_needed`/)
+  assert.match(s, /Leave `tracker_round` \/ `tracker_cap_park_round`\s+untouched/)
+})
+
+// ─── merge-and-state-hygiene AC7: proposed_version changes only through wolfpack-version.mjs ───
+test('AC7: every prompt that mentions proposed_version (bar the scaffold) carries the wolfpack-version.mjs set rule', async () => {
+  const { calls, find } = await runHunt({})
+  const hits = calls.filter(c => /proposed_version/.test(c.prompt) && !c.label.startsWith('scaffold'))
+  assert.ok(hits.length >= 3, hits.map(c => c.label).join(', '))
+  for (const c of hits) assert.ok(c.prompt.includes("wolfpack-version.mjs' set --plan-dir"), c.label)
+  for (const p of ['alpha:', 'debrief', 'watchdog:']) {
+    assert.match(find(p)[0].prompt, /VERSION PROVENANCE \(hard rule\): never hand-edit metadata\.proposed_version/, p)
+  }
+  assert.ok(find('alpha:')[0].prompt.includes("'/pack/scripts/wolfpack-version.mjs' set --plan-dir '"), 'the pack script, shq-quoted')
+  assert.match(find('scaffold')[0].prompt, /proposed_version: \{ bump: null, tag: null, set_by: null \}/)
+  assert.match(SRC, /the LAST dated HUMAN block is the current direction \(a block headed \\`SEAT NOTE \(not\s+human direction\)\\`/)
+  const runner = readFileSync(join(here, '..', '.agents', 'workflows', 'campaign-runner.js'), 'utf8')
+  assert.doesNotMatch(runner, /proposed_version["']?\s*[=:]/, 'campaign-runner.js never writes proposed_version')
+})
+
+test('AC7: an Alpha revision round also carries the provenance rule', async () => {
+  const { find } = await runHunt({ answers: { bloodhound: (_p, _o, n) => (n === 1
+    ? { verdict: 'ISSUES_FOUND', findings: 1, findingsList: [FINDING], provider: 'glm', status: 'glm' }
+    : { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'glm', status: 'glm' }),
+    alpha: { ...BASE.alpha, bloodhoundRounds: 2 } } })
+  const rev = find('alpha-revise')
+  assert.ok(rev.length >= 1)
+  assert.match(rev[0].prompt, /VERSION PROVENANCE \(hard rule\)/)
+})
+
+// ─── merge-and-state-hygiene AC16: Certify uses the worktree shim when the hunt changes it ───
+const certShimPathFn = () => {
+  const lines = SRC.split('\n')
+  const i = lines.findIndex(l => l.startsWith('const SHIM_SOURCES = '))
+  const body = lines.slice(i, i + 4).join('\n')   // SHIM_SOURCES + the 3-line certShimPath arrow
+  return new Function(`${body}\nreturn { SHIM_SOURCES, certShimPath }`)()
+}
+
+test('AC16: certShimPath picks the worktree shim only when the diff touches a shim source AND the worktree holds a shim', () => {
+  const { SHIM_SOURCES, certShimPath } = certShimPathFn()
+  assert.deepEqual(SHIM_SOURCES, ['scripts/podman-vibe.sh', 'scripts/lib/wolfpack-ratelimit.sh', 'scripts/lib/wolfpack-sandbox.sh'])
+  const base = { packShim: '/pack/scripts/podman-vibe.sh', worktreePath: WT }
+  for (const f of SHIM_SOURCES) {
+    assert.equal(certShimPath({ ...base, changed: [f], worktreeShimExists: true }), `${WT}/scripts/podman-vibe.sh`, f)
+  }
+  assert.equal(certShimPath({ ...base, changed: [], worktreeShimExists: true }), base.packShim, 'no shim change')
+  assert.equal(certShimPath({ ...base, changed: ['scripts/other.sh'], worktreeShimExists: true }), base.packShim, 'unrelated change')
+  assert.equal(certShimPath({ ...base, changed: ['scripts/podman-vibe.sh'], worktreeShimExists: false }), base.packShim, 'shim absent in the worktree')
+  assert.equal(certShimPath({ ...base, changed: ['scripts/podman-vibe.sh'], worktreeShimExists: 'yes' }), base.packShim, 'only boolean true counts')
+  assert.equal(certShimPath({ ...base, changed: null, worktreeShimExists: true }), base.packShim)
+})
+
+test('AC16: a hunt that changes the shim certifies on the WORKTREE shim; review seats keep the pack shim', async () => {
+  const { find, logs, result } = await runHunt({ answers: { 'cert-shim-probe': { changed: ['scripts/podman-vibe.sh'], worktreeShimExists: true } } })
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  const wd = find('watchdog:')[0].prompt
+  assert.ok(hasHandoffCall(wd, `'${WT}/scripts/podman-vibe.sh'`, ' wolfpack-watchdog-glm '), 'GLM certify on the worktree shim')
+  assert.ok(hasHandoffCall(wd, `'${WT}/scripts/podman-vibe.sh'`, ' wolfpack-watchdog '), 'Mistral certify on the worktree shim')
+  assert.equal(wd.includes(`'/pack/scripts/podman-vibe.sh'`), false)
+  assert.ok(find('pointer:')[0].prompt.includes(`'/pack/scripts/podman-vibe.sh'`), 'the Pointer keeps the pack shim')
+  assert.ok(logs.some(l => l.startsWith(`Certify seat shim: ${WT}/scripts/podman-vibe.sh (the hunt worktree shim`)), logs.join('\n'))
+  const probe = find('cert-shim-probe')[0]
+  assert.equal(probe.opts.label, 'cert-shim-probe:h')
+  assert.equal(probe.opts.model, 'sonnet')
+  assert.match(probe.prompt, /Read-only probe\. Do NOT modify/)
+  assert.ok(probe.prompt.includes(`diff --name-only main..HEAD -- 'scripts/podman-vibe.sh' 'scripts/lib/wolfpack-ratelimit.sh' 'scripts/lib/wolfpack-sandbox.sh'`), probe.prompt)
+})
+
+test('AC16: the default (no shim change) certifies on the pack shim and logs why', async () => {
+  const { find, logs } = await runHunt({})
+  assert.ok(hasHandoffCall(find('watchdog:')[0].prompt, `'/pack/scripts/podman-vibe.sh'`, ' wolfpack-watchdog '))
+  assert.ok(logs.some(l => l.startsWith('Certify seat shim: /pack/scripts/podman-vibe.sh (the pack shim')), logs.join('\n'))
+  assert.equal(find('cert-shim-probe-retry').length, 0, 'a valid first answer needs no retry')
+})
+
+test('AC16: an invalid probe answer is retried ONCE; still invalid → parks cert_shim_probe_failed (fail closed), never certifies', async () => {
+  for (const bad of [{}, null, { changed: 'scripts/podman-vibe.sh', worktreeShimExists: true }, { changed: [], worktreeShimExists: 'no' }]) {
+    const { result, find } = await runHunt({ answers: { 'cert-shim-probe': () => bad } })
+    assert.equal(result.status, 'parked:cert_shim_probe_failed', JSON.stringify(bad))
+    assert.equal(find('cert-shim-probe').length, 2, 'probe + one retry')
+    assert.equal(find('cert-shim-probe-retry').length, 1)
+    assert.equal(find('watchdog:').length, 0)
+    assert.equal(find('verify').length, 0)
+    assert.match(find('park:h:cert_shim_probe_failed')[0].prompt, /resume_phase: Certify/)
+  }
+})
+
+test('AC16: an invalid first answer then a valid retry certifies with the RETRY\'s shim', async () => {
+  const { result, find } = await runHunt({ answers: {
+    'cert-shim-probe': (_p, o) => (o.label.startsWith('cert-shim-probe-retry') ? { changed: ['scripts/lib/wolfpack-sandbox.sh'], worktreeShimExists: true } : {}),
+  } })
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY', JSON.stringify(result))
+  assert.ok(hasHandoffCall(find('watchdog:')[0].prompt, `'${WT}/scripts/podman-vibe.sh'`, ' wolfpack-watchdog '))
+})
+
+test('AC16: the parked skill registers cert_shim_probe_failed (clarify → re-run Certify)', () => {
+  const skill = readFileSync(join(PACK_ROOT, '.agents', 'skills', 'parked', 'SKILL.md'), 'utf8')
+  const row = skill.split('\n').find(l => /^\|.*`cert_shim_probe_failed`/.test(l))
+  assert.ok(row)
+  assert.match(row, /clarify → re-run Certify/)
 })

@@ -32,7 +32,7 @@ Your final response MUST end with the exact block in "## Finishing message" belo
 2. Read `.wolfpack/campaigns/<slug>/metadata.json`. If it has no `chain` block with `chain.mode == "chain"` →
    STOP: *"`<slug>` is not a chain campaign — use /merge-wave."*
 3. Read `node "$PACK/scripts/wolfpack-config.mjs" --json` once (exit 2 → STOP with its problem line) and keep
-   `devDeployCommand`, `tagPattern`, `changelogFile` and `complianceAreas`; read wolfpack-config.md →
+   `devDeployCommand`, `tagPattern`, `releaseTags`, `changelogFile` and `complianceAreas`; read wolfpack-config.md →
    Deployment Notes → **Migration command** by eye (the first backticked span, or `none`).
 
 ## Step 1 — Reconcile `main`, then check
@@ -104,6 +104,11 @@ absent, use `v[0-9]*` and say so. Use the `bump` of every `included` hunt from t
 `BUMP=major` → STOP and confirm with the operator (MAJOR is reserved for a production launch — same rule as
 `/merge-wave`). `BUMP=none` → tooling-only: no tag.
 
+**No-tag fallback.** If `releaseTags` (Step 0's config read) is `false` — wolfpack-config.md → Deployment Notes →
+Tag pattern: `none` — skip the version math, set `VERSION=""`, and say: *This project does not tag releases — no
+tag; hunts are stamped `released_version: null`.* Steps 5–7 then run with the empty version (the changelog stamp
+moves nothing; `merge-commands` prints only the merge; `stamp-released` records `released_version: null`).
+
 ## Step 5 — One CHANGELOG stamp
 Read the changelog file from wolfpack-config.md → Deployment Notes → **Changelog file** (`changelogFile`). If it
 is `none` (or absent), skip this step with the note "No changelog configured — nothing to stamp." The script
@@ -112,8 +117,10 @@ stamps `CHANGELOG.md`; if the configured file is any other name, STOP and say so
 node "$PACK/scripts/wolfpack-release.mjs" changelog --campaign <slug> --version "$VERSION" --apply
 ```
 It moves every included hunt's `<!-- hunt:<slug> -->` lines under one `## [$VERSION] — <date>` heading and
-commits that on `campaign/<slug>` (nothing moves for a tooling-only release). Print its `unattributed`
-warnings verbatim.
+commits that on `campaign/<slug>` (nothing moves for a tooling-only release). Before the stamp it tags any
+untagged `[Unreleased]` item with the hunt whose merge carried it (never deleting one), so an item attributed to
+an included hunt moves under the heading too; that tagging is committed even when nothing else moves. Print its
+`unattributed` warnings verbatim.
 
 ## Step 6 — Merge into `main` + one tag (after the operator approves)
 1. Re-sync immediately before merging — `main` may have advanced during the deploy and sign-offs:
@@ -153,7 +160,8 @@ warnings verbatim.
 node "$PACK/scripts/wolfpack-release.mjs" stamp-released --campaign <slug> --version "$VERSION"
 ```
 It refuses until `campaign/<slug>` is merged into `main`, then stamps each included hunt `status: "merged"`
-with `merge_commit`, `release_merge_commit`, `released_version` (`null` when tooling-only) and `merged_at`.
+(via the shared `stampMerged`, phase `done`) with `merge_commit`, `release_merge_commit`, `released_version`
+(`null` when tooling-only) and `merged_at`.
 Print its `push` lines for the operator, verbatim. Never run them yourself.
 - Final release (no `--checkpoint`): also print `git branch -d campaign/<slug>` and, for each hunt worktree,
   the worktree-cleanup prompt from `"$PACK/.agents/commands/merge.md"` step 8.

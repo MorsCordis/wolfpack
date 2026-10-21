@@ -111,6 +111,12 @@ Tests must exercise the code's actual behavior, not work around it. If a test is
 
 If you find yourself simplifying a test to make it pass, stop. Either the test setup is wrong (fix it) or the implementation has a bug (trigger a Shepherd rewrite). A test that passes by avoiding the hard parts is worse than no test — it provides false confidence.
 
+### No assertions a release stamp invalidates
+Never assert pre-release state that `/merge`, `/merge-wave` or `/release-campaign` will change — e.g. "this hunt's
+CHANGELOG entries are under `[Unreleased]`", a metadata `status` of `certified`, or the absence of a version tag.
+The first post-tag CI run turns such a test red. Assert the stable property instead: "the entry exists under
+`[Unreleased]` or a version heading", "status is `certified` or `merged`".
+
 ## Running Tests
 
 Use the project's **Test command** (`wolfpack-config.md → Project Identity / Deployment`) — including its narrowing flags (single app, single test class, fail-fast, fresh DB) where the project provides them.
@@ -227,6 +233,9 @@ If tests expose legitimate bugs in the implementation (Yellow+ tiers, not Blue):
    ```
 2. Update `metadata.json`: `status: "test_rewrite_needed"`, `tracker_round: <N>`
 3. Finishing message directs to `/shepherd --tracker-rewrite=N`
+
+Under the pipeline (`hunt-pipeline.js`) a bounce loops back to Implement in the same run, bounded by
+`tracker_rounds`, then parks `non_convergence`; the `/shepherd --tracker-rewrite=N` route is the manual path.
 
 ## MANDATORY OUTPUT
 

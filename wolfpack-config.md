@@ -39,7 +39,7 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 ## Plan Review Checklist (Bloodhound uses this)
 - Cross-repo effects named: which consumer copies regenerate, which consumer config keys a change requires.
 - The running session caches named workflows: a workflow change takes effect only for the NEXT run. The run start logs the running script's stamped version; a mismatch stops the run with "restart Claude Code".
-- Review seats may lack `node` in their sandbox image: plans must not depend on a review seat running node suites.
+- The GLM review image ships `node` (Containerfile.wolfpack-glm; rebuild an older image with `scripts/wolfpack-build-images.sh`). The base (Mistral) seat image still has none (TODO: unified sandbox image): a plan must not depend on a Mistral seat running node suites.
 
 ## Multi-Tenancy
 - Not applicable.

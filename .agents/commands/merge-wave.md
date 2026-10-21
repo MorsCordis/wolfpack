@@ -94,13 +94,16 @@ deliberate omissions — **do not lay a tag and do not stamp a version heading p
 3. `git merge --no-ff <branch> -m "Merge branch '<branch>'"` then `git push origin main`.
    `--no-ff` keeps each hunt a single cleanly-revertible merge commit — this is what makes a
    smoke failure revert exactly one hunt (AC3).
-4. **Plan copy-back + stamp MERGED** (only if `worktree_path` set) — same as `/merge` step 7:
-   copy `.wolfpack/plans/<slug>/` back to the main repo, collision-archive, then stamp the
-   main-repo metadata as the authoritative done-log: `status: "merged"`, `phase: "done"`,
-   `merged_at` (`date -Iseconds`), `merge_commit` (this hunt's `--no-ff` merge SHA). Leave
-   `released_version` to be backfilled in Step 3 (the wave tag isn't laid until all merges
-   finish). Do NOT leave it at `certified` — a shipped hunt reading `certified` is exactly the
-   divergence that makes the kickoff re-run merged work.
+4. **Plan copy-back + stamp MERGED.** When `worktree_path` is set, copy the plan dir back with the
+   script (same as `/merge` step 7 — contents copied into the main checkout's
+   `.wolfpack/plans/<slug>/`, never nested, no `.prior-<ts>` archive):
+   `node "$PACK/scripts/wolfpack-merge-state.mjs" copy-back --slug <slug> --from "<worktree_path>/.wolfpack/plans/<slug>"`.
+   Then ALWAYS (worktree hunt or `--no-worktree` hunt) stamp it merged:
+   `node "$PACK/scripts/wolfpack-merge-state.mjs" stamp-merged --slug <slug> --merge-commit <this hunt's merge SHA>`
+   (`status: "merged"`, `phase: "done"`, `merge_commit`, `merged_at`; `released_version` is left unset
+   and backfilled in Step 3 — the wave tag isn't laid until all merges finish). Do NOT leave it at
+   `certified` — a shipped hunt reading `certified` is exactly the divergence that makes the
+   kickoff re-run merged work.
 5. **CHANGELOG: fold under `[Unreleased]` only.** Confirm the hunt's entries carry
    `<!-- hunt:<slug> -->` under `## [Unreleased]`. Do **NOT** create a `## [version]` heading
    yet — that happens once, in Step 3. If a hunt has no attributed entries and is not
@@ -123,13 +126,18 @@ abort leaves them recoverable.
      (`feedback_tooling_only_no_version_bump`).
    - If `BUMP=major`: STOP and confirm with the user — MAJOR is reserved for prod launch and
      should not auto-apply on a dev wave.
-   - If `BUMP=none` (every hunt tooling-only): skip tagging entirely (jump to Step 4). Tell the
-     user "Tooling-only wave — no version tag."
+   - If `BUMP=none` (every hunt tooling-only), or `node "$PACK/scripts/wolfpack-config.mjs" --json`
+     → `releaseTags` is `false` (Deployment Notes → Tag pattern: `none`): lay no tag and
+     no version heading (skip items 2's stamp and 3's tag/push, but still run item 3's
+     `released_version` backfill with `""`, then continue to Step 4) and say so visibly ("Tooling-only wave — no version tag." / "This project
+     does not tag releases — no tag."). The `released_version` backfill below then uses `""`.
 2. **Stamp the CHANGELOG ONCE.** Create a single `## [$VERSION] — <YYYY-MM-DD>` heading
    immediately after `## [Unreleased]`, and move **every** wave hunt's `<!-- hunt:<slug> -->`
    entries (across all merged hunts) under it, grouped by category (### Added / ### Fixed /
-   ### Changed). Leave any unmatched `[Unreleased]` items in place and warn if they're
-   unattributed. Commit on a `fix/changelog-wave-$1-$2` branch, merge `--no-ff` to main, push.
+   ### Changed). Run `node "$PACK/scripts/wolfpack-merge-state.mjs" attribute-changelog --file
+   "<changelog file>" --apply` FIRST (before the stamp), so an untagged item the script attributes
+   to a wave hunt moves with it; print its stderr verbatim. Leave any unmatched `[Unreleased]`
+   items in place — unattributable ones are listed loudly, never deleted. Commit on a `fix/changelog-wave-$1-$2` branch, merge `--no-ff` to main, push.
 3. **Lay ONE annotated tag** on the final merge commit (current `main` HEAD):
    ```bash
    git tag -a "$VERSION" -m "$VERSION — <campaign> wave <wave>: <slug list>"
@@ -137,10 +145,13 @@ abort leaves them recoverable.
    ```
    APP_VERSION bakes from this tag via `git describe` at deploy — satisfies tag-before-deploy
    and the image invariant (one image, one tag for the wave).
-   **Backfill `released_version`:** write `released_version: "$VERSION"` into each merged
-   hunt's main-repo `metadata.json` (the Step 2.4 stamp left it pending). Now each hunt's
-   on-disk log carries `status: merged` + `merge_commit` + `released_version` — the full
-   authoritative done-record the kickoff reads without touching git.
+   **Backfill `released_version`:** per merged hunt, run
+   `node "$PACK/scripts/wolfpack-merge-state.mjs" stamp-merged --slug <slug> --merge-commit <that hunt's merge SHA, recorded in Step 2.6> --released-version "$VERSION"`
+   (the Step 2.4 stamp left it pending). A tooling-only wave (`BUMP=none`) or `releaseTags: false`
+   runs the same command with `--released-version ""` (records `released_version: null`) — the
+   backfill still happens, there is just no tag. Now each hunt's on-disk log carries
+   `status: merged` + `merge_commit` + `released_version` — the full authoritative done-record the
+   kickoff reads without touching git.
 4. **Migration detection + graph-collision gate (do NOT run migrations).**
    Skip this step entirely if wolfpack-config.md → Deployment Notes → **Migration file pattern**
    is `none` (the project has no migrations; `HAS_MIGRATIONS` stays false).

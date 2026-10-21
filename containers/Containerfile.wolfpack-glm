@@ -8,6 +8,9 @@
 # separate tag gives GLM a current Vibe WITHOUT changing the Vibe that the Mistral path
 # (and any live hunt) runs on in the base tag.
 #
+# NODE: this layer also ships `node` (>= 22, copied from the official node image) so a GLM review
+# seat can run the node test suites. The base (Mistral) seat image has none.
+#
 # Build (podman-vibe.sh / wolfpack-build-images.sh build it on demand; BASE_IMAGE is
 # REQUIRED — without it the FROM is empty and the build fails):
 #   podman build --build-arg BASE_IMAGE=<sandbox image> -t <glm image> \
@@ -17,4 +20,7 @@ FROM ${BASE_IMAGE}
 
 USER root
 RUN /opt/vibe/bin/pip install --no-cache-dir --upgrade "mistral-vibe>=2.24.1"
+# node for review seats that run the node suites (bookworm's nodejs is 18; the pack needs >= 20.11)
+COPY --from=docker.io/library/node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+RUN node --version
 USER ${WOLFPACK_USER}

@@ -99,6 +99,12 @@ function commandsCheck(ctx) {
       const rel = e.path.slice(dir.length + 1)
       const name = rel.endsWith('.md') ? rel.slice(0, -3) : rel
       if (!rel.includes('/') && rel.endsWith('.md') && allow.includes(name)) continue
+      // A nested entry or a non-.md file can never be allow-listed (only a plain <name>.md directly
+      // under the dir can), so do not point the user at the Project commands list for it.
+      if (rel.includes('/') || !rel.endsWith('.md')) {
+        out.push({ path: e.path, fix: `delete \`${e.path}\` (or move a real project-only command to \`${dir}/<name>.md\`) — only a plain <name>.md directly under ${dir} can be allow-listed` })
+        continue
+      }
       out.push({
         path: e.path,
         fix: inventory.commands.has(name)

@@ -163,9 +163,9 @@ For each item you believe genuinely can't be done in this hunt:
 ## Changelog & Version (MANDATORY)
 - **CHANGELOG.md** — draft the entry text verbatim under `[Unreleased]`, grouped by `Added` / `Changed` / `Fixed` / `Removed` as appropriate. Shepherd copies this into the file as-is. **Every line MUST end with `<!-- hunt:<slug> -->`** where `<slug>` is this hunt's feature slug. This invisible HTML comment lets `/merge` attribute items and stamp version headings at tag time. Example: `- Fixed the frobnitz (Ticket #99) <!-- hunt:frobnitz-fix -->`
 - **TODO.md** — name the exact line(s) to remove when this hunt lands (or "no TODO match" if this didn't come from a tracked item).
-- **Proposed version bump** — read `metadata.proposed_version` first. If `/hunt` already set a `bump` and `tag`, validate them against your dimension scoring:
-  - If the user said PATCH but your plan adds user-visible capability → override to MINOR and note the change.
-  - If the user said MINOR but the plan is a pure bug fix → override to PATCH and note the change.
+- **Proposed version bump** — read `metadata.proposed_version` first. If `proposed_version.set_by` is `"human"`, the version is the human's: do NOT change `bump`/`tag`; if your scoring disagrees, run `node "$PACK/scripts/wolfpack-version.mjs" set --plan-dir "$PLAN_DIR" --bump <B> --tag <T> --by alpha --reason '<why>'` (it records a `SEAT NOTE` in `human-notes.md` and leaves metadata unchanged). Otherwise (`set_by` null or a role) validate the `bump`/`tag` against your dimension scoring and write your decision with `--by alpha`:
+  - If the bump was PATCH but your plan adds user-visible capability → override to MINOR and note the change.
+  - If the bump was MINOR but the plan is a pure bug fix → override to PATCH and note the change.
   - If `proposed_version` is null (user skipped at hunt time), pick the bump and compute the tag yourself.
   - Bump types:
     - `PATCH` (0.0.X) — bug fix, polish, smoke-test follow-up, no new user-visible capability
@@ -173,7 +173,7 @@ For each item you believe genuinely can't be done in this hunt:
     - `MAJOR` (X.0.0) — reserved for 1.0.0 production launch (all credential integrations live) — do not propose casually
   - Last released tag: `<run git describe --tags --abbrev=0 and paste it here>`
   - Proposed next tag: `v<X.Y.Z>`
-- **Update `metadata.proposed_version`** — after writing the plan, update `metadata.json`'s `proposed_version.bump` and `proposed_version.tag` to match your final decision. This is the authoritative version that `/merge` and `/smoke` will apply.
+- **Update `metadata.proposed_version`** — after writing the plan, write your final decision ONLY through `node "$PACK/scripts/wolfpack-version.mjs" set --plan-dir "$PLAN_DIR" --bump <B> --tag <T> --by alpha --reason '<why>'` — never hand-edit `metadata.proposed_version`. This is the authoritative version that `/merge` and `/smoke` will apply. A human-set version (`set_by: "human"`) is immutable: the script keeps the human's bump/tag and records your disagreement as a `SEAT NOTE` in `human-notes.md`.
 
 Both `CHANGELOG.md` and `TODO.md` MUST appear in the "Files to Modify" list above with concrete edit text. Do not defer this to Shepherd — the version decision is a scoping decision and belongs in the plan the Bloodhound reviews.
 
@@ -322,13 +322,13 @@ When given a Bloodhound review:
 2. **Accept or reject each finding explicitly.** No silent ignores — every Bloodhound finding must be acknowledged, either by incorporating the change OR by recording why you rejected it. Record these dispositions in `revision-log-N.md` (see 4), NOT inside the plan.
 3. **Edit the plan in place — surgically.** `plan-revised-N.md` must be the COMPLETE, self-contained plan (Shepherd implements from it, so it can't be a diff), but you PRODUCE it by making the minimal targeted edits that address the findings and preserving every untouched section verbatim. Do NOT rewrite, re-explain, or pad sections the findings don't concern. **The plan must not grow round-over-round** (aim to keep it under ~1,200 lines) — a revised plan materially larger than the prior one means you rewrote instead of edited, which both bloats the plan past the headless reviewer's size limit (it times out) AND introduces NEW defects in sections that were already correct: the two failure modes that stall convergence. If the current plan is already oversized (accreted response sections, redundant restatements), COMPACT it back down as part of the revision.
 4. **Log what you changed — in a separate file.** Write the per-finding dispositions (ACCEPTED with what changed, REJECTED with why) to `revision-log-N.md` in the plan dir. Do NOT embed a `## Revisions After Review N` or `## Bloodhound Response` section in the plan itself — that per-round log accreting inside the plan is what bloated it in the first place.
-5. **Re-evaluate the version bump if scope shifted.** If Bloodhound flagged scope creep or you accepted findings that add user-visible surface (new field on a form, new endpoint, new template block), reconsider whether the proposed bump still fits. PATCH → MINOR is the common drift. Update the `## Changelog & Version` section, the CHANGELOG.md draft text, AND `metadata.proposed_version` to match. If the bump changes, call it out explicitly in `## Revisions After Review N`.
+5. **Re-evaluate the version bump if scope shifted.** If Bloodhound flagged scope creep or you accepted findings that add user-visible surface (new field on a form, new endpoint, new template block), reconsider whether the proposed bump still fits. PATCH → MINOR is the common drift. Update the `## Changelog & Version` section and the CHANGELOG.md draft text; if the bump changed, write it ONLY via `node "$PACK/scripts/wolfpack-version.mjs" set --plan-dir "$PLAN_DIR" --bump <B> --tag <T> --by alpha --reason '<why>'` — never hand-edit `metadata.proposed_version`. A human-set version (`set_by: "human"`) is immutable: the script keeps the human's bump/tag and records a SEAT NOTE in `human-notes.md` instead. Call out any bump change in `revision-log-N.md`.
 
 ## Phase 2.5: The Debrief
 
 **Green tier guard:** If `metadata.tier == "Green"`, the debrief is abbreviated — skip the Pedigree Context section and the model pool analysis. Green hunts default to trust-Shepherd with no Pointer/Tracker phases, so model selection is moot for most roles. Still write `debrief.md` and `plan-final.md`.
 
-After the review loop ends (APPROVED or max rounds reached), synthesize `debrief.md`:
+After the review loop ends (APPROVED or max rounds reached), synthesize `debrief.md`. The version is settled here too: a human-set `proposed_version` (`set_by: "human"`) is immutable to this seat — if the final plan's scope makes you disagree, run `wolfpack-version.mjs set … --by debrief --reason '<why>'` (a SEAT NOTE, metadata unchanged); otherwise write any bump change with `--by debrief`. Never hand-edit `metadata.proposed_version`.
 
 ```markdown
 # The Debrief: <feature-slug>

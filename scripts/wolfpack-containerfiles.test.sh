@@ -69,6 +69,18 @@ instr "$GLM" | grep -qE '^ARG BASE_IMAGE=' && no "glm: BASE_IMAGE has a default"
 has "$GLM" '^RUN /opt/vibe/bin/pip install --no-cache-dir --upgrade "mistral-vibe>=2\.24\.1"$' "glm: upgrades Vibe through the venv's pip"
 has "$GLM" '^USER \$\{WOLFPACK_USER\}$' "glm: back to the seat user (from the base's ENV)"
 instr "$GLM" | grep -qE '^FROM [a-z]' && no "glm: a hard-coded FROM image" || ok "glm: no hard-coded FROM image"
+# merge-and-state-hygiene AC18: the GLM layer ships node >= 22 (COPY from the official node image —
+# accepted deviation A4: bookworm's `nodejs` package is 18, the suites need >= 20.11), between
+# `USER root` and the final `USER`, and the build proves it runs.
+has "$GLM" '^COPY --from=docker\.io/library/node:2[2-9][^ ]* /usr/local/bin/node /usr/local/bin/node$' "glm: node >= 22 copied from the official node image"
+has "$GLM" '^RUN node --version$' "glm: the build runs node --version"
+r=$(instr "$GLM" | grep -n '^USER root$' | head -1 | cut -d: -f1)
+n=$(instr "$GLM" | grep -n '^COPY --from=docker\.io/library/node' | head -1 | cut -d: -f1)
+v=$(instr "$GLM" | grep -n '^RUN node --version$' | head -1 | cut -d: -f1)
+last=$(instr "$GLM" | grep -n '^USER ' | tail -1 | cut -d: -f1)
+[ -n "$r" ] && [ -n "$n" ] && [ -n "$v" ] && [ -n "$last" ] && [ "$r" -lt "$n" ] && [ "$n" -lt "$v" ] && [ "$v" -lt "$last" ] \
+  && ok "glm: node COPY + check sit between USER root and the final USER" || no "glm: node order (root $r / copy $n / check $v / user $last)"
+grep -qE '^# .*node' "$GLM" && ok "glm: the header comment mentions node" || no "glm: header comment does not mention node"
 
 echo
 echo "──────────────────────────────"
