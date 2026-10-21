@@ -200,7 +200,7 @@ and warns that it may deploy the main checkout instead of the branch.
 
 ```bash
 cd {worktree}
-VERSION=$(git describe --tags --always 2>/dev/null || echo "dev-{slug}")
+VERSION=$(git describe --tags --always --match 'v[0-9]*' 2>/dev/null || echo "dev-{slug}")
 ./deploy.sh staging --version "$VERSION"     # your project's branch-deploy command(s)
 ```
 

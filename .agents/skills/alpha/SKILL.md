@@ -171,7 +171,7 @@ For each item you believe genuinely can't be done in this hunt:
     - `PATCH` (0.0.X) — bug fix, polish, smoke-test follow-up, no new user-visible capability
     - `MINOR` (0.X.0) — new feature, sprint/wave completion, user-visible capability added
     - `MAJOR` (X.0.0) — reserved for 1.0.0 production launch (all credential integrations live) — do not propose casually
-  - Last released tag: `<run git describe --tags --abbrev=0 and paste it here>`
+  - Last released tag: `<run git describe --tags --abbrev=0 --match 'v[0-9]*' and paste it here>`
   - Proposed next tag: `v<X.Y.Z>`
 - **Update `metadata.proposed_version`** — after writing the plan, write your final decision ONLY through `node "$PACK/scripts/wolfpack-version.mjs" set --plan-dir "$PLAN_DIR" --bump <B> --tag <T> --by alpha --reason '<why>'` — never hand-edit `metadata.proposed_version`. This is the authoritative version that `/merge` and `/smoke` will apply. A human-set version (`set_by: "human"`) is immutable: the script keeps the human's bump/tag and records your disagreement as a `SEAT NOTE` in `human-notes.md`.
 

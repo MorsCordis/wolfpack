@@ -35,7 +35,7 @@ consumer() {
   echo "$(realpath "$d")"
 }
 listing() { find "$@" -printf '%p %l\n' 2>/dev/null | LC_ALL=C sort; }
-VERSION="$(git -C "$PACK" describe --tags)"
+VERSION="$(git -C "$PACK" describe --tags --match 'v[0-9]*')"
 COMMIT="$(git -C "$PACK" rev-parse HEAD)"
 FIX="bash '$PACK/install.sh'"
 

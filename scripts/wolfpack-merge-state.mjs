@@ -28,6 +28,7 @@
 //
 // Run tests: node --test scripts/wolfpack-merge-state.test.mjs
 
+import { spawnSync } from 'node:child_process'
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, copyFileSync,
   lstatSync, readlinkSync, symlinkSync, unlinkSync, realpathSync, statSync,
@@ -47,6 +48,13 @@ const writeMeta = (path, meta) => writeFileSync(path, JSON.stringify(meta, null,
 
 // ─── 1. copy-back ─────────────────────────────────────────────────
 
+// Paths (relative to dir) that git tracks there; [] when dir is not in a work tree.
+export function trackedIn(dir) {
+  const r = spawnSync('git', ['-C', dir, 'ls-files', '-z', '--', '.'], { encoding: 'utf8' })
+  if (r.status !== 0) return []
+  return r.stdout.split('\0').filter(Boolean)
+}
+
 const sameBytes = (a, b) => {
   try {
     const x = readFileSync(a)
@@ -56,7 +64,11 @@ const sameBytes = (a, b) => {
 }
 
 // Copy the CONTENTS of `src` into `dest`, file by file. Never creates <dest>/<basename(src)>.
-export function copyBack({ src, dest }) {
+// `skip` holds src-relative paths to leave alone: the files git tracks on the hunt branch
+// (pedigree.json) arrive with the merge itself, and an untracked copy made before the merge
+// would make `git merge` abort ("untracked working tree files would be overwritten").
+export function copyBack({ src, dest, skip = [] }) {
+  const skipSet = new Set(skip)
   if (!src || !existsSync(src) || !statSync(src).isDirectory()) {
     throw new Error(`copy-back: source plan dir ${src} does not exist`)
   }
@@ -80,6 +92,7 @@ export function copyBack({ src, dest }) {
         mkdirSync(d, { recursive: true })
         walk(r)
       } else if (ent.isFile()) {
+        if (skipSet.has(r)) continue
         mkdirSync(dirname(d), { recursive: true })
         if (existsSync(d) && !sameBytes(s, d)) overwritten.push(r)
         copyFileSync(s, d)
@@ -285,7 +298,9 @@ function main(argv) {
       const slug = needSlug(f.slug)
       if (typeof f.from !== 'string') throw new ChainError('--from <worktree plan dir> is required')
       const dest = join(root, '.wolfpack', 'plans', slug)
-      return emit({ status: 'copied', slug, dest, ...copyBack({ src: resolve(f.from), dest }) })
+      const src = resolve(f.from)
+      const skip = trackedIn(src)
+      return emit({ status: 'copied', slug, dest, ...copyBack({ src, dest, skip }), ...(skip.length ? { skipped_tracked: skip } : {}) })
     }
     if (cmd === 'stamp-merged') {
       const rv = f['released-version']

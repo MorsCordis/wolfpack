@@ -30,7 +30,12 @@
 //
 // CLI (JSON on stdout with --json; human lines on stderr):
 //   run    --stage S --record-dir D [--repo R] [--rev REV] [--config PATH] [--timeout-min N] [--json]
-//   ensure (same flags)  reuse a pass/fail record at the target commit + command; else run
+//   ensure (same flags) [--fresh]  reuse a pass/fail record at the target commit + command; else run.
+//                        --fresh always re-takes (the gate's fix line adds it after a failure).
+//                        A FAILING record is re-taken instead when the hunt was re-armed after it
+//                        was taken (<record-dir>/human-notes.md modified after its finished_at):
+//                        an environment fix (expired credentials, a shared-DB collision) must get
+//                        a fresh run at the same commit, not the stale failure.
 //   check  --stage S --record-dir D [--rev REV] [--repo R] [--json]   never runs
 //   gate   (same flags as check)  check; a STALE record (tip moved) is re-run once, then re-checked
 // Exit codes: run/ensure 0 = pass, 2 = fail; check/gate 0 = allow, 2 = refuse (prints the fix
@@ -42,7 +47,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
+  closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -98,9 +103,10 @@ export function checkRecord(record, { sha, command, verdictCommand, stage } = {}
 }
 
 // The exact command that (re-)takes a record.
-export function fixLine({ stage, recordDir, rev, repo, pack }) {
+// fresh: the refused record FAILED at this commit, so plain `ensure` would reuse it; --fresh re-takes it.
+export function fixLine({ stage, recordDir, rev, repo, pack, fresh = false }) {
   const script = join(pack, 'scripts', 'wolfpack-test-record.mjs')
-  return `node ${shq(script)} ensure --stage ${stage} --record-dir ${shq(recordDir)} --rev ${shq(rev)}${repo ? ` --repo ${shq(repo)}` : ''}`
+  return `node ${shq(script)} ensure${fresh ? ' --fresh' : ''} --stage ${stage} --record-dir ${shq(recordDir)} --rev ${shq(rev)}${repo ? ` --repo ${shq(repo)}` : ''}`
 }
 
 // ─── host I/O ────────────────────────────────────────────────────────────────
@@ -121,6 +127,7 @@ function parseArgs(argv) {
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]
     if (a === '--json') { o.json = true; continue }
+    if (a === '--fresh') { o.fresh = true; continue }
     if (takes[a]) {
       if (i + 1 >= rest.length) throw new InfraError(`${a} needs a value`)
       o[takes[a]] = rest[++i]
@@ -269,6 +276,17 @@ function emit(o, obj, human) {
 
 const recordLine = (r, reused) => `wolfpack-test-record: ${r.stage} ${r.commit.slice(0, 12)} ${r.pass ? 'PASS' : 'FAIL'} — ${r.summary} [${reused ? 'reused' : `ran in ${r.ran_in}`}] log ${r.log}`
 
+// A failing record is stale once a human re-armed the hunt after it finished: /resolve and a
+// manual re-arm both write human-notes.md, and the usual reason is an environment fix. Seat
+// notes appended by wolfpack-version.mjs keep the file's mtime, so only human writes count.
+export function rearmedSince(recordDir, rec) {
+  const notes = join(resolve(recordDir), 'human-notes.md')
+  if (!rec || rec.pass || !existsSync(notes)) return false
+  const done = Date.parse(rec.finished_at || '')
+  if (!Number.isFinite(done)) return false
+  return statSync(notes).mtimeMs > done
+}
+
 export async function main(argv) {
   let o = { json: argv.includes('--json') }
   try {
@@ -282,7 +300,7 @@ export async function main(argv) {
     if (o.cmd === 'run' || o.cmd === 'ensure') {
       if (o.cmd === 'ensure') {
         const j = judge()
-        if (j.state === 'pass' || j.state === 'fail') {
+        if (!o.fresh && (j.state === 'pass' || (j.state === 'fail' && !rearmedSince(o.recordDir, j.rec)))) {
           emit(o, { ...j.rec, reused: true }, recordLine(j.rec, true))
           return j.rec.pass ? 0 : 2
         }
@@ -300,10 +318,11 @@ export async function main(argv) {
       ran = true
       j = judge()
     }
-    const res = { stage: o.stage, target: c.sha, state: j.state, ok: j.ok, reason: j.reason, ran, record_path: c.paths.json, fix: j.ok ? null : fix }
+    const fixFor = j.state === 'fail' ? fixLine({ stage: o.stage, recordDir: resolve(o.recordDir), rev: o.rev || 'HEAD', repo: o.repo ? resolve(o.repo) : null, pack: PACK_ROOT, fresh: true }) : fix
+    const res = { stage: o.stage, target: c.sha, state: j.state, ok: j.ok, reason: j.reason, ran, record_path: c.paths.json, fix: j.ok ? null : fixFor }
     emit(o, res, j.ok
       ? `wolfpack-test-record: ${o.cmd} ALLOW — passing ${o.stage} record at ${c.sha.slice(0, 12)}`
-      : `wolfpack-test-record: ${o.cmd} REFUSE — ${j.state}: ${j.reason}\n  fix: ${fix}`)
+      : `wolfpack-test-record: ${o.cmd} REFUSE — ${j.state}: ${j.reason}\n  fix: ${fixFor}`)
     return j.ok ? 0 : 2
   } catch (e) {
     const msg = e instanceof InfraError ? e.message : (e && e.stack) || String(e)

@@ -290,7 +290,9 @@ writes two files to the plan dir:
 `/release-campaign`).
 
 **Reuse rule.** `ensure` reuses a record whose commit (and test command) equals the target and
-re-runs only when HEAD moved. Watchdog cites the record when its commit equals HEAD instead of
+re-runs only when HEAD moved, with one exception: a FAILING record is re-taken when the hunt was
+re-armed after it (`human-notes.md` in the plan dir modified after the record's `finished_at`). That way,
+an environment fix such as refreshed credentials gets a fresh run at the same commit. Watchdog cites the record when its commit equals HEAD instead of
 re-running the suite.
 
 **Gates.** A failing `tracker` record bounces the hunt to Implement before Certify. A failing

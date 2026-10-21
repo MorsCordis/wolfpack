@@ -16,7 +16,7 @@
 //
 // Run tests: node --test scripts/wolfpack-version.test.mjs
 
-import { existsSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, appendFileSync, statSync, utimesSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { parseFlags } from './wolfpack-chain.mjs'
 
@@ -101,8 +101,13 @@ function main(argv) {
       const block = seatNoteBlock({ date, role: r.disagreement.role, current: r.disagreement.current, proposed: r.disagreement.proposed, reason: r.disagreement.reason })
       const prior = existsSync(np) ? readFileSync(np, 'utf8') : ''
       const sep = prior === '' ? '' : (prior.endsWith('\n\n') ? '' : (prior.endsWith('\n') ? '\n' : '\n\n'))
+      // A SEAT NOTE is not a human re-arm: keep the file's mtime (test-record `ensure` reads it as
+      // the time of the last human write), and back-date a file the note itself creates.
+      const before = existsSync(np) ? statSync(np) : null
       if (prior === '') writeFileSync(np, block)
       else appendFileSync(np, sep + block)
+      if (before) utimesSync(np, before.atime, before.mtime)
+      else utimesSync(np, new Date(0), new Date(0))
     }
     console.log(JSON.stringify({ applied: r.applied, disagreement: r.disagreement, proposed_version: r.meta.proposed_version || null }, null, 2))
     return 0
