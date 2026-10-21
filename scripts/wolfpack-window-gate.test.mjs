@@ -139,7 +139,7 @@ test('collectEvents: file older than the window is SKIPPED but still counts as r
 // ════════════════════════════════════════════════════════════════════════════
 import {
   computeUsageDecision, thresholdsFromEnv, readSnapshot, normTier, isValidWindow,
-  flatten, snapshotUnusableReason, DEFAULT_THRESHOLDS, WEEK_MS, WEEKLY_UNAVAILABLE_NOTE,
+  flatten, snapshotUnusableReason, snapshotStaleOnly, DEFAULT_THRESHOLDS, WEEK_MS, WEEKLY_UNAVAILABLE_NOTE,
 } from './wolfpack-window-gate.mjs'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -230,9 +230,9 @@ test('usage AC2: thresholds env-overridable; invalid values THROW (fail loud, ne
     WOLFPACK_USAGE_STALE_MINUTES: '30', WOLFPACK_5H_START_MAX_PCT: '85', WOLFPACK_5H_START_MAX_PCT_RED: '60',
     WOLFPACK_WEEKLY_PACE_POINTS: '5', WOLFPACK_WEEKLY_DEFER_PCT: '95',
   })
-  assert.deepEqual(all, { staleMinutes: 30, fiveHourMaxPct: 85, fiveHourMaxPctRed: 60, weeklyPacePoints: 5, weeklyDeferPct: 95,
-    fiveHourBoundaryPct: 95, weeklyBoundaryPct: 98 })   // run-observability: boundary ceilings keep their defaults
-  assert.deepEqual(thresholdsFromEnv({}), { staleMinutes: 10, fiveHourMaxPct: 80, fiveHourMaxPctRed: 70, weeklyPacePoints: 15, weeklyDeferPct: 90,
+  assert.deepEqual(all, { staleMinutes: 30, lastKnownMaxMinutes: 120, fiveHourMaxPct: 85, fiveHourMaxPctRed: 60, weeklyPacePoints: 5, weeklyDeferPct: 95,
+    fiveHourBoundaryPct: 95, weeklyBoundaryPct: 98 })   // run-observability: boundary ceilings keep their defaults; consolidation-acceptance: last-known max too
+  assert.deepEqual(thresholdsFromEnv({}), { staleMinutes: 10, lastKnownMaxMinutes: 120, fiveHourMaxPct: 80, fiveHourMaxPctRed: 70, weeklyPacePoints: 15, weeklyDeferPct: 90,
     fiveHourBoundaryPct: 95, weeklyBoundaryPct: 98 })
   for (const [k, v] of [['WOLFPACK_5H_START_MAX_PCT', 'abc'], ['WOLFPACK_5H_START_MAX_PCT', '101'],
     ['WOLFPACK_5H_START_MAX_PCT_RED', '-1'], ['WOLFPACK_WEEKLY_PACE_POINTS', 'NaN'],
@@ -879,5 +879,185 @@ test('run-observability AC5 CLI: an invalid boundary threshold in boundary mode 
     const s = runGate(['--json'], { snapshot: liveSnap(), env: { WOLFPACK_5H_BOUNDARY_MAX_PCT: 'abc' } })
     assert.equal(s.code, 1)
     assert.equal(s.stdout, '')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// consolidation-acceptance AC7/AC8 — the BOUNDARY gate decides on the last-known live figures when
+// the snapshot is merely stale (nothing renders the status line during a long headless phase), instead
+// of the spurious "window gate DISABLED"; the start gate and every broken-snapshot case stay as before.
+// ════════════════════════════════════════════════════════════════════════════
+const MIN = 60 * 1000
+// The shape recorded in the wave-5 usage-gate.jsonl: a valid snapshot (5h 40%, 7d 60%) 12 min old.
+const wave5 = (over = {}) => snap({ fh: 40, sd: 60, capturedAgoMs: 12 * MIN, ...over })
+
+test('consolidation-acceptance AC7: boundary + valid snapshot 12 min old → last-known figures, degraded, never DISABLED', () => {
+  const d = bdecide(wave5())
+  assert.doesNotMatch(d.reason, /DISABLED/)
+  assert.equal(d.decision, 'proceed')
+  assert.equal(d.exit, PROCEED)
+  assert.equal(d.five_hour_pct, 40)
+  assert.equal(d.seven_day_pct, 60)
+  assert.equal(d.source, 'last_known')
+  assert.equal(d.degraded, true)
+  assert.equal(d.gateEnabled, true)
+  assert.equal(d.mode, 'boundary')
+  assert.match(d.degraded_reason, /12 min old/)
+  assert.match(d.degraded_reason, /deciding on the last-known live figures/)
+  assert.match(d.reason, /^boundary \(last-known, 12 min old\): 5h 40% < 95%; week 60% < 98%/)
+  assert.equal(d.captured_at, wave5().captured_at)
+  assert.equal(d.offload, false)
+  for (const k of ALWAYS_KEYS) assert.ok(k in d, k)
+  noNaN(d)
+  // an estimate that is NOT configured (the transcript fallback's DISABLED proceed) does not override it
+  const disabledEst = () => computeDecision({ events: [], nowMs: NOW, limit: null, headroomPct: 15, windowMs: WIN, readOk: true })
+  const d2 = computeUsageDecision({ snapshot: wave5(), nowMs: NOW, tier: 'Yellow', estimate: disabledEst, mode: 'boundary' })
+  assert.equal(d2.source, 'last_known')
+  assert.doesNotMatch(d2.reason, /DISABLED/)
+  // a configured estimate that says proceed does not override it either
+  const okEst = () => ({ decision: 'proceed', exit: PROCEED, reason: 'estimate: fine', reset_at: null, gateEnabled: true })
+  assert.equal(computeUsageDecision({ snapshot: wave5(), nowMs: NOW, tier: 'Yellow', estimate: okEst, mode: 'boundary' }).source, 'last_known')
+})
+
+test('consolidation-acceptance AC7: the same stale snapshot in START mode is unchanged (transcript estimate, DISABLED when unconfigured)', () => {
+  const d = decide(wave5())
+  assert.equal(d.source, 'transcript_estimate')
+  assert.equal(d.degraded, true)
+  assert.equal(d.mode, 'start')
+  assert.equal(d.five_hour_pct, null)
+  assert.equal(d.seven_day_pct, null)
+  assert.match(d.reason, /DISABLED/)
+  assert.match(d.degraded_reason, /12 min old/)
+})
+
+test('consolidation-acceptance AC7: last-known figures still enforce the boundary ceilings (5h 96% / 7d 99% → defer)', () => {
+  const d = bdecide(wave5({ fh: 96 }))
+  assert.equal(d.decision, 'defer')
+  assert.equal(d.exit, DEFER)
+  assert.equal(d.source, 'last_known')
+  assert.equal(d.degraded, true)
+  assert.equal(d.five_hour_pct, 96)
+  assert.match(d.reason, /^boundary \(last-known, 12 min old\): 5h 96% ≥ 95%/)
+  assert.equal(d.reset_at, new Date(NOW + 2 * HOUR).toISOString())
+  const w = bdecide(wave5({ fh: 10, sd: 99 }))
+  assert.equal(w.decision, 'defer')
+  assert.match(w.reason, /7d 99% ≥ 98%/)
+  // a window whose resets_at passed since capture reads 0% (A-6 reset handling applies to last-known too)
+  const reset = bdecide(snap({ fh: 99, fhResetInMs: -5 * MIN, sd: 10, capturedAgoMs: 30 * MIN }))
+  assert.equal(reset.decision, 'proceed')
+  assert.equal(reset.source, 'last_known')
+  assert.equal(reset.five_hour_pct, 0)
+  // no weekly window: still decides on the 5h figure, week n/a
+  const noWeek = bdecide(snap({ fh: 20, seven_day: null, capturedAgoMs: 15 * MIN }))
+  assert.equal(noWeek.source, 'last_known')
+  assert.equal(noWeek.seven_day_pct, null)
+  assert.match(noWeek.reason, /week n\/a/)
+})
+
+test('consolidation-acceptance AC7/AC8: beyond WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES (default 120) the old loud path runs', () => {
+  const old = bdecide(wave5({ capturedAgoMs: 200 * MIN }))
+  assert.equal(old.source, 'transcript_estimate')
+  assert.match(old.reason, /DISABLED/)
+  assert.equal(old.five_hour_pct, null)
+  // the edge: exactly at the max still decides; one minute past does not
+  assert.equal(bdecide(wave5({ capturedAgoMs: 120 * MIN })).source, 'last_known')
+  assert.equal(bdecide(wave5({ capturedAgoMs: 121 * MIN })).source, 'transcript_estimate')
+  // the knob moves the line
+  const th = thresholdsFromEnv({ WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES: '30' })
+  assert.equal(th.lastKnownMaxMinutes, 30)
+  assert.equal(bdecide(wave5({ capturedAgoMs: 25 * MIN }), 'Yellow', th).source, 'last_known')
+  assert.equal(bdecide(wave5({ capturedAgoMs: 35 * MIN }), 'Yellow', th).source, 'transcript_estimate')
+  // a fresh snapshot is still plain live (not last_known)
+  const fresh = bdecide(wave5({ capturedAgoMs: 1 * MIN }))
+  assert.equal(fresh.source, 'live')
+  assert.equal(fresh.degraded, false)
+})
+
+test('consolidation-acceptance AC8: missing / no-five_hour / future / bad captured_at in boundary mode keep today\'s degraded estimate path', () => {
+  const cases = {
+    missing: [null, 'snapshot missing (/x)'],
+    staleNoFiveHour: [snap({ five_hour: null, capturedAgoMs: 12 * MIN }), null],
+    staleBadFiveHour: [snap({ five_hour: { used_percentage: '40', resets_at: sec(NOW + HOUR) }, capturedAgoMs: 12 * MIN }), null],
+    future: [snap({ capturedAgoMs: -5 * MIN }), null],
+    badCapturedAt: [{ ...wave5(), captured_at: 'yesterday-ish' }, null],
+    noCapturedAt: [{ rate_limits: wave5().rate_limits }, null],
+    unparseable: [null, 'snapshot unparseable (/x: bad json)'],   // readSnapshot never returns a snapshot WITH an error
+  }
+  for (const [name, [s, err]] of Object.entries(cases)) {
+    const d = computeUsageDecision({ snapshot: s, snapshotError: err, nowMs: NOW, tier: 'Yellow', thresholds: DEFAULT_THRESHOLDS, mode: 'boundary' })
+    assert.equal(d.source, 'transcript_estimate', name)
+    assert.equal(d.degraded, true, name)
+    assert.equal(d.mode, 'boundary', name)
+    assert.equal(d.five_hour_pct, null, name)
+    assert.match(d.reason, /DISABLED/, `${name}: unconfigured estimate stays loud`)
+  }
+})
+
+test('consolidation-acceptance AC8: boundary + stale + a CONFIGURED estimate that says defer → the defer wins (fail closed)', () => {
+  // configured but unreadable transcripts → computeDecision defers (readOk:false)
+  const unreadable = () => computeDecision({ events: [], nowMs: NOW, limit: 1_000_000, headroomPct: 15, windowMs: WIN, readOk: false })
+  const d = computeUsageDecision({ snapshot: wave5(), nowMs: NOW, tier: 'Yellow', thresholds: DEFAULT_THRESHOLDS, estimate: unreadable, mode: 'boundary' })
+  assert.equal(d.decision, 'defer')
+  assert.equal(d.exit, DEFER)
+  assert.equal(d.source, 'transcript_estimate')
+  assert.equal(d.degraded, true)
+  assert.equal(d.mode, 'boundary')
+  assert.match(d.degraded_reason, /12 min old/)
+  // a configured estimate over headroom also wins over a low last-known reading
+  const over = () => ({ decision: 'defer', exit: DEFER, reason: 'estimate: over headroom', reset_at: '2026-06-07T13:00:00.000Z', gateEnabled: true })
+  const d2 = computeUsageDecision({ snapshot: wave5({ fh: 5 }), nowMs: NOW, tier: 'Yellow', estimate: over, mode: 'boundary' })
+  assert.equal(d2.decision, 'defer')
+  assert.equal(d2.reason, 'estimate: over headroom')
+})
+
+test('consolidation-acceptance: snapshotStaleOnly is true only for stale-but-valid snapshots within the last-known max', () => {
+  const th = DEFAULT_THRESHOLDS
+  assert.equal(snapshotStaleOnly(wave5(), NOW, th), true)
+  assert.equal(snapshotStaleOnly(wave5({ capturedAgoMs: 5 * MIN }), NOW, th), false, 'fresh is not stale')
+  assert.equal(snapshotStaleOnly(wave5({ capturedAgoMs: 10 * MIN }), NOW, th), false, 'exactly at staleMinutes is not stale')
+  assert.equal(snapshotStaleOnly(wave5({ capturedAgoMs: 200 * MIN }), NOW, th), false, 'too old')
+  assert.equal(snapshotStaleOnly(snap({ five_hour: null, capturedAgoMs: 12 * MIN }), NOW, th), false)
+  assert.equal(snapshotStaleOnly(snap({ capturedAgoMs: -5 * MIN }), NOW, th), false, 'future')
+  for (const bad of [null, undefined, 'x', 42, {}, { captured_at: 5 }, { ...wave5(), captured_at: 'nope' }]) {
+    assert.equal(snapshotStaleOnly(bad, NOW, th), false, JSON.stringify(bad))
+  }
+})
+
+test('consolidation-acceptance: WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES invalid values THROW naming the variable', () => {
+  for (const v of ['abc', '0', '-5', 'NaN', 'Infinity']) {
+    assert.throws(() => thresholdsFromEnv({ WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES: v }), /WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES/, v)
+  }
+  // a CLI with the bad knob is a hard error (exit 1), never a silent default
+  const r = runGate(['--json', '--boundary'], { snapshot: liveSnap(), env: { WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES: 'abc' } })
+  assert.equal(r.code, 1)
+  assert.match(r.stderr, /WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES/)
+})
+
+test('consolidation-acceptance AC7 CLI: --boundary --record on a 12-min-old snapshot records a last_known line with real figures + a DEGRADED stderr', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wflk-'))
+  try {
+    const rec = join(dir, 'usage-gate.jsonl')
+    const s = liveSnap({ fh: 40, sd: 60 })
+    s.captured_at = new Date(Date.now() - 12 * MIN).toISOString()
+    const r = runGate(['--json', '--boundary', '--phase', 'Certify', '--record', rec], { snapshot: s })
+    assert.equal(r.code, 0, r.stderr)
+    assert.equal(r.json.source, 'last_known')
+    assert.equal(r.json.degraded, true)
+    assert.equal(r.json.five_hour_pct, 40)
+    assert.equal(r.json.seven_day_pct, 60)
+    assert.doesNotMatch(r.json.reason, /DISABLED/)
+    assert.match(r.stderr, /DEGRADED — .*min old.*; boundary decided on last-known live figures \(5h 40%, 7d 60%\)/)
+    assert.doesNotMatch(r.stderr, /falling back to the transcript estimate/)
+    const line = JSON.parse(readFileSyncRO(rec, 'utf8').trim())
+    assert.equal(line.phase, 'Certify')
+    assert.equal(line.source, 'last_known')
+    assert.equal(line.degraded, true)
+    assert.equal(line.five_hour_pct, 40)
+    assert.equal(line.seven_day_pct, 60)
+    assert.doesNotMatch(line.reason, /DISABLED/)
+    // the start gate on the same snapshot keeps the old degraded warning
+    const st = runGate(['--json'], { snapshot: s })
+    assert.equal(st.json.source, 'transcript_estimate')
+    assert.match(st.stderr, /falling back to the transcript estimate/)
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })

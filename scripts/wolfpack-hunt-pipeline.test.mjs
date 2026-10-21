@@ -1198,7 +1198,9 @@ test('human-patch gate: no staged patches → no park, Code Review runs', async 
 test('human-patch gate: an unapplied patch parks human_patch at Implement, before any code review', async () => {
   const patch = `${PD}/human-patches/01-guard.patch`
   const { result, find } = await runHunt({ answers: {
-    'human-patch-check': { pending: [{ patch, paths: ['.claude/hooks/bash-guards.sh'], applies: true }] },
+    // consolidation-acceptance: the probe relays wolfpack-human-patches.mjs check, so every pending item
+    // carries its target + repo (no back-compat default for a missing one).
+    'human-patch-check': { pending: [{ patch, rel: '01-guard.patch', paths: ['.claude/hooks/bash-guards.sh'], applies: true, target: 'hunt', repo: WT }], consumer: null },
   } })
   assert.equal(result.verdict, 'PARKED')
   assert.equal(result.status, 'parked:human_patch')
@@ -1214,11 +1216,158 @@ test('human-patch gate: a patch staged during a Pointer rework parks before the 
   const { result, find } = await runHunt({ answers: {
     pointer: (p, opts) => issues(pointerRoundOf(opts), 'glm'),
     'human-patch-check': (p, opts, n) => n === 1 ? { pending: [] }
-      : { pending: [{ patch: `${PD}/human-patches/01-guard.patch`, paths: ['.claude/hooks/bash-guards.sh'], applies: false }] },
+      : { pending: [{ patch: `${PD}/human-patches/01-guard.patch`, paths: ['.claude/hooks/bash-guards.sh'], applies: false, target: 'hunt', repo: WT }], consumer: null },
   } })
   assert.equal(result.status, 'parked:human_patch')
   assert.equal(find('pointer:').length, 1, 'parks after the round-1 rework, before round 2')
   assert.match(find('park:h:human_patch')[0].prompt, /does NOT apply cleanly/)
+})
+
+// ─── consolidation-acceptance AC1–AC3: the human-patch gate knows each patch's target repo ───
+const CWT = '/consumer/.claude/worktrees/h'
+const consumerPending = (over = {}) => ({ patch: `${PD}/human-patches/consumer/01-smoke.patch`, rel: 'consumer/01-smoke.patch',
+  paths: ['.claude/hooks/smoke.sh'], applies: true, target: 'consumer', repo: CWT, ...over })
+
+test('consolidation-acceptance AC2: the gate probe runs the deterministic CLI (not an LLM git walk) with plan dir + worktree', async () => {
+  const { find } = await runHunt()
+  const probe = find('human-patch-check')[0]
+  assert.ok(probe.prompt.includes(`node '/pack/scripts/wolfpack-human-patches.mjs' check --plan-dir '${PD}' --worktree '${WT}'; echo "RC=$?"`), probe.prompt)
+  assert.match(probe.prompt, /return the command's JSON stdout VERBATIM/)
+  assert.doesNotMatch(probe.prompt, /git apply --check -R/, 'the old in-prompt probe is gone')
+  assert.equal(probe.opts.schema.properties.pending.items.properties.target.enum.join(','), 'hunt,consumer')
+  assert.deepEqual(probe.opts.schema.properties.pending.items.required, ['patch', 'paths', 'applies', 'target', 'repo'])
+})
+
+test('consolidation-acceptance AC3: a pending CONSUMER patch parks with git -C <consumer> apply/add/commit and names the consumer branch', async () => {
+  const { result, find } = await runHunt({ answers: {
+    'human-patch-check': { pending: [consumerPending()], consumer: { path: CWT, branch: 'feat/h' } },
+  } })
+  assert.equal(result.status, 'parked:human_patch')
+  assert.equal(find('pointer:').length, 0)
+  const park = find('park:h:human_patch')[0].prompt
+  assert.ok(park.includes(`git -C ${CWT} apply ${PD}/human-patches/consumer/01-smoke.patch`), park)
+  assert.ok(park.includes(`git -C ${CWT} add .claude/hooks/smoke.sh`))
+  assert.ok(park.includes(`git -C ${CWT} commit -m`))
+  assert.ok(!park.includes(`git -C ${WT} apply ${PD}/human-patches/consumer/01-smoke.patch`), 'never the hunt worktree for a consumer patch')
+  assert.ok(!park.includes(`git -C ${WT} add`), 'no hunt-worktree add line when only a consumer patch is pending')
+  assert.ok(park.includes(`commit them on feat/h (consumer worktree ${CWT})`), 'the needFromUser names the consumer branch')
+  assert.match(park, /resume_phase: Code Review/)
+})
+
+test('consolidation-acceptance AC3: hunt + consumer patches → one add/commit block per repo; both branches named', async () => {
+  const hunt = { patch: `${PD}/human-patches/01-guard.patch`, rel: '01-guard.patch', paths: ['.claude/hooks/bash-guards.sh'], applies: true, target: 'hunt', repo: WT }
+  const { result, find } = await runHunt({ answers: {
+    'human-patch-check': { pending: [hunt, consumerPending({ applies: false })], consumer: { path: CWT, branch: 'feat/consumer-h' } },
+  } })
+  assert.equal(result.status, 'parked:human_patch')
+  const park = find('park:h:human_patch')[0].prompt
+  assert.ok(park.includes(`git -C ${WT} apply ${PD}/human-patches/01-guard.patch\n  git -C ${WT} add .claude/hooks/bash-guards.sh\n  git -C ${WT} commit -m`), park)
+  assert.ok(park.includes(`git -C ${CWT} apply ${PD}/human-patches/consumer/01-smoke.patch   # does NOT apply cleanly: inspect it first`))
+  assert.ok(park.includes(`git -C ${CWT} add .claude/hooks/smoke.sh`))
+  assert.ok(park.includes(`commit them on feat/h (hunt worktree) and feat/consumer-h (consumer worktree ${CWT})`))
+  assert.ok(park.indexOf(`git -C ${WT} apply`) < park.indexOf(`git -C ${CWT} apply`), 'hunt group first')
+})
+
+test('consolidation-acceptance AC2: an already-applied consumer patch (CLI pending: []) → no park, Code Review runs', async () => {
+  const { result, find } = await runHunt({ answers: { 'human-patch-check': { pending: [], consumer: { path: CWT, branch: 'feat/h' } } } })
+  assert.notEqual(result.status, 'parked:human_patch')
+  assert.equal(find('park:h:human_patch').length, 0)
+  assert.ok(find('pointer:').length >= 1)
+})
+
+test('consolidation-acceptance fail closed: an unreadable / inconsistent check parks human_patch "could not run" — never "nothing pending"', async () => {
+  const cases = {
+    'CLI error': [{ pending: [], error: 'a consumer-targeted human patch needs metadata.consumer_worktree.path (absolute)' }, /consumer_worktree\.path/],
+    'no target (old shape)': [{ pending: [{ patch: `${PD}/human-patches/01-guard.patch`, paths: ['x'], applies: true }] }, /has no valid target/],
+    'unknown target': [{ pending: [consumerPending({ target: 'elsewhere' })], consumer: { path: CWT, branch: 'b' } }, /has no valid target/],
+    'missing repo': [{ pending: [{ ...consumerPending(), repo: undefined }], consumer: { path: CWT, branch: 'b' } }, /names repo undefined, expected/],
+    'hunt patch, wrong repo': [{ pending: [{ patch: `${PD}/human-patches/01-g.patch`, paths: ['x'], applies: true, target: 'hunt', repo: '/elsewhere' }], consumer: null }, /names repo "\/elsewhere", expected "\/repo\/\.agents\/worktrees\/h"/],
+    'consumer patch, no consumer recorded': [{ pending: [consumerPending()], consumer: null }, /needs metadata\.consumer_worktree\.path/],
+    'consumer repo mismatch': [{ pending: [consumerPending({ repo: WT })], consumer: { path: CWT, branch: 'b' } }, /expected "\/consumer\/\.claude\/worktrees\/h"/],
+    'null answer': [null, /the check returned nothing/],
+  }
+  for (const [name, [answer, re]] of Object.entries(cases)) {
+    const { result, find } = await runHunt({ answers: { 'human-patch-check': () => answer } })
+    assert.equal(result.status, 'parked:human_patch', name)
+    assert.equal(result.verdict, 'PARKED', name)
+    assert.equal(find('pointer:').length, 0, `${name}: no review on an unreadable check`)
+    const park = find('park:h:human_patch')
+    assert.equal(park.length, 1, name)
+    assert.match(park[0].prompt, /The human-patch check could not run: /, name)
+    assert.match(park[0].prompt, re, name)
+    assert.match(park[0].prompt, /record metadata\.consumer_worktree/, name)
+    assert.ok(park[0].prompt.includes(`wolfpack-human-patches.mjs check --plan-dir ${PD} --worktree ${WT}`), name)
+    assert.doesNotMatch(park[0].prompt, /Apply \(from any shell\)/, `${name}: no apply commands for an unreadable check`)
+  }
+})
+
+test('consolidation-acceptance AC1: Shepherd prompts teach the consumer/ subdir + consumer_worktree; the Debrief asks for each file\'s repo', async () => {
+  const { find } = await runHunt()
+  const shep = find('shepherd:')[0].prompt
+  assert.ok(shep.includes(`${PD}/human-patches/consumer/<NN>-<short-name>.patch`))
+  assert.match(shep, /git -C <consumer worktree> apply --check <patch>/)
+  assert.match(shep, /"consumer_worktree": \{"path": "<abs>", "branch": "<branch>"\}/)
+  // the existing hunt-worktree strings stay
+  assert.match(shep, /human-patches\/<NN>-<short-name>\.patch/)
+  assert.match(shep, /git apply --check <patch>/)
+  assert.match(find('debrief:')[0].prompt, /listing each such file, its repo \(hunt worktree or consumer\), and the exact change/)
+  const glm = (await runHunt({ answers: { 'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] } } })).find('shepherd-glm')[0].prompt
+  assert.ok(glm.includes(`${PD}/human-patches/consumer/<NN>-<short-name>.patch`))
+  assert.match(glm, /"consumer_worktree": \{"path": "<abs>", "branch": "<branch>"\}/)
+})
+
+test('consolidation-acceptance AC1: core drift — the human-patch block is byte-identical (minus export) in the module and hunt-pipeline.js', () => {
+  const RE = /\/\/ ── BEGIN wolfpack-human-patch core[^\n]*\n[\s\S]*?\/\/ ── END wolfpack-human-patch core ──/
+  const modSrc = readFileSync(join(here, 'lib', 'human-patch.mjs'), 'utf8')
+  const wfSrc = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8')
+  const mod = modSrc.match(RE)
+  const wf = wfSrc.match(RE)
+  assert.ok(mod, 'core markers missing in scripts/lib/human-patch.mjs')
+  assert.ok(wf, 'core markers missing in hunt-pipeline.js')
+  for (const name of ['humanPatchTarget', 'humanPatchRepo', 'humanPatchApplySteps']) assert.match(mod[0], new RegExp(`^export function ${name}\\(`, 'm'))
+  assert.match(mod[0], /^export const HUMAN_PATCH_TARGETS = /m)
+  assert.equal(wf[0], mod[0].replace(/^export /gm, ''))
+  assert.doesNotMatch(modSrc, /^import /m, 'the module is pure (the workflow runner cannot import)')
+  assert.equal((wfSrc.match(/^function humanPatchApplySteps\(/gm) || []).length, 1)
+  assert.equal((wfSrc.match(/^const HUMAN_PATCH_TARGETS = /gm) || []).length, 1)
+})
+
+// ─── consolidation-acceptance AC10: Certify parks pedigree_incomplete instead of writing a dashed row ───
+test('consolidation-acceptance AC10: a PASS whose pedigree row was refused → parked:pedigree_incomplete, no Verify', async () => {
+  const err = 'index-row: missing or invalid pedigree scores: Adherence (execution_scores.plan_adherence), Verdict (certifier_verdict)'
+  const { result, find, logs } = await runHunt({ answers: { watchdog: { ...BASE.watchdog, pedigreeRowError: err } } })
+  assert.equal(result.status, 'parked:pedigree_incomplete', JSON.stringify(result))
+  assert.equal(result.verdict, 'PARKED')
+  assert.equal(result.reason, 'pedigree_incomplete')
+  assert.equal(find('verify').length, 0, 'no Verify after a refused row')
+  const park = find('park:h:pedigree_incomplete')
+  assert.equal(park.length, 1)
+  assert.match(park[0].prompt, /resume_phase: Certify/)
+  assert.ok(park[0].prompt.includes(err), 'the park names the missing fields')
+  assert.match(park[0].prompt, /lacks scores, so no index row was written/)
+  assert.ok(logs.some(l => /certification PASSED but the pedigree row was refused/.test(l)))
+})
+
+test('consolidation-acceptance AC10: a PASS without pedigreeRowError is unchanged (Verify runs); a non-PASS with one does not park pedigree_incomplete', async () => {
+  const ok = await runHunt()
+  assert.notEqual(ok.result.status, 'parked:pedigree_incomplete')
+  assert.ok(ok.find('verify').length >= 1)
+  assert.equal(ok.find('park:h:pedigree_incomplete').length, 0)
+  const empty = await runHunt({ answers: { watchdog: { ...BASE.watchdog, pedigreeRowError: '' } } })
+  assert.notEqual(empty.result.status, 'parked:pedigree_incomplete', 'an empty error string is not a refusal')
+})
+
+test('consolidation-acceptance AC10: the cert seat prompt names the required pedigree score fields; VERDICT_SCHEMA carries pedigreeRowError', async () => {
+  const { find } = await runHunt()
+  const wd = find('watchdog:')[0]
+  const seat = wd.prompt.slice(wd.prompt.indexOf('2. Write the Watchdog prompt'), wd.prompt.indexOf('3. Walk the CERTIFIER CHAIN'))
+  assert.match(seat, /pedigree\.json MUST carry certifier_verdict \(pass\|rework\|flawed_plan, matching your verdict\)/)
+  for (const f of ['plan_adherence', 'code_quality', 'implementation_judgment', 'test_result', 'code_review_quality',
+    'test_authoring_quality', 'rework_rounds', 'pointer_rounds', 'tracker_rounds', 'human_interventions',
+    'pointer_value_add', 'tracker_value_add', 'cycle_efficiency']) assert.ok(seat.includes(f), f)
+  assert.equal(wd.opts.schema.properties.pedigreeRowError.type, 'string')
+  assert.match(wd.prompt, /return `pedigreeRowError` = its stderr/)
+  assert.match(wd.prompt, /pass it to the index-row writer \(--duration\) in step 4\.6/)
 })
 
 // ─── seat-profiles-into-pack: toolcheck preflight (AC5) + audit_only (AC6) ───
@@ -2208,7 +2357,11 @@ test('seat-handoff-writes P10: the Watchdog SEAT prompt no longer commits or app
   const s46 = wd.slice(wd.indexOf('4.6 PASS-ONLY ACTIONS'), wd.indexOf('5. If a link failed'))
   assert.match(s46, /YOU, the shim agent — never the certifier seat/)
   // scripts-unfork: the lessons aggregator is the PACK's, run with cwd = the worktree
-  assert.match(s46, /append to\s+\.wolfpack\/pedigree\/index\.md, run `bash '\/pack\/scripts\/wolfpack-lessons\.sh'` \(cwd = the worktree\), then commit/)
+  // consolidation-acceptance: the index row goes through the validating writer (never by hand), then the lessons aggregator
+  assert.match(s46, /write the\s+\.wolfpack\/pedigree\/index\.md row with the validating writer \(cwd = the worktree\) — NEVER by hand/)
+  assert.ok(s46.includes(`node '/pack/scripts/wolfpack-pedigree.mjs' index-row --plan-dir '${PD}' --index .wolfpack/pedigree/index.md --date "$(date -u +%F)" --duration "<DURATION from step 8>"`))
+  assert.match(s46, /If it exits 0, run\s+`bash '\/pack\/scripts\/wolfpack-lessons\.sh'` \(cwd = the worktree\), then commit/)
+  assert.doesNotMatch(s46, /append to\s+\.wolfpack\/pedigree\/index\.md/)
   assert.doesNotMatch(s46, /\.\/scripts\/wolfpack-lessons/)
   assert.ok(s46.includes('FIRST `cd /repo/.agents/worktrees/h`'))
   assert.match(s46, /NEVER `git add \.` \/ `git add -A` \/ `git add -f`\. NEVER stage certification\.md or\s+metadata\.json/)
