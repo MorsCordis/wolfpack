@@ -2,7 +2,7 @@
 
 Aggregated patterns from the last 1 hunts (window: 10).
 Updated by `scripts/wolfpack-lessons.sh`, called at end of every Watchdog cert.
-Last regenerated: 2026-10-21T05:44:52Z
+Last regenerated: 2026-10-21T06:52:05Z
 
 ## Patterns That Work (count >= 3)
 
@@ -21,9 +21,9 @@ _(none yet)_
 ## Parallelism Trends
 
 - Average sub-agents per hunt: 0
-- Average redundancy rate: 0%
+- Average redundancy rate: _(no data yet)_
 - Hunts where parallelism was high-value: _(none yet)_
-- Hunts where parallelism was low-value or none: consolidation-acceptance
+- Hunts where parallelism was low-value or none: _(none yet)_
 
 ## Recommendations for Next Plan
 
