@@ -426,3 +426,30 @@ test('consolidation-acceptance AC9: the merge-and-state-hygiene row in the real 
   assert.equal((c[20].match(/duration 3h 25m 5s/g) || []).length, 1, 'duration appears once');
   assert.match(c[20], /scored after the fact by (glm|mistral) \(consolidation-acceptance\)/, 'a cross-family seat scored it');
 });
+
+test('consolidation-acceptance F3 CLI: a Green pedigree.json with "N/A" round counters and no metadata fallback exits 2 (index untouched); with metadata pointer_round/tracker_round it writes numbers, never a dash in the counter cells', () => {
+  const ped = canonical();
+  ped.execution_scores.code_review_quality = 'N/A';
+  ped.process_value_add.pointer_value_add = 'N/A';
+  ped.execution_scores.pointer_rounds = 'N/A';
+  ped.execution_scores.tracker_rounds = 'N/A';
+  const { plan, index } = planDir({ pedigree: ped, meta: { ...META, tier: 'Green' } });
+  const before = readFileSync(index, 'utf8');
+  const r = pedCli('index-row', '--plan-dir', plan, '--index', index, '--date', '2026-10-21');
+  assert.equal(r.status, 2, r.stdout);
+  assert.ok(r.stderr.includes('PtrRnd (execution_scores.pointer_rounds)'), r.stderr);
+  assert.ok(r.stderr.includes('TrkRnd (execution_scores.tracker_rounds)'), r.stderr);
+  assert.doesNotMatch(r.stderr, /CodeRev|PtrVal/, 'the four Green-excused score fields are not refused');
+  assert.equal(readFileSync(index, 'utf8'), before, 'byte-identical after a refusal');
+
+  delete ped.execution_scores.pointer_rounds;
+  delete ped.execution_scores.tracker_rounds;
+  const { plan: p2, index: i2 } = planDir({ pedigree: ped, meta: { ...META, tier: 'Green', pointer_round: 1, tracker_round: 0 } });
+  const ok = pedCli('index-row', '--plan-dir', p2, '--index', i2, '--date', '2026-10-21');
+  assert.equal(ok.status, 0, ok.stderr);
+  const c = cellsOf(readFileSync(i2, 'utf8').trimEnd().split('\n').pop());
+  assert.equal(c.length, 21);
+  assert.equal(c[2], 'Green');
+  assert.deepEqual(c.slice(17, 19), ['1', '0']);
+  assert.equal(c[11], '—', 'CodeRev N/A on Green is still written as a dash');
+});

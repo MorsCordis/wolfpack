@@ -1268,6 +1268,19 @@ test('consolidation-acceptance AC3: hunt + consumer patches → one add/commit b
   assert.ok(park.indexOf(`git -C ${WT} apply`) < park.indexOf(`git -C ${CWT} apply`), 'hunt group first')
 })
 
+test('consolidation-acceptance F4: a pending patch with no b/ paths (deletion-only) parks with a stage hint, never a pathspec-less `git -C <repo> add`', async () => {
+  const del = { patch: `${PD}/human-patches/01-del.patch`, rel: '01-del.patch', paths: [], applies: true, target: 'hunt', repo: WT }
+  const { result, find } = await runHunt({ answers: {
+    'human-patch-check': { pending: [del, consumerPending()], consumer: { path: CWT, branch: 'feat/h' } },
+  } })
+  assert.equal(result.status, 'parked:human_patch')
+  assert.equal(find('pointer:').length, 0)
+  const park = find('park:h:human_patch')[0].prompt
+  assert.ok(park.includes(`git -C ${WT} apply ${PD}/human-patches/01-del.patch\n  # these patches name no b/ paths: stage the changed files in ${WT} by name before committing\n  git -C ${WT} commit -m`), park)
+  assert.doesNotMatch(park, new RegExp(`git -C ${WT.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&')} add`), 'no pathspec-less hunt add')
+  assert.ok(park.includes(`git -C ${CWT} add .claude/hooks/smoke.sh`), 'the consumer group with paths still stages them')
+})
+
 test('consolidation-acceptance AC2: an already-applied consumer patch (CLI pending: []) → no park, Code Review runs', async () => {
   const { result, find } = await runHunt({ answers: { 'human-patch-check': { pending: [], consumer: { path: CWT, branch: 'feat/h' } } } })
   assert.notEqual(result.status, 'parked:human_patch')

@@ -128,6 +128,53 @@ test('F4: humanPatchApplySteps — patches with no b/ paths never emit a pathspe
   assert.ok(lines.some(l => l.includes('name no b/ paths')), 'a visible hint instead')
 })
 
+test('F4: humanPatchApplySteps — per-repo guard: a path-less hunt group gets the hint, the consumer group still gets its exact add; a group mixing path-less and pathed patches stages only the real paths', () => {
+  const W = '/w/hunt'
+  const C = '/c/consumer'
+  const { steps } = humanPatchApplySteps([
+    { patch: '/d/hp/01-del.patch', paths: [], applies: true, target: 'hunt' },
+    { patch: '/d/hp/consumer/01-del.patch', paths: [], applies: true, target: 'consumer' },
+    { patch: '/d/hp/consumer/02-c.patch', paths: ['.claude/hooks/smoke.sh'], applies: true, target: 'consumer' },
+  ], { worktreePath: W, consumer: { path: C, branch: 'feat/c' }, slug: 'h' })
+  assert.deepEqual(steps.split('\n'), [
+    `  git -C ${W} apply /d/hp/01-del.patch`,
+    `  # these patches name no b/ paths: stage the changed files in ${W} by name before committing`,
+    `  git -C ${W} commit -m "fix(hooks): apply the Shepherd's staged patch"`,
+    `  git -C ${C} apply /d/hp/consumer/01-del.patch`,
+    `  git -C ${C} apply /d/hp/consumer/02-c.patch`,
+    `  git -C ${C} add .claude/hooks/smoke.sh`,
+    `  git -C ${C} commit -m "fix(hooks): apply the Shepherd's staged patch"`,
+  ])
+  // a pending item with no paths key at all is treated like paths: []
+  const { steps: s2 } = humanPatchApplySteps([{ patch: '/d/hp/01.patch', applies: true, target: 'hunt' }],
+    { worktreePath: W, consumer: null, slug: 'h' })
+  assert.ok(!/git -C \S+ add\b/.test(s2), s2)
+  assert.ok(s2.includes('name no b/ paths'), s2)
+})
+
+test('F4 end to end: a REAL deletion-only patch (+++ /dev/null) through the CLI → paths: [] → no pathspec-less add in the park text', () => {
+  const { W, D } = scenario({ consumer: false })
+  g(W, 'rm', '-q', '--', '.claude/hooks/guard.sh')
+  const diff = g(W, 'diff', '--cached', '--', '.claude/hooks/guard.sh') + '\n'
+  g(W, 'reset', '-q', '--', '.claude/hooks/guard.sh')
+  g(W, 'checkout', '-q', '--', '.claude/hooks/guard.sh')
+  assert.match(diff, /^\+\+\+ \/dev\/null$/m, 'git made a deletion patch')
+  put(D, 'human-patches/01-del.patch', diff)
+  const r = cli('check', '--plan-dir', D, '--worktree', W)
+  assert.equal(r.code, 0, r.stdout + r.stderr)
+  assert.equal(r.json.pending.length, 1)
+  assert.deepEqual(r.json.pending[0].paths, [])
+  assert.equal(r.json.pending[0].applies, true)
+  const { steps } = humanPatchApplySteps(r.json.pending, { worktreePath: W, consumer: r.json.consumer, slug: 'h' })
+  const lines = steps.split('\n')
+  assert.ok(!lines.some(l => /^\s*git -C \S+ add\s*$/.test(l) || /^\s*git -C \S+ add\b/.test(l)), steps)
+  assert.deepEqual(lines, [
+    `  git -C ${W} apply ${join(D, 'human-patches', '01-del.patch')}`,
+    `  # these patches name no b/ paths: stage the changed files in ${W} by name before committing`,
+    `  git -C ${W} commit -m "fix(hooks): apply the Shepherd's staged patch"`,
+  ])
+})
+
 test('AC3: humanPatchApplySteps — mixed patches: hunt group first, then consumer; each repo gets its own add (deduped paths) + commit', () => {
   const W = '/w/hunt'
   const C = '/c/consumer'
