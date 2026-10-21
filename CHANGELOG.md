@@ -4,6 +4,19 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+### Added
+- `scripts/wolfpack-human-patches.mjs check`: the human-patch gate's deterministic probe. A patch under `human-patches/consumer/` targets the consumer worktree recorded in `metadata.consumer_worktree`; it is checked there and the park prints that repo's apply/add/commit commands and branch. <!-- hunt:consolidation-acceptance -->
+- `wolfpack-pedigree.mjs index-row`: writes the pedigree index row from `pedigree.json` and refuses (naming the missing fields) a scorecard without execution scores; Certify parks `pedigree_incomplete` instead of writing a dashed row. <!-- hunt:consolidation-acceptance -->
+- README and SETUP state the one-source model. <!-- hunt:consolidation-acceptance -->
+### Changed
+- The boundary usage gate decides on the last-known live figures (labelled `source: last_known`, degraded) when the snapshot is only stale, up to `WOLFPACK_USAGE_LAST_KNOWN_MAX_MINUTES` (default 120), instead of reporting "window gate DISABLED". <!-- hunt:consolidation-acceptance -->
+### Fixed
+- `backfill-merged` proves the older `Merge <branch> (…)` / `Merge <branch>: …` merge subjects, for `feat/<slug>` and the metadata `branch`. <!-- hunt:consolidation-acceptance -->
+- `attribute-changelog` fails closed (exit 2, naming the git error) when `git rev-list --first-parent` fails, instead of treating every entry as unattributable. <!-- hunt:consolidation-acceptance -->
+- `wolfpack-version.mjs set --tag` rejects anything but `vMAJOR.MINOR.PATCH[-prerelease]` or `none`. <!-- hunt:consolidation-acceptance -->
+- The merge-and-state-hygiene pedigree row carries scores (re-scored after the fact by a cross-family seat). <!-- hunt:consolidation-acceptance -->
+- The wolfpack skill and `/merge` no longer claim a `.gitattributes` `union` merge driver on the shared append-only files; none was ever committed. <!-- hunt:consolidation-acceptance -->
+
 ## [v0.5.0] - 2026-10-21
 
 ### Added

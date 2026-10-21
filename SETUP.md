@@ -10,9 +10,11 @@ Wolfpack is harness-agnostic. The roles are `SKILL.md` files (an open standard) 
 - A git repository for your project
 - At least one model per family in your pool (judgment / work-horse / reviewer) — see Step 3
 
-## How distribution works
+## One source
 
-You do **not** copy the skills and commands into each project. Wolfpack lives in one cloned repo, and `install.sh` links your harness's user-level `~/.claude/commands` and `~/.claude/skills` at this repo's canonical `.agents/commands` and `.agents/skills`. The framework's real home is `.agents/` (skills, commands, workflows). Each project then only needs its own `wolfpack-config.md`, a `.wolfpack/` artifacts directory and the generated workflow copies `install.sh` writes into its `.claude/workflows/`.
+Wolfpack is the **one source** of the pipeline. Every pipeline command, role skill, workflow, the router, every pack script, the seat shims and the design docs live once, in this repo. A consuming project keeps only its `wolfpack-config.md`, its `.wolfpack/` artifacts, and its own project skills, commands and hooks. It installs the pack with `install.sh` (`bash install.sh --consumer <repo>` generates the stamped workflow copies; `bash install.sh --check` verifies the install read-only), and the no-copies guard (`scripts/wolfpack-no-copies.mjs`) fails CI if a project tracks a copy.
+
+You do **not** copy the skills and commands into each project. Wolfpack lives in one cloned repo, and `install.sh` links your harness's user-level `~/.claude/commands` and `~/.claude/skills` at this repo's canonical `.agents/commands` and `.agents/skills`. The framework's real home is `.agents/` (skills, commands, workflows). Each project then only needs its own `wolfpack-config.md`, a `.wolfpack/` artifacts directory and the generated workflow copies `install.sh --consumer` writes into its `.claude/workflows/`.
 
 ## Step 1: Clone Wolfpack and run install.sh
 

@@ -109,7 +109,7 @@ Before reading any plan files:
    git push origin main
    ```
 
-   **Note on shared append-only files:** `.gitattributes` configures the `union` merge driver on `pedigree/index.md`, `known-broken-tests.md`, and `cross-cutting-debt.md`. This auto-resolves appends from concurrent hunts without conflicts.
+   **Note on shared append-only files:** No merge driver is configured for the shared append-only files (`pedigree/index.md`, `known-broken-tests.md`, `cross-cutting-debt.md`): git's default text merge applies, so two branches that each append after the same last line conflict, and the conflict is resolved by hand keeping both entries.
 7. **Plan copy-back (only if `worktree_path` was set):** Before removing the worktree, preserve the plan artifacts locally for post-hoc traceability. Plans are gitignored and ride the worktree filesystem — without this step they die with the worktree. Run, from the main checkout:
    ```bash
    node "$PACK/scripts/wolfpack-merge-state.mjs" copy-back --slug "$SLUG" --from "$worktree_path/.wolfpack/plans/$SLUG"
