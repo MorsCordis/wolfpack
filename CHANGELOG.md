@@ -4,6 +4,18 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+### Added
+- `scripts/wolfpack-test-record.mjs`: the pipeline's SHA-stamped full-suite record (commit, exit code, the suite's own summary line, verdict, full raw log beside it), taken by a script with no agent in between, after Tracker (`tracker`), at the final HEAD after the certify commit (`final`) and at the campaign tip (`release`); `ensure` reuses a record whose commit equals the target and re-runs only when it moved. <!-- hunt:run-observability -->
+- Optional `Test verdict command` config key (Project Identity; `{log}`, `{exit}`, `{main}` placeholders) for suites that exit non-zero on documented baseline failures; `wolfpack-config.mjs --json` exposes it as `testVerdictCommand`. <!-- hunt:run-observability -->
+- `wolfpack-window-gate.mjs --boundary` (with `WOLFPACK_5H_BOUNDARY_MAX_PCT`, default 95, and `WOLFPACK_WEEKLY_BOUNDARY_PCT`, default 98) and `--record` / `--record-note` (append-only `usage-gate.jsonl` in the plan dir). <!-- hunt:run-observability -->
+### Changed
+- Review-finding fingerprints are composed by the pipeline from file, symbol and a closed claim class (`scripts/lib/review-convergence.mjs`, byte-identical with the workflow), so a different defect in the same file no longer reads as a fixed finding returning; plan-file revisions normalize to one `plan` key. Seats now supply `symbol` and `claim_class` on every finding. <!-- hunt:run-observability -->
+- `hunt-pipeline.js` re-checks the usage window before every agent phase and parks `model_quota` at the boundary (auto-resuming at that phase) instead of dying mid-agent; a gate that cannot be read proceeds loudly and is recorded, and a gate error parks `usage_gate_error`. <!-- hunt:run-observability -->
+- A failing pipeline test record bounces at Test before Certify; Watchdog takes the test result from the record when its commit equals HEAD; a failing final-HEAD record parks `final_test_record_failed` and the hunt is not mergeable. <!-- hunt:run-observability -->
+- `/merge`, `/merge-wave` and `/release-campaign` refuse to merge without a passing test record at the exact tip being merged, printing the command that re-takes it. <!-- hunt:run-observability -->
+### Fixed
+- The run-start config probe's key leg single-quotes the Wolfpack home (`PACK='<home>'`) in both workflows. <!-- hunt:run-observability -->
+
 ## [v0.4.0] - 2026-10-20
 
 ### Added

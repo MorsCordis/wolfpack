@@ -122,6 +122,14 @@ warnings verbatim.
    ```
    `conflict` → STOP as in Step 1. `merged` → re-run `check` (it must be `ok`; any refusal → STOP and re-run
    `/release-campaign <slug>` from Step 1).
+1b. **Release test record** (run-observability). The tip is now final (Step 5's CHANGELOG commit included), so take
+   the SHA-stamped full-suite record AT the branch that merges into `main`:
+   ```bash
+   node "$PACK/scripts/wolfpack-test-record.mjs" ensure --stage release --record-dir ".wolfpack/campaigns/<slug>" --rev "campaign/<slug>"
+   ```
+   No `--repo`: it runs in a scratch worktree at the campaign tip (the main checkout stays on `main`). Exit ≠ 0 →
+   STOP: print the record's `summary` and `log` path, and do NOT print or run the merge commands. A campaign
+   that does not pass its full suite at the tip never reaches `main`.
 2. Print the commands:
    ```bash
    node "$PACK/scripts/wolfpack-release.mjs" merge-commands --campaign <slug> --version "$VERSION"
@@ -130,7 +138,9 @@ warnings verbatim.
    is not an ancestor of `campaign/<slug>` (`main_not_merged`). Otherwise it prints
    `git merge --no-ff campaign/<slug> -m "Merge branch 'campaign/<slug>'"` and, when `$VERSION` is set,
    `git tag -a <VERSION> -m "<VERSION> — campaign <slug>: <slugs>"`.
-3. Show them and ask: **"Merge campaign/<slug> into main and tag <VERSION>? [y/N]"**. Only on `y`, run them
+3. Show them and ask: **"Merge campaign/<slug> into main and tag <VERSION>? [y/N]"**. Only on `y`, first re-check
+   the release record — `node "$PACK/scripts/wolfpack-test-record.mjs" check --stage release --record-dir ".wolfpack/campaigns/<slug>" --rev "campaign/<slug>"`
+   must exit 0 immediately before the merge (exit 2 → STOP and run the fix line it prints); then run them
    as **two plain Bash calls**, from the main repo on `main`.
    - If the merge **conflicts** (`main` moved after the re-sync): capture
      `git diff --name-only --diff-filter=U`, then `git merge --abort`, print the conflicted files and STOP —
@@ -154,6 +164,7 @@ Print its `push` lines for the operator, verbatim. Never run them yourself.
 - Do NOT push anything (the release is the operator's to push).
 - Do NOT deploy anything but dev; do NOT run prod commands.
 - Do NOT merge `campaign/<slug>` into `main` while any hunt owes a compliance sign-off.
+- Do NOT merge `campaign/<slug>` into `main` without a passing `release` test record at its tip, and never hand-edit `test-record-*.json`.
 - Do NOT fast-forward, force-push, or rebase `main`.
 
 ## Finishing message

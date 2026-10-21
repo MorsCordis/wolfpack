@@ -41,6 +41,7 @@ const hasHandoffCall = (text, shimPrefix, agentTok) => text.split('\n').some(l =
 const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/test-all.sh', worktreeLinks: [],
   complianceAreas: null, compliancePaths: [], devDeployCommand: 'deploy-x', changelogFile: 'CHANGELOG.md',
   tagPattern: 'v[0-9]*', backlogFile: 'TODO.md', missing: [], problems: [],
+  testVerdictCommand: null,   // run-observability: Project Identity → Test verdict command (none)
   // exec-layer-into-pack: the pack home (Project Identity → Wolfpack home) + the Execution Layer.
   wolfpackHome: '/pack',
   // pack-install-model: Project Identity → Worktree root (required by both workflows).
@@ -52,7 +53,7 @@ const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/tes
 // the seat copied the config key (the reader JSON's wolfpackHome — the shell's `~` case already
 // expanded, as the reader's expandHome does). A function of the prompt, like the real seat.
 const probePack = (prompt, keyHome) => {
-  const m = /PACK='((?:[^']|'\\'')*)'; /.exec(prompt || '')
+  const m = /PACK='((?:[^']|'\\'')*)'; echo /.exec(prompt || '')   // env leg only (the key leg is now `PACK='<home>'; case`)
   return m ? m[1].replace(/'\\''/g, "'") : (typeof keyHome === 'string' ? keyHome : '')
 }
 const configAnswer = (cfg = FIXTURE_CONFIG, cwd = '/repo') => (prompt) =>
@@ -71,6 +72,16 @@ const stampAnswer = (opts = {}, exitCode, cwd = '/repo') => {
   const r = stampResult(opts)
   return { exitCode: exitCode ?? (r.ok ? 0 : 1), output: JSON.stringify(r), cwd }
 }
+
+// run-observability: a relayed `wolfpack-test-record.mjs ensure --json` answer for a stage.
+const REC_SHA = 'b'.repeat(40)
+const stageOf = (prompt) => (/ensure --json --stage (\w+)/.exec(prompt || '') || [])[1] || 'tracker'
+const recordAnswer = (stage, over = {}) => ({
+  exitCode: over.exitCode ?? (over.pass === false ? 2 : 0),
+  output: JSON.stringify({ schema: 1, stage, commit: REC_SHA, head: REC_SHA, exit: over.pass === false ? 1 : 0, pass: true,
+    summary: 'test-all: 1 passed, 0 failed', log: `${PD}/test-record-${stage}.log`, command: FIXTURE_CONFIG.testCommand,
+    verdict_command: null, reused: false, ran_in: 'repo', ...Object.fromEntries(Object.entries(over).filter(([k]) => k !== 'exitCode')) }),
+})
 
 const BASE = {
   'project-config': configAnswer(),
@@ -95,6 +106,10 @@ const BASE = {
   'compliance-gate': { determined: true, complianceTouched: false, alreadySignedOff: false },
   verify: { verdict: 'PASS' },
   park: {},
+  // run-observability: the boundary usage gate (one relay per agent phase) proceeds by default,
+  // and the pipeline's SHA-stamped test record passes at every stage (a fn of the prompt's stage).
+  'usage-gate': { exitCode: 0, output: JSON.stringify({ decision: 'proceed', exit: 0, reason: '5h 10% < 95% boundary', source: 'live', degraded: false, mode: 'boundary' }) },
+  'test-record': (prompt) => recordAnswer(stageOf(prompt)),
 }
 
 async function runHunt({ env = {}, answers = {}, args = {}, rawArgs, src = SRC } = {}) {
@@ -243,7 +258,7 @@ test('resume: metadata.shepherd_families=["glm"] keeps glm out of the chain even
 })
 
 test('Pointer rework goes back to the GLM Shepherd (same family that wrote the code)', async () => {
-  const finding = { id: 1, severity: 'MEDIUM', title: 't', file: 'app/x.py', line: 1, claim: 'c', evidence: 'e', fingerprint: 'app/x.py:null-deref' }
+  const finding = { id: 1, severity: 'MEDIUM', title: 't', file: 'app/x.py', line: 1, claim: 'c', evidence: 'e', fingerprint: 'app/x.py:null-deref', symbol: 'x', claim_class: 'missing-handling' }
   const { find } = await runHunt({ answers: {
     'shepherd-seat': { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] },
     pointer: (_p, _o, n) => (n === 1
@@ -260,7 +275,7 @@ test('Pointer rework goes back to the GLM Shepherd (same family that wrote the c
 })
 
 const GLM_SEAT = { shepherdPin: 'glm:5.3', complianceCritical: false, shepherdFamilies: [] }
-const FINDING = { id: 1, severity: 'MEDIUM', title: 't', file: 'app/x.py', line: 1, claim: 'c', evidence: 'e', fingerprint: 'app/x.py:null-deref' }
+const FINDING = { id: 1, severity: 'MEDIUM', title: 't', file: 'app/x.py', line: 1, claim: 'c', evidence: 'e', fingerprint: 'app/x.py:null-deref', symbol: 'x', claim_class: 'missing-handling' }
 // mistral answers: it is cross-family for BOTH a Claude writer and a GLM writer, so the same
 // fixture is a LEGAL accepted review in every scenario below (a glm answer would correctly
 // park cross_family_violation on a GLM-written diff).
@@ -879,7 +894,9 @@ const glmReworkAll = (p) => (/rework/i.test(p)
   : BASE['shepherd-glm'])
 // Distinct fingerprint per round ⇒ classifyConvergence sees "converging" (all-new, flat
 // count), so ONLY the circuit breaker can park — isolates the r1 F3 round accounting.
-const findingFor = (round) => ({ ...FINDING, fingerprint: `app/x.py:defect-r${round}` })
+// run-observability: the pipeline composes fingerprint = file::symbol::claim_class (a seat value is
+// overwritten), so per-round distinctness comes from the SYMBOL.
+const findingFor = (round) => ({ ...FINDING, fingerprint: `app/x.py:defect-r${round}`, symbol: `defect-r${round}` })
 const issues = (round, provider) => ({ verdict: 'ISSUES_FOUND', findings: 1, findingsList: [findingFor(round)], provider })
 
 test('r1 F1: the Claude FINAL round renders its OWN review step — no fallback marker / fallback-record instruction', async () => {
@@ -2800,13 +2817,22 @@ test('AC7 config probe, key leg (env unset): the seat copies Wolfpack home VERBA
     const { calls } = await runHunt({ env })
     const p = calls[0].prompt
     assert.match(p, /Wolfpack home\*\*: its backticked path, VERBATIM — do NOT expand `~`, resolve symlinks or substitute any other path/, JSON.stringify(env))
-    assert.ok(p.includes(`PACK="<home>"; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; echo "PROBE_PWD=$(pwd)"; echo "PACK_HOME=$PACK"; node "$PACK/scripts/wolfpack-config.mjs"`), p)
-    assert.doesNotMatch(p, /PACK='/)
+    // run-observability AC12: the key leg SINGLE-quotes the copied home (no $ / backtick expansion)
+    assert.ok(p.includes(`PACK='<home>'; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; echo "PROBE_PWD=$(pwd)"; echo "PACK_HOME=$PACK"; node "$PACK/scripts/wolfpack-config.mjs"`), p)
+    assert.match(p, /inside the single quotes \(the config reader refuses a pack home that contains a single quote\)/)
+    assert.doesNotMatch(p, /PACK='(?!<home>')/)   // no env-leg literal is injected
+    assert.equal(p.includes('PACK="<home>"'), false)
   }
   // the probe's case line is the reader's expandHome rule — run it for real on the key shapes
   for (const [key, want] of [['~/pk', `${process.env.HOME}/pk`], ['~', process.env.HOME], ['/abs/pk', '/abs/pk'], ['~other/pk', '~other/pk'], ['', '']]) {
-    const out = execFileSync('bash', ['-c', `PACK="${key}"; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; printf %s "$PACK"`], { encoding: 'utf8' })
+    const out = execFileSync('bash', ['-c', `PACK='${key}'; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; printf %s "$PACK"`], { encoding: 'utf8' })
     assert.equal(out, want, key)
+  }
+  // run-observability AC12: a config-derived home with $ / backticks is INERT under the single quotes
+  // (the old double-quoted leg expanded them).
+  for (const key of ['/opt/$HOME/pk', '/opt/`echo hi`/pk', '/opt/$(echo x)/pk']) {
+    const out = execFileSync('bash', ['-c', `PACK='${key}'; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; printf %s "$PACK"`], { encoding: 'utf8' })
+    assert.equal(out, key, key)
   }
 })
 
@@ -2835,4 +2861,567 @@ test("AC7 both examiner gates off + a Claude writer: the plan review PARKS no_cr
   assert.equal(result.status, 'parked:no_cross_family_reviewer', JSON.stringify(result))
   assert.equal(find('bloodhound:').length, 0, 'no same-family (Claude) plan review')
   assert.equal(find('shepherd').length, 0)
+})
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// run-observability — composed fingerprints (AC1–AC3), boundary usage gate (AC4–AC6),
+// SHA-stamped pipeline test record (AC7–AC10), parked-skill rows. Plan-final § Tests.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+import {
+  CLAIM_CLASSES, SYMBOL_NONE, normalizeFingerprintFile, normalizeSymbol, normalizeClaimClass, findingFingerprint,
+  fingerprintFinding, newConvergenceHistory, classifyConvergence, commitRound, suspectedSymbolDrift,
+} from './lib/review-convergence.mjs'
+
+const OSC = JSON.parse(readFileSync(join(here, 'fixtures', 'review-oscillation.json'), 'utf8'))
+const oscCase = (name) => OSC.cases.find(c => c.name === name)
+// The REAL Orange convergence knobs (hunt-pipeline.js CONVERGENCE_BY_TIER.Orange); floor = baseRounds.
+const ORANGE_CONV = { baseRounds: 2, planSmellBound: 12, critPersist: 3, maxRounds: 6 }
+// Replay a fixture case's rounds through the REAL classifier; returns per-round {fps, verdict, drift}.
+function replay(rounds, cfg = ORANGE_CONV) {
+  const history = newConvergenceHistory()
+  return rounds.map((raw, i) => {
+    const findings = raw.map(fingerprintFinding)
+    const drift = suspectedSymbolDrift(history, findings)
+    const verdict = classifyConvergence({ round: i + 1, findings, history, cfg, floor: cfg.baseRounds })
+    commitRound(history, findings, verdict.cumulativeCrit)
+    return { fps: findings.map(f => f.fingerprint), verdict, drift }
+  })
+}
+const fpAt = (c, [round, idx]) => fingerprintFinding(c.rounds[round - 1][idx]).fingerprint
+
+test('run-observability AC1: findingFingerprint composes file::symbol::claim_class with every normalization', () => {
+  assert.equal(findingFingerprint({ file: 'app/x.py', symbol: 'load_rows', claimClass: 'logic-error' }), 'app/x.py::load_rows::logic-error')
+  // missing symbol → '-', unknown / missing class → 'other'
+  assert.equal(findingFingerprint({ file: 'app/x.py', claimClass: 'logic-error' }), `app/x.py::${SYMBOL_NONE}::logic-error`)
+  assert.equal(findingFingerprint({ file: 'app/x.py', symbol: 'f', claimClass: 'made-up-class' }), 'app/x.py::f::other')
+  assert.equal(findingFingerprint({ file: 'app/x.py', symbol: 'f' }), 'app/x.py::f::other')
+  // /workspace/ and ./ prefixes, backslashes, doubled slashes
+  for (const f of ['/workspace/app/x.py', './app/x.py', '/app/x.py', 'app//x.py', 'app\\x.py', '././/app/x.py'])
+    assert.equal(findingFingerprint({ file: f, symbol: 'f', claimClass: 'leak' }), 'app/x.py::f::leak', f)
+  // every plan revision (and no file) → 'plan'
+  for (const f of ['.wolfpack/plans/h/plan.md', '.wolfpack/plans/h/plan-revised-2.md', '/workspace/.wolfpack/plans/h/plan-final.md', '', null, undefined])
+    assert.equal(normalizeFingerprintFile(f), 'plan', String(f))
+  assert.equal(normalizeFingerprintFile('docs/plan.md'), 'docs/plan.md')   // only the hunt plan dir normalizes
+  for (const { file, normalized } of OSC.plan_file_normalization) assert.equal(normalizeFingerprintFile(file), normalized)
+  // symbol: quotes, a leading keyword, a trailing (...), case, whitespace
+  for (const [raw, want] of [['`loadRows`', 'loadrows'], ['function loadRows()', 'loadrows'], ['def load_rows(a, b)', 'load_rows'],
+    ['class Foo', 'foo'], ['§ Files to Modify', 'files-to-modify'], ['section Design Alternatives', 'design-alternatives'], ['  ', SYMBOL_NONE], [null, SYMBOL_NONE]])
+    assert.equal(normalizeSymbol(raw), want, String(raw))
+  // claim class: case and _/space → '-'
+  assert.equal(normalizeClaimClass('Missing_Handling'), 'missing-handling')
+  assert.equal(normalizeClaimClass('silent fallback'), 'silent-fallback')
+  assert.equal(CLAIM_CLASSES.length, 17)
+  assert.ok(CLAIM_CLASSES.includes('other'))
+  assert.ok(Object.isFrozen(CLAIM_CLASSES))
+  // fingerprintFinding never mutates and OVERWRITES a seat-supplied fingerprint; claimClass alias accepted
+  const seat = { file: 'a.js', symbol: 'f', claim_class: 'leak', fingerprint: 'a.js:seat-slug' }
+  const out = fingerprintFinding(seat)
+  assert.equal(out.fingerprint, 'a.js::f::leak')
+  assert.equal(seat.fingerprint, 'a.js:seat-slug')
+  assert.equal(fingerprintFinding({ file: 'a.js', symbol: 'f', claimClass: 'leak' }).fingerprint, 'a.js::f::leak')
+})
+
+test("run-observability AC1: a '::' inside a symbol cannot add a leg; suspectedSymbolDrift still recovers file + class from a 4-leg string", () => {
+  assert.equal(normalizeSymbol('Foo::bar'), 'foo-bar')
+  const fp = findingFingerprint({ file: 'a.js', symbol: 'Foo::bar', claimClass: 'logic-error' })
+  assert.equal(fp.split('::').length, 3)
+  assert.equal(fp, 'a.js::foo-bar::logic-error')
+  // a hand-built history whose fp has 4 legs (defensive split: first = file, last = class)
+  const history = { fpRounds: [new Set(['a.js::ns::old::logic-error']), new Set(['b.js::z::leak'])], counts: [1, 1], cumulativeCritFps: new Set(), critStreak: new Map() }
+  const drift = suspectedSymbolDrift(history, [{ fingerprint: 'a.js::new::logic-error' }])
+  assert.deepEqual(drift, [{ file: 'a.js', claimClass: 'logic-error', was: 'ns::old', now: 'new' }])
+})
+
+test('run-observability AC1: core drift — the convergence block is byte-identical (minus export) in the module and hunt-pipeline.js', () => {
+  const RE = /\/\/ ── BEGIN wolfpack-convergence core[^\n]*\n[\s\S]*?\/\/ ── END wolfpack-convergence core ──/
+  const mod = readFileSync(join(here, 'lib', 'review-convergence.mjs'), 'utf8').match(RE)
+  const wf = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8').match(RE)
+  assert.ok(mod, 'core markers missing in scripts/lib/review-convergence.mjs')
+  assert.ok(wf, 'core markers missing in hunt-pipeline.js')
+  assert.match(mod[0], /^export function classifyConvergence/m)
+  assert.match(mod[0], /^export function suspectedSymbolDrift/m)
+  assert.equal(wf[0], mod[0].replace(/^export /gm, ''))
+  assert.doesNotMatch(mod[0], /\.agents\//)
+  // the module has no imports (pure; the workflow runner cannot import)
+  assert.doesNotMatch(readFileSync(join(here, 'lib', 'review-convergence.mjs'), 'utf8'), /^import /m)
+  // the old inline classifier is gone (exactly one definition in the workflow)
+  const src = readFileSync(join(here, '..', '.agents', 'workflows', 'hunt-pipeline.js'), 'utf8')
+  assert.equal((src.match(/^function classifyConvergence\(/gm) || []).length, 1)
+  assert.equal((src.match(/^const isCriticalSev = /gm) || []).length, 1)
+})
+
+test('run-observability AC1: both grounding prompts pass symbol + claim_class through; the verdict contract lists every class', async () => {
+  const { find } = await runHunt({ answers: { pointer: issuesThenApprove } })
+  for (const p of [find('bloodhound:')[0].prompt, find('pointer:')[0].prompt]) {
+    assert.match(p, /6\.5 FINGERPRINT PARTS/)
+    assert.match(p, /file \+ symbol \+ claim_class/)
+    assert.match(p, /Do NOT invent, reword or compute a fingerprint/)
+    assert.match(p, /\/claim\/evidence\/symbol\/claim_class/)
+    assert.doesNotMatch(p, /\/claim\/evidence\/FINGERPRINT/)
+    assert.doesNotMatch(p, /compute a coarse `fingerprint`/)
+    assert.match(p, /"symbol": "functionOrSection"/)
+    assert.ok(p.includes(`"claim_class" is EXACTLY one of: ${CLAIM_CLASSES.join(', ')}`), 'the contract interpolates the closed list')
+    for (const c of CLAIM_CLASSES) assert.ok(p.includes(c), c)
+  }
+})
+
+test('run-observability AC1: a seat fingerprint is overwritten before classification (the pointer park context shows the composed one)', async () => {
+  // A CRITICAL with the SAME {file, symbol, class} three rounds running, each round with a DIFFERENT
+  // seat slug: under the seat slug it would never be "stuck"; under the composed fp it parks at r3.
+  const crit = (n) => ({ id: 1, severity: 'CRITICAL', title: 't', file: './app/x.py', line: 1, claim: 'c', evidence: 'e',
+    symbol: 'load', claim_class: 'data-integrity', fingerprint: `app/x.py:slug-${n}` })
+  const { result, find } = await runHunt({ answers: { alpha: { ...ORANGE, pointerRounds: 3 },
+    pointer: (_p, _o, n) => ({ verdict: 'ISSUES_FOUND', findings: 1, findingsList: [crit(n)], provider: 'mistral' }),
+    'shepherd-rewrite': { findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true } } })
+  assert.equal(result.status, 'parked:open_critical', JSON.stringify(result))
+  assert.equal(find('pointer:').length, 3)
+  assert.ok(find('park:h:open_critical')[0].prompt.includes('app/x.py::load::data-integrity'))
+})
+
+test('run-observability AC2: the recorded FALSE collisions no longer park oscillation (F1; F2 R2 vs R3)', () => {
+  const f1 = oscCase('F1')
+  assert.equal(f1.label, 'false_collision')
+  assert.notEqual(fpAt(f1, f1.expect.differ[0]), fpAt(f1, f1.expect.differ[1]))
+  const r1 = replay(f1.rounds)
+  for (const r of r1) assert.doesNotMatch(r.verdict.detail, /oscillation/)
+  assert.ok(r1.every(r => r.verdict.action === 'continue'), JSON.stringify(r1.map(r => r.verdict)))
+  // the OLD seat slugs (both 'web/js/calendar.js:fragile-js-test') DID park at R3 — the replay proves the regression
+  const old = newConvergenceHistory()
+  const oldRounds = f1.rounds.map((rs, i) => rs.map(f => ({ ...f, fingerprint: i === 1 ? 'docs/setup.md:x' : 'web/js/calendar.js:fragile-js-test' })))
+  let oldVerdict
+  oldRounds.forEach((fs, i) => { oldVerdict = classifyConvergence({ round: i + 1, findings: fs, history: old, cfg: ORANGE_CONV, floor: 2 }); commitRound(old, fs, oldVerdict.cumulativeCrit) })
+  assert.equal(oldVerdict.action, 'park_non_convergence')
+  assert.match(oldVerdict.detail, /oscillation/)
+  // F2: R2 (submitShiftForm) and R3 (eventDidMount) are different defects
+  const f2 = oscCase('F2')
+  assert.notEqual(fpAt(f2, f2.expect.differ[0]), fpAt(f2, f2.expect.differ[1]))
+  const r2 = replay(f2.rounds)
+  assert.equal(r2[2].verdict.action, 'continue', 'R3 is not a return of R2')
+})
+
+test('run-observability AC3: GENUINE returns still park — F2 R5 and F3 R3 oscillate; the 3-round CRITICAL parks open_critical', () => {
+  const f2 = oscCase('F2')
+  assert.equal(fpAt(f2, f2.expect.same[0]), fpAt(f2, f2.expect.same[1]))
+  const r2 = replay(f2.rounds)
+  for (let i = 0; i < f2.expect.oscillation_at - 1; i++) assert.doesNotMatch(r2[i].verdict.detail, /oscillation/, `F2 R${i + 1}`)
+  const at5 = r2[f2.expect.oscillation_at - 1].verdict
+  assert.equal(at5.action, 'park_non_convergence')
+  assert.match(at5.detail, /oscillation: fingerprint "web\/js\/calendar\.js::eventdidmount::missing-handling" returned/)
+  const f3 = oscCase('F3')
+  assert.notEqual(fpAt(f3, f3.expect.differ[0]), fpAt(f3, f3.expect.differ[1]))
+  assert.equal(fpAt(f3, f3.expect.same[0]), fpAt(f3, f3.expect.same[1]))
+  const r3 = replay(f3.rounds)
+  assert.equal(r3[1].verdict.action, 'continue', 'F3 R2 is distinct')
+  assert.equal(r3[2].verdict.action, 'park_non_convergence')
+  assert.match(r3[2].verdict.detail, /oscillation: fingerprint "hooks\/guard\.sh::exec_re::security"/)
+  const cs = oscCase('critical-stuck')
+  const rc = replay(cs.rounds)
+  assert.equal(rc[cs.expect.action_at.round - 1].verdict.action, cs.expect.action_at.action)
+  assert.equal(rc[0].verdict.action, 'continue')
+  assert.equal(rc[1].verdict.action === 'park_open_critical', false)
+})
+
+test('run-observability AC2/AC3: the fixture file is labelled, generic and covers every label', () => {
+  const labels = new Set(OSC.cases.map(c => c.label))
+  for (const l of ['false_collision', 'genuine_return', 'critical_stuck']) assert.ok(labels.has(l), l)
+  for (const c of OSC.cases) for (const r of c.rounds) for (const f of r) {
+    assert.ok(f.file && f.severity && f.claim_class, `${c.name}: ${JSON.stringify(f)}`)
+    assert.ok(CLAIM_CLASSES.includes(f.claim_class), `${c.name}: closed class ${f.claim_class}`)
+    assert.equal('fingerprint' in f, false, 'the fixture never carries a seat fingerprint')
+  }
+})
+
+test('run-observability: suspectedSymbolDrift is log-only — a renamed returning defect is reported, never parked', () => {
+  const rounds = [
+    [{ severity: 'LOW', file: 'a.js', symbol: 'foo', claim_class: 'logic-error' }],
+    [{ severity: 'LOW', file: 'b.js', symbol: 'bar', claim_class: 'leak' }],
+    [{ severity: 'LOW', file: 'a.js', symbol: 'fooCaller', claim_class: 'logic-error' }],
+  ]
+  const r = replay(rounds)
+  assert.deepEqual(r[2].drift, [{ file: 'a.js', claimClass: 'logic-error', was: 'foo', now: 'foocaller' }])
+  assert.notEqual(r[2].verdict.action, 'park_non_convergence')
+  assert.deepEqual(r[0].drift, [])   // < 2 rounds of history
+  assert.deepEqual(r[1].drift, [])
+  // F1 R3 (different class) and F2 R3 (present in N-1 → not "fixed") are NOT drift
+  assert.deepEqual(replay(oscCase('F1').rounds)[2].drift, [])
+  assert.deepEqual(replay(oscCase('F2').rounds)[2].drift, [])
+  // an exact-match return is the classifier's job, not drift
+  assert.deepEqual(replay(oscCase('F3').rounds)[2].drift, [])
+  // deduped: two findings with the same rename report once
+  const dup = replay([rounds[0], rounds[1], [rounds[2][0], { ...rounds[2][0], title: 'again' }]])
+  assert.equal(dup[2].drift.length, 1)
+})
+
+// The pipeline end to end on a Bloodhound history: answers carry {file, symbol, claim_class} (+ an
+// optional seat fingerprint the pipeline must ignore).
+const bhRounds = (rounds, seatFp) => (_p, _o, n) => {
+  if (n > rounds.length) return { verdict: 'APPROVED', findings: 0, findingsList: [], provider: 'glm', status: 'glm' }
+  const list = rounds[n - 1].map((f, i) => ({ id: i + 1, title: f.title || 't', claim: 'c', evidence: 'e', line: 1, ...f, ...(seatFp ? { fingerprint: seatFp(n) } : {}) }))
+  return { verdict: 'ISSUES_FOUND', findings: list.length, findingsList: list, provider: 'glm', status: 'glm' }
+}
+const REVISE_OK = { findingsAddressed: [{ id: 1, disposition: 'ACCEPTED', justification: 'x' }], allAddressed: true }
+
+test('run-observability AC2 (pipeline): F1 replayed through Bloodhound does NOT park non_convergence at round 3 — even with the old colliding seat slug', async () => {
+  const f1 = oscCase('F1')
+  const { result, find, logs } = await runHunt({ answers: { alpha: { ...ORANGE, bloodhoundRounds: 2 },
+    bloodhound: bhRounds(f1.rounds, (n) => (n === 2 ? 'docs/setup.md:x' : 'web/js/calendar.js:fragile-js-test')),
+    'alpha-revise': REVISE_OK } })
+  assert.notEqual(result.status, 'parked:non_convergence', JSON.stringify(result))
+  assert.equal(find('park:h:non_convergence').length, 0)
+  assert.equal(find('bloodhound:').length, 4, 'three ISSUES rounds, approved at round 4')
+  assert.ok(logs.some(l => /Bloodhound APPROVED at round 4/.test(l)))
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+})
+
+test('run-observability AC3 (pipeline): F3 replayed through Pointer still parks the genuine return at round 3', async () => {
+  const f3 = oscCase('F3')
+  const { result, find } = await runHunt({ answers: { alpha: { ...ORANGE, pointerRounds: 2 },
+    pointer: (_p, _o, n) => ({ verdict: 'ISSUES_FOUND', provider: 'mistral',
+      findingsList: f3.rounds[Math.min(n, 3) - 1].map((f, i) => ({ id: i + 1, claim: 'c', evidence: 'e', line: 1, ...f })) }),
+    'shepherd-rewrite': REVISE_OK } })
+  assert.equal(result.status, 'parked:non_convergence', JSON.stringify(result))
+  assert.equal(find('pointer:').length, 3)
+  assert.match(find('park:h:non_convergence')[0].prompt, /oscillation: fingerprint "hooks\/guard\.sh::exec_re::security"/)
+})
+
+test('run-observability (pipeline): a renamed returning defect logs "suspected oscillation (symbol drift" and does not park at round 3', async () => {
+  const rounds = [
+    [{ severity: 'LOW', file: 'a.js', symbol: 'foo', claim_class: 'logic-error' }],
+    [{ severity: 'LOW', file: 'b.js', symbol: 'bar', claim_class: 'leak' }],
+    [{ severity: 'LOW', file: 'a.js', symbol: 'fooCaller', claim_class: 'logic-error' }],
+  ]
+  const { result, logs, find } = await runHunt({ answers: { alpha: { ...ORANGE, bloodhoundRounds: 2 },
+    bloodhound: bhRounds(rounds), 'alpha-revise': REVISE_OK } })
+  assert.ok(logs.some(l => /⚠ suspected oscillation \(symbol drift: foo vs foocaller\) at a\.js \[logic-error\] — not parked on/.test(l)), logs.filter(l => /suspect/.test(l)).join('\n'))
+  assert.equal(find('park:h:non_convergence').length, 0)
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+})
+
+// ─── AC4–AC6: the boundary usage gate ───
+const GATED = ['Spec', 'Plan', 'Review', 'Debrief', 'Implement', 'Code Review', 'Test', 'Certify']
+const PHASE_FIRST_AGENT = { Spec: 'spec:', Plan: 'alpha:', Review: 'bloodhound:', Debrief: 'debrief:', Implement: 'shepherd:',
+  'Code Review': 'pointer:', Test: 'tracker:', Certify: 'watchdog:' }
+const gateAns = (decision, exitCode, extra = {}) => ({ exitCode, output: JSON.stringify({ decision, exit: exitCode, reason: `r-${decision}`, source: 'live', degraded: false, mode: 'boundary', ...extra }) })
+const gateAt = (phase, ans) => (_p, opts) => (opts.label === `usage-gate:h:${phase}` ? (typeof ans === 'function' ? ans() : ans) : BASE['usage-gate'])
+
+test('run-observability AC4: a fresh run gates EVERY agent phase once, in order, each before that phase\'s first agent; never at Verify', async () => {
+  const { calls, result } = await runHunt({})
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  const gates = calls.filter(c => c.label.startsWith('usage-gate:'))
+  assert.deepEqual(gates.map(c => c.label), GATED.map(p => `usage-gate:h:${p}`))
+  const idx = (pred) => calls.findIndex(pred)
+  let prevAgent = -1
+  for (const p of GATED) {
+    const g = idx(c => c.label === `usage-gate:h:${p}`)
+    const a = idx(c => c.label.startsWith(PHASE_FIRST_AGENT[p]))
+    assert.ok(a > g, `${p}: gate before ${PHASE_FIRST_AGENT[p]}`)
+    assert.ok(g > prevAgent, `${p}: gate after the previous phase's agent`)
+    prevAgent = a
+  }
+  const g0 = gates[0]
+  assert.equal(g0.opts.model, 'sonnet')
+  assert.ok(g0.prompt.includes(`node '/pack/scripts/wolfpack-window-gate.mjs' --json --boundary --phase 'Spec' --record '${PD}/usage-gate.jsonl'; echo "GATE_RC=$?"`), g0.prompt)
+  assert.match(g0.prompt, /Exit 10 is a NORMAL "defer"/)
+  assert.doesNotMatch(g0.prompt, /--record-note/)   // nothing pending
+  assert.ok(calls.findIndex(c => c.label.startsWith('verify:')) > calls.findIndex(c => c.label === 'usage-gate:h:Certify'))
+  // the result carries every gate outcome
+  assert.deepEqual(result.usageGateEvents.map(e => [e.phase, e.kind]), GATED.map(p => [p, 'proceed']))
+})
+
+test('run-observability AC4: a defer at the Implement boundary parks model_quota cleanly — no Shepherd runs', async () => {
+  const { result, find, logs } = await runHunt({ answers: { 'usage-gate': gateAt('Implement', gateAns('defer', 10, { reset_at: '2026-10-21T05:00:00.000Z', reason: 'boundary: 5h 96% ≥ 95%' })) } })
+  assert.equal(result.status, 'parked:model_quota', JSON.stringify(result))
+  assert.equal(result.reason, 'model_quota')
+  assert.equal(result.verdict, 'PARKED')
+  assert.equal(result.resumePhase, 'Implement')
+  assert.equal(result.resetAt, '2026-10-21T05:00:00.000Z')
+  // (the shepherd-SEAT probe belongs to Plan; no implementer of any family runs)
+  assert.equal(find('shepherd:').length + find('shepherd-glm').length + find('shepherd-fallback').length, 0)
+  assert.equal(find('pointer:').length + find('tracker:').length + find('watchdog:').length + find('test-record').length, 0)
+  const park = find('park:h:model_quota')
+  assert.equal(park.length, 1)
+  assert.match(park[0].prompt, /resume_phase: Implement/)
+  assert.ok(logs.some(l => /⏸ h: usage window cannot carry Implement \(boundary: 5h 96% ≥ 95%\) — parking model_quota at the boundary; resumes after 2026-10-21T05:00:00\.000Z/.test(l)))
+  assert.deepEqual(result.usageGateEvents.at(-1), { phase: 'Implement', kind: 'defer', decision: 'defer', degraded: false, why: 'boundary: 5h 96% ≥ 95%' })
+})
+
+test('run-observability AC4: a defer at the very first boundary (Spec) runs no phase agent at all', async () => {
+  const { result, find } = await runHunt({ answers: { 'usage-gate': gateAt('Spec', gateAns('defer', 10)) } })
+  assert.equal(result.status, 'parked:model_quota')
+  assert.equal(result.resumePhase, 'Spec')
+  assert.equal(find('spec:').length + find('alpha:').length, 0)
+})
+
+test('run-observability AC5: an UNAVAILABLE gate (null) proceeds LOUDLY; the next gate carries the note via --record-note', async () => {
+  const { result, find, logs } = await runHunt({ answers: { 'usage-gate': gateAt('Plan', () => null) } })
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  assert.ok(logs.some(l => /⚠ USAGE GATE UNAVAILABLE at Plan \(the gate agent returned no result\) — proceeding UNGATED; recorded in usage-gate\.jsonl/.test(l)))
+  assert.equal(find('alpha:').length, 1, 'Plan ran')
+  const next = find('usage-gate:h:Review')[0].prompt
+  const m = /--record-note '([^']*)'/.exec(next)
+  assert.ok(m, next)
+  assert.deepEqual(JSON.parse(m[1]), [{ at_phase: 'Plan', kind: 'gate_unavailable', why: 'the gate agent returned no result' }])
+  // flushed exactly once
+  assert.doesNotMatch(find('usage-gate:h:Debrief')[0].prompt, /--record-note/)
+  assert.ok(result.usageGateEvents.some(e => e.phase === 'Plan' && e.kind === 'gate_unavailable' && e.degraded === true && e.decision === null))
+})
+
+test('run-observability AC5: garbled / inconsistent gate relays are UNAVAILABLE (proceed + recorded), never a fabricated decision', async () => {
+  for (const [ans, why] of [
+    [{ exitCode: 0, output: 'not json' }, /no parseable JSON decision/],
+    [gateAns('defer', 0), /decision "defer" inconsistent with exit 0/],
+    [gateAns('proceed', 10), /decision "proceed" inconsistent with exit 10/],
+    [{ exitCode: 7, output: '{}' }, /unexpected gate exit 7/],
+  ]) {
+    const { result, logs, find } = await runHunt({ answers: { 'usage-gate': gateAt('Debrief', ans) } })
+    assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY', JSON.stringify(ans))
+    const l = logs.find(x => /USAGE GATE UNAVAILABLE at Debrief/.test(x))
+    assert.ok(l, JSON.stringify(ans))
+    assert.match(l, why)
+    assert.equal(find('debrief:').length, 1)
+    assert.match(find('usage-gate:h:Implement')[0].prompt, /--record-note '.*gate_unavailable/)
+  }
+})
+
+test('run-observability AC5: a gate ERROR (exit 1, or decision error) parks usage_gate_error — never model_quota, no phase agent', async () => {
+  for (const ans of [{ exitCode: 1, output: '' }, gateAns('error', 1, { reason: 'WOLFPACK_5H_BOUNDARY_MAX_PCT must be a number' }), gateAns('error', 0)]) {
+    const { result, find } = await runHunt({ answers: { 'usage-gate': gateAt('Plan', ans) } })
+    assert.equal(result.status, 'parked:usage_gate_error', JSON.stringify(ans))
+    assert.equal(result.reason, 'usage_gate_error')
+    assert.equal(result.resumePhase, 'Plan')
+    assert.equal(find('alpha:').length, 0)
+    assert.equal(find('park:h:model_quota').length, 0)
+    const park = find('park:h:usage_gate_error')
+    assert.equal(park.length, 1)
+    assert.match(park[0].prompt, /resume_phase: Plan/)
+    assert.match(park[0].prompt, /redirect/)
+    assert.match(park[0].prompt, /an invalid WOLFPACK_\* threshold is the usual cause/)
+  }
+})
+
+test('run-observability AC5: a DEGRADED proceed is logged loudly and recorded degraded on the result', async () => {
+  const { result, logs } = await runHunt({ answers: { 'usage-gate': gateAt('Test', gateAns('proceed', 0, { degraded: true, degraded_reason: 'snapshot 30 min old', source: 'transcript_estimate' })) } })
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  assert.ok(logs.some(l => /⚠ USAGE GATE DEGRADED at Test: snapshot 30 min old \(source transcript_estimate\) — decision proceed; recorded/.test(l)))
+  assert.ok(result.usageGateEvents.some(e => e.phase === 'Test' && e.kind === 'proceed' && e.degraded === true))
+  assert.ok(logs.some(l => /^usage gate Spec: proceed — /.test(l)))
+})
+
+test('run-observability AC5: an unavailable gate at Certify (the LAST gated phase) is on the certified result; a later park flushes it to usage-gate.jsonl', async () => {
+  const ok = await runHunt({ answers: { 'usage-gate': gateAt('Certify', () => null) } })
+  assert.equal(ok.result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  assert.ok(ok.result.usageGateEvents.some(e => e.phase === 'Certify' && e.kind === 'gate_unavailable'), JSON.stringify(ok.result.usageGateEvents))
+  // the same, with the FINAL record failing afterwards: the park agent is the flush channel
+  const bad = await runHunt({ answers: { 'usage-gate': gateAt('Certify', () => null),
+    'test-record': (p) => recordAnswer(stageOf(p), stageOf(p) === 'final' ? { pass: false, summary: 'test-all: 9 passed, 1 failed' } : {}) } })
+  assert.equal(bad.result.status, 'parked:final_test_record_failed')
+  const park = bad.find('park:h:final_test_record_failed')[0].prompt
+  assert.match(park, /USAGE-GATE RECORD/)
+  assert.ok(park.includes(`${PD}/usage-gate.jsonl`))
+  assert.match(park, /"kind":"pipeline_note","note":\{"at_phase":"Certify","kind":"gate_unavailable"/)
+  assert.match(park, /"usage_gate_events" = \[.*"phase":"Certify","kind":"gate_unavailable"/)
+  assert.ok(bad.result.usageGateEvents.some(e => e.phase === 'Certify' && e.kind === 'gate_unavailable'))
+})
+
+test('run-observability AC5: with nothing pending, the write-only agents carry no flush step', async () => {
+  const { find } = await runHunt({ answers: { 'usage-gate': gateAt('Implement', gateAns('defer', 10)) } })
+  assert.doesNotMatch(find('park:h:model_quota')[0].prompt, /USAGE-GATE RECORD/)
+})
+
+test('run-observability AC6: a boundary model_quota park auto-resumes AT that phase — no re-plan, the first gate is Implement', async () => {
+  const probe = { fresh: false, status: 'parked:model_quota', parkResumePhase: 'Implement', resumePhase: 'Implement', tier: 'Yellow',
+    worktreePath: WT, planDir: PD, worktreeExists: true, branchExists: true, trackerRounds: 1, pointerRounds: 1, bloodhoundRounds: 1 }
+  const { result, find, calls } = await runHunt({ answers: { 'resume-probe': probe } })
+  assert.equal(find('alpha').length + find('bloodhound').length + find('debrief').length + find('spec:').length, 0)
+  assert.equal(find('shepherd:').length, 1)
+  assert.equal(calls.filter(c => c.label.startsWith('usage-gate:'))[0].label, 'usage-gate:h:Implement')
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+})
+
+// ─── AC7–AC10: the SHA-stamped pipeline test record ───
+test('run-observability AC7: the Test phase relays wolfpack-test-record.mjs ensure (shq-quoted, rc-file wait) and runs no suite itself', async () => {
+  const { find, logs } = await runHunt({})
+  const tr = find('test-record:h:tracker')
+  assert.equal(tr.length, 1)
+  const p = tr[0].prompt
+  assert.equal(tr[0].opts.model, 'sonnet')
+  assert.equal(tr[0].opts.phase, 'Test')
+  assert.ok(p.includes(`node '/pack/scripts/wolfpack-test-record.mjs' ensure --json --stage tracker --record-dir '${PD}' --repo '${WT}'`), p)
+  assert.ok(p.includes(`${PD}/.test-record-tracker.rc`), 'the rc-file wait')
+  assert.match(p, /Do NOT run tests yourself, do NOT summarise, do NOT edit, stage or commit any file/)
+  assert.equal(p.includes('bash scripts/test-all.sh'), false, 'the relay never runs the test command itself')
+  // tracker record comes AFTER the tracker and BEFORE the watchdog
+  const order = find('').map(c => c.label)
+  assert.ok(order.indexOf('test-record:h:tracker') > order.indexOf('tracker:h'))
+  assert.ok(order.indexOf('test-record:h:tracker') < order.findIndex(l => l.startsWith('watchdog:')))
+  assert.ok(logs.some(l => /🧪 test record \(tracker\) bbbbbbbbbbbb: PASS — test-all: 1 passed, 0 failed \[ran in repo\] log /.test(l)))
+  // the Tracker is told the record, not its report, gates Certify
+  const trk = find('tracker:')[0].prompt
+  assert.match(trk, /PIPELINE TEST RECORD: after you return TESTS_PASS the pipeline itself runs bash scripts\/test-all\.sh at the committed HEAD/)
+  assert.match(trk, /commit EVERY test file before returning/)
+})
+
+test('run-observability AC8: a FAILING tracker record bounces at Test even though Tracker said TESTS_PASS — no Certify', async () => {
+  const { result, find, logs } = await runHunt({ answers: { 'test-record': (p) => recordAnswer(stageOf(p), { pass: false, summary: 'test-all: 33 passed, 1 failed', reason: 'suite exit 1' }) } })
+  assert.equal(result.verdict, 'TESTS_FAIL', JSON.stringify(result))
+  assert.equal(result.testRecord.pass, false)
+  assert.equal(result.testRecord.stage, 'tracker')
+  assert.equal(result.testRecord.commit, REC_SHA)
+  assert.equal(result.testRecord.summary, 'test-all: 33 passed, 1 failed')
+  assert.equal(find('watchdog').length, 0)
+  assert.equal(find('usage-gate:h:Certify').length, 0)
+  assert.equal(find('test-rewrite').length, 1)
+  assert.ok(logs.some(l => /⛔ pipeline test record FAILED at b{40}: test-all: 33 passed, 1 failed \(Tracker reported TESTS_PASS\) — bouncing at Test; Certify not entered/.test(l)))
+})
+
+test('run-observability AC8: the bounce routes to Implement, whose rewrite directive points at the record log', async () => {
+  const probe = { fresh: false, status: 'test_rewrite_needed', resumePhase: 'Implement', tier: 'Yellow',
+    worktreePath: WT, planDir: PD, worktreeExists: true, branchExists: true, trackerRounds: 1, pointerRounds: 1, bloodhoundRounds: 1 }
+  const { find } = await runHunt({ answers: { 'resume-probe': probe } })
+  const shep = [...find('shepherd:'), ...find('shepherd-rewrite')].map(c => c.prompt).join('\n')
+  assert.ok(shep.includes(`If ${PD}/test-record-tracker.json exists with "pass": false, the PIPELINE's full-suite run failed (Tracker may have reported a pass) — read ${PD}/test-record-tracker.log first`), 'rewrite directive')
+})
+
+test('run-observability AC8: an UNTRUSTED record fails closed → parked:test_record_error (never a bounce, never certified)', async () => {
+  const cases = [
+    ['commit ≠ head', { head: 'c'.repeat(40) }],
+    ['short commit', { commit: 'abc', head: 'abc' }],
+    ['command mismatch', { command: 'true' }],
+    ['verdict command mismatch', { verdict_command: 'exit 0' }],
+    ['stage mismatch', { stage: 'final' }],
+    ['exit/pass disagree', { exitCode: 0, pass: false }],
+    ['exit 2 but pass', { exitCode: 2 }],
+    ['script infra error', { exitCode: 1 }],
+    ['non-integer exit', { exit: '0' }],
+    ['no log', { log: '' }],
+  ]
+  for (const [name, over] of cases) {
+    const { result, find } = await runHunt({ answers: { 'test-record': (p) => {
+      const a = recordAnswer(stageOf(p), over)
+      if (over.stage) { const o = JSON.parse(a.output); o.stage = over.stage; a.output = JSON.stringify(o) }
+      return a
+    } } })
+    assert.equal(result.status, 'parked:test_record_error', `${name}: ${JSON.stringify(result)}`)
+    assert.equal(result.resumePhase, 'Test', name)
+    assert.equal(find('watchdog').length, 0, name)
+    assert.equal(find('test-rewrite').length, 0, name)
+    assert.match(find('park:h:test_record_error')[0].prompt, /resume_phase: Test/, name)
+  }
+  for (const out of [{ exitCode: 0, output: 'garbled, no json' }, { exitCode: 5, output: '{}' }]) {
+    const { result } = await runHunt({ answers: { 'test-record': out } })
+    assert.equal(result.status, 'parked:test_record_error', JSON.stringify(out))
+  }
+})
+
+test('run-observability AC8: a test-record relay that returns null 3x parks model_quota at Test', async () => {
+  const { result, find, logs } = await runHunt({ answers: { 'test-record': () => null } })
+  assert.equal(result.status, 'parked:model_quota')
+  assert.equal(result.resumePhase, 'Test')
+  assert.equal(find('test-record:h:tracker').length, 3)
+  assert.equal(find('watchdog').length, 0)
+  assert.ok(logs.some(l => /↻ test-record:h:tracker dropped mid-response — retry 3\/3/.test(l)))
+  assert.match(find('park:h:model_quota')[0].prompt, /resume_phase: Test/)
+})
+
+test('run-observability AC8: a non-PASS Tracker verdict takes no record (the Tracker bounce is enough)', async () => {
+  const { find, result } = await runHunt({ answers: { tracker: { verdict: 'REWRITE_NEEDED' } } })
+  assert.equal(find('test-record').length, 0)
+  assert.notEqual(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+})
+
+test('run-observability AC9: a fresh run takes exactly ONE tracker record (no second one at Certify); the Watchdog reuses it', async () => {
+  const { find } = await runHunt({})
+  assert.equal(find('test-record:h:tracker').length, 1)
+  assert.equal(find('test-record:h:tracker')[0].opts.phase, 'Test')
+  const wd = find('watchdog:')[0].prompt
+  assert.ok(wd.includes(`${PD}/test-record-tracker.json`))
+  assert.match(wd, /Run git rev-parse HEAD: if it EQUALS the record's "commit", the record IS this certification's test result/)
+  assert.match(wd, /do NOT re-run the full suite/)
+  assert.doesNotMatch(wd, /and the project's test command yourself\./)
+  assert.match(wd, /After this commit the pipeline re-takes the record at the FINAL HEAD \(test-record-final\.json\)/)
+})
+
+test('run-observability AC9: a resume at Certify takes the tracker record at Certify entry (reused when HEAD did not move); a failing one bounces', async () => {
+  const reused = await runHunt({ answers: { 'resume-probe': RESUME_AT_CERTIFY, 'test-record': (p) => recordAnswer(stageOf(p), { reused: true }) } })
+  const t = reused.find('test-record:h:tracker')
+  assert.equal(t.length, 1)
+  assert.equal(t[0].opts.phase, 'Certify')
+  assert.equal(reused.find('tracker:').length, 0)
+  assert.ok(reused.logs.some(l => /🧪 test record \(tracker\) .*\[reused in repo\]/.test(l)))
+  const order = reused.calls.map(c => c.label)
+  assert.ok(order.indexOf('usage-gate:h:Certify') < order.indexOf('test-record:h:tracker'))
+  assert.ok(order.indexOf('test-record:h:tracker') < order.findIndex(l => l.startsWith('watchdog:')))
+  assert.equal(reused.result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  const failing = await runHunt({ answers: { 'resume-probe': RESUME_AT_CERTIFY, 'test-record': (p) => recordAnswer(stageOf(p), { pass: false, summary: 'x failed' }) } })
+  assert.equal(failing.result.verdict, 'TESTS_FAIL')
+  assert.equal(failing.find('watchdog').length, 0)
+  assert.equal(failing.find('test-rewrite').length, 1)
+  const dead = await runHunt({ answers: { 'resume-probe': RESUME_AT_CERTIFY, 'test-record': () => null } })
+  assert.equal(dead.result.status, 'parked:model_quota')
+  assert.equal(dead.result.resumePhase, 'Certify')
+})
+
+test('run-observability AC10: the FINAL record is taken at Verify entry after the Watchdog; a pass certifies', async () => {
+  const { result, find, calls } = await runHunt({})
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+  const f = find('test-record:h:final')
+  assert.equal(f.length, 1)
+  assert.ok(f[0].prompt.includes(`ensure --json --stage final --record-dir '${PD}' --repo '${WT}'`))
+  const order = calls.map(c => c.label)
+  const fi = order.indexOf('test-record:h:final')
+  assert.ok(fi > order.findIndex(l => l.startsWith('watchdog:')))
+  assert.ok(fi < order.indexOf('compliance-gate:h'), 'before the compliance gate')
+  assert.ok(fi < order.indexOf('verify:h'))
+})
+
+test('run-observability AC10: a FAILING final record parks final_test_record_failed — never CERTIFIED, no verify', async () => {
+  const { result, find } = await runHunt({ answers: { 'test-record': (p) => recordAnswer(stageOf(p), stageOf(p) === 'final' ? { pass: false, summary: 'test-all: 38 passed, 1 failed' } : {}) } })
+  assert.equal(result.status, 'parked:final_test_record_failed', JSON.stringify(result))
+  assert.equal(result.verdict, 'PARKED')
+  assert.equal(result.reason, 'final_test_record_failed')
+  assert.equal(result.testRecord.stage, 'final')
+  assert.equal(result.testRecord.pass, false)
+  assert.equal(find('verify').length + find('compliance-gate').length, 0)
+  const park = find('park:h:final_test_record_failed')[0].prompt
+  assert.match(park, /resume_phase: Verify/)
+  assert.match(park, /redirect/)
+  assert.match(park, /The full suite FAILS at the final HEAD b{40} \(after the certify commit\) — test-all: 38 passed, 1 failed\. The hunt is NOT mergeable/)
+  assert.ok(park.includes(`record: ${PD}/test-record-final.json`))
+  // an untrusted / dead final record parks at Verify too
+  const err = await runHunt({ answers: { 'test-record': (p) => recordAnswer(stageOf(p), stageOf(p) === 'final' ? { command: 'true' } : {}) } })
+  assert.equal(err.result.status, 'parked:test_record_error')
+  assert.equal(err.result.resumePhase, 'Verify')
+  const dead = await runHunt({ answers: { 'test-record': (p) => (stageOf(p) === 'final' ? null : recordAnswer('tracker')) } })
+  assert.equal(dead.result.status, 'parked:model_quota')
+  assert.equal(dead.result.resumePhase, 'Verify')
+})
+
+test('run-observability AC10: a resume at Verify re-takes the final record (no watchdog, no tracker record)', async () => {
+  const probe = { ...RESUME_AT_CERTIFY, status: 'certified', resumePhase: 'Verify' }
+  const { find, result } = await runHunt({ answers: { 'resume-probe': probe } })
+  assert.equal(find('watchdog').length, 0)
+  assert.equal(find('test-record:h:tracker').length, 0)
+  assert.equal(find('test-record:h:final').length, 1)
+  assert.equal(result.verdict, 'CERTIFIED_AWAITING_DEPLOY')
+})
+
+test('run-observability AC10: chain mode also takes the final record before its certified return; a failing one parks', async () => {
+  const ok = await runHunt({ args: CHAIN_ARGS })
+  assert.equal(ok.find('test-record:h:final').length, 1)
+  assert.equal(ok.find('verify').length, 0)
+  assert.match(ok.result.verdict, /^CERTIFIED/)
+  assert.ok(Array.isArray(ok.result.usageGateEvents))
+  const bad = await runHunt({ args: CHAIN_ARGS, answers: { 'test-record': (p) => recordAnswer(stageOf(p), stageOf(p) === 'final' ? { pass: false } : {}) } })
+  assert.equal(bad.result.status, 'parked:final_test_record_failed')
+})
+
+test('run-observability: the parked skill registers usage_gate_error, test_record_error and final_test_record_failed (redirect) and the boundary model_quota', () => {
+  const skill = readFileSync(join(PACK_ROOT, '.agents', 'skills', 'parked', 'SKILL.md'), 'utf8')
+  for (const reason of ['usage_gate_error', 'test_record_error', 'final_test_record_failed']) {
+    const row = skill.split('\n').find(l => new RegExp(`^\\|.*\`${reason}\``).test(l))
+    assert.ok(row, `a ${reason} row`)
+    assert.match(row, /redirect/, reason)
+  }
+  const q = skill.split('\n').find(l => /^\|.*`model_quota`/.test(l))
+  assert.match(q, /phase boundary/)
 })

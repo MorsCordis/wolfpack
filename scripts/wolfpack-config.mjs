@@ -21,6 +21,9 @@
 // RESOLVED KEYS (`--json`):
 //   name             Project Identity → Name                     required (none = missing)
 //   testCommand      Project Identity → Test command (code)      required (none = missing)
+//   testVerdictCommand  Project Identity → Test verdict command (code)  optional, null when absent/none:
+//                    decides the pipeline test record's pass/fail from the run log ({log}, {exit},
+//                    {main} placeholders) instead of the raw exit code (scripts/wolfpack-test-record.mjs).
 //   worktreeLinks    Project Identity → Worktree links (list)    optional, [] when absent
 //   complianceAreas  Compliance Requirements → Compliance areas  required; none → null
 //   compliancePaths  Compliance Requirements → Risk-surface paths (list)  required; none → []
@@ -381,6 +384,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
 
   const name = scalarRequired('name', 'Project Identity', 'Name', (v) => v)
   const testCommand = scalarRequired('testCommand', 'Project Identity', 'Test command', code)
+  const testVerdictCommand = optionalCode('Project Identity', 'Test verdict command')
   const worktreeLinks = list(field(sec('Project Identity'), 'Worktree links'))
 
   const areasRaw = field(sec('Compliance Requirements'), 'Compliance areas')
@@ -397,6 +401,11 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     wolfpackHome = expandHome(wolfpackHome.trim())
     if (!isAbsolute(wolfpackHome)) {
       problems.push('Project Identity → Wolfpack home must be an absolute path or ~/…')
+      wolfpackHome = null
+    } else if (wolfpackHome.includes("'")) {
+      // The workflows' run-start probe single-quotes this path (PACK='<home>'): refuse a quote
+      // here so it is a clean config problem, never a garbled probe.
+      problems.push('Project Identity → Wolfpack home must not contain a single quote')
       wolfpackHome = null
     }
   }
@@ -425,6 +434,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
   return {
     name,
     testCommand,
+    testVerdictCommand,
     worktreeLinks,
     complianceAreas,
     compliancePaths,
@@ -467,6 +477,7 @@ function summary(cfg) {
   const lines = [
     `name: ${cfg.name ?? '(missing)'}`,
     `testCommand: ${cfg.testCommand ?? '(missing)'}`,
+    `testVerdictCommand: ${cfg.testVerdictCommand ?? 'none'}`,
     `devDeployCommand: ${cfg.devDeployCommand ?? 'none'}`,
     `wolfpackHome: ${cfg.wolfpackHome ?? 'none'}`,
     `worktreeRoot: ${cfg.worktreeRoot ?? 'none'}`,

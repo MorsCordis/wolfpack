@@ -7,6 +7,7 @@ Pipeline-facing rules for hunts hosted in this repo. Public repository: everythi
 - **Language/Framework:** Node.js ESM scripts (no dependencies), Bash, Markdown commands/skills, Claude Code Workflow scripts
 - **Repo root:** auto-detected from git
 - **Test command:** `bash scripts/test-all.sh` — the single entry point: every `scripts/**/*.test.mjs`, every `scripts/**/*.test.sh`, and the leak grep. Narrow while iterating with `node --test scripts/<file>.test.mjs`. Podman-dependent tests print `SKIP: needs podman` when podman is absent or `WOLFPACK_TEST_NO_PODMAN=1`.
+- **Test verdict command:** none — the suite's exit code is the verdict.
 - **Worktree links:** none
 - **Worktree root:** `.agents/worktrees` — where /hunt and the pipeline create hunt worktrees (repo-relative).
 - **Project commands:** none — the pack itself (its .claude/commands is the link to .agents/commands).

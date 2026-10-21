@@ -117,6 +117,8 @@ Use the project's **Test command** (`wolfpack-config.md → Project Identity / D
 
 **Test cadence (narrow-first):** While iterating, run only the test class you wrote. Before declaring done, run the full app suite once per changed app.
 
+**Pipeline test record:** in a pipeline run, your TESTS_PASS is followed by the PIPELINE's own full-suite run at the committed HEAD (`scripts/wolfpack-test-record.mjs` → `<plan dir>/test-record-tracker.json` + `.log`) — that SHA-stamped record, not your report, gates Certify, and a failing record bounces the hunt back to Implement. So: run targeted tests while you write them, commit EVERY test file before you return (uncommitted tracked changes are not in the commit the record tests), and never write or edit `test-record-*.json`.
+
 **DB reuse:** Reuse the test DB by default where the project supports it; force a fresh rebuild after adding a migration.
 
 ## Triage-before-fix (MANDATORY before any rewrite request)

@@ -891,3 +891,49 @@ test('mainWorktree: a hunt worktree resolves to its MAIN checkout; outside git �
   withTemp((dir) => assert.equal(mainWorktree(dir), null))
   assert.equal(mainWorktree('/nonexistent/path/for/wolfpack-test'), null)
 })
+
+// ─── run-observability: Test verdict command (P5) + the single-quote guard on Wolfpack home (AC12) ───
+const withVerdict = (line) => FULL.replace(/(- \*\*Test command:\*\*.*\n)/, `$1${line}\n`)
+
+test('run-observability P5: Test verdict command — present → the code span; none / absent → null; never a problem', () => {
+  assert.equal(readConfig(FULL).testVerdictCommand, null)
+  const c = readConfig(withVerdict('- **Test verdict command:** `python3 {main}/v.py --log {log} --runner-exit {exit}` — decides pass/fail'))
+  assert.equal(c.testVerdictCommand, 'python3 {main}/v.py --log {log} --runner-exit {exit}')
+  assert.deepEqual(c.missing, [])
+  assert.deepEqual(c.problems, [])
+  for (const v of ['none', '`none`', 'none — the suite exit code is the verdict', 'n/a']) {
+    const n = readConfig(withVerdict(`- **Test verdict command:** ${v}`))
+    assert.equal(n.testVerdictCommand, null, v)
+    assert.deepEqual(n.missing, [], v)
+  }
+  // the Test command itself is unaffected by the new key
+  assert.equal(c.testCommand, 'make test')
+})
+
+test('run-observability P5: the REAL pack config and the example both read testVerdictCommand as null; the CLI summary prints it', () => {
+  assert.equal(loadConfig(REAL).testVerdictCommand, null)
+  assert.equal(loadConfig(join(ROOT, 'wolfpack-config.example.md')).testVerdictCommand, null)
+  const j = JSON.parse(runCli(['--json', REAL]).stdout)
+  assert.ok('testVerdictCommand' in j)
+  assert.equal(j.testVerdictCommand, null)
+  withTemp((dir) => {
+    const p = writeCfg(dir, withVerdict('- **Test verdict command:** `check {log}`'))
+    const r = runCli([p])
+    assert.match(r.stdout, /^testVerdictCommand: check \{log\}$/m)
+    assert.match(runCli([writeCfg(dir, FULL, 'b.md')]).stdout, /^testVerdictCommand: none$/m)
+  })
+})
+
+test("run-observability AC12: a Wolfpack home containing a single quote is a config problem (never a garbled probe); plain paths stay accepted", () => {
+  for (const v of ["`/opt/o'brien/pack`", "/opt/o'brien/pack", "`~/it's/pack`"]) {
+    const c = readConfig(withHome(`- **Wolfpack home:** ${v}`))
+    assert.equal(c.wolfpackHome, null, v)
+    assert.ok(c.problems.includes('Project Identity → Wolfpack home must not contain a single quote'), `${v}: ${c.problems}`)
+  }
+  const ok = readConfig(withHome('- **Wolfpack home:** `/opt/pack`'))
+  assert.equal(ok.wolfpackHome, '/opt/pack')
+  assert.deepEqual(ok.problems, [])
+  // a path with a space or a $ is NOT refused (the single-quoted key leg makes it inert)
+  assert.equal(readConfig(withHome('- **Wolfpack home:** `/opt/my pack`')).wolfpackHome, '/opt/my pack')
+  assert.equal(readConfig(withHome('- **Wolfpack home:** `/opt/$x/pack`')).wolfpackHome, '/opt/$x/pack')
+})

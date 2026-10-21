@@ -99,6 +99,11 @@ Before reading any plan files:
      git checkout main
    fi
 
+   # run-observability: the merge requires a PASSING full-suite record at the exact tip being merged.
+   # gate re-runs once when the tip moved since the record (e.g. the auto-rebase above); missing/failing → refuse.
+   node "$PACK/scripts/wolfpack-test-record.mjs" gate --stage final --record-dir "$PLAN_DIR" --rev "$BRANCH" ${worktree_path:+--repo "$worktree_path"} \
+     || { echo "⛔ No passing test record at $BRANCH's tip — not merging. Run the fix line printed above, then re-run /merge $SLUG."; git checkout main; exit 1; }
+
    git merge --no-ff $BRANCH -m "Merge branch '$BRANCH'"
    git push origin main
    ```
@@ -201,5 +206,6 @@ Next: /clear → /hunt <new-slug> "<next task>"
 - Do NOT delete the feature branch.
 - Do NOT run prod-targeted commands.
 - Do NOT push to any remote the project's `## Hard Rules` does not name.
+- Never merge past a refused test-record gate or hand-edit `test-record-*.json`.
 
 Begin.

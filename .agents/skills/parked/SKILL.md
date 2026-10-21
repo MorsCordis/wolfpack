@@ -40,7 +40,10 @@ merged                terminal
 | 🐛 | `repro_failed` | bug not reproducible [01] | clarify (more repro detail) or redirect |
 | 🩹 | `human_patch` | the plan changes a protected agent-config file (`.claude/hooks/`, `.claude/settings*.json`) that agents cannot edit; the Shepherd staged it in `human-patches/` | apply + commit the patches (commands in parked.md), then clarify → resume at **Code Review** (`implementing_done`) |
 | 🧩 | `shim_missing` | a cross-family seat shim (e.g. `podman-vibe.sh`) does not exist at the resolved path; no non-Claude seat can run, and Claude is never substituted | provide the shim (the pack's execution layer), or disable the Vibe families (`WOLFPACK_ENABLE_GLM=0 WOLFPACK_ENABLE_MISTRAL_AUTO=0`), then `/resolve` (redirect, as the park expects) → resumes at the parked phase |
-| ⏳ | `model_quota` | both cross-model CLIs rate-limited [05] | usually just re-run later |
+| ⏳ | `model_quota` | both cross-model CLIs rate-limited [05] — also parked at a phase boundary when the usage window is near exhaustion (auto-resumes at that phase) | usually just re-run later |
+| 📉 | `usage_gate_error` | the boundary usage gate itself failed before a phase (an invalid `WOLFPACK_*` threshold env, or a gate crash) | fix the env/gate, then `/resolve` (redirect) → resumes at that phase |
+| 🧪 | `test_record_error` | the pipeline could not trust its SHA-stamped test record (record-script infra error, SHA or test-command mismatch) | fix the cause, then `/resolve` (redirect) → resumes at Test / Verify, which re-takes the record |
+| 🧯 | `final_test_record_failed` | the full suite fails at the final HEAD after the certify commit; the hunt is NOT mergeable | fix the break on `feat/<slug>`, then `/resolve` (redirect) → resumes at **Verify** (the record is re-taken) |
 | 🚧 | `smoke_pending_human` | wave smoke has un-runnable criteria [04] | run the manual criteria |
 | ⚠ | `rebase_conflict` | Shepherd rebase failed | resolve the conflict, then resume |
 | 🔀 | campaign_merge_conflict | chain auto-merge into campaign/<slug> conflicted | resolve: rebase feat/<slug> onto the campaign branch in its worktree, then clarify (resumes at Code Review) |

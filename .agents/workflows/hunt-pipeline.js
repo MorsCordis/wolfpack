@@ -116,9 +116,10 @@ const REVIEW_SCHEMA = {
           line: { type: 'number' },
           claim: { type: 'string' },     // one-sentence defect statement
           evidence: { type: 'string' },  // what in the diff/file shows it
-          // [03] Part B — coarse semantic key the shim computes from file+claim
-          // (normalize(file) + ":" + defectClass(claim)). Convergence reasons over
-          // these: the SAME underlying defect across rounds must yield the SAME key.
+          symbol: { type: 'string' },      // function/class/constant (code) or plan section heading
+          claim_class: { type: 'string' }, // one of CLAIM_CLASSES (unknown/missing → 'other')
+          // composed by the pipeline (findingFingerprint) from file + symbol + claim_class;
+          // a seat-supplied value is overwritten. Convergence reasons over these.
           fingerprint: { type: 'string' },
         },
         required: ['id', 'severity', 'title'],
@@ -275,7 +276,6 @@ const TIER_CONFIG = {
 const tierCfg = (t) => TIER_CONFIG[t] || TIER_CONFIG.Red
 
 const SEV_RANK = { critical: 4, high: 3, medium: 2, low: 1 }
-const isCriticalSev = (s) => String(s || '').toLowerCase().includes('critical')
 
 // [03] Part B — CONVERGENCE CLASSIFIER. Replaces the count-based severity ceiling
 // (CRIT_CEILING/HIGH_CEILING/roundCap++). On cron, round COUNT is a noisy proxy; what
@@ -293,6 +293,61 @@ const isCriticalSev = (s) => String(s || '').toLowerCase().includes('critical')
 //   { fpRounds: Array<Set<fp>>, counts: number[], cumulativeCritFps: Set<fp>,
 //     critStreak: Map<fp,int> }
 // `findings` is THIS ISSUES_FOUND round's grounded findingsList (each {fingerprint,severity}).
+// run-observability: the classifier, its history helpers and the fingerprint composer live
+// in the core block below, mirrored byte-identically in scripts/lib/review-convergence.mjs
+// (Hard Rule 7). Fingerprints are composed by the PIPELINE (fingerprintFinding in
+// runReviewFanout) as file::symbol::claim_class; a seat-supplied value is overwritten.
+// ── BEGIN wolfpack-convergence core (keep byte-identical: scripts/lib/review-convergence.mjs ⇄ hunt-pipeline.js) ──
+// Closed claim-class vocabulary. An unknown or missing class normalizes to 'other'.
+const CLAIM_CLASSES = Object.freeze(['logic-error', 'missing-handling', 'silent-fallback', 'missing-test', 'weak-test',
+  'contract-drift', 'scope-gap', 'scope-creep', 'spec-misread', 'security', 'data-integrity', 'concurrency',
+  'performance', 'leak', 'docs-drift', 'config', 'other'])
+const SYMBOL_NONE = '-'
+const PLAN_FILE_RE = /(^|\/)\.wolfpack\/plans\/[^/]+\/plan(-revised-\d+|-final)?\.md$/
+
+// '' / null → 'plan'; '\' → '/'; collapse '//'; strip leading './', '/workspace/', '/';
+// any hunt plan revision file → 'plan'.
+function normalizeFingerprintFile(file) {
+  let p = String(file ?? '').trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/')
+  for (;;) {
+    const q = p.replace(/^\.\//, '').replace(/^\/workspace\//, '').replace(/^\//, '')
+    if (q === p) break
+    p = q
+  }
+  if (!p || PLAN_FILE_RE.test(p)) return 'plan'
+  return p
+}
+
+// trim; strip quotes/backticks; strip one leading keyword; strip a trailing '(...)';
+// lowercase; '::' → '-' (a fingerprint always has exactly 3 '::'-legs); whitespace → '-'.
+function normalizeSymbol(symbol) {
+  let s = String(symbol ?? '').trim().replace(/^[`'"]+|[`'"]+$/g, '').trim()
+  s = s.replace(/^(?:function|def|class|const|let|var|method|fn|section)\s+/i, '').replace(/^§\s*/, '')
+  s = s.replace(/\s*\([^()]*\)\s*$/, '').trim()
+  s = s.toLowerCase().replace(/::/g, '-').replace(/\s+/g, '-')
+  return s || SYMBOL_NONE
+}
+
+function normalizeClaimClass(c) {
+  const k = String(c ?? '').trim().toLowerCase().replace(/[\s_]+/g, '-')
+  return CLAIM_CLASSES.includes(k) ? k : 'other'
+}
+
+function findingFingerprint({ file, symbol, claimClass }) {
+  return `${normalizeFingerprintFile(file)}::${normalizeSymbol(symbol)}::${normalizeClaimClass(claimClass)}`
+}
+
+// Returns a copy with the pipeline-composed fingerprint; a seat-supplied value is overwritten.
+function fingerprintFinding(f) {
+  return { ...f, fingerprint: findingFingerprint({ file: f.file, symbol: f.symbol, claimClass: f.claim_class ?? f.claimClass }) }
+}
+
+const isCriticalSev = (s) => String(s || '').toLowerCase().includes('critical')
+
+function newConvergenceHistory() {
+  return { fpRounds: [], counts: [], cumulativeCritFps: new Set(), critStreak: new Map() }
+}
+
 function classifyConvergence({ round, findings, history, cfg, floor }) {
   const thisFps = findings.map(f => f.fingerprint).filter(Boolean)
   const thisFpSet = new Set(thisFps)
@@ -371,6 +426,45 @@ function commitRound(history, findings, cumulativeCrit) {
   for (const fp of critFps) next.set(fp, (history.critStreak.get(fp) || 0) + 1)
   history.critStreak = next
 }
+
+// LOG-ONLY (never parks, never feeds classifyConvergence): a finding whose exact
+// fingerprint was never seen, but whose file + claim class match a fingerprint seen in
+// some round ≤ N-2 and absent in N-1, under a DIFFERENT symbol — possibly the same defect
+// renamed by another seat. Call BEFORE commitRound (history = prior rounds only).
+// Fingerprints split on '::': first leg = file, last leg = class, middle leg(s) = symbol.
+function suspectedSymbolDrift(history, findings) {
+  const rounds = history.fpRounds
+  if (rounds.length < 2) return []
+  const split = (fp) => {
+    const legs = String(fp).split('::')
+    if (legs.length < 3) return null
+    return { file: legs[0], symbol: legs.slice(1, -1).join('::'), claimClass: legs[legs.length - 1] }
+  }
+  const seen = new Set()
+  rounds.forEach(s => s.forEach(fp => seen.add(fp)))
+  const last = rounds[rounds.length - 1]
+  const out = []
+  const keys = new Set()
+  for (const f of findings || []) {
+    const fp = f && f.fingerprint
+    if (!fp || seen.has(fp)) continue
+    const cur = split(fp)
+    if (!cur) continue
+    for (const s of rounds.slice(0, -1)) {
+      for (const old of s) {
+        if (last.has(old)) continue
+        const o = split(old)
+        if (!o || o.file !== cur.file || o.claimClass !== cur.claimClass || o.symbol === cur.symbol) continue
+        const k = JSON.stringify([cur.file, cur.claimClass, o.symbol, cur.symbol])
+        if (keys.has(k)) continue
+        keys.add(k)
+        out.push({ file: cur.file, claimClass: cur.claimClass, was: o.symbol, now: cur.symbol })
+      }
+    }
+  }
+  return out
+}
+// ── END wolfpack-convergence core ──
 
 // The ledger row-set for one round: a coarse {fp, severity, id, title} per finding —
 // the model-grading substrate ([06] queries it; here we just record it). Bare keys
@@ -792,8 +886,8 @@ const configProbeCommand = (envHome) => {
   const run = 'echo "PROBE_PWD=$(pwd)"; echo "PACK_HOME=$PACK"; node "$PACK/scripts/wolfpack-config.mjs" --json wolfpack-config.md 2>&1; echo "CONFIG_RC=$?"'
   if (envHome) return `Run exactly:
   PACK=${shq(envHome)}; ${run}`
-  return `First read wolfpack-config.md (in your starting directory) → ## Project Identity → **Wolfpack home**: its backticked path, VERBATIM — do NOT expand \`~\`, resolve symlinks or substitute any other path (the workflow rejects a non-absolute or mismatched home itself). Substitute it for <home> below, inside the double quotes; if there is no such key, use an empty <home>. Then run exactly:
-  PACK="<home>"; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; ${run}`
+  return `First read wolfpack-config.md (in your starting directory) → ## Project Identity → **Wolfpack home**: its backticked path, VERBATIM — do NOT expand \`~\`, resolve symlinks or substitute any other path (the workflow rejects a non-absolute or mismatched home itself). Substitute it for <home> below, inside the single quotes (the config reader refuses a pack home that contains a single quote); if there is no such key, use an empty <home>. Then run exactly:
+  PACK='<home>'; case "$PACK" in "~"|"~/"*) PACK="$HOME\${PACK#"~"}" ;; esac; ${run}`
 }
 const requireProbedPack = (who, home) => {
   if (probeRoot(probedPackHome) !== probeRoot(home.home)) throw new Error(`${who}: the config probe ran the reader from '${probedPackHome}' but the pack home resolves to '${home.home}' (${home.source}) — the config was not read by this pack's reader. Fix: make WOLFPACK_HOME and wolfpack-config.md → Wolfpack home name the same absolute path, then relaunch.`)
@@ -1571,7 +1665,8 @@ MANDATORY VERDICT CONTRACT — your response MUST end with exactly ONE machine-p
     { "id": 1, "severity": "CRITICAL|HIGH|MEDIUM|LOW", "title": "short title",
       "file": "src/app/module.py", "line": 142,
       "claim": "one-sentence defect statement",
-      "evidence": "what in the diff or file shows it" }
+      "evidence": "what in the diff or file shows it",
+      "symbol": "functionOrSection", "claim_class": "<one of the claim classes below>" }
   ],
   "tool_access": { "shell": "ok" | "denied" | "unused", "denied_tools": [] }
 }
@@ -1580,6 +1675,7 @@ Rules:
 - verdict APPROVED ⇒ findings MAY be [] (empty). verdict ISSUES_FOUND ⇒ findings MUST be non-empty (an ISSUES_FOUND with no findings is a contradiction and will be discarded).
 - Every "file" MUST be repo-root-relative (e.g. src/app/module.py) — never absolute, never a container mount path like /workspace/... — so the pipeline can ground it with test -f against the worktree.
 - Put "file" and "line" on every finding that points at code; "claim" and "evidence" are required on each finding.
+- "symbol" names the function/class/constant (code) or the plan section heading (plan) the finding is about (omit it only when there is none); "claim_class" is EXACTLY one of: ${CLAIM_CLASSES.join(', ')} (use "other" only when none fits). The pipeline fingerprints a finding as file + symbol + claim_class: the SAME defect in a later round must repeat the SAME symbol and claim_class, and a DIFFERENT defect must not borrow them.
 - Emitting NO <verdict> block, malformed JSON, or paths the grounding check cannot find means your review is DISCARDED (counts as no review at all).
 - "tool_access" is MANDATORY: report honestly whether your shell ran (\`git diff\`, the project's test command). "ok" = it ran; "denied" = a shell call was refused/unavailable; "unused" = you never tried. Put every tool call that was denied or reported as an unknown tool in "denied_tools" (e.g. ["bash"]). Never present a file-reading audit as a review that ran the diff.`
 
@@ -1869,7 +1965,7 @@ ${options ? `\n## Options (feeds AskUserQuestion)\n${options}\n` : ''}${error ? 
      "redirect_count" rather than resetting it to 0 — the redirect-loop guard counts
      across cycles. Preserve every other top-level field too.
 
-${extraMeta || ''}
+${extraMeta || ''}${gateNotesFlushStep()}
 Do NOT commit. Do NOT push. Do NOT git add.
 Return { parked: true, reason: "${reason}", parkedAt: "<NOW>" }.
 ${heartbeat('Park', reason)}
@@ -1889,7 +1985,7 @@ cd to ${worktreePath}. Use absolute paths.
 1. Edit ${planDir}/metadata.json: set top-level "status" = "flawed_plan", "phase" = "plan".
    Preserve every other field. (The worktree metadata is authoritative — do NOT
    mirror to any main-repo plan dir.)
-${extraMeta || ''}
+${extraMeta || ''}${gateNotesFlushStep()}
 Do NOT commit. Do NOT push. Do NOT git add.
 Return { ok: true }.
 ${heartbeat(phaseLabel || 'Review', 'recording FLAWED_PLAN (plan smell)')}
@@ -1913,13 +2009,176 @@ cd to ${worktreePath}. Use absolute paths.
    tracker_round / tracker_rounds / pointer_round, and do NOT touch any park block.
    (The worktree metadata is authoritative — do NOT mirror to any main-repo plan dir.)
    If the status is ALREADY "test_rewrite_needed", leave the file unchanged and return ok.
-
+${gateNotesFlushStep()}
 Do NOT commit. Do NOT push. Do NOT git add.
 Return { ok: true }.
 ${heartbeat(phaseLabel || 'Test', 'recording TEST_REWRITE_NEEDED (tests failed)')}
 `, { label: `test-rewrite:${slug}`, phase: phaseLabel || 'Test',
      schema: { type: 'object', properties: { ok: { type: 'boolean' } } } })
 }
+
+// ─── run-observability: BOUNDARY GATE + TEST RECORD ───
+// (1) BOUNDARY USAGE GATE. The start gate (campaign-runner.js usageGate) only runs before a
+// hunt starts, so a long hunt that started at 79% used to hit the wall MID-agent and die as a
+// confusing failure. boundaryGate() re-checks the window before every agent phase after
+// Scaffold (scripts/wolfpack-window-gate.mjs --boundary: its own near-exhaustion ceilings) and
+// parks model_quota CLEANLY at the boundary — isQuotaPark resumes at park.resume_phase. A gate
+// that cannot be READ (agent failed / garbled relay) proceeds LOUDLY and is RECORDED; a gate
+// that ERRORS (bad WOLFPACK_* threshold) parks usage_gate_error. Not checked per review round
+// and not at Verify (see plan § Design Alternatives).
+// `var`, not const: parkHunt (which flushes gateNotes) can run before this line executes (the
+// Certify preflight parks), and a const would be in its temporal dead zone there.
+var gateNotes = []         // JS-side gate failures, flushed into usage-gate.jsonl by the NEXT gate
+                           // run (--record-note) or, if the run ends first, by gateNotesFlushStep()
+                           // inside parkHunt / recordTestRewriteNeeded / recordFlawedPlan.
+var usageGateEvents = []   // every gate outcome {phase, kind, decision, degraded, why}; carried on
+                           // the hunt RESULT of every return this hunt adds or edits (AC5).
+const BOUNDARY_GATE_SCHEMA = { type: 'object', properties: { exitCode: { type: 'integer' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+// One prompt step for a write-only agent ('' when nothing is pending). Splices the pending
+// notes, so each note is handed to exactly one writer.
+function gateNotesFlushStep() {
+  if (!gateNotes || !gateNotes.length) return ''
+  const notes = gateNotes.splice(0)
+  const lines = notes.map(note => JSON.stringify({ at: '<NOW>', kind: 'pipeline_note', note }))
+  return `
+USAGE-GATE RECORD (do this too, before you return): get a timestamp with \`date -u +%Y-%m-%dT%H:%M:%SZ\` (call it NOW), then append each of these JSON lines, with "<NOW>" replaced by NOW, to ${planDir}/usage-gate.jsonl (create it if absent; never rewrite existing lines):
+${lines.join('\n')}
+In ${planDir}/metadata.json set "usage_gate_events" = ${JSON.stringify(usageGateEvents || [])} ${META_PRESERVE_NOTE}.
+`
+}
+// Pure: classify one gate relay → { kind: 'proceed'|'defer'|'error'|'unavailable', d, why }.
+function gateOutcome(g) {
+  if (!g || typeof g !== 'object') return { kind: 'unavailable', d: null, why: 'the gate agent returned no result' }
+  let d = null
+  const block = firstJsonObject(g.output)
+  try { d = block ? JSON.parse(block) : null } catch { d = null }
+  if (d && (typeof d !== 'object' || Array.isArray(d))) d = null
+  const code = g.exitCode
+  if (code === 1 || (d && d.decision === 'error')) return { kind: 'error', d, why: (d && d.reason) || `the gate exited ${code}` }
+  if (code !== 0 && code !== 10) return { kind: 'unavailable', d, why: `unexpected gate exit ${JSON.stringify(code ?? null)}` }
+  if (!d) return { kind: 'unavailable', d: null, why: 'no parseable JSON decision in the gate output' }
+  if (d.decision === 'proceed' && code === 0) return { kind: 'proceed', d, why: d.reason || '' }
+  if (d.decision === 'defer' && code === 10) return { kind: 'defer', d, why: d.reason || '' }
+  return { kind: 'unavailable', d, why: `decision ${JSON.stringify(d.decision ?? null)} inconsistent with exit ${code}` }
+}
+// → null (proceed) | a PARKED hunt result the caller returns.
+async function boundaryGate(phaseName) {
+  const notes = gateNotes.splice(0)
+  const g = await agent(`READ-ONLY apart from the gate's own log line — modify nothing else. Run exactly (ONE command line):
+  node ${shq(packScript('wolfpack-window-gate.mjs'))} --json --boundary --phase ${shq(phaseName)} --record ${shq(`${planDir}/usage-gate.jsonl`)}${notes.length ? ` --record-note ${shq(JSON.stringify(notes))}` : ''}; echo "GATE_RC=$?"
+Exit 10 is a NORMAL "defer", not an error. Return exitCode = the number after GATE_RC= and output = the command's stdout VERBATIM (minus the GATE_RC line). Never invent a decision.`,
+    { label: `usage-gate:${slug}:${phaseName}`, phase: phaseName, model: 'sonnet', schema: BOUNDARY_GATE_SCHEMA })
+  const o = gateOutcome(g)
+  const d = o.d || {}
+  if (o.kind === 'unavailable') {
+    log(`⚠ USAGE GATE UNAVAILABLE at ${phaseName} (${o.why}) — proceeding UNGATED; recorded in usage-gate.jsonl`)
+    // The notes this run carried may never have been written (the gate may not have run):
+    // re-queue them — a duplicate line beats a lost one.
+    gateNotes.push(...notes, { at_phase: phaseName, kind: 'gate_unavailable', why: o.why })
+    usageGateEvents.push({ phase: phaseName, kind: 'gate_unavailable', decision: null, degraded: true, why: o.why })
+    return null
+  }
+  usageGateEvents.push({ phase: phaseName, kind: o.kind, decision: d.decision ?? null, degraded: d.degraded === true, why: o.why })
+  if (o.kind === 'error') {
+    log(`⛔ ${slug}: usage gate ERROR before ${phaseName} (${o.why}) — parking usage_gate_error`)
+    await parkHunt({
+      reason: 'usage_gate_error', resumePhase: phaseName, resolutionTypeExpected: 'redirect', phaseLabel: phaseName,
+      needFromUser: `The usage gate failed before ${phaseName} (${o.why}) — fix the gate (an invalid WOLFPACK_* threshold is the usual cause), then resume.`,
+      context: `Gate: ${packScript('wolfpack-window-gate.mjs')} --boundary --phase ${phaseName}; exit ${g && g.exitCode}; output: ${String((g && g.output) || '(none)').slice(0, 600)}\nRecord: ${planDir}/usage-gate.jsonl`,
+    })
+    return { slug, verdict: 'PARKED', status: 'parked:usage_gate_error', reason: 'usage_gate_error', resumePhase: phaseName, tier, worktreePath, usageGateEvents: [...usageGateEvents] }
+  }
+  if (o.kind === 'defer') {
+    log(`⏸ ${slug}: usage window cannot carry ${phaseName} (${o.why}) — parking model_quota at the boundary; resumes after ${d.reset_at ?? 'the window resets'}`)
+    await parkHunt({
+      reason: 'model_quota', resumePhase: phaseName, resolutionTypeExpected: 'clarify', phaseLabel: phaseName,
+      needFromUser: `The usage window is near exhaustion at the ${phaseName} boundary (${o.why}). This park is TRANSIENT and auto-resumes: re-run after the window resets${d.reset_at ? ` (${d.reset_at})` : ''} and the hunt picks up at ${phaseName}. Nothing about the work has been judged.`,
+      context: `Boundary gate (scripts/wolfpack-window-gate.mjs --boundary): decision defer, source ${d.source ?? 'unknown'}${d.degraded ? ` (DEGRADED: ${d.degraded_reason ?? 'estimate'})` : ''}; 5h ${d.five_hour_pct ?? 'n/a'}%, 7d ${d.seven_day_pct ?? 'n/a'}%. Record: ${planDir}/usage-gate.jsonl`,
+    })
+    return { slug, verdict: 'PARKED', status: 'parked:model_quota', reason: 'model_quota', resumePhase: phaseName, resetAt: d.reset_at ?? null, tier, worktreePath, usageGateEvents: [...usageGateEvents] }
+  }
+  if (d.degraded) log(`⚠ USAGE GATE DEGRADED at ${phaseName}: ${d.degraded_reason ?? 'unknown'} (source ${d.source ?? 'unknown'}) — decision ${d.decision}; recorded`)
+  log(`usage gate ${phaseName}: proceed — ${o.why}`)
+  return null
+}
+
+// (2) SHA-STAMPED TEST RECORD. After Tracker, the PIPELINE (not an agent's prose) runs the
+// project's test command once at the committed HEAD through scripts/wolfpack-test-record.mjs,
+// which writes <planDir>/test-record-<stage>.json (commit, exit, the suite's own summary line,
+// verdict) + the raw .log. A relay agent only runs the script and returns its stdout VERBATIM;
+// the JS validates it and FAILS CLOSED (test_record_error) on anything it cannot trust. The
+// script reads the test command from the MAIN checkout's wolfpack-config.md, and the JS
+// cross-checks it against cfg(), so a hunt branch cannot rewrite its own test command.
+// Stages: tracker (after Tracker / at Certify entry on a resume), final (Verify entry, after the
+// certify commit). `ensure` reuses a record whose commit equals HEAD and re-runs when it moved.
+const TEST_RECORD_SCHEMA = { type: 'object', properties: { exitCode: { type: 'integer' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+// → { ok:true, rec } | { ok:false, kind:'fail'|'error'|'dead', rec?, why }
+async function takeTestRecord(stage, phaseLabel) {
+  const base = `${planDir}/.test-record-${stage}`
+  const cmd = `node ${shq(packScript('wolfpack-test-record.mjs'))} ensure --json --stage ${stage} --record-dir ${shq(planDir)} --repo ${shq(worktreePath)}`
+  let r = null
+  for (let attempt = 1; attempt <= 3 && !r; attempt++) {
+    if (attempt > 1) log(`↻ test-record:${slug}:${stage} dropped mid-response — retry ${attempt}/3`)
+    r = await agent(`You are a RELAY for the pipeline's SHA-stamped full-suite test record of Wolfpack hunt ${slug}.
+Do NOT run tests yourself, do NOT summarise, do NOT edit, stage or commit any file.
+
+cd to ${worktreePath}. First run: rm -f ${shq(`${base}.out`)} ${shq(`${base}.err`)} ${shq(`${base}.rc`)}
+Then run exactly (ONE command line — a full suite can outlast one shell call, so it runs in the background):
+       ${shimRun(cmd, shq(base))}
+${SHIM_WAIT_RULE}
+Return exitCode = the integer content of ${base}.rc and output = the content of ${base}.out VERBATIM (the script's JSON).
+If the command could not run at all, return exitCode 1 and the error text as output. Never invent a result.`,
+      { label: `test-record:${slug}:${stage}`, phase: phaseLabel, model: 'sonnet', schema: TEST_RECORD_SCHEMA })
+  }
+  if (!r) return { ok: false, kind: 'dead', why: 'the test-record relay agent returned no result 3 times' }
+  let rec = null
+  const block = firstJsonObject(r.output)
+  try { rec = block ? JSON.parse(block) : null } catch { rec = null }
+  if (rec && (typeof rec !== 'object' || Array.isArray(rec))) rec = null
+  const bad = (why) => {
+    log(`⛔ test record (${stage}) NOT TRUSTED: ${why}`)
+    return { ok: false, kind: 'error', rec, why }
+  }
+  if (r.exitCode === 1) return bad(`the record script failed (exit 1): ${String((rec && (rec.error || rec.reason)) || r.output || '(no output)').slice(0, 300)}`)
+  if (r.exitCode !== 0 && r.exitCode !== 2) return bad(`unexpected record exit ${JSON.stringify(r.exitCode ?? null)}`)
+  if (!rec) return bad('no parseable JSON record in the relay output')
+  if (rec.stage !== stage) return bad(`record stage ${JSON.stringify(rec.stage ?? null)} ≠ ${stage}`)
+  if (typeof rec.commit !== 'string' || !/^[0-9a-f]{40}$/.test(rec.commit)) return bad('record commit is not a 40-hex SHA')
+  if (rec.head !== rec.commit) return bad(`record commit ${String(rec.commit).slice(0, 12)} ≠ head ${String(rec.head).slice(0, 12)}`)
+  if (!Number.isInteger(rec.exit)) return bad('record exit is not an integer')
+  if (typeof rec.pass !== 'boolean') return bad('record pass is not a boolean')
+  if (typeof rec.summary !== 'string') return bad('record summary is not a string')
+  if (typeof rec.log !== 'string' || !rec.log) return bad('record has no log path')
+  if (rec.command !== cfg().testCommand) return bad(`record command ${JSON.stringify(rec.command ?? null)} ≠ the configured test command ${JSON.stringify(cfg().testCommand)}`)
+  if ((rec.verdict_command ?? null) !== (cfg().testVerdictCommand ?? null)) return bad(`record verdict command ${JSON.stringify(rec.verdict_command ?? null)} ≠ the configured one ${JSON.stringify(cfg().testVerdictCommand ?? null)}`)
+  if ((r.exitCode === 0) !== (rec.pass === true)) return bad(`exit ${r.exitCode} disagrees with pass ${rec.pass}`)
+  log(`🧪 test record (${stage}) ${rec.commit.slice(0, 12)}: ${rec.pass ? 'PASS' : 'FAIL'} — ${rec.summary} [${rec.reused ? 'reused' : 'ran'} in ${rec.ran_in ?? 'unknown'}] log ${rec.log}`)
+  if (!rec.pass) return { ok: false, kind: 'fail', rec, why: rec.reason || `suite exit ${rec.exit}` }
+  return { ok: true, rec }
+}
+const testRecordSummary = (rec) => rec ? { stage: rec.stage, commit: rec.commit, exit: rec.exit, pass: rec.pass, summary: rec.summary, log: rec.log } : null
+// error → park test_record_error (redirect); dead → park model_quota (the "agent dropped 3x"
+// precedent: a dead agent ≈ a session limit). Returns the PARKED result the caller returns.
+async function parkTestRecord(tr, { stage, resumePhase, phaseLabel }) {
+  if (tr.kind === 'dead') {
+    log(`⏸ ${slug}: test-record relay dropped 3x — parking model_quota at ${resumePhase} (auto-resumes next pass).`)
+    await parkHunt({
+      reason: 'model_quota', resumePhase, resolutionTypeExpected: 'clarify', phaseLabel,
+      needFromUser: `The test-record relay agent died 3 times before returning (almost always a rate-limit / session-limit window). This park is TRANSIENT and auto-resumes at ${resumePhase}; the ${stage} record is re-taken then.`,
+      context: `Stage ${stage}; record dir ${planDir}.`,
+    })
+    return { slug, verdict: 'PARKED', status: 'parked:model_quota', reason: 'model_quota', resumePhase, tier, worktreePath, usageGateEvents: [...usageGateEvents] }
+  }
+  await parkHunt({
+    reason: 'test_record_error', resumePhase, resolutionTypeExpected: 'redirect', phaseLabel,
+    needFromUser: `The pipeline could not trust the ${stage} test record (${tr.why}). Fix the cause (record script infra error, SHA or test-command mismatch), then resume — ${resumePhase} re-takes the record. Never hand-edit test-record-*.json.`,
+    context: `Record: ${planDir}/test-record-${stage}.json (log beside it).\nRe-take by hand: node ${shq(packScript('wolfpack-test-record.mjs'))} ensure --stage ${stage} --record-dir ${shq(planDir)} --repo ${shq(worktreePath)}`,
+  })
+  return { slug, verdict: 'PARKED', status: 'parked:test_record_error', reason: 'test_record_error', resumePhase, tier, worktreePath, testRecord: testRecordSummary(tr.rec), usageGateEvents: [...usageGateEvents] }
+}
+// Top level: the Test phase sets it, the Certify entry reads it (a resume that skipped Test
+// takes the tracker record at Certify instead).
+let testRecordTakenThisPass = false
 
 // [03] Part B — merge the findings of N review-fanout units into one set. For the DEFAULT
 // single-lens round this is a strict pass-through: the one unit's findingsList is returned
@@ -2001,7 +2260,7 @@ async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
     results.forEach((r, i) => {
       const unit = pending[i]
       if (r && r.verdict && r.verdict !== 'ERROR') {
-        done.push({ unit, r })
+        done.push({ unit, r: { ...r, findingsList: (r.findingsList || []).map(fingerprintFinding) } })
         return
       }
       const st = (r && r.status) || 'null/error'
@@ -2085,6 +2344,7 @@ async function runReviewFanout({ lenses, buildPrompt, label, phaseLabel }) {
 // the hunt as needs_spec (full /resolve plumbing is [02]).
 let specVerdict = null
 if (at('Spec')) {
+const gateSpec = await boundaryGate('Spec'); if (gateSpec) return gateSpec
 phase('Spec')
 log(`Spec (intent → acceptance.md): ${slug}`)
 
@@ -2188,6 +2448,7 @@ one-line summary.
 
 // ─── Phase 1: Alpha Planning (skipped on resume) ──────────────
 if (at('Plan')) {
+const gatePlan = await boundaryGate('Plan'); if (gatePlan) return gatePlan
 phase('Plan')
 log(`Alpha planning: ${slug}`)
 
@@ -2580,6 +2841,7 @@ const noteTrackerWrote = (res) => {
 
 // ─── Phase 2: Bloodhound Review Loop (skipped on resume) ───────
 if (at('Review')) {
+  const gateReview = await boundaryGate('Review'); if (gateReview) return gateReview
   phase('Review')
 
   let approved = false
@@ -2598,7 +2860,7 @@ if (at('Review')) {
   // proceeds past an open real finding; the ONLY proceed is a clean APPROVED (AC3/AC5).
   const cfg = tierCfg(tier)
   const floor = bloodhoundRounds            // tier base (Alpha may have raised it)
-  const history = { fpRounds: [], counts: [], cumulativeCritFps: new Set(), critStreak: new Map() }
+  const history = newConvergenceHistory()
   let lastFindings = []
   let lastCriticalFindings = []
 
@@ -2712,16 +2974,11 @@ ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound', handoff)}
       findings seen, G = grounded, D = dropped), with the dropped findings beneath it, to
       ${planDir}/seat-notes/${rawFile} (mkdir -p ${planDir}/seat-notes; overwrite). NEVER add it
       to ${planDir}/${rawFile} — that file is the seat's byte-identical handoff.
-6.5 FINGERPRINT — for every GROUNDED finding compute a coarse \`fingerprint\`:
-   <normalized repo-relative file path, or "plan" if the finding has no file> + ":" +
-   <defect-class>. The defect-class is a 2-4 word lowercase-kebab slug naming the
-   UNDERLYING defect bucket, derived from the claim/title — e.g. "missing-related-name",
-   "tenant-leak", "unrounded-tax", "cs-retention-short", "pci-scope-downgrade",
-   "null-deref", "missing-migration", "missing-test". CRUCIAL: the SAME underlying defect
-   in the SAME file across DIFFERENT rounds MUST yield the SAME fingerprint — bucket by
-   the DEFECT, not by wording or line number (the pipeline uses these to detect
-   convergence vs oscillation; a defect re-described differently each round must still
-   match). Put \`fingerprint\` on every finding in findingsList.
+6.5 FINGERPRINT PARTS — the pipeline composes each finding's fingerprint from its file, symbol
+   and claim class (file + symbol + claim_class). For every GROUNDED finding pass "file" (the
+   normalized path from step 7), "symbol" and "claim_class" through VERBATIM from the verdict
+   block. Do NOT invent, reword or compute a fingerprint. Missing "claim_class" → "other";
+   missing "symbol" → leave it out.
 7.5 ${toolDenialCheck(`${tmpFile.replace(/\.txt$/, '')}-l<N>, N = that link's number in step 3`)}
 8. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: review_round=${round}, status="reviewed",
    phase="review-${round}", and record grounded/dropped counts. Do NOT write
@@ -2732,7 +2989,7 @@ ${chainSteps(bhChain, 'wolfpack-bloodhound', tmpFile, 'bloodhound', handoff)}
    line (Vibe link), or \`sha256sum ${planDir}/${rawFile}\` of the file the claude link wrote.
 9. Clean up temp files: rm -f ${tmpFile}
 10. Return: verdict, findings (count of GROUNDED findingsList items), findingsList
-    (grounded only, each with id/severity/title/file/line/claim/evidence/FINGERPRINT),
+    (grounded only, each with id/severity/title/file/line/claim/evidence/symbol/claim_class),
     grounded (count), dropped (the array from step 7), and the provider FAMILY that produced
     the ACCEPTED review as \`provider\` (exactly one of ${bhChain.map(f => `"${f}"`).join(', ')}). Also set
     \`status\` to that provider. Also return \`deniedTools\` and (when the block had it) \`toolAccess\`
@@ -2829,6 +3086,7 @@ ${heartbeat('Review', `Bloodhound round ${round}${unit.key !== 'full' ? ' ' + un
     lastCriticalFindings = findings.filter(f => isCriticalSev(f.severity))
     log(`Bloodhound ISSUES_FOUND: ${findings.length} grounded finding(s)`)
 
+    for (const s of suspectedSymbolDrift(history, findings)) log(`⚠ suspected oscillation (symbol drift: ${s.was} vs ${s.now}) at ${s.file} [${s.claimClass}] — not parked on; exact-match fingerprints differ`)
     const verdictC = classifyConvergence({ round, findings, history, cfg, floor })
     commitRound(history, findings, verdictC.cumulativeCrit)
     // [06] AC3 — role-keyed ledger entry (signal/noise from grounded vs dropped).
@@ -2967,6 +3225,7 @@ ${heartbeat('Review', `Alpha revision round ${round}`)}${HUMAN_NOTES_DIRECTIVE}$
 
 // ─── Phase 3: Debrief (skipped on resume) ─────────────────────
 if (at('Debrief')) {
+const gateDebrief = await boundaryGate('Debrief'); if (gateDebrief) return gateDebrief
 phase('Debrief')
 log(`Alpha debrief: ${slug}`)
 
@@ -3058,6 +3317,7 @@ Return { pending: [...] }.
 
 // ─── Phase 4: Shepherd Implementation (skipped on resume) ──────
 if (at('Implement')) {
+const gateImplement = await boundaryGate('Implement'); if (gateImplement) return gateImplement
 phase('Implement')
 log(`Shepherd implementing: ${slug}`)
 
@@ -3075,6 +3335,7 @@ REWRITE ENTRY — Tracker round ${n} (NOT a fresh build): the code is already im
 committed on feat/${slug}; the Tracker bounced it back. Read ${planDir}/tracker-report-${n}.md
 and fix EVERY finding it lists (all severities) — do not re-scaffold or re-implement settled
 plan items. After fixing, re-run your self-check (git diff ${BASE}..HEAD) and commit on feat/${slug}.
+If ${planDir}/test-record-tracker.json exists with "pass": false, the PIPELINE's full-suite run failed (Tracker may have reported a pass) — read ${planDir}/test-record-tracker.log first and fix what it shows.
 `
 } else if (resumeStatus === 'code_rewrite_needed') {
   const n = resumeProbe.pointerRounds || 1
@@ -3182,6 +3443,7 @@ if (implPatchPark) return implPatchPark
 
 // ─── Phase 5: Pointer Code Review Loop (skipped on resume) ─────
 if (at('Code Review') && pointerRounds > 0) {
+  const gateCodeReview = await boundaryGate('Code Review'); if (gateCodeReview) return gateCodeReview
   phase('Code Review')
 
   let pointerApproved = false
@@ -3190,7 +3452,7 @@ if (at('Code Review') && pointerRounds > 0) {
   // loop). pointerRounds is the FLOOR; convergence detection extends/parks past it.
   const pcfg = tierCfg(tier)
   const pFloor = pointerRounds
-  const pHistory = { fpRounds: [], counts: [], cumulativeCritFps: new Set(), critStreak: new Map() }
+  const pHistory = newConvergenceHistory()
   let lastPointerFindings = []
   // usage-limit-gate (AC6, A-5): under a usage offload the GLM Shepherd wrote the code on a
   // tier that normally forces Opus. On Red OR compliance-critical hunts, an APPROVED
@@ -3314,14 +3576,11 @@ ${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChai
       findings beneath it, to ${planDir}/seat-notes/${rawFile} (mkdir -p ${planDir}/seat-notes;
       overwrite). NEVER add it to ${planDir}/${rawFile} — that file is the seat's
       byte-identical handoff.
-6.5 FINGERPRINT — for every GROUNDED finding compute a coarse \`fingerprint\`:
-   <normalized repo-relative file path, or "plan" if no file> + ":" + <defect-class>.
-   The defect-class is a 2-4 word lowercase-kebab slug naming the UNDERLYING defect
-   bucket from the claim/title — e.g. "missing-related-name", "tenant-leak",
-   "unrounded-tax", "cs-retention-short", "null-deref", "missing-test". CRUCIAL: the SAME
-   underlying defect in the SAME file across DIFFERENT rounds MUST yield the SAME
-   fingerprint — bucket by the DEFECT, not by wording or line number. Put \`fingerprint\`
-   on every finding in findingsList.
+6.5 FINGERPRINT PARTS — the pipeline composes each finding's fingerprint from its file, symbol
+   and claim class (file + symbol + claim_class). For every GROUNDED finding pass "file" (the
+   normalized path from step 7), "symbol" and "claim_class" through VERBATIM from the verdict
+   block. Do NOT invent, reword or compute a fingerprint. Missing "claim_class" → "other";
+   missing "symbol" → leave it out.
 7.5 ${toolDenialCheck(`${tmpFile.replace(/\.txt$/, '')}-l<N>, N = that link's number in step 3`)}
 8. Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}: pointer_round=${pRound}, status per verdict, record
    grounded/dropped counts. Do NOT write review_fingerprints or convergence here — the
@@ -3331,7 +3590,7 @@ ${claudeFinalRound ? CLAUDE_FINAL_SELF_REVIEW_STEP(tmpFile) : chainSteps(ptrChai
    line (Vibe link), or \`sha256sum ${planDir}/${rawFile}\` of the file the claude link wrote.${claudeFinalRound ? CLAUDE_FINAL_REVIEW_STEP(pRound) : ''}
 9. Clean up temp files: rm -f ${tmpFile}
 10. Return: verdict, findings (count of GROUNDED items), findingsList (grounded only,
-    each with id/severity/title/file/line/claim/evidence/FINGERPRINT), grounded (count),
+    each with id/severity/title/file/line/claim/evidence/symbol/claim_class), grounded (count),
     dropped (array), and the provider FAMILY that produced the accepted review as
     \`provider\` (exactly one of ${ptrChain.map(f => `"${f}"`).join(', ')}). Also return \`deniedTools\`
     and (when the block had it) \`toolAccess\` from step 7.5. Also return \`artifacts\`:
@@ -3460,6 +3719,7 @@ ${META_PRESERVE_NOTE}. Do NOT alter any other file. Do NOT commit. Return record
     // cross-family round is already ≥ maxRounds+1 and parks on ISSUES; a further Claude-final
     // ISSUES parks at ≥ maxRounds+1.
     const effRound = pRound - claudeFinalRoundsRun
+    for (const s of suspectedSymbolDrift(pHistory, pFindings)) log(`⚠ suspected oscillation (symbol drift: ${s.was} vs ${s.now}) at ${s.file} [${s.claimClass}] — not parked on; exact-match fingerprints differ`)
     const pv = classifyConvergence({
       round: effRound, findings: pFindings, history: pHistory, floor: pFloor,
       cfg: wasClaudeFinalRound ? { ...pcfg, maxRounds: pcfg.maxRounds + 1 } : pcfg,
@@ -3615,6 +3875,7 @@ ${heartbeat('Code Review', `Shepherd rewrite round ${pRound}`)}${HUMAN_NOTES_DIR
 // ─── Phase 6: Tracker Tests (skipped on resume) ───────────────
 // Tracker always runs in automated mode (minimums enforced above)
 if (at('Test')) {
+  const gateTest = await boundaryGate('Test'); if (gateTest) return gateTest
   phase('Test')
   log(`Tracker testing: ${slug}`)
 
@@ -3643,6 +3904,7 @@ Execute ALL Tracker instructions:
 - Write tests per the tier strategy
 - Run tests using: ${cfg().testCommand}
   (wolfpack-config.md → Project Identity → Test command — follow its notes on narrowing and on which test backend the sandbox uses)
+- PIPELINE TEST RECORD: after you return TESTS_PASS the pipeline itself runs ${cfg().testCommand} at the committed HEAD and writes ${planDir}/test-record-tracker.json + .log — that record, not your report, gates Certify. Run targeted tests while you write them; commit EVERY test file before returning (uncommitted tracked changes are not in the commit the record tests). Never write or edit test-record-*.json.
 - Classify failures (baseline/transient/pre-existing/legitimate)
 - Write ${planDir}/tracker-log.md and ${planDir}/tracker-report-1.md if needed
 - Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}
@@ -3702,6 +3964,18 @@ ${heartbeat('Test', 'Tracker writing and running tests')}
     return { slug, verdict: trackerResult.verdict, tier, findings: trackerResult.findings, worktreePath }
   }
   log(`Tracker: ${trackerResult.verdict}`)
+  // run-observability (AC7/AC8): the PIPELINE's own SHA-stamped full-suite run gates Certify,
+  // not the Tracker's report. A failing record bounces exactly like a Tracker failure.
+  if (trackerResult.verdict === 'TESTS_PASS') {
+    const tr = await takeTestRecord('tracker', 'Test')
+    if (!tr.ok && tr.kind === 'fail') {
+      log(`⛔ pipeline test record FAILED at ${tr.rec.commit}: ${tr.rec.summary} (Tracker reported TESTS_PASS) — bouncing at Test; Certify not entered`)
+      await recordTestRewriteNeeded({ phaseLabel: 'Test' })
+      return { slug, verdict: 'TESTS_FAIL', tier, worktreePath, testRecord: testRecordSummary(tr.rec), usageGateEvents: [...usageGateEvents] }
+    }
+    if (!tr.ok) return await parkTestRecord(tr, { stage: 'tracker', resumePhase: 'Test', phaseLabel: 'Test' })
+    testRecordTakenThisPass = true
+  }
 }
 
 // ─── Phase 7: Watchdog Certification (skipped on resume) ──────
@@ -3710,6 +3984,19 @@ ${heartbeat('Test', 'Tracker writing and running tests')}
 // must exist at outer scope or the return throws ReferenceError.
 let watchdogResult
 if (at('Certify')) {
+const gateCertify = await boundaryGate('Certify'); if (gateCertify) return gateCertify
+// run-observability (AC9): a resume that skipped Test (or a Tracker verdict other than
+// TESTS_PASS) takes the tracker record here. ensure reuses it when HEAD has not moved.
+if (!testRecordTakenThisPass) {
+  const tr = await takeTestRecord('tracker', 'Certify')
+  if (!tr.ok && tr.kind === 'fail') {
+    log(`⛔ pipeline test record FAILED at ${tr.rec.commit}: ${tr.rec.summary} — bouncing to Implement; Certify not entered`)
+    await recordTestRewriteNeeded({ phaseLabel: 'Certify' })
+    return { slug, verdict: 'TESTS_FAIL', tier, worktreePath, testRecord: testRecordSummary(tr.rec), usageGateEvents: [...usageGateEvents] }
+  }
+  if (!tr.ok) return await parkTestRecord(tr, { stage: 'tracker', resumePhase: 'Certify', phaseLabel: 'Certify' })
+  testRecordTakenThisPass = true
+}
 phase('Certify')
 log(`Watchdog certifying: ${slug}`)
 
@@ -3809,7 +4096,7 @@ Steps:
    Read .wolfpack/known-broken-tests.md and .wolfpack/cross-cutting-debt.md.
    EFFICIENCY (mandatory): certify from the diff plus targeted greps — do NOT read whole large files; grep for a symbol then read only the relevant range, and scope greps to the changed app directory (never the repo root) so they don't time out. Whole-file reads of large modules bloat context and can crash the certification request.
    SAFETY: No git push. No deploy commands. No \`git add -f\` — ever.
-   You MUST run git diff ${BASE}..HEAD and the project's test command yourself. End your response with a <verdict> block: {verdict, plan_adherence, code_quality, test_result, tool_access: {shell: ok|denied|unused, denied_tools: []}} — tool_access is MANDATORY: report honestly whether your shell ran; list every denied or unknown tool call in denied_tools; never present a file-reading audit as a verified certification.${HANDOFF_NOTE(wdHandoff)}"
+   You MUST run git diff ${BASE}..HEAD yourself. TEST EVIDENCE — the pipeline's SHA-stamped full-suite record is ${planDir}/test-record-tracker.json (raw log: ${planDir}/test-record-tracker.log), written by a script with no agent in between. Run git rev-parse HEAD: if it EQUALS the record's "commit", the record IS this certification's test result — cite its pass/exit/summary, audit the log against .wolfpack/known-broken-tests.md, and do NOT re-run the full suite. Only if the record is missing or its commit differs from HEAD, run the project's test command yourself. End your response with a <verdict> block: {verdict, plan_adherence, code_quality, test_result, tool_access: {shell: ok|denied|unused, denied_tools: []}} — tool_access is MANDATORY: report honestly whether your shell ran; list every denied or unknown tool call in denied_tools; never present a file-reading audit as a verified certification.${HANDOFF_NOTE(wdHandoff)}"
 
 3. Walk the CERTIFIER CHAIN in order. Each wrapper caps concurrent calls on its model
    (flock). Run each EXACTLY as given, capture stdout for verdict parsing:
@@ -3862,6 +4149,7 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
        metadata.json — they are GITIGNORED plan artifacts that ride the worktree and are
        copied back by /merge; force-adding them is the leak.
    Then \`git commit\`.
+   After this commit the pipeline re-takes the record at the FINAL HEAD (test-record-final.json); a failing final record parks the hunt — never edit test-record-*.json.
 
 5. If a link failed, move to the NEXT link of the chain (step 3 list) and repeat step 4.
 
@@ -3986,6 +4274,20 @@ if (watchdogResult.verdict !== 'PASS') {
 // hunts. Fail-closed: if path detection is uncertain, park anyway. A prior /resolve
 // sign-off (park.compliance_signed_off) short-circuits the gate so resume proceeds.
 if (at('Verify')) {
+  // run-observability (AC10): the record is re-taken at the FINAL HEAD (after the certify
+  // commit). A failing final record parks — never auto-rework, never a mergeable verdict.
+  // Before the compliance gate, so chain mode is covered too.
+  const fr = await takeTestRecord('final', 'Certify')
+  if (!fr.ok && fr.kind === 'fail') {
+    log(`⛔ ${slug}: FINAL test record FAILED at ${fr.rec.commit}: ${fr.rec.summary} — parking final_test_record_failed (NOT mergeable)`)
+    await parkHunt({
+      reason: 'final_test_record_failed', resumePhase: 'Verify', resolutionTypeExpected: 'redirect', phaseLabel: 'Certify',
+      needFromUser: `The full suite FAILS at the final HEAD ${fr.rec.commit} (after the certify commit) — ${fr.rec.summary}. The hunt is NOT mergeable. Fix the break on feat/${slug} (often the certify commit's own pedigree row), then resume (Verify re-takes the record).`,
+      context: `log: ${fr.rec.log}\nrecord: ${planDir}/test-record-final.json`,
+    })
+    return { slug, verdict: 'PARKED', status: 'parked:final_test_record_failed', reason: 'final_test_record_failed', tier, worktreePath, testRecord: testRecordSummary(fr.rec), usageGateEvents: [...usageGateEvents] }
+  }
+  if (!fr.ok) return await parkTestRecord(fr, { stage: 'final', resumePhase: 'Verify', phaseLabel: 'Certify' })
   const complianceGate = (await agent(`
 You are the compliance-review gate for a certified Wolfpack hunt. You ONLY inspect
 which paths the diff touched and whether a human already signed off — you do NOT
@@ -4083,7 +4385,7 @@ Do NOT write parked.md. Do NOT touch the "park" block. Do NOT commit. Do NOT pus
 Return {ok:true}.
 ${heartbeat('Certify', 'chain mode: recording compliance hold (merge-and-await)')}
 `, { label: `compliance-hold:${slug}`, phase: 'Certify', model: 'sonnet', schema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] } })
-      return { slug, verdict: 'CERTIFIED_PENDING_COMPLIANCE', status: 'certified_pending_compliance', reason: 'compliance_review', tier, worktreePath }
+      return { slug, verdict: 'CERTIFIED_PENDING_COMPLIANCE', status: 'certified_pending_compliance', reason: 'compliance_review', tier, worktreePath, usageGateEvents: [...usageGateEvents] }
     }
     log(`⛔ ${slug}: compliance-review checkpoint (${why}). Parking compliance_review before the release queue.`)
     await parkHunt({
@@ -4110,14 +4412,14 @@ phase('Verify')
 // ONCE for the whole campaign (AC14). The certified hunt goes back to the runner, which merges it.
 if (baseBranch) {
   log(`Chain mode: per-hunt dev deploy skipped — /release-campaign deploys ${baseBranch} once.`)
-  return { slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', tier, findings: watchdogResult?.findings, worktreePath, status: 'certified' }
+  return { slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', tier, findings: watchdogResult?.findings, worktreePath, status: 'certified', usageGateEvents: [...usageGateEvents] }
 }
 // wolfpack-self-hosting (AC10): a project with no deploy step (wolfpack-config.md → Deployment
 // Notes → Dev deploy command: none) has nothing to verify on dev. The verdict token stays
 // CERTIFIED_AWAITING_DEPLOY — campaign-runner and wolfpack-release.mjs key on it.
 if (!cfg().devDeployCommand) {
   log(`No deploy step: wolfpack-config.md → Deployment Notes → Dev deploy command is none — ${slug} is certified; next: /merge ${slug}.`)
-  return { slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', tier, findings: watchdogResult?.findings, worktreePath, status: 'certified' }
+  return { slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', tier, findings: watchdogResult?.findings, worktreePath, status: 'certified', usageGateEvents: [...usageGateEvents] }
 }
 log(`Deploying feat/${slug} to dev for pre-merge verification`)
 
@@ -4194,4 +4496,5 @@ return {
   findings: watchdogResult?.findings,
   worktreePath,
   status: verifyResult?.status ?? 'awaiting_user_deploy',
+  usageGateEvents: [...usageGateEvents],
 }

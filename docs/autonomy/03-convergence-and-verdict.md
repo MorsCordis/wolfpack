@@ -109,15 +109,40 @@ What distinguishes them isn't *count*, it's *progress*. So gate on progress.
 
 ### Finding fingerprints
 
-After Part A, every finding has `{file, line, claim}`. Fingerprint each:
+After Part A, every finding has `{file, line, claim}` plus two contract fields the seat supplies:
+`symbol` (the function/class/constant, or the plan section heading, the finding is about) and
+`claim_class` (one of a CLOSED vocabulary). The PIPELINE, never the seat or the shim agent,
+composes each finding's fingerprint from three normalized legs:
 
 ```
-fp = normalize(file) + ":" + defectClass(claim)
+fp = file + "::" + symbol + "::" + claim_class
 ```
 
-where `defectClass` buckets the claim (e.g. "missing related_name", "tenant leak",
-"unrounded tax", "record retention below the required minimum" -- generic review classes) — a coarse semantic key, computed by the shim
-agent from the claim text. Track the set of fingerprints seen per round in metadata:
+- **file**: repo-relative (leading `./`, `/workspace/` and `/` stripped, `\` → `/`); no file → `plan`.
+  Every hunt plan revision (`.wolfpack/plans/<slug>/plan.md`, `plan-revised-N.md`, `plan-final.md`)
+  normalizes to `plan`, so a genuine plan oscillation can match across revisions.
+- **symbol**: trimmed and unquoted, one leading keyword (`function`, `class`, `section`, `§`, …) and a
+  trailing `(...)` stripped, lowercased, whitespace and `::` → `-`; missing → `-`.
+- **claim_class**: one of `logic-error`, `missing-handling`, `silent-fallback`, `missing-test`,
+  `weak-test`, `contract-drift`, `scope-gap`, `scope-creep`, `spec-misread`, `security`,
+  `data-integrity`, `concurrency`, `performance`, `leak`, `docs-drift`, `config`, `other`. An unknown
+  or missing class → `other`.
+
+The composer and the classifier live in `scripts/lib/review-convergence.mjs`, pasted byte-identically
+into `hunt-pipeline.js` (a drift test guards it), so tests replay recorded review histories against the
+real classifier. A seat-supplied `fingerprint` is overwritten.
+
+**Why.** The old key was a seat-invented `normalize(file) + ":" + defectClass(claim)` slug. Two
+DIFFERENT defects in one file regularly got the same coarse slug, so a round read as "a fixed finding
+returned" and parked a healthy review as an oscillation (a false collision). Plan-review keys also
+changed file every round (`plan-revised-N.md`), so a genuine plan oscillation could never match. The
+symbol leg separates distinct defects, and the closed class list stops near-synonym drift. The
+trade-off is a false-NEGATIVE risk: a genuinely returning defect that another seat names with a
+different symbol no longer matches, so it runs to the round breaker instead. The pipeline logs that
+case and never parks on it: `⚠ suspected oscillation (symbol drift: <a> vs <b>) at <file> [<claim_class>]`
+(`suspectedSymbolDrift`).
+
+Track the set of fingerprints seen per round in metadata:
 `review_fingerprints: [["fpA","fpB"], ["fpC"], ...]` (one array per round).
 
 ### The convergence rules (per review loop — Bloodhound and Pointer)

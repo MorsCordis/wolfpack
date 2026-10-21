@@ -1,0 +1,102 @@
+{
+  "about": "Recorded review-oscillation histories (genericized: paths and titles rewritten; no project names, paths or client data) for replaying scripts/lib/review-convergence.mjs. Each round is that round's GROUNDED findings, holding only what the classifier needs: severity, file, symbol, claim_class, plus a generic title. Rounds are 1-based; 'differ'/'same' name findings as [round, index]. Filler findings stand in for the unrelated findings of a round where the tracked defect was absent. See plan run-observability § Fixtures (F1-F3) and the synthetic CRITICAL case.",
+  "tier": "Orange",
+  "cases": [
+    {
+      "name": "F1",
+      "label": "false_collision",
+      "role": "bloodhound",
+      "rounds": [
+        [
+          { "severity": "LOW", "title": "fragile JS testing approach", "file": "web/js/calendar.js", "claim_class": "weak-test" }
+        ],
+        [
+          { "severity": "LOW", "title": "filler: setup step order unclear", "file": "docs/setup.md", "symbol": "Install", "claim_class": "docs-drift" }
+        ],
+        [
+          { "severity": "HIGH", "title": "local constants inside the IIFE cannot be stubbed, so the proposed test mocking fails", "file": "web/js/calendar.js", "symbol": "calendarModalIife", "claim_class": "spec-misread" }
+        ]
+      ],
+      "expect": {
+        "differ": [[1, 0], [3, 0]],
+        "oscillation": false,
+        "note": "Old fingerprints were both web/js/calendar.js:fragile-js-test and parked 'oscillation' at R3; a different defect in the same file is not a return."
+      }
+    },
+    {
+      "name": "F2",
+      "label": "genuine_return",
+      "role": "bloodhound",
+      "rounds": [
+        [
+          { "severity": "MEDIUM", "title": "filler: shift API pagination unspecified", "file": "app/api/shifts.py", "symbol": "list_shifts", "claim_class": "scope-gap" }
+        ],
+        [
+          { "severity": "MEDIUM", "title": "falsy picker value submitted, causing a validation error", "file": "web/js/calendar.js", "symbol": "submitShiftForm", "claim_class": "missing-handling" }
+        ],
+        [
+          { "severity": "MEDIUM", "title": "falsy/null colour styling in eventDidMount", "file": "web/js/calendar.js", "symbol": "eventDidMount", "claim_class": "missing-handling" }
+        ],
+        [
+          { "severity": "LOW", "title": "filler: settings label wording", "file": "web/templates/settings.html", "symbol": "Settings", "claim_class": "docs-drift" }
+        ],
+        [
+          { "severity": "LOW", "title": "missing inline style reset in eventDidMount", "file": "web/js/calendar.js", "symbol": "eventDidMount", "claim_class": "missing-handling" }
+        ]
+      ],
+      "expect": {
+        "differ": [[2, 0], [3, 0]],
+        "same": [[3, 0], [5, 0]],
+        "oscillation_at": 5,
+        "note": "R2 vs R3/R5 was a false collision (all three were ...:falsy-fk-not-nulled); R3 -> R5 is a genuine return (same symbol and class, absent in R4)."
+      }
+    },
+    {
+      "name": "F3",
+      "label": "genuine_return",
+      "role": "pointer",
+      "rounds": [
+        [
+          { "severity": "LOW", "title": "guard regex misses env-with-flags", "file": "hooks/guard.sh", "symbol": "EXEC_RE", "claim_class": "security" }
+        ],
+        [
+          { "severity": "LOW", "title": "interpreter regex accepts a quoted path", "file": "hooks/guard.sh", "symbol": "INTERP_RE", "claim_class": "security" }
+        ],
+        [
+          { "severity": "LOW", "title": "guard regex long-flag gap", "file": "hooks/guard.sh", "symbol": "EXEC_RE", "claim_class": "security" }
+        ]
+      ],
+      "expect": {
+        "differ": [[1, 0], [2, 0]],
+        "same": [[1, 0], [3, 0]],
+        "oscillation_at": 3,
+        "note": "The same guard regex re-broken: same file, symbol and class; R2 stays distinct."
+      }
+    },
+    {
+      "name": "critical-stuck",
+      "label": "critical_stuck",
+      "role": "pointer",
+      "rounds": [
+        [
+          { "severity": "CRITICAL", "title": "tenant filter dropped on export", "file": "app/export/service.py", "symbol": "export_rows", "claim_class": "data-integrity" }
+        ],
+        [
+          { "severity": "CRITICAL", "title": "export still skips the tenant filter", "file": "app/export/service.py", "symbol": "export_rows", "claim_class": "data-integrity" }
+        ],
+        [
+          { "severity": "CRITICAL", "title": "tenant filter missing from export rows", "file": "app/export/service.py", "symbol": "export_rows", "claim_class": "data-integrity" }
+        ]
+      ],
+      "expect": {
+        "same": [[1, 0], [2, 0], [3, 0]],
+        "action_at": { "round": 3, "action": "park_open_critical" },
+        "note": "Synthetic: identical {file, symbol, claim_class} CRITICAL in 3 consecutive rounds."
+      }
+    }
+  ],
+  "plan_file_normalization": [
+    { "file": ".wolfpack/plans/example-hunt/plan-revised-2.md", "normalized": "plan" },
+    { "file": ".wolfpack/plans/example-hunt/plan-revised-3.md", "normalized": "plan" }
+  ]
+}

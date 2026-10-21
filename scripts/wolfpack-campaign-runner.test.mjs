@@ -45,7 +45,7 @@ const FIXTURE_CONFIG = { name: 'fixture-project', testCommand: 'bash scripts/tes
 // seat: the env leg's injected literal `PACK='<home>'` (shq-quoted) in the prompt wins; otherwise the
 // seat copied the config key (the reader JSON's wolfpackHome). Callers pass the probe prompt.
 const probePack = (prompt, keyHome) => {
-  const m = /PACK='((?:[^']|'\\'')*)'; /.exec(prompt || '')
+  const m = /PACK='((?:[^']|'\\'')*)'; echo /.exec(prompt || '')   // env leg only (the key leg is now `PACK='<home>'; case`)
   return m ? m[1].replace(/'\\''/g, "'") : (typeof keyHome === 'string' ? keyHome : '')
 }
 const configAnswer = (cfg = FIXTURE_CONFIG, cwd = '/repo', prompt = '') =>
