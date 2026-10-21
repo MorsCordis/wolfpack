@@ -100,7 +100,7 @@ test('AC4: generate into a temp consumer from the REAL pack — stamp names HEAD
   const consumer = consumerDir()
   try {
     const head = git(REAL_PACK, 'rev-parse', 'HEAD')
-    const describe = git(REAL_PACK, 'describe', '--tags')
+    const describe = git(REAL_PACK, 'describe', '--tags', '--match', 'v[0-9]*')
     const r1 = generate({ pack: REAL_PACK, consumer })
     assert.equal(r1.ok, true)
     assert.deepEqual(r1.results.map(x => x.action), ['generated', 'generated'])
@@ -281,6 +281,21 @@ test('the REAL wolfpack checkout: checkAll({ pack: root, consumer: root }) → b
   const c = checkAll({ pack: REAL_PACK, consumer: REAL_PACK })
   assert.equal(c.ok, true)
   assert.deepEqual(c.workflows.map(w => [w.name, w.state]), [['campaign-runner.js', 'canonical'], ['hunt-pipeline.js', 'canonical']])
+})
+
+test('packInfo: the version is the nearest RELEASE tag (v*), never a lightweight pre-hunt marker tag', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wpwf-tag-'))
+  try {
+    git(dir, 'init', '-q', '-b', 'main')
+    writeFileSync(join(dir, 'a'), '1\n')
+    git(dir, 'add', 'a'); git(dir, 'commit', '-q', '-m', 'one')
+    git(dir, 'tag', '-a', 'v1.2.3', '-m', 'release')
+    writeFileSync(join(dir, 'a'), '2\n')
+    git(dir, 'commit', '-q', '-am', 'two')
+    git(dir, 'tag', 'pre-hunt-something')
+    const { version } = packInfo(dir)
+    assert.match(version, /^v1\.2\.3-1-g[0-9a-f]+$/)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
 test('packInfo: a pack with no reachable tag fails loud with the fetch --tags fix', () => {

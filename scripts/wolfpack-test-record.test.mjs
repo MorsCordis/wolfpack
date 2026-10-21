@@ -11,7 +11,7 @@ import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -227,6 +227,32 @@ test('AC9 ensure: a FAILING record at the same HEAD is reused too (exit 2, no re
   assert.equal(runs(f), 1)
   assert.equal(f.run(['run', '--json', '--stage', 'tracker', '--record-dir', f.recordDir]).code, 2)
   assert.equal(runs(f), 2)
+})
+
+test('ensure: a FAILING record is re-taken once the hunt is re-armed after it (human-notes.md newer); a PASS is still reused', () => {
+  const f = fixture({ exitCode: 1 })
+  assert.equal(f.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir]).code, 2)
+  assert.equal(runs(f), 1)
+  // notes written BEFORE the record finished do not count as a re-arm
+  const notes = join(f.recordDir, 'human-notes.md')
+  writeFileSync(notes, 'old note\n')
+  const past = new Date(Date.now() - 3600_000)
+  utimesSync(notes, past, past)
+  assert.equal(f.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir]).json.reused, true)
+  assert.equal(runs(f), 1)
+  // a re-arm after the failure: fresh run at the same commit
+  const future = new Date(Date.now() + 60_000)
+  utimesSync(notes, future, future)
+  const again = f.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  assert.equal(again.json.reused, false)
+  assert.equal(runs(f), 2)
+  // the new record finished after the notes' real write, so a passing environment would now be reused
+  const g2 = fixture({ exitCode: 0 })
+  assert.equal(g2.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', g2.recordDir]).code, 0)
+  writeFileSync(join(g2.recordDir, 'human-notes.md'), 'n\n')
+  utimesSync(join(g2.recordDir, 'human-notes.md'), future, future)
+  assert.equal(g2.run(['ensure', '--json', '--stage', 'tracker', '--record-dir', g2.recordDir]).json.reused, true)
+  assert.equal(runs(g2), 1)
 })
 
 test('ensure: a record whose command differs from the configured one is stale → re-run; a corrupt record → re-run', () => {

@@ -89,7 +89,7 @@ export function parseStamp(text) {
 export function packInfo(pack) {
   const git = (args) => execFileSync('git', ['-C', pack, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim()
   let version
-  try { version = git(['describe', '--tags']) } catch {
+  try { version = git(['describe', '--tags', '--match', 'v[0-9]*']) } catch {
     throw new Error(`cannot read the pack version at ${pack} (no tags reachable) — fix: git -C '${pack}' fetch --tags`)
   }
   let commit

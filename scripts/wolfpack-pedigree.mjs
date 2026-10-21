@@ -210,10 +210,13 @@ export function indexRow({ pedigree, meta, date, duration, notes } = {}) {
     missing.push(`${col} (${jpath})`);
     return null;
   };
-  const rework = intField('Rework', 'execution_scores.rework_rounds');
-  const ptrRnd = intField('PtrRnd', 'execution_scores.pointer_rounds', { fallback: m.pointer_round });
-  const trkRnd = intField('TrkRnd', 'execution_scores.tracker_rounds', { fallback: m.tracker_round });
-  const human = intField('Human', 'execution_scores.human_interventions');
+  // The counters belong under execution_scores; a certifier that wrote them at the top level of
+  // pedigree.json (seen from the GLM Watchdog) carries the same values, so read them there next.
+  const top = (k) => (ped[k] === undefined || ped[k] === null ? undefined : ped[k]);
+  const rework = intField('Rework', 'execution_scores.rework_rounds', { fallback: top('rework_rounds') });
+  const ptrRnd = intField('PtrRnd', 'execution_scores.pointer_rounds', { fallback: top('pointer_rounds') ?? m.pointer_round });
+  const trkRnd = intField('TrkRnd', 'execution_scores.tracker_rounds', { fallback: top('tracker_rounds') ?? m.tracker_round });
+  const human = intField('Human', 'execution_scores.human_interventions', { fallback: top('human_interventions') });
 
   if (missing.length) return { ok: false, missing };
 

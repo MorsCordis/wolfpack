@@ -113,6 +113,19 @@ test('AC2 (b): existing target — source wins, a differing file is reported ove
   assert.equal(existsSync(join(dest, 'h')), false)
 })
 
+test('copy-back: files the hunt branch TRACKS (pedigree.json) are skipped; they arrive with the merge, and copying them first makes git merge abort', () => {
+  const root = repo({ ignorePlans: false })
+  const wt = repo({ ignorePlans: false })
+  commitFiles(wt, { '.wolfpack/plans/h/pedigree.json': '{"score":5}\n' }, 'pedigree')
+  const src = join(wt, '.wolfpack', 'plans', 'h')
+  writeFileSync(join(src, 'certification.md'), 'PASS\n')
+  const r = cli(root, 'copy-back', '--slug', 'h', '--from', src, '--repo', root)
+  assert.equal(r.code, 0, r.stdout + r.stderr)
+  assert.deepEqual(r.json.skipped_tracked, ['pedigree.json'])
+  assert.ok(r.json.copied.includes('certification.md'))
+  assert.equal(existsSync(join(root, '.wolfpack', 'plans', 'h', 'pedigree.json')), false)
+})
+
 test('AC2 (c): a target whose pedigree.json is TRACKED → overwritten in place (git shows modified, never deleted), no .prior-* archive', () => {
   const root = repo({ ignorePlans: false })
   const mainPlan = join(root, '.wolfpack', 'plans', 'h')

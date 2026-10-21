@@ -177,6 +177,25 @@ test('consolidation-acceptance AC10: the merge-and-state-hygiene-shaped pedigree
   assert.equal('row' in r, false);
 });
 
+test('index-row: counters at the TOP level of pedigree.json (the GLM Watchdog layout) are read like nested ones', () => {
+  const nested = deep(canonical());
+  Object.assign(nested.execution_scores, { rework_rounds: 2, pointer_rounds: 1, tracker_rounds: 3, human_interventions: 1 });
+  const flat = deep(nested);
+  for (const k of ['rework_rounds', 'pointer_rounds', 'tracker_rounds', 'human_interventions']) {
+    flat[k] = flat.execution_scores[k];
+    delete flat.execution_scores[k];
+  }
+  const a = indexRow({ pedigree: nested, meta: META, date: '2026-10-21' });
+  const b = indexRow({ pedigree: flat, meta: META, date: '2026-10-21' });
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true, `refused: ${b.missing}`);
+  assert.equal(b.row, a.row);
+  // nested still wins when both are present
+  const both = deep(nested);
+  both.rework_rounds = 9;
+  assert.equal(indexRow({ pedigree: both, meta: META, date: '2026-10-21' }).row, a.row);
+});
+
 test('consolidation-acceptance AC10: the run-observability-shaped pedigree (scores:{…}) is refused', () => {
   const ped = { certifier_verdict: 'pass', scores: { plan_adherence: 5, code_quality: 4, rework: 0 } };
   const r = indexRow({ pedigree: ped, meta: META, date: '2026-10-21' });

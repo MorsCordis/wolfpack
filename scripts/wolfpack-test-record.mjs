@@ -30,7 +30,11 @@
 //
 // CLI (JSON on stdout with --json; human lines on stderr):
 //   run    --stage S --record-dir D [--repo R] [--rev REV] [--config PATH] [--timeout-min N] [--json]
-//   ensure (same flags)  reuse a pass/fail record at the target commit + command; else run
+//   ensure (same flags)  reuse a pass/fail record at the target commit + command; else run.
+//                        A FAILING record is re-taken instead when the hunt was re-armed after it
+//                        was taken (<record-dir>/human-notes.md modified after its finished_at):
+//                        an environment fix (expired credentials, a shared-DB collision) must get
+//                        a fresh run at the same commit, not the stale failure.
 //   check  --stage S --record-dir D [--rev REV] [--repo R] [--json]   never runs
 //   gate   (same flags as check)  check; a STALE record (tip moved) is re-run once, then re-checked
 // Exit codes: run/ensure 0 = pass, 2 = fail; check/gate 0 = allow, 2 = refuse (prints the fix
@@ -42,7 +46,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
-  closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
+  closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -269,6 +273,16 @@ function emit(o, obj, human) {
 
 const recordLine = (r, reused) => `wolfpack-test-record: ${r.stage} ${r.commit.slice(0, 12)} ${r.pass ? 'PASS' : 'FAIL'} — ${r.summary} [${reused ? 'reused' : `ran in ${r.ran_in}`}] log ${r.log}`
 
+// A failing record is stale once a human re-armed the hunt after it finished: /resolve and a
+// manual re-arm both write human-notes.md, and the usual reason is an environment fix.
+export function rearmedSince(recordDir, rec) {
+  const notes = join(resolve(recordDir), 'human-notes.md')
+  if (!rec || rec.pass || !existsSync(notes)) return false
+  const done = Date.parse(rec.finished_at || '')
+  if (!Number.isFinite(done)) return false
+  return statSync(notes).mtimeMs > done
+}
+
 export async function main(argv) {
   let o = { json: argv.includes('--json') }
   try {
@@ -282,7 +296,7 @@ export async function main(argv) {
     if (o.cmd === 'run' || o.cmd === 'ensure') {
       if (o.cmd === 'ensure') {
         const j = judge()
-        if (j.state === 'pass' || j.state === 'fail') {
+        if (j.state === 'pass' || (j.state === 'fail' && !rearmedSince(o.recordDir, j.rec))) {
           emit(o, { ...j.rec, reused: true }, recordLine(j.rec, true))
           return j.rec.pass ? 0 : 2
         }
