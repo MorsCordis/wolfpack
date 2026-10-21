@@ -196,6 +196,11 @@ Steps through smoke tests one at a time. Collects all issues, makes fixes in one
 with no wave barriers; non-conflicting hunts push through a blocked one, and `/release-campaign` ships it once.
 Details: the wolfpack skill (`.agents/skills/wolfpack/SKILL.md` § Chain mode).
 
+**Unattended + cron resume** (`/run-campaign-local <slug> --chain --unattended`): no confirmation, no pre-spec
+sweep, no questions (anything needing a human parks). A 15-minute cron (`scripts/wolfpack-cron-resume.sh tick`)
+relaunches an ARMED campaign's runner in tmux once the usage window allows, disarms after 3 failed relaunches and
+pages your phone through a private ntfy topic. Install, arming and the state file: [cron-resume.md](cron-resume.md).
+
 **Hunt flags:**
 ```
 /hunt [--no-worktree] [--shepherd=<model>]

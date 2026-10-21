@@ -1,5 +1,5 @@
 ---
-description: Run/resume a Wolfpack campaign IN-SESSION via the Workflow tool (no headless `claude -p` container). Keeps Alpha/Shepherd/Tracker on your interactive session's billing; GLM/Mistral still run in their pods. Usage: /run-campaign-local [--no-prespec | --prespec=all | --prespec=wave] [--chain] <slug> [max-parallel]
+description: Run/resume a Wolfpack campaign IN-SESSION via the Workflow tool (no headless `claude -p` container). Keeps Alpha/Shepherd/Tracker on your interactive session's billing; GLM/Mistral still run in their pods. Usage: /run-campaign-local [--no-prespec | --prespec=all | --prespec=wave] [--chain] [--unattended] <slug> [max-parallel]
 ---
 
 Launch (or resume) a Wolfpack campaign using the built-in **Workflow tool from THIS interactive
@@ -15,9 +15,10 @@ usage page; news reports have flip-flopped). Even if `-p` is NOT metered, this p
 no container, no podman-in-podman for the reviewer shims, and worktree git registration uses host
 paths (no `/workspace` mismatch).
 
-Parse `$ARGUMENTS` as `[--no-prespec | --prespec=all | --prespec=wave] [--chain] <campaign-slug> [max-parallel]`
+Parse `$ARGUMENTS` as `[--no-prespec | --prespec=all | --prespec=wave] [--chain] [--unattended] <campaign-slug> [max-parallel]`
 (default max-parallel **2**). `--chain` may appear in any position; strip it before the positional parse; with it
-max-parallel defaults to 1 (see § Chain mode). The pre-spec flag picks Step 1.5's scope:
+max-parallel defaults to 1 (see § Chain mode). `--unattended` may appear in any position; strip it before the
+positional parse, like `--chain` (see § Unattended mode). The pre-spec flag picks Step 1.5's scope:
 - *(no flag)* or `--prespec=all` — **whole-campaign sweep (the default):** the pending hunts of every wave.
 - `--prespec=wave` — the resume wave only (the old behaviour).
 - `--no-prespec` — skip Step 1.5; hunts self-spec headlessly in-run and may park mid-wave.
@@ -25,6 +26,8 @@ max-parallel defaults to 1 (see § Chain mode). The pre-spec flag picks Step 1.5
 Refuse before doing anything else, naming the problem:
 - more than one of these flags → *"Pick one of --no-prespec, --prespec=all, --prespec=wave (got: <flags>)."*
 - any other `--prespec=<v>` → *"Unknown --prespec value '<v>' — use all or wave."*
+- `--unattended` without `--chain` → *"--unattended needs --chain: unattended runs are chain-mode only (barrier mode stops at every wave for a human)."*
+- `--unattended` with `--prespec=<v>` → *"--unattended skips the pre-spec sweep (no one is there to answer); drop --prespec=<v>."*
 
 Note: a plain `/run-campaign-local <slug>` now sweeps every wave. Use `--prespec=wave` for the old behaviour.
 
@@ -184,6 +187,7 @@ Live progress — paste into a separate terminal:
 Then call the **Workflow tool**:
 - `Workflow({ name: "campaign-runner", args: { campaignSlug: "<slug>", maxParallel: <N> } })`
 - With --chain: args: { campaignSlug, maxParallel: <N, default 1 when --chain>, chain: true } — see § Chain mode.
+- With --unattended (always with --chain): args also carry `unattended: true` — see § Unattended mode.
 
 It runs as a **background task in this session**: `campaign-runner` → `workflow('hunt-pipeline')`
 per hunt → `agent()` Claude subagents (this-session billing) → `podman-vibe.sh`
@@ -244,8 +248,34 @@ default.
 - A smoke-blocked or rejected hunt is reverted from the campaign branch (never from `main`):
   `node "$PACK/scripts/wolfpack-release.mjs" revert --campaign <slug> --hunt <hunt> --reason "<why>"`.
 
+## Unattended mode (--unattended)
+For a run nobody is watching — normally the one `wolfpack-cron-resume.sh tick` starts in tmux `paw:runner`
+(see `"$PACK/docs/cron-resume.md"`). Chain mode only (`--chain` is required; see the refusals above). Every
+rule below overrides the attended text above for this session:
+- **Preconditions 1–3 still apply.** Precondition 2 (permission mode) is logged, not asked.
+- **Step 1: no confirmation.** Render the RESUME PLAN to the output and launch without asking.
+- **Step 1.5: skipped** (as `--no-prespec`). Hunts self-spec headlessly in the run; a hunt with an open
+  load-bearing question stays `needs_spec` (parked) and the launch continues with the rest.
+- **No `AskUserQuestion` anywhere** in this session — not for a confirmation, a pre-spec question, a `/hunt`
+  scaffold question or a commit offer. Anything that needs a human parks instead.
+- **A permission refusal** (the auto-mode classifier or a hook) in this session's own steps is never retried and
+  never turned into a prompt. If it hit a hunt's step, set that hunt's `metadata.json` `status` to
+  `parked:permission_denied` (read-modify-write, preserving every other field) and run
+  `bash "$PACK/scripts/wolfpack-cron-resume.sh" event park --campaign <slug> --hunt <hunt> --status parked:permission_denied --reason permission_denied`,
+  then continue. If it hit a campaign-level step, run
+  `bash "$PACK/scripts/wolfpack-cron-resume.sh" note-exit --campaign <slug> --verdict permission_denied` and stop.
+- **Launch:** `Workflow({ name: "campaign-runner", args: { campaignSlug: "<slug>", maxParallel: <N, default 1>, chain: true, unattended: true } })`.
+- **When the workflow task ends** (any verdict, or an error), run
+  `bash "$PACK/scripts/wolfpack-cron-resume.sh" note-exit --campaign <slug> --verdict <verdict|error>` and stop.
+  The runner itself disarms the campaign and sends the phone notifications (park, ready-for-release,
+  waiting-on-you).
+- **Arming is the human's:** `bash "$PACK/scripts/wolfpack-cron-resume.sh" arm <slug>` from the consumer repo.
+  This command never arms (and never disarms) a campaign. The crontab line comes from
+  `bash "$PACK/scripts/wolfpack-cron-resume.sh" --print-crontab`; the script never edits the crontab.
+
 ## What NOT to do
 - Do NOT `exec run-pipeline-sandbox.sh` or call `claude -p` — that's the metered/headless path
   this command exists to avoid.
 - Do NOT hand-edit `.claude/workflows/campaign-runner.js` / `hunt-pipeline.js` — pipeline changes go canonical-first, then `install.sh --consumer` (above).
 - Do NOT deploy or push — the workflow stops at wave barriers; the user drives releases.
+- Do NOT ask anything under `--unattended` — no `AskUserQuestion`, no confirmation; park instead (§ Unattended mode).
