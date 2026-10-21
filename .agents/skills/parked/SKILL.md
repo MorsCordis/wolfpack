@@ -109,6 +109,8 @@ If nothing is parked: `No parked hunts — the queue is clear.`
 
 ## `/resolve <slug>` — answer and re-arm
 
+**Resolve the pack (`PACK`).** `PACK="$WOLFPACK_HOME"`; if that is empty, read `wolfpack-config.md` → Project Identity → **Wolfpack home** (the backticked path; expand a leading `~`). If neither is set, or `"$PACK/scripts/wolfpack-config.mjs"` does not exist, STOP with the fix: "export WOLFPACK_HOME=<absolute path of your wolfpack checkout>, or add a `Wolfpack home` line (the path in backticks) under ## Project Identity in wolfpack-config.md". Pack scripts run as `"$PACK/scripts/<name>"`, never from a copy in this repo.
+
 1. **Locate** the hunt (dual-scan). If it's `needs_spec`, stop and tell the user to run
    `/spec <slug>` instead (the spec interview is the right channel). If no park record
    exists at all, say so and stop.
