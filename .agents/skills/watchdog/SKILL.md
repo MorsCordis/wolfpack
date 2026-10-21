@@ -66,7 +66,7 @@ A transient infra failure (auth expired, service down, port in use, connection r
 
 Work through each systematically. Record each item's result in `$PLAN_DIR/certification.md`.
 
-**Tool access (hard rule).** You must run `git diff <base>..HEAD` yourself, and take the test result from the SHA-matching pipeline record (or run the project's test command when there is none — see § Pipeline test record). If your shell is denied or unavailable, say so in the verdict's `tool_access` (`{"shell": "ok"|"denied"|"unused", "denied_tools": [...]}`; list every denied or unknown tool call). Never present a file-reading audit as a verified certification. On Orange and Red tiers the pipeline parks an audit-only certification (`audit_only_certification`) instead of accepting its PASS, and there a verdict that omits `tool_access`, or reports `shell` as anything other than `"ok"` (including `"unused"`: you never ran the diff or the tests), counts as audit-only. On lighter tiers it is allowed but recorded in `metadata.audit_only_seats`.
+**Tool access (hard rule).** You must run `git diff <base>..HEAD` yourself, and take the test result from the SHA-matching pipeline record (or run the project's test command when there is none — see § Pipeline test record). If your shell is denied or unavailable, say so in the verdict's `tool_access` (`{"shell": "ok"|"denied"|"unused", "denied_tools": [...]}`; list every denied or unknown tool call). Never present a file-reading audit as a verified certification. On Orange and Red tiers the pipeline parks an audit-only certification (`audit_only_certification`) instead of accepting its PASS, and there a verdict that omits `tool_access`, or reports `shell` as anything other than `"ok"` (including `"unused"`: you never ran the diff or the tests), counts as audit-only. On lighter tiers it is allowed but recorded in `metadata.audit_only_seats`. A PASS whose `pedigree.json` lacks `certifier_verdict` or the scores is parked `pedigree_incomplete` (see § Index append format).
 
 ### Parallel Certification (optional)
 
@@ -566,13 +566,15 @@ Telemetry, not a gate: if `node` is unavailable, log and continue.
 
 ### Index append format
 
-Append one line to `.wolfpack/pedigree/index.md` (preserve table formatting):
+The index row is written by `node <pack>/scripts/wolfpack-pedigree.mjs index-row --plan-dir <plan dir> --index .wolfpack/pedigree/index.md --date YYYY-MM-DD --duration "<DURATION>"` (pipeline and interactive runs alike) — never typed by hand. It reads `pedigree.json` + `metadata.json` and REFUSES (exit 2, naming every missing field, index untouched) a `pedigree.json` without `certifier_verdict` (`pass|rework|flawed_plan`), the `execution_scores` (integer 1-5 each), `process_value_add` (integer 1-5 each) and the counters (`rework_rounds`, `pointer_rounds`, `tracker_rounds`, `human_interventions`). The pipeline then parks the hunt `pedigree_incomplete` instead of writing dashes. Green-tier hunts, where Pointer and Tracker are skipped, may leave `code_review_quality`, `test_authoring_quality`, `pointer_value_add` and `tracker_value_add` null or `N/A` (written as `—`).
+
+The row has the real 21-column header of `.wolfpack/pedigree/index.md`:
 
 ```
-| YYYY-MM-DD | feature-slug | tier | shepherd:model | pointer:model | tracker:model | verdict | adherence | quality | judgment | test | code_rev | test_auth | ptr_val | trk_val | cycle_eff | rework | ptr_rnd | trk_rnd | human | duration | short notes |
+| Date | Feature | Tier | Shepherd | Pointer | Tracker | Verdict | Adherence | Quality | Judgment | Test | CodeRev | TestAuth | PtrVal | TrkVal | CycleEff | Rework | PtrRnd | TrkRnd | Human | Notes |
 ```
 
-`duration` is the `DURATION=<…>` value from the timing aggregator above (e.g. `23m 41s`); use `—` if the aggregator produced no total. For Green-tier hunts where Pointer/Tracker are skipped, use `—` for those columns.
+Shepherd, Pointer and Tracker are the model families (`claude`, `glm`, …). `--duration` is the `DURATION=<…>` value from the timing aggregator above (e.g. `23m 41s`); it is appended to Notes as `; duration <…>`.
 
 ## certification.md format
 

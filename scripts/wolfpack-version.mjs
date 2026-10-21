@@ -8,7 +8,7 @@
 //
 // CLI:
 //   node scripts/wolfpack-version.mjs set --plan-dir D --bump B --tag T --by ROLE [--reason TEXT] [--at ISO]
-//       B = PATCH|MINOR|MAJOR|none (case-insensitive)   T = vX.Y.Z | none
+//       B = PATCH|MINOR|MAJOR|none (case-insensitive)   T = vX.Y.Z[-pre] | none
 //       ROLE = human|alpha|debrief|shepherd|pointer|tracker|watchdog
 //       prints {applied, disagreement, proposed_version}; exit 0, or 2 on bad arguments.
 //       applied → D/metadata.json rewritten; not applied → left byte-identical, and a real
@@ -31,10 +31,15 @@ export function normBump(b) {
   throw new Error(`invalid bump ${JSON.stringify(b)} (want PATCH|MINOR|MAJOR|none)`)
 }
 
-const normTag = (t) => {
+export const TAG_RE = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$/
+
+// 'vX.Y.Z[-prerelease]' | null (none / null / ''); anything else throws.
+export function normTag(t) {
   if (t === undefined || t === null) return null
   const s = String(t).trim()
-  return (s === '' || s.toLowerCase() === 'none' || s === 'null') ? null : s
+  if (s === '' || s.toLowerCase() === 'none' || s === 'null') return null
+  if (!TAG_RE.test(s)) throw new Error(`invalid --tag ${JSON.stringify(t)} (want vMAJOR.MINOR.PATCH[-prerelease] or none)`)
+  return s
 }
 
 // Pure: never mutates `meta`.
@@ -81,12 +86,13 @@ function main(argv) {
     if (typeof f['plan-dir'] !== 'string') return fail('--plan-dir is required')
     if (typeof f.by !== 'string' || !ROLES.includes(f.by)) return fail(`--by must be one of ${ROLES.join(', ')}`)
     if (f.bump === undefined || f.bump === true) return fail('--bump is required (PATCH|MINOR|MAJOR|none)')
-    if (f.tag === undefined || f.tag === true) return fail('--tag is required (vX.Y.Z|none)')
+    if (f.tag === undefined || f.tag === true) return fail('--tag is required (vX.Y.Z[-pre]|none)')
     const dir = resolve(f['plan-dir'])
     const mp = join(dir, 'metadata.json')
     if (!existsSync(mp)) return fail(`no metadata.json in ${dir}`)
     const meta = JSON.parse(readFileSync(mp, 'utf8'))
     normBump(f.bump)   // validate before touching anything
+    normTag(f.tag)
     const r = applyProposedVersion(meta, { bump: f.bump, tag: f.tag, by: f.by, reason: typeof f.reason === 'string' ? f.reason : undefined })
     if (r.applied) writeFileSync(mp, JSON.stringify(r.meta, null, 2) + '\n')
     if (r.disagreement) {

@@ -133,7 +133,7 @@ Each phase records its orchestration in metadata.json's `orchestration` block vi
 Multiple hunts can run concurrently in separate worktrees. Infrastructure for safe concurrent merges:
 
 - **Auto-rebase on merge:** When main has moved since the feature branch was created, `/merge` auto-rebases the feature branch onto main before the `--no-ff` merge. If the rebase fails (conflict), it aborts cleanly and provides manual resolution instructions.
-- **Shared file append safety:** `.gitattributes` configures the `union` merge driver on three append-only files: `pedigree/index.md`, `known-broken-tests.md`, `cross-cutting-debt.md`. The `union` driver auto-resolves by keeping all lines from both sides — correct for append-only markdown lists where ordering doesn't matter.
+- **Shared file append safety:** No merge driver is configured for the shared append-only files (`pedigree/index.md`, `known-broken-tests.md`, `cross-cutting-debt.md`): git's default text merge applies, so two branches that each append after the same last line conflict, and the conflict is resolved by hand keeping both entries.
 - **Version tag collision prevention:** `/hunt` scans in-progress hunts' `proposed_version.tag` across BOTH `.wolfpack/plans/*/` AND `.agents/worktrees/*/.wolfpack/plans/*/`, and computes the next version from the highest of {latest git tag, all claimed in-progress tags}. `/merge` runs a pre-merge gate that blocks if the proposed tag already exists (`exit 1`).
 
 ## Running the Pipeline

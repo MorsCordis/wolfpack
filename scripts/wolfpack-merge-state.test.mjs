@@ -16,7 +16,9 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { copyBack, stampMerged, surveyMerged, backfillMerged, attributeUnreleased } from './wolfpack-merge-state.mjs'
+import {
+  copyBack, stampMerged, surveyMerged, backfillMerged, attributeUnreleased, mergeSubjectBranch, MERGE_SUBJECT_RE,
+} from './wolfpack-merge-state.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const CLI = join(here, 'wolfpack-merge-state.mjs')
@@ -428,4 +430,147 @@ test('AC12: the pack\'s own CHANGELOG [Unreleased] has no untagged item (the hyg
   // (a release stamp may leave [Unreleased] empty or absent — AC14: never assert pre-release state)
   const untagged = (m ? m[1] : '').split('\n').filter(l => /^- /.test(l) && !/<!-- hunt:/.test(l))
   assert.deepEqual(untagged, [])
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// consolidation-acceptance AC4–AC6 — backfill-merged proves the OLDER merge subjects
+// (`Merge feat/<slug> (…)`, `Merge <b>: …`, `Merge <b> — …`, `Merge <b>`), for feat/<slug> and the
+// metadata `branch`, in both forms; AC11 — attributeUnreleased fails closed on a git error.
+// ════════════════════════════════════════════════════════════════════════════
+
+// Merge `branch` into main --no-ff with an arbitrary subject (the older hand-written forms).
+function mergeWithSubject(root, branch, subject, files) {
+  g(root, 'checkout', '-q', '-b', branch, 'main')
+  commitFiles(root, files || { [`${branch.replace(/\//g, '_')}.txt`]: `${branch}\n` }, `work on ${branch}`)
+  g(root, 'checkout', '-q', 'main')
+  g(root, 'merge', '-q', '--no-ff', branch, '-m', subject)
+  return sha(root, 'HEAD')
+}
+
+test('consolidation-acceptance AC4: mergeSubjectBranch reads the new form and every older form seen on a real main', () => {
+  const table = [
+    ["Merge branch 'feat/run-observability'", 'feat/run-observability'],
+    ["Merge branch 'feat/k' into campaign/c", 'feat/k'],
+    ["Merge branch 'fix/x-y'", 'fix/x-y'],
+    // the four older subject SHAPES seen on a real consumer main (names genericized)
+    ['Merge feat/receive-new-item: receive a new item', 'feat/receive-new-item'],
+    ['Merge fix/list-contact-fields: contact fields (v0.46.2)', 'fix/list-contact-fields'],
+    ['Merge fix/changelog-wave-3-v0.30.9 — stamp v0.30.9', 'fix/changelog-wave-3-v0.30.9'],
+    ['Merge chore/wave2-finalize', 'chore/wave2-finalize'],
+    ['Merge feat/old-form (wave 1)', 'feat/old-form'],
+  ]
+  for (const [subject, want] of table) assert.equal(mergeSubjectBranch(subject), want, subject)
+  const negatives = [
+    'merge: stamp v0.32.0 changelog',             // lowercase, no slash
+    'Merge pull request #12 from u/b',            // `pull` has no slash
+    "Merge remote-tracking branch 'origin/main'", // `remote-tracking` has no slash
+    'Merge wave2 finalize',                       // no slash at all
+    'Merged feat/x',                              // not the word "Merge"
+    'chore: Merge feat/x',                        // not at the start
+    '', null, undefined,
+  ]
+  for (const s of negatives) assert.equal(mergeSubjectBranch(s), null, String(s))
+  assert.ok(MERGE_SUBJECT_RE instanceof RegExp)
+})
+
+test('consolidation-acceptance AC4/AC5: survey proves `Merge feat/<slug> (…)` and a metadata fix/<slug> branch in BOTH forms; new-form cases stay green', () => {
+  const root = repo()
+  const plans = join(root, '.wolfpack', 'plans')
+  writeMeta(join(plans, 'old'), { feature: 'old', status: 'certified' })                         // Merge feat/old (wave 1)
+  writeMeta(join(plans, 'colon'), { feature: 'colon', status: 'certified' })                     // Merge feat/colon: …
+  writeMeta(join(plans, 'fixnew'), { feature: 'fixnew', status: 'certified', branch: 'fix/fixnew' })   // Merge branch 'fix/fixnew'
+  writeMeta(join(plans, 'fixold'), { feature: 'fixold', status: 'certified', branch: 'fix/fixold' })   // Merge fix/fixold (…)
+  writeMeta(join(plans, 'newform'), { feature: 'newform', status: 'certified' })                 // Merge branch 'feat/newform'
+  writeMeta(join(plans, 'never'), { feature: 'never', status: 'certified' })                     // branch exists, never merged
+  const OLD = mergeWithSubject(root, 'feat/old', 'Merge feat/old (wave 1)')
+  const COLON = mergeWithSubject(root, 'feat/colon', 'Merge feat/colon: the colon form')
+  const FIXNEW = mergeWithSubject(root, 'fix/fixnew', "Merge branch 'fix/fixnew'")
+  const FIXOLD = mergeWithSubject(root, 'fix/fixold', 'Merge fix/fixold (v0.1.1)')
+  const NEW = mergeFeat(root, 'newform')
+  g(root, 'branch', 'feat/never', 'main')
+  const s = surveyMerged(root)
+  assert.deepEqual(s.certified, ['colon', 'fixnew', 'fixold', 'never', 'newform', 'old'])
+  assert.deepEqual(s.provable.map(p => p.slug).sort(), ['colon', 'fixnew', 'fixold', 'newform', 'old'])
+  assert.deepEqual(s.unprovable, ['never'])
+  const commitOf = (slug) => s.provable.find(p => p.slug === slug).commit
+  assert.equal(commitOf('old'), OLD)
+  assert.equal(commitOf('colon'), COLON)
+  assert.equal(commitOf('fixnew'), FIXNEW)
+  assert.equal(commitOf('fixold'), FIXOLD)
+  assert.equal(commitOf('newform'), NEW)
+  // the CLI agrees (dry run)
+  const r = cli(root, 'backfill-merged', '--repo', root)
+  assert.equal(r.code, 0, r.stderr)
+  assert.equal(r.stdout.split('\n')[0], 'certified=6 provable=5')
+  assert.equal(r.stdout.split('\n')[2], 'unprovable: never')
+})
+
+test('consolidation-acceptance AC4: an old-form merge that is NOT on main\'s first-parent line proves nothing', () => {
+  const root = repo()
+  const plans = join(root, '.wolfpack', 'plans')
+  writeMeta(join(plans, 'side'), { feature: 'side', status: 'certified' })
+  // feat/side is merged (old form) into `other`, which main never takes.
+  g(root, 'checkout', '-q', '-b', 'other', 'main')
+  g(root, 'checkout', '-q', '-b', 'feat/side', 'other')
+  commitFiles(root, { 'side.txt': 'side\n' }, 'feat(side)')
+  g(root, 'checkout', '-q', 'other')
+  g(root, 'merge', '-q', '--no-ff', 'feat/side', '-m', 'Merge feat/side (wave 9)')
+  g(root, 'checkout', '-q', 'main')
+  const s = surveyMerged(root)
+  assert.deepEqual(s.provable, [])
+  assert.deepEqual(s.unprovable, ['side'])
+})
+
+test('consolidation-acceptance AC6: --apply stamps the old-form provable hunt exactly as today; the unmerged certified hunt stays certified', () => {
+  const root = repo()
+  const plans = join(root, '.wolfpack', 'plans')
+  writeMeta(join(plans, 'old'), { feature: 'old', status: 'certified', keep: { x: 1 } })
+  writeMeta(join(plans, 'open'), { feature: 'open', status: 'certified' })
+  const OLD = mergeWithSubject(root, 'feat/old', 'Merge feat/old (wave 1)')
+  g(root, 'branch', 'feat/open', 'main')
+  const openBefore = hash(join(plans, 'open', 'metadata.json'))
+  const r = cli(root, 'backfill-merged', '--apply', '--repo', root)
+  assert.equal(r.code, 0, r.stderr)
+  assert.match(r.stdout, /^certified=2 provable=1\n/)
+  assert.match(r.stdout, /\nstamped: old\n/)
+  const m = readJ(join(plans, 'old', 'metadata.json'))
+  assert.equal(m.status, 'merged')
+  assert.equal(m.phase, 'done')
+  assert.equal(m.merge_commit, OLD)
+  assert.equal(m.merged_at, g(root, 'log', '-1', '--format=%cI', OLD))
+  assert.equal(m.backfilled, true)
+  assert.deepEqual(m.keep, { x: 1 }, 'other fields preserved')
+  assert.equal(readJ(join(plans, 'open', 'metadata.json')).status, 'certified')
+  assert.equal(hash(join(plans, 'open', 'metadata.json')), openBefore, 'the unprovable hunt is byte-identical')
+})
+
+test('consolidation-acceptance AC11: attributeUnreleased fails closed when git rev-list --first-parent errors (missing ref)', () => {
+  const base = ['# Changelog', '', '## [Unreleased]', '', '### Added', '- an item', ''].join('\n')
+  const root = repo({ files: { 'CHANGELOG.md': base } })
+  assert.throws(
+    () => attributeUnreleased(root, { ref: 'refs/heads/does-not-exist', text: base }),
+    /attribute-changelog: git rev-list --first-parent refs\/heads\/does-not-exist failed \(exit \d+\)/,
+  )
+  // the existing ref still works (and attributes nothing here: the item was committed straight to main)
+  const ok = attributeUnreleased(root, { text: base })
+  assert.deepEqual(ok.attributed, [])
+  assert.deepEqual(ok.unattributed, ['- an item'])
+})
+
+test('consolidation-acceptance AC11 CLI: attribute-changelog in a repo with no `main` exits 2 naming the git failure; the file is untouched', () => {
+  const root = tmp('wpms-nomain-')
+  g(root, 'init', '-q', '-b', 'trunk')
+  const base = ['# Changelog', '', '## [Unreleased]', '', '### Added', '- trunk item', ''].join('\n')
+  commitFiles(root, { 'CHANGELOG.md': base }, 'initial')
+  const r = cli(root, 'attribute-changelog', '--apply', '--repo', root)
+  assert.equal(r.code, 2, r.stdout + r.stderr)
+  assert.equal(r.json.status, 'error')
+  assert.match(r.json.reason, /git rev-list --first-parent refs\/heads\/main failed/)
+  assert.equal(readFileSync(join(root, 'CHANGELOG.md'), 'utf8'), base)
+  // no [Unreleased] section → nothing to attribute → no git call → still exit 0 (not an error)
+  const root2 = tmp('wpms-nomain2-')
+  g(root2, 'init', '-q', '-b', 'trunk')
+  commitFiles(root2, { 'CHANGELOG.md': '# Changelog\n\n## [v1.0.0]\n- x\n' }, 'initial')
+  const r2 = cli(root2, 'attribute-changelog', '--repo', root2)
+  assert.equal(r2.code, 0, r2.stdout + r2.stderr)
 })

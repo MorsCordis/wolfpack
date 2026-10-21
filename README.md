@@ -41,6 +41,10 @@ The one invariant that never relaxes: **review roles must be a different model f
 | **Orange** | Full (can loop) | Multi-component, API changes |
 | **Red** | Full + security/compliance | High-risk, compliance, architectural |
 
+## One source
+
+Wolfpack is the **one source** of the pipeline. Every pipeline command, role skill, workflow, the router, every pack script, the seat shims and the design docs live once, in this repo. A consuming project keeps only its `wolfpack-config.md`, its `.wolfpack/` artifacts, and its own project skills, commands and hooks. It installs the pack with `install.sh` (`bash install.sh --consumer <repo>` generates the stamped workflow copies; `bash install.sh --check` verifies the install read-only), and the no-copies guard (`scripts/wolfpack-no-copies.mjs`) fails CI if a project tracks a copy.
+
 ## Quick Start
 
 Wolfpack ships as a self-contained repo. You don't copy files into your project — `install.sh` points your agent harness at this repo's `.agents/` tree, then you drop a `wolfpack-config.md` into your project so the roles know your conventions; the pack's no-copies guard keeps consuming projects from tracking copies. Full walkthrough: [SETUP.md](SETUP.md).

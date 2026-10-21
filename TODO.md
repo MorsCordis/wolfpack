@@ -17,6 +17,9 @@ keep their original filing dates.
 
 ## Orchestration layer
 
+- [ ] **`pedigree.json` is never tracked** (Low, 2026-10-21; from consolidation-acceptance): `.gitignore` `.wolfpack/plans/*/` ignores the directory, so `!.wolfpack/plans/*/pedigree.json` cannot re-include it; the Watchdog skill, SETUP Step 5 and `/merge` copy-back assume it is tracked. Fix the ignore pattern (`.wolfpack/plans/*/*` + negation) in the pack and in `install.sh`'s consumer gitignore lines, and decide the copy-back behaviour.
+- [ ] **`attributeUnreleased` merge-subject regex** (Low, 2026-10-21; from consolidation-acceptance): it still knows only `Merge branch 'feat/…'`; reuse `mergeSubjectBranch()` from `backfill-merged` so old-form merges attribute too.
+
 - [ ] **Runtime examiner chain from the Model Pool** (Low, 2026-10-20; from scripts-unfork): `hunt-pipeline.js` / `campaign-runner.js` still hard-code `EXAMINER_ORDER` and the per-family seat agents; drive them from the pool + `gates` so a non-default pool's runtime chain matches the router's.
 
 - [ ] Unified sandbox image needs `node` for the hunt-pipeline toolcheck preflight; until it has it, container (`WOLFPACK_SANDBOX`) campaign runs park `toolcheck_failed` at the preflight.

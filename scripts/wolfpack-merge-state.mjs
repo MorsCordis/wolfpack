@@ -15,7 +15,8 @@
 //       refuses a SHA that is not on main
 //   backfill-merged [--apply] [--repo R]
 //       TEXT output. Survey every `certified` plan dir in the main checkout, prove which ones git
-//       shows merged into main (a `Merge branch 'feat/<slug>'` first-parent merge), and with
+//       shows merged into main (a first-parent merge whose subject is `Merge branch '<b>'` or the
+//       older `Merge <b> (…)` / `Merge <b>: …` form, <b> = feat/<slug> or the metadata `branch`), and with
 //       --apply stamp exactly those. Dry run by default; idempotent
 //   attribute-changelog [--file F] [--apply] [--repo R]
 //       tag untagged [Unreleased] items with the hunt whose merge carried them and place them with
@@ -123,15 +124,23 @@ export function stampMerged(root, slug, { mergeCommit, releasedVersion, at, extr
 
 // ─── 3. survey + backfill ─────────────────────────────────────────
 
-// `Merge branch '<branch>'` merges on main's first-parent line → branch → newest {commit, date}.
+// `Merge branch '<b>'[ into …]`  |  older forms: `Merge <b> (…)`, `Merge <b>: …`, `Merge <b> — …`, `Merge <b>`
+// where <b> contains a '/' (feat/x, fix/x, chore/x). Returns the branch or null.
+export const MERGE_SUBJECT_RE = /^Merge (?:branch '([^']+)'|([^\s':]+\/[^\s':]+))(?=$|[\s:])/
+export function mergeSubjectBranch(subject) {
+  const m = MERGE_SUBJECT_RE.exec(String(subject || ''))
+  return m ? (m[1] || m[2]) : null
+}
+
+// Merges on main's first-parent line (see mergeSubjectBranch) → branch → newest {commit, date}.
 function mergedBranches(root) {
   const out = git(['log', 'refs/heads/main', '--first-parent', '--merges', '--format=%H%x09%cI%x09%s'], { cwd: root, allowFail: true })
   const map = new Map()
   if (out.code !== 0) return map
   for (const row of out.stdout.split('\n').filter(Boolean)) {
     const [commit, date, ...rest] = row.split('\t')
-    const m = /^Merge branch '([^']+)'/.exec(rest.join('\t'))
-    if (m && !map.has(m[1])) map.set(m[1], { commit, date })
+    const b = mergeSubjectBranch(rest.join('\t'))
+    if (b && !map.has(b)) map.set(b, { commit, date })
   }
   return map
 }
@@ -202,13 +211,21 @@ export function attributeUnreleased(root, { file = 'CHANGELOG.md', text, ref = '
   let end = lines.findIndex((l, i) => i > start && /^## /.test(l))
   if (end === -1) end = lines.length
 
-  const firstParent = new Set(git(['rev-list', '--first-parent', ref], { cwd: root, allowFail: true }).stdout.split('\n').filter(Boolean))
+  // An error is not "no match": a failing git call must stop attribution, never read as "unattributable".
+  const gitOrThrow = (args) => {
+    const r = git(args, { cwd: root, allowFail: true })
+    if (r.code !== 0) throw new ChainError(`attribute-changelog: git ${args.slice(0, 3).join(' ')} failed (exit ${r.code}): ${r.stderr.trim()}`)
+    return r
+  }
+  const fpr = git(['rev-list', '--first-parent', ref], { cwd: root, allowFail: true })
+  if (fpr.code !== 0) throw new ChainError(`attribute-changelog: git rev-list --first-parent ${ref} failed (exit ${fpr.code}): ${fpr.stderr.trim()}`)
+  const firstParent = new Set(fpr.stdout.split('\n').filter(Boolean))
   const attributedOf = (line) => {
-    const log = git(['log', ref, '--reverse', '--format=%H', `-S${line}`, '--', relFile], { cwd: root, allowFail: true })
+    const log = gitOrThrow(['log', ref, '--reverse', '--format=%H', `-S${line}`, '--', relFile])
     const commit = log.stdout.split('\n').filter(Boolean)[0]
     if (!commit) return null
     if (firstParent.has(commit)) return null                      // committed straight to the branch
-    const carry = git(['rev-list', '--first-parent', '--merges', '--reverse', '--ancestry-path', `${commit}..${ref}`], { cwd: root, allowFail: true })
+    const carry = gitOrThrow(['rev-list', '--first-parent', '--merges', '--reverse', '--ancestry-path', `${commit}..${ref}`])
     const merge = carry.stdout.split('\n').filter(Boolean)[0]
     if (!merge) return null
     const subject = git(['log', '-1', '--format=%s', merge], { cwd: root }).stdout

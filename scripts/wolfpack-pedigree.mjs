@@ -154,6 +154,97 @@ export function buildRecord({
   return record;
 }
 
+// ─── Index row: the ONE validated writer of .wolfpack/pedigree/index.md rows ────────────────────
+// A pedigree.json without scores must never become a dashed row (the Certify seat once wrote
+// dashes from prose). indexRow() returns the row or names every missing/invalid field.
+// column → where it lives in pedigree.json (the Watchdog skill's schema)
+export const INDEX_SCORE_FIELDS = [
+  ['Adherence', 'execution_scores.plan_adherence'], ['Quality', 'execution_scores.code_quality'],
+  ['Judgment', 'execution_scores.implementation_judgment'], ['Test', 'execution_scores.test_result'],
+  ['CodeRev', 'execution_scores.code_review_quality'], ['TestAuth', 'execution_scores.test_authoring_quality'],
+  ['PtrVal', 'process_value_add.pointer_value_add'], ['TrkVal', 'process_value_add.tracker_value_add'],
+  ['CycleEff', 'process_value_add.cycle_efficiency'],
+];
+// Green skips Pointer and Tracker, so these four may be null / "N/A" there (written as "—").
+const GREEN_OPTIONAL = new Set(['CodeRev', 'TestAuth', 'PtrVal', 'TrkVal']);
+export const INDEX_VERDICTS = ['pass', 'rework', 'flawed_plan'];
+export const INDEX_COLUMNS = [
+  'Date', 'Feature', 'Tier', 'Shepherd', 'Pointer', 'Tracker', 'Verdict',
+  ...INDEX_SCORE_FIELDS.map((f) => f[0]), 'Rework', 'PtrRnd', 'TrkRnd', 'Human', 'Notes',
+];
+
+const jsonGet = (o, dotted) => dotted.split('.').reduce((a, k) => (a != null && typeof a === 'object' ? a[k] : undefined), o);
+const isNA = (v) => v === null || v === undefined || (typeof v === 'string' && v.trim().toUpperCase() === 'N/A');
+const unwrapScore = (v) => (v !== null && typeof v === 'object' && !Array.isArray(v) ? v.score : v);
+// The family cell is the model's leading token ("claude:opus:high" → "claude"), as in every existing row.
+const familyCell = (m) => (m ? String(m).split(':')[0].trim().toLowerCase() || '—' : '—');
+const cellText = (s) => String(s).replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim().replace(/\|/g, '\\|');
+
+export function indexRow({ pedigree, meta, date, duration, notes } = {}) {
+  const ped = pedigree && typeof pedigree === 'object' ? pedigree : {};
+  const m = meta && typeof meta === 'object' ? meta : {};
+  const missing = [];
+  const tier = m.tier ? String(m.tier) : null;
+  const green = tier === 'Green';
+  const slug = m.feature || m.slug || ped.hunt_id || null;
+  if (!slug) missing.push('Feature (metadata.feature)');
+  if (!tier) missing.push('Tier (metadata.tier)');
+  if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) missing.push('Date (--date YYYY-MM-DD)');
+
+  const verdictRaw = ped.certifier_verdict;
+  const verdictNorm = typeof verdictRaw === 'string' ? verdictRaw.trim().toLowerCase() : null;
+  if (!verdictNorm || !INDEX_VERDICTS.includes(verdictNorm)) missing.push('Verdict (certifier_verdict)');
+
+  const scores = [];
+  for (const [col, jpath] of INDEX_SCORE_FIELDS) {
+    const raw = unwrapScore(jsonGet(ped, jpath));
+    if (green && GREEN_OPTIONAL.has(col) && isNA(raw)) { scores.push('—'); continue; }
+    if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 1 && raw <= 5) scores.push(String(raw));
+    else { scores.push(null); missing.push(`${col} (${jpath})`); }
+  }
+
+  const intField = (col, jpath, { fallback } = {}) => {
+    let raw = unwrapScore(jsonGet(ped, jpath));
+    if (raw === undefined || raw === null) raw = fallback;
+    if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0) return String(raw);
+    missing.push(`${col} (${jpath})`);
+    return null;
+  };
+  const rework = intField('Rework', 'execution_scores.rework_rounds');
+  const ptrRnd = intField('PtrRnd', 'execution_scores.pointer_rounds', { fallback: m.pointer_round });
+  const trkRnd = intField('TrkRnd', 'execution_scores.tracker_rounds', { fallback: m.tracker_round });
+  const human = intField('Human', 'execution_scores.human_interventions');
+
+  if (missing.length) return { ok: false, missing };
+
+  const ma = m.model_assignments || {};
+  let noteText = cellText(notes !== undefined && notes !== null ? notes : (ped.notes || ''));
+  if (duration) noteText = (noteText ? `${noteText}; ` : '') + `duration ${cellText(duration)}`;
+  const cells = [
+    String(date), slug, tier, familyCell(ma.shepherd), familyCell(ma.pointer), familyCell(ma.tracker),
+    verdictNorm.toUpperCase(), ...scores, rework, ptrRnd, trkRnd, human, noteText,
+  ];
+  return { ok: true, row: `| ${cells.join(' | ')} |` };
+}
+
+// Index file edit (pure): append the row, or with replace swap exactly one existing row for the slug.
+export function applyIndexRow(indexText, slug, row, { replace = false } = {}) {
+  const lines = indexText.split('\n');
+  const hits = [];
+  lines.forEach((l, i) => {
+    if (!l.startsWith('|')) return;
+    const cells = l.split('|');
+    if (cells.length > 3 && cells[2].trim() === slug) hits.push(i);
+  });
+  if (replace) {
+    if (hits.length !== 1) throw new Error(`--replace needs exactly one existing row for ${slug} (found ${hits.length})`);
+    lines[hits[0]] = row;
+    return lines.join('\n');
+  }
+  if (hits.length) throw new Error(`a row for ${slug} already exists (use --replace to rewrite it)`);
+  return (indexText.endsWith('\n') ? indexText : indexText + '\n') + row + '\n';
+}
+
 // ─── CLI: emit (cert-time) + outcome (post-smoke/merge) ─────────────────────────
 // emit:    node wolfpack-pedigree.mjs emit --plan-dir <dir> [--tier T] [--rounds N]
 //            [--caught N] [--slipped N] [--completeness 0-1] [--correctness 0-1]
@@ -161,6 +252,11 @@ export function buildRecord({
 //          Reads <dir>/metadata.json (routing + task + rounds) + the counts, COMPUTES the v2
 //          block, and MERGES it into <dir>/pedigree.json (v1 fields preserved — model-stats reads
 //          overall/routing/dimensions from that one file). Validates; prints the scorecard.
+// index-row: node wolfpack-pedigree.mjs index-row --plan-dir <dir> --index <index.md> [--date YYYY-MM-DD]
+//            [--duration TEXT] [--notes TEXT] [--replace]
+//          Writes the pedigree index row from <dir>/pedigree.json + metadata.json. A pedigree.json
+//          without the Watchdog scores (or certifier_verdict) is REFUSED (exit 2, naming every
+//          missing field; index.md untouched). Without --replace a second row for the slug is refused.
 // outcome: node wolfpack-pedigree.mjs outcome --plan-dir <dir> [--slipped-smoke N] [--reverted]
 //          Folds post-merge reality into the existing record (retroactive downgrade). Run from
 //          /merge or /smoke once the hunt's real outcome lands.
@@ -171,6 +267,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--reverted') opt.reverted = true;
+    else if (a === '--replace') opt.replace = true;
     else if (a.startsWith('--')) opt[a.slice(2)] = argv[++i];
   }
   const planDir = opt['plan-dir'];
@@ -212,6 +309,29 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(0);
   }
 
+  if (cmd === 'index-row') {
+    const refuse = (msg) => { process.stderr.write(`index-row: ${msg}\n`); process.exit(2); };
+    if (typeof opt.index !== 'string') refuse('--index <index.md> is required');
+    const ped = readJson(pedPath);
+    if (!ped) refuse(`no readable pedigree.json at ${pedPath}`);
+    const meta = readJson(path.join(planDir, 'metadata.json'));
+    if (!meta) refuse(`no readable metadata.json in ${planDir}`);
+    const date = typeof opt.date === 'string' ? opt.date : new Date().toISOString().slice(0, 10);
+    const r = indexRow({
+      pedigree: ped, meta, date,
+      duration: typeof opt.duration === 'string' ? opt.duration : undefined,
+      notes: typeof opt.notes === 'string' ? opt.notes : undefined,
+    });
+    if (!r.ok) refuse(`missing or invalid pedigree scores: ${r.missing.join(', ')}`);
+    let text;
+    try { text = readFileSync(opt.index, 'utf8'); } catch (e) { refuse(`cannot read ${opt.index}: ${e.message}`); }
+    let next;
+    try { next = applyIndexRow(text, meta.feature || meta.slug || ped.hunt_id, r.row, { replace: opt.replace === true }); } catch (e) { refuse(e.message); }
+    writeFileSync(opt.index, next);
+    process.stdout.write(`index-row: ${opt.replace ? 'replaced' : 'appended'} the ${meta.feature || meta.slug || ped.hunt_id} row in ${opt.index}\n`);
+    process.exit(0);
+  }
+
   if (cmd === 'outcome') {
     const existing = readJson(pedPath);
     if (!existing) { process.stderr.write(`no pedigree.json at ${pedPath}\n`); process.exit(1); }
@@ -221,6 +341,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     process.exit(0);
   }
 
-  process.stderr.write('usage: wolfpack-pedigree.mjs <emit|outcome> --plan-dir <dir> [...]\n');
+  process.stderr.write('usage: wolfpack-pedigree.mjs <emit|outcome|index-row> --plan-dir <dir> [...]\n');
   process.exit(2);
 }
