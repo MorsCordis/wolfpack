@@ -203,17 +203,16 @@ export function indexRow({ pedigree, meta, date, duration, notes } = {}) {
     else { scores.push(null); missing.push(`${col} (${jpath})`); }
   }
 
-  const intField = (col, jpath, { fallback, naOnGreen = false } = {}) => {
+  const intField = (col, jpath, { fallback } = {}) => {
     let raw = unwrapScore(jsonGet(ped, jpath));
     if (raw === undefined || raw === null) raw = fallback;
-    if (naOnGreen && green && isNA(raw)) return '—';
     if (typeof raw === 'number' && Number.isInteger(raw) && raw >= 0) return String(raw);
     missing.push(`${col} (${jpath})`);
     return null;
   };
   const rework = intField('Rework', 'execution_scores.rework_rounds');
-  const ptrRnd = intField('PtrRnd', 'execution_scores.pointer_rounds', { fallback: m.pointer_round, naOnGreen: true });
-  const trkRnd = intField('TrkRnd', 'execution_scores.tracker_rounds', { fallback: m.tracker_round, naOnGreen: true });
+  const ptrRnd = intField('PtrRnd', 'execution_scores.pointer_rounds', { fallback: m.pointer_round });
+  const trkRnd = intField('TrkRnd', 'execution_scores.tracker_rounds', { fallback: m.tracker_round });
   const human = intField('Human', 'execution_scores.human_interventions');
 
   if (missing.length) return { ok: false, missing };

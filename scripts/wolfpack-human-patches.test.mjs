@@ -118,6 +118,16 @@ test('AC3: humanPatchApplySteps — a consumer patch gets git -C <consumer> appl
   assert.deepEqual(branches, [`feat/h-consumer (consumer worktree ${C})`])
 })
 
+test('F4: humanPatchApplySteps — patches with no b/ paths never emit a pathspec-less stage command', () => {
+  const C = '/c/consumer'
+  const { steps } = humanPatchApplySteps(
+    [{ patch: '/d/human-patches/consumer/01-del.patch', paths: [], applies: true, target: 'consumer' }],
+    { worktreePath: '/w/hunt', consumer: { path: C, branch: null }, slug: 'h' })
+  const lines = steps.split('\n')
+  assert.ok(!lines.some(l => /^\s*git -C \S+ add\b/.test(l)), 'no stage command without paths')
+  assert.ok(lines.some(l => l.includes('name no b/ paths')), 'a visible hint instead')
+})
+
 test('AC3: humanPatchApplySteps — mixed patches: hunt group first, then consumer; each repo gets its own add (deduped paths) + commit', () => {
   const W = '/w/hunt'
   const C = '/c/consumer'

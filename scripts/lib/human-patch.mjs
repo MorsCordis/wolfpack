@@ -40,7 +40,8 @@ export function humanPatchApplySteps(pending, { worktreePath, consumer, slug }) 
       lines.push(`  git -C ${repo} apply ${x.patch}${x.applies ? '' : '   # does NOT apply cleanly: inspect it first'}`)
     }
     const files = [...new Set(group.flatMap(x => x.paths || []))]
-    lines.push(`  git -C ${repo} add ${files.join(' ')}`)
+    if (files.length) lines.push(`  git -C ${repo} add ${files.join(' ')}`)
+    else lines.push(`  # these patches name no b/ paths: stage the changed files in ${repo} by name before committing`)
     lines.push(`  git -C ${repo} commit -m "fix(hooks): apply the Shepherd's staged patch"`)
     if (target === 'hunt') branches.push(`feat/${slug} (hunt worktree)`)
     else branches.push(`${(consumer && consumer.branch) || `feat/${slug}`} (consumer worktree ${repo})`)

@@ -234,6 +234,32 @@ test('consolidation-acceptance AC10: PtrRnd / TrkRnd fall back to metadata.{poin
   assert.deepEqual(r2.missing, ['PtrRnd (execution_scores.pointer_rounds)', 'TrkRnd (execution_scores.tracker_rounds)']);
 });
 
+test('consolidation-acceptance AC10: Green PtrRnd/TrkRnd get NO N/A allowance — the metadata fallback covers a Green scorecard without counters', () => {
+  const ped = canonical();
+  ped.execution_scores.code_review_quality = 'N/A';
+  ped.execution_scores.test_authoring_quality = null;
+  ped.process_value_add.pointer_value_add = 'N/A';
+  ped.process_value_add.tracker_value_add = null;
+  delete ped.execution_scores.pointer_rounds;
+  delete ped.execution_scores.tracker_rounds;
+  const green = { ...META, tier: 'Green', pointer_round: 0, tracker_round: 0 };
+  const ok = indexRow({ pedigree: ped, meta: green, date: '2026-10-21' });
+  assert.equal(ok.ok, true, JSON.stringify(ok.missing));
+  const c = cellsOf(ok.row);
+  assert.deepEqual(c.slice(17, 19), ['0', '0'], 'Green rounds come from metadata, never a dash');
+  // no counters and no metadata fallback: refused, even on Green
+  const bare = indexRow({ pedigree: ped, meta: { ...META, tier: 'Green' }, date: '2026-10-21' });
+  assert.equal(bare.ok, false);
+  assert.deepEqual(bare.missing, ['PtrRnd (execution_scores.pointer_rounds)', 'TrkRnd (execution_scores.tracker_rounds)']);
+  // an explicit "N/A" counter on Green is refused too
+  const na = deep(ped);
+  na.execution_scores.pointer_rounds = 'N/A';
+  na.execution_scores.tracker_rounds = 'N/A';
+  const rn = indexRow({ pedigree: na, meta: green, date: '2026-10-21' });
+  assert.equal(rn.ok, false);
+  assert.deepEqual(rn.missing, ['PtrRnd (execution_scores.pointer_rounds)', 'TrkRnd (execution_scores.tracker_rounds)']);
+});
+
 test('consolidation-acceptance AC10: Green may leave the four Pointer/Tracker scores N/A (→ "—"); non-Green may not', () => {
   const ped = canonical();
   ped.execution_scores.code_review_quality = 'N/A';
