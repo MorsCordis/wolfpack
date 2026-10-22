@@ -248,3 +248,27 @@ test('P1: every command that runs a pack script resolves the pack home first', (
     assert.match(t, /PACK=|pack home|Wolfpack home|WOLFPACK_HOME/i, `${f} uses $PACK without resolving it`)
   }
 })
+
+// ── campaign-cron-resume AC10: run-campaign-local --unattended ─────────
+test('AC10: run-campaign-local parses --unattended, refuses it without --chain / with --prespec, and documents unattended mode', () => {
+  const t = ALL['run-campaign-local.md']
+  const front = t.split('---')[1] ?? ''
+  assert.match(front, /\[--chain\] \[--unattended\] <slug>/, 'description carries --unattended')
+  const parse = t.split('\n').find((l) => l.startsWith('Parse `$ARGUMENTS` as'))
+  assert.ok(parse && parse.includes('[--unattended]'), 'the Parse line carries --unattended')
+  assert.match(t, /`--unattended` may appear in any position; strip it before the\s+positional parse/)
+  has(t, '"--unattended needs --chain: unattended runs are chain-mode only (barrier mode stops at every wave for a human)."', 'refusal 1')
+  has(t, '"--unattended skips the pre-spec sweep (no one is there to answer); drop --prespec=<v>."', 'refusal 2')
+  const u = section(t, '## Unattended mode (--unattended)', '## What NOT to do')
+  for (const s of ['no confirmation', 'Step 1.5: skipped', 'No `AskUserQuestion`', 'parked:permission_denied', 'note-exit',
+    'unattended: true', 'never arms', 'chain: true', '--print-crontab', 'event park --campaign']) has(u, s, 'unattended section')
+  // the cron CLI is reached through the pack home, never a relative path
+  assert.ok(!/(^|[^$A-Z/])scripts\/wolfpack-cron-resume\.sh/.test(u.replace(/"\$PACK\/scripts\/wolfpack-cron-resume\.sh"/g, '')), 'cron CLI via "$PACK/…"')
+  has(t.slice(t.indexOf('## What NOT to do')), 'Do NOT ask anything under `--unattended`', 'What NOT to do')
+})
+
+test('AC10: the attended Step 1 confirmation text is unchanged', () => {
+  const t = ALL['run-campaign-local.md']
+  has(t, 'runner will actually touch, render the one-glance plan, and **confirm before launching**. Do not', 'Step 1')
+  has(t, '## Step 2 — Launch IN-SESSION via the Workflow tool (only after the user confirms)', 'Step 2 heading')
+})

@@ -67,7 +67,10 @@ const CAMPAIGN_SCHEMA = {
 // args may arrive as an object or, when the invoker stringifies it, as a JSON
 // string. Parse defensively so campaignSlug never silently resolves to undefined.
 const parsedArgs = typeof args === 'string' ? JSON.parse(args) : (args || {})
-const { campaignSlug, maxParallel, chain: chainArg } = parsedArgs
+const { campaignSlug, maxParallel, chain: chainArg, unattended: unattendedArg } = parsedArgs
+// campaign-cron-resume: `/run-campaign-local --unattended` (chain mode only) passes unattended: true.
+// The runner itself behaves the same; the flag is echoed in the result and the log.
+const unattended = unattendedArg === true
 const parallelCap = maxParallel || 2
 // Chain mode (`--chain`, campaign-chain-mode): the launch command greps this marker.
 // WOLFPACK_CHAIN_RUNNER=1
@@ -281,6 +284,7 @@ const usagePausedReturn = (pause, waveResults, deferred, waveNumber) => {
 // ─── Phase: Parse Campaign ─────────────────────────────────────
 phase('Parse')
 log(`Parsing campaign: ${campaignSlug}`)
+if (unattended) log(`UNATTENDED run: no one is watching — anything that needs a human parks; the armed campaign is disarmed and paged at the end (campaign-cron-resume)`)
 
 // ─── Preflight: the consuming project's wolfpack-config.md (wolfpack-self-hosting, AC10) ───
 // pack-install-model (D9): this block runs FIRST in the Parse phase — before the parse-campaign
@@ -735,6 +739,42 @@ reason:<the JSON "reason" field if there is one, else the first stderr line>}.
   return r
 }
 
+// campaign-cron-resume (AC11): disarm + phone notifications through the pack's
+// wolfpack-cron-resume.sh. NEVER throws, never blocks (AC13): a failure is a ⚠ log line, and
+// the CLI itself is a no-op for a campaign that is not armed. The runner cannot run a shell,
+// so a sonnet agent runs the one command (the usageGate / chainCli precedent).
+const CRON_EVENT_SCHEMA = { type: 'object', properties: { exitCode: { type: 'integer' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+const cronEvent = async (cliArgs, label) => {
+  let r = null
+  try {
+    r = await agent(`
+From the repo root run exactly ONE command line:
+  bash ${shq(packScript('wolfpack-cron-resume.sh'))} ${cliArgs}
+Return exitCode (its real exit code) and output (its last stdout line). Modify nothing else.
+`, { label, phase: 'Execute', model: 'sonnet', schema: CRON_EVENT_SCHEMA })
+  } catch (e) { log(`⚠ cron event ${label} failed: ${e && e.message}`); return }
+  if (!r || r.exitCode !== 0 || /^dropped:|FAILED/.test(String(r.output || ''))) log(`⚠ cron event ${label}: exit ${r ? r.exitCode : 'none'} — ${r ? r.output : 'no result'} (runner continues)`)
+}
+// End of a chain run → the cron state: completion and "everything waits on a human" disarm
+// (with a page); a quota pause tells the cron when to resume; anything else marks the session
+// ended so the next tick may relaunch.
+const cronFinish = async (res) => {
+  const v = String((res && res.verdict) || 'unknown')
+  const c = shq(campaignSlug)
+  // Everything merged but a compliance sign-off is still owed: that waits on a human (AC11).
+  if (v === 'CAMPAIGN_READY_FOR_RELEASE' && res.pendingComplianceHunts && res.pendingComplianceHunts.length) {
+    return cronEvent(`event waiting-on-you --campaign ${c} --status merged_awaiting_compliance`, 'cron-finish')
+  }
+  if (v === 'CAMPAIGN_READY_FOR_RELEASE') return cronEvent(`event ready-for-release --campaign ${c}`, 'cron-finish')
+  if (v === 'CAMPAIGN_AWAITING_HUMAN' || v === 'CAMPAIGN_PARKED_MAIN_CONFLICT') {
+    return cronEvent(`event waiting-on-you --campaign ${c} --status ${shq(v.toLowerCase())}`, 'cron-finish')
+  }
+  if (v === 'WAVE_PAUSED_QUOTA' && res.resetAt) return cronEvent(`note-pause --campaign ${c} --reset-at ${shq(res.resetAt)}`, 'cron-finish')
+  // The per-run runaway breaker tripped: a relaunch would reset the run budget and defeat it.
+  if (v === 'WAVE_PAUSED_BUDGET') return cronEvent(`event waiting-on-you --campaign ${c} --status wave_paused_budget`, 'cron-finish')
+  return cronEvent(`note-exit --campaign ${c} --verdict ${shq(v)}`, 'cron-finish')
+}
+
 async function runChain(campaign) {
   // Reverted-dependent guard: `revert` always stamps reverted_because, so a parsed
   // reverted_with_dependency hunt without it means the parse dropped the field. Never "waits".
@@ -824,6 +864,15 @@ async function runChain(campaign) {
       status.set(hunt.slug, 'failed')
       log(`  ✗ ${hunt.slug}: ${r.verdict}${r.status ? ` (${r.status})` : ''} — did not certify; treated as blocked for the rest of this run`)
     }
+  }
+
+  // campaign-cron-resume (AC11): one `park` page per newly parked hunt. parked:model_quota is
+  // transient (it auto-resumes; the cron's own gate defer covers the wait), so it never pages.
+  const notifyPark = async (hunt) => {
+    const st = String(status.get(hunt.slug) || '')
+    if (!(st === 'needs_spec' || (st.startsWith('parked:') && st !== 'parked:model_quota'))) return
+    const reasonCode = st === 'needs_spec' ? 'needs_spec' : st.slice('parked:'.length)
+    await cronEvent(`event park --campaign ${shq(campaignSlug)} --hunt ${shq(hunt.slug)} --status ${shq(st)} --reason ${shq(reasonCode)}`, `cron-park:${hunt.slug}`)
   }
 
   // Merge every awaiting-merge hunt (and every reapply-ready reverted dependent) of waves ≤ N,
@@ -975,6 +1024,7 @@ async function runChain(campaign) {
           }
           if (result) waveResults.push(result)
           recordResult(hunt, result)
+          await notifyPark(hunt)
         }
       }
       await Promise.all(Array.from({ length: Math.min(chainCap, independent.length) }, () => worker()))
@@ -1062,6 +1112,7 @@ async function runChain(campaign) {
       })
       if (result) waveResults.push(result)
       recordResult(hunt, result)
+      await notifyPark(hunt)
       await mergeStep(wave.number, mergedThisWave, heldThisWave)
     }
 
@@ -1164,7 +1215,11 @@ if (chainMode) {
   if (ccap.chainScriptPresent !== true) {
     throw new Error(`campaign-runner: ${packScript('wolfpack-chain.mjs')} is MISSING (or the probe could not confirm it) — chain mode cannot run its git steps. Fix: point WOLFPACK_HOME / Wolfpack home at an up-to-date wolfpack checkout, then relaunch.`)
   }
-  return await runChain(campaign)   // the barrier loop below is byte-identical to today
+  let chainResult
+  try { chainResult = await runChain(campaign) }   // the barrier loop below is byte-identical to today
+  catch (e) { await cronEvent(`note-exit --campaign ${shq(campaignSlug)} --verdict error`, 'cron-exit:error'); throw e }
+  await cronFinish(chainResult)
+  return { ...chainResult, unattended }
 }
 
 // ─── Phase: Execute Waves ──────────────────────────────────────
