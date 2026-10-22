@@ -53,6 +53,26 @@
 //                    Problems: no backticked template, no {host}, {account} with no account listed,
 //                    an account outside [A-Za-z0-9_.@-]+, a TAB or newline in the template (both
 //                    values null/[] on a problem).
+//   POST-MERGE STAGE KEYS (chain mode, docs/post-merge-stage.md; all optional unless
+//   postMergeStage is true, when wolfpack-smoke-stage.mjs check-config requires every STAGE_KEYS
+//   entry marked required — the reader itself never adds them to `missing`):
+//   postMergeStage   Deployment Notes → Post-merge smoke stage    `on` → true; absent/`off` → false;
+//                    any other value is a problem (false).
+//   migrateCommand   Deployment Notes → Migration command (code)   optional
+//   migrationFilePattern  Deployment Notes → Migration file pattern (code)  optional (a regex source)
+//   neverSmokeHosts  Deployment Notes → Never-smoke hosts (list)    optional, []
+//   prodHostSuffix   Deployment Notes → Prod URL                    the URL's host with a leading `*.`
+//                    stripped (`https://*.example.vet` → `example.vet`); null when absent
+//   smokeTenants     Deployment Notes → Smoke tenants (list of `name=host`)  {name: host}, {} when absent;
+//                    names ^[a-z][a-z0-9-]*$, hosts ^[a-z0-9.-]+$ (a malformed pair is a problem, {}).
+//   smokeManifests   Deployment Notes → Smoke tenant manifests (list of `tenant=path`)  {tenant: path}
+//   smokeTenantEnsureCommand / waveReportDirCommand / waveReportBuildCommand / campaignReportCommand /
+//   reportUrlCommand Deployment Notes → Smoke tenant ensure command / Wave report dir command /
+//                    Wave report build command / Campaign report command / Report URL command (code)  optional
+//   appMarkerFile    Project Identity → App marker file (code)       optional
+//   integrationTestArgs  Project Identity → Integration test args (code)  optional; may hold {campaign}
+//   integrationFullSuitePaths  Project Identity → Integration full-suite paths (list)  optional, []
+//   triageBlockPaths Compliance Requirements → Triage block paths (list)  optional, []
 //   exec             ## Execution Layer (see execLayer below) — the execution-layer keys the
 //                    seat shim / sandbox launcher need. NOT part of the top-level `missing`
 //                    (a project with no Vibe seats needs none of them): exec.missing lists the
@@ -369,6 +389,64 @@ export function smokeLoginHookValue(v, problems = []) {
   return { hook, accounts }
 }
 
+// The post-merge stage keys: [field, written name, required when postMergeStage is on].
+// wolfpack-smoke-stage.mjs check-config reports a missing one by its written name.
+export const STAGE_KEYS = [
+  ['devDeployCommand', 'Deployment Notes → Dev deploy command', true],
+  ['migrateCommand', 'Deployment Notes → Migration command', true],
+  ['migrationFilePattern', 'Deployment Notes → Migration file pattern', true],
+  ['neverSmokeHosts', 'Deployment Notes → Never-smoke hosts', true],
+  ['prodHostSuffix', 'Deployment Notes → Prod URL', true],
+  ['smokeTenants', 'Deployment Notes → Smoke tenants', true],
+  ['smokeManifests', 'Deployment Notes → Smoke tenant manifests', true],
+  ['smokeTenantEnsureCommand', 'Deployment Notes → Smoke tenant ensure command', true],
+  ['waveReportDirCommand', 'Deployment Notes → Wave report dir command', true],
+  ['waveReportBuildCommand', 'Deployment Notes → Wave report build command', true],
+  ['campaignReportCommand', 'Deployment Notes → Campaign report command', true],
+  ['reportUrlCommand', 'Deployment Notes → Report URL command', true],
+  ['smokeLoginHook', 'Deployment Notes → Smoke login hook', true],
+  ['appMarkerFile', 'Project Identity → App marker file', true],
+  ['integrationTestArgs', 'Project Identity → Integration test args', true],
+  ['testCommand', 'Project Identity → Test command', true],
+  ['testVerdictCommand', 'Project Identity → Test verdict command', true],
+  ['integrationFullSuitePaths', 'Project Identity → Integration full-suite paths', false],
+  ['triageBlockPaths', 'Compliance Requirements → Triage block paths', true],
+]
+
+const TENANT_NAME = /^[a-z][a-z0-9-]*$/
+const HOSTNAME = /^[a-z0-9.-]+$/
+
+// `name=value` spans → {name: value}. Pushes a problem (and returns {}) on a malformed pair.
+export function pairList(v, written, problems, { valueRe = null } = {}) {
+  const out = {}
+  for (const span of list(v)) {
+    const m = /^([^=\s]+)=(\S+)$/.exec(span)
+    if (!m || !TENANT_NAME.test(m[1])) {
+      problems.push(`${written}: malformed pair '${span}' (expected \`name=value\`, name ^[a-z][a-z0-9-]*$)`)
+      return {}
+    }
+    if (valueRe && !valueRe.test(m[2])) {
+      problems.push(`${written}: '${m[2]}' (for ${m[1]}) must match ${valueRe.source}`)
+      return {}
+    }
+    if (m[1] in out) {
+      problems.push(`${written}: duplicate name '${m[1]}'`)
+      return {}
+    }
+    out[m[1]] = m[2]
+  }
+  return out
+}
+
+// Deployment Notes → Prod URL → the prod host suffix (`https://*.x.vet …` → `x.vet`), or null.
+export function prodHostSuffixOf(v) {
+  if (isNone(v)) return null
+  const first = code(v).trim().split(/\s+/)[0] || ''
+  const host = first.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/')[0].replace(/:\d+$/, '').toLowerCase()
+  const bare = host.replace(/^\*\./, '')
+  return bare && HOSTNAME.test(bare) ? bare : null
+}
+
 export function readConfig(text, { configDir = process.cwd() } = {}) {
   const secs = parseSections(text)
   const byKey = {}
@@ -436,6 +514,19 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
   const exec = execLayer(sec('Execution Layer'), configDir)
   if (sec('Execution Layer') !== undefined) problems.push(...exec.problems)
 
+  // Post-merge stage keys (chain mode).
+  const stageRaw = field(sec('Deployment Notes'), 'Post-merge smoke stage')
+  let postMergeStage = false
+  if (stageRaw !== undefined && !isNone(stageRaw)) {
+    const v = code(stageRaw).trim().toLowerCase().split(/\s+/)[0]
+    if (v === 'on') postMergeStage = true
+    else if (v !== 'off') problems.push(`Deployment Notes → Post-merge smoke stage must be \`on\` or \`off\` (got '${v}')`)
+  }
+  const smokeTenants = pairList(field(sec('Deployment Notes'), 'Smoke tenants'),
+    'Deployment Notes → Smoke tenants', problems, { valueRe: HOSTNAME })
+  const smokeManifests = pairList(field(sec('Deployment Notes'), 'Smoke tenant manifests'),
+    'Deployment Notes → Smoke tenant manifests', problems)
+
   return {
     name,
     testCommand,
@@ -453,6 +544,22 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     projectCommands,
     smokeLoginHook,
     smokeLoginAccounts,
+    postMergeStage,
+    migrateCommand: optionalCode('Deployment Notes', 'Migration command'),
+    migrationFilePattern: optionalCode('Deployment Notes', 'Migration file pattern'),
+    neverSmokeHosts: list(field(sec('Deployment Notes'), 'Never-smoke hosts')).map((h) => h.toLowerCase()),
+    prodHostSuffix: prodHostSuffixOf(field(sec('Deployment Notes'), 'Prod URL')),
+    smokeTenants,
+    smokeManifests,
+    smokeTenantEnsureCommand: optionalCode('Deployment Notes', 'Smoke tenant ensure command'),
+    waveReportDirCommand: optionalCode('Deployment Notes', 'Wave report dir command'),
+    waveReportBuildCommand: optionalCode('Deployment Notes', 'Wave report build command'),
+    campaignReportCommand: optionalCode('Deployment Notes', 'Campaign report command'),
+    reportUrlCommand: optionalCode('Deployment Notes', 'Report URL command'),
+    appMarkerFile: optionalCode('Project Identity', 'App marker file'),
+    integrationTestArgs: optionalCode('Project Identity', 'Integration test args'),
+    integrationFullSuitePaths: list(field(sec('Project Identity'), 'Integration full-suite paths')),
+    triageBlockPaths: list(field(sec('Compliance Requirements'), 'Triage block paths')),
     exec,
     pool,
     models,
@@ -489,6 +596,7 @@ function summary(cfg) {
     `worktreeRoot: ${cfg.worktreeRoot ?? 'none'}`,
     `releaseTags: ${cfg.releaseTags}`,
     `smokeLoginHook: ${cfg.smokeLoginHook ?? 'none'}`,
+    `postMergeStage: ${cfg.postMergeStage ? 'on' : 'off'}`,
     cfg.exec && cfg.exec.missing.length
       ? `exec: missing ${cfg.exec.missing.join(', ')}`
       : `exec: sandbox ${cfg.exec?.sandboxImage} · glm ${cfg.exec?.glmImage} · layer ${cfg.exec?.projectLayer ?? 'none'}`,

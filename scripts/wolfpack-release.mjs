@@ -10,11 +10,15 @@
 // CLI:
 //   node scripts/wolfpack-release.mjs version <lastTag> <bumpA> [bumpB ...]
 //       → prints BUMP=<level|none> and VERSION=<next|"" for tooling-only>
-//   node scripts/wolfpack-release.mjs criteria <acceptance.md path> <slug>
-//       → prints JSON array of parsed criteria
+//   node scripts/wolfpack-release.mjs criteria <acceptance.md path> <slug> [--tenants a,b]
+//       → prints JSON array of parsed criteria (each with `tenant`: a name or 'both'); exit 2 on
+//         an unknown or malformed `[tenant:…]` scope. --tenants defaults to the configured
+//         Smoke tenants (wolfpack-config.md) when set, else surgical,mobile.
 //
 // Chain-mode campaign release (`/release-campaign`; JSON on stdout unless noted, exit 2 = refused/error):
-//   revert         --campaign C --hunt H [--reason TEXT] [--at ISO]   revert H (+ campaign-merged dependents) out of campaign/C
+//   revert         --campaign C --hunt H [--reason TEXT] [--at ISO]   revert H (+ campaign-merged dependents, + their
+//                  [--summary TEXT --evidence TEXT --issues CSV --question TEXT]   post-merge-stage fix merges) out of campaign/C
+//   revert-merge   --campaign C --commit SHA --reason TEXT            revert the recorded polish merge out of campaign/C
 //   sign-off       --campaign C --hunt H --by NAME [--at ISO]         record a Red/compliance sign-off
 //   check          --campaign C [--checkpoint]                        release preflight {ok, refusals, hunts}
 //   summary        --campaign C [--checkpoint]                        readable release summary (text)
@@ -32,9 +36,10 @@ import {
   CHAIN_STATUS, chainClass, needsComplianceHold, renderParkRecord, parkBlock, revertTargets,
   git, repoRoot, branchExists, revParse, isAncestor, findWorktree, dirtyPaths, withTempWorktree,
   unmergedFiles, revertInProgress, readHuntMeta, writeHuntMeta, readCampaignMeta, campaignHunts,
-  huntPlanDirs, parseFlags, ChainError,
+  huntPlanDirs, parseFlags, ChainError, TEXT_FLAGS, writeCampaignMeta,
 } from './wolfpack-chain.mjs'
 import { stampMerged, attributeUnreleased } from './wolfpack-merge-state.mjs'
+import { readConfig } from './wolfpack-config.mjs'
 
 // ─── Version aggregation ──────────────────────────────────────────
 // Per 04 § "Sequential batch merge + per-wave version tag": the WAVE owns the
@@ -119,20 +124,41 @@ export function releaseQueue(hunts) {
 // (spec/SKILL.md § "The artifact"). Surface grouping is LLM judgment in the
 // command; this just yields the structured criteria carrying their owning hunt
 // so a smoke failure maps to exactly one merge commit (AC3 attribution).
-export function parseAcceptanceCriteria(md, slug) {
+//
+// Tenant scope (post-merge stage, AC34): an optional `[tenant:<name>]` right after the tag
+// names the smoke tenant the criterion runs on; absent → 'both' (every configured tenant).
+// The value must be 'both' or one of opts.tenants (default DEFAULT_SMOKE_TENANTS); anything
+// else — or a malformed scope (no closing bracket, empty name) — throws CriteriaError.
+export const DEFAULT_SMOKE_TENANTS = Object.freeze(['surgical', 'mobile'])
+export class CriteriaError extends Error {}
+export const CRITERION_RE = /^\s*-\s+(AC\d+)\s+\[(auto|manual|compliance)\](?:\s+\[tenant:([^\]\s]*)\])?\s+(.*\S)\s*$/i
+export function parseAcceptanceCriteria(md, slug, opts = {}) {
   const out = []
+  const tenants = Array.isArray(opts.tenants) && opts.tenants.length ? opts.tenants : DEFAULT_SMOKE_TENANTS
+  const allowed = () => `allowed: both, ${tenants.join(', ')}`
   // Tolerate leading indentation (markdown auto-formatters indent nested bullets).
-  const re = /^\s*-\s+(AC\d+)\s+\[(auto|manual|compliance)\]\s+(.*\S)\s*$/i
   for (const line of String(md || '').split('\n')) {
-    const m = line.match(re)
+    const m = line.match(CRITERION_RE)
     if (!m) continue
     const id = m[1].toUpperCase()
+    const ref = `${slug}/${id.replace(/^AC/, '')}` // e.g. invoice-bundle/2
+    const text = m[4].trim()
+    let tenant = 'both'
+    if (m[3] !== undefined) {
+      const v = m[3].toLowerCase()
+      if (!v) throw new CriteriaError(`${ref}: malformed tenant scope "[tenant:]" (${allowed()})`)
+      if (v !== 'both' && !tenants.includes(v)) throw new CriteriaError(`${ref}: unknown tenant scope "${v}" (${allowed()})`)
+      tenant = v
+    } else if (/^\[tenant:/i.test(text)) {
+      throw new CriteriaError(`${ref}: malformed tenant scope "${text.split(/\s/)[0]}" (${allowed()})`)
+    }
     out.push({
       slug,
       id,
       tag: m[2].toLowerCase(),
-      text: m[3].trim(),
-      ref: `${slug}/${id.replace(/^AC/, '')}`, // e.g. invoice-bundle/2
+      tenant,
+      text,
+      ref,
     })
   }
   return out
@@ -337,7 +363,7 @@ export function cmdSignOff(root, { campaign, hunt, by, at }) {
 // AC10 + A-11: revert H and every campaign-merged dependent (newest first) out of campaign/C,
 // then rebuild feat/H as (new campaign tip + one reapply commit) so the fix cycle re-reviews and
 // re-merges the FULL change. Preconditions first; any failure rolls everything back, stamps nothing.
-export function cmdRevert(root, { campaign, hunt, reason, at }) {
+export function cmdRevert(root, { campaign, hunt, reason, at, summary, evidence, issues, question }) {
   const { meta: camp, branch, hunts } = loadCampaign(root, campaign)
   if (!branchExists(root, branch)) throw new ChainError(`${branch} does not exist`)
   const graph = (camp.chain && camp.chain.graph) || {}
@@ -355,6 +381,19 @@ export function cmdRevert(root, { campaign, hunt, reason, at }) {
   for (const t of targets) {
     if (!bySlug[t].campaign_merge_commit) throw new ChainError(`${t} is ${bySlug[t].status} but has no campaign_merge_commit`)
   }
+  // Post-merge stage (AC24): a target's smoke-fix merges go out with it. Every commit to revert
+  // (each target's own merge + its smoke_fixes merges) in first-parent order, NEWEST FIRST.
+  const commits = []
+  for (const t of targets) {
+    commits.push({ slug: t, commit: bySlug[t].campaign_merge_commit, own: true })
+    for (const fx of (Array.isArray(bySlug[t].smoke_fixes) ? bySlug[t].smoke_fixes : [])) {
+      if (!fx || !fx.merge_commit) continue
+      if (!firstParent.includes(fx.merge_commit)) throw new ChainError(`${t}'s smoke fix ${fx.slug || '?'} (${fx.merge_commit}) is not on ${branch}'s first-parent line`)
+      commits.push({ slug: t, commit: fx.merge_commit, own: false, fix: fx.slug || null })
+    }
+  }
+  const pos = (c) => { const i = firstParent.indexOf(c); return i === -1 ? Number.MAX_SAFE_INTEGER : i }
+  commits.sort((a, b) => pos(a.commit) - pos(b.commit))
   const wt = findWorktree(root, hunt)
   if (!wt) throw new ChainError(`no worktree has feat/${hunt} checked out — cannot rebuild it after the revert`)
   const dirty = dirtyPaths(wt)
@@ -369,25 +408,33 @@ export function cmdRevert(root, { campaign, hunt, reason, at }) {
   const preRef = `refs/wolfpack/pre-revert/${hunt}`
   const priorRef = git(['rev-parse', '--verify', '--quiet', preRef], { cwd: root, allowFail: true })
   const r = withTempWorktree(root, branch, (dir) => {
-    const reverts = {}
+    const reverts = {}       // slug → the revert of its OWN merge (merge-hunt's reapply reads it)
+    const revertLists = {}   // slug → every revert commit made for it (own + fixes), in creation order
     try {
-      for (const t of targets) {
-        const rv = git(['revert', '--no-edit', '-m', '1', bySlug[t].campaign_merge_commit], { cwd: dir, allowFail: true })
+      for (const c of commits) {
+        const rv = git(['revert', '--no-edit', '-m', '1', c.commit], { cwd: dir, allowFail: true })
         if (rv.code !== 0) {
           const files = unmergedFiles(dir)
-          throw new ChainError(`git revert of ${t}'s merge conflicted${files.length ? ` (${files.join(', ')})` : `: ${rv.stderr.split('\n')[0]}`} — nothing reverted`)
+          const what = c.own ? `${c.slug}'s merge` : `${c.slug}'s smoke fix ${c.fix || c.commit}`
+          throw new ChainError(`git revert of ${what} conflicted${files.length ? ` (${files.join(', ')})` : `: ${rv.stderr.split('\n')[0]}`} — nothing reverted`)
         }
-        reverts[t] = revParse(dir, 'HEAD')
+        const sha = revParse(dir, 'HEAD')
+        if (c.own) reverts[c.slug] = sha
+        ;(revertLists[c.slug] = revertLists[c.slug] || []).push(sha)
       }
       const newTip = revParse(dir, 'HEAD')
       git(['checkout', '--quiet', '--detach', newTip], { cwd: wt })
-      const re = git(['revert', '--no-edit', reverts[hunt]], { cwd: wt, allowFail: true })
-      if (re.code !== 0) throw new ChainError(`rebuilding feat/${hunt} (reapply commit) failed: ${re.stderr.split('\n')[0]}`)
+      // Reapply the hunt AND its fixes: revert its revert commits in reverse creation order
+      // (the hunt's own merge-revert first, the newest fix's revert last).
+      for (const rc of [...revertLists[hunt]].reverse()) {
+        const re = git(['revert', '--no-edit', rc], { cwd: wt, allowFail: true })
+        if (re.code !== 0) throw new ChainError(`rebuilding feat/${hunt} (reapply commit) failed: ${re.stderr.split('\n')[0]}`)
+      }
       git(['update-ref', preRef, preTip], { cwd: root })
       if (process.env.WOLFPACK_CHAIN_FAULT === 'rebuild') throw new ChainError('WOLFPACK_CHAIN_FAULT=rebuild (test-only fault before branch -f)')
       git(['branch', '-f', `feat/${hunt}`, 'HEAD'], { cwd: wt })
       git(['checkout', '--quiet', `feat/${hunt}`], { cwd: wt })
-      return { reverts, newTip, rebuilt: revParse(wt, 'HEAD') }
+      return { reverts, revertLists, newTip, rebuilt: revParse(wt, 'HEAD') }
     } catch (e) {
       if (revertInProgress(dir)) git(['revert', '--abort'], { cwd: dir, allowFail: true })
       git(['reset', '--hard', '--quiet', preSha], { cwd: dir, allowFail: true })
@@ -400,19 +447,38 @@ export function cmdRevert(root, { campaign, hunt, reason, at }) {
   })
   const now = at || new Date().toISOString()
   const why = (typeof reason === 'string' && reason.trim()) ? reason.trim() : '(no reason given)'
+  const txt = (v) => (typeof v === 'string' && v.trim()) ? v.trim() : null
+  const stage = { summary: txt(summary), evidence: txt(evidence), issues: txt(issues), question: txt(question) }
+  const fixNote = (t) => {
+    const n = (r.revertLists[t] || []).length - 1
+    return n > 0 ? ` (+${n} smoke fix merge${n === 1 ? '' : 's'})` : ''
+  }
+  const defaultContext = `Revert commit(s) on ${branch}: ${targets.map(t => `${t}=${(r.revertLists[t] || [r.reverts[t]]).join('+')}${fixNote(t)}`).join(', ')}\nOld feat/${hunt} tip saved at ${preRef}\nDependents reverted with it (auto re-merge once ${hunt} is campaign-merged again): ${targets.filter(t => t !== hunt).join(', ') || 'none'}`
+  const stageNeed = stage.summary
+    ? `${stage.summary}\n\n${hunt} was reverted out of ${branch} by the post-merge stage. feat/${hunt} was rebuilt as the campaign tip + its reapply commit(s) (the hunt and its smoke fixes), so the fix cycle reviews and re-merges the full change.${stage.question ? `\n\n${stage.question}` : ''}`
+    : null
+  const stageContext = (stage.summary || stage.evidence || stage.issues)
+    ? [stage.issues ? `Issue ids: ${stage.issues}` : null, stage.evidence ? `Evidence: ${stage.evidence}` : null, defaultContext].filter(Boolean).join('\n')
+    : null
   writeHuntMeta(root, hunt, (meta) => {
     meta.status = CHAIN_STATUS.REVERTED
     // A FRESH park block: a prior compliance sign-off must not survive the revert.
     meta.park = parkBlock({ reason: 'reverted_from_campaign', parkedAt: now, resumePhase: 'Implement', resolutionType: 'clarify', tier: meta.tier })
     meta.campaign_revert_commit = r.reverts[hunt]
+    meta.campaign_revert_commits = r.revertLists[hunt]
+    if (Array.isArray(meta.smoke_fixes) && meta.smoke_fixes.length) {
+      meta.smoke_fixes_reverted = [...(Array.isArray(meta.smoke_fixes_reverted) ? meta.smoke_fixes_reverted : []), ...meta.smoke_fixes]
+      delete meta.smoke_fixes
+    }
     meta.reverted_reason = why
     meta.reverted_at = now
+    if (stage.issues) meta.reverted_issues = stage.issues.split(',').map(x => x.trim()).filter(Boolean)
   }, {
     'parked.md': renderParkRecord({
       slug: hunt, reason: 'reverted_from_campaign', parkedAt: now, resumePhase: 'Implement', resolutionType: 'clarify',
       tier: H.tier,
-      need: `${hunt} was reverted out of ${branch}: ${why}. feat/${hunt} was rebuilt as the campaign tip + one reapply commit, so the fix cycle reviews and re-merges the full change. Answer with the fix direction (clarify) or send it back to planning (redirect).`,
-      context: `Revert commit(s) on ${branch}: ${targets.map(t => `${t}=${r.reverts[t]}`).join(', ')}\nOld feat/${hunt} tip saved at ${preRef}\nDependents reverted with it (auto re-merge once ${hunt} is campaign-merged again): ${targets.filter(t => t !== hunt).join(', ') || 'none'}`,
+      need: stageNeed || `${hunt} was reverted out of ${branch}: ${why}. feat/${hunt} was rebuilt as the campaign tip + one reapply commit, so the fix cycle reviews and re-merges the full change. Answer with the fix direction (clarify) or send it back to planning (redirect).`,
+      context: stageContext || defaultContext,
       options: `- A (clarify): here is the fix — resume at Implement.\n- B (redirect): re-plan the hunt.`,
     }),
   })
@@ -421,14 +487,51 @@ export function cmdRevert(root, { campaign, hunt, reason, at }) {
       meta.status = CHAIN_STATUS.REVERTED_WITH_DEP
       meta.reverted_because = hunt
       meta.campaign_revert_commit = r.reverts[t]
+      meta.campaign_revert_commits = r.revertLists[t]
+      if (Array.isArray(meta.smoke_fixes) && meta.smoke_fixes.length) {
+        meta.smoke_fixes_reverted = [...(Array.isArray(meta.smoke_fixes_reverted) ? meta.smoke_fixes_reverted : []), ...meta.smoke_fixes]
+        delete meta.smoke_fixes
+      }
       meta.reverted_at = now
     })
   }
   return {
     status: 'reverted', branch, campaign_sha: r.newTip,
-    reverted: targets.map(t => ({ slug: t, revert_commit: r.reverts[t] })),
+    reverted: targets.map(t => ({ slug: t, revert_commit: r.reverts[t], revert_commits: r.revertLists[t] })),
     rebuilt: { branch: `feat/${hunt}`, sha: r.rebuilt, pre_revert_ref: preRef },
   }
+}
+
+// Post-merge stage (AC28): revert the recorded polish merge out of campaign/C. Refused unless SHA
+// is on the branch's first-parent line AND equals the campaign metadata's stage.polish_merge_commit.
+// A conflict leaves the branch unchanged (exit 2).
+export function cmdRevertMerge(root, { campaign, commit, reason }) {
+  const { meta: camp, branch } = loadCampaign(root, campaign)
+  if (!branchExists(root, branch)) throw new ChainError(`${branch} does not exist`)
+  if (typeof commit !== 'string' || !/^[0-9a-f]{7,40}$/.test(commit)) throw new ChainError('--commit <sha> is required')
+  if (typeof reason !== 'string' || !reason.trim()) throw new ChainError('--reason TEXT is required')
+  const full = git(['rev-parse', '--verify', '--quiet', `${commit}^{commit}`], { cwd: root, allowFail: true })
+  if (full.code !== 0) throw new ChainError(`${commit} is not a commit`)
+  const sha = full.stdout
+  const recorded = camp.stage && camp.stage.polish_merge_commit
+  if (!recorded || recorded !== sha) throw new ChainError(`refusing: ${sha} is not the recorded polish merge of ${campaign} (stage.polish_merge_commit = ${recorded || 'none'})`)
+  const firstParent = git(['rev-list', '--first-parent', `refs/heads/${branch}`], { cwd: root }).stdout.split('\n').filter(Boolean)
+  if (!firstParent.includes(sha)) throw new ChainError(`refusing: ${sha} is not on ${branch}'s first-parent line`)
+  const pre = revParse(root, `refs/heads/${branch}`)
+  const r = withTempWorktree(root, branch, (dir) => {
+    const rv = git(['revert', '--no-edit', '-m', '1', sha], { cwd: dir, allowFail: true })
+    if (rv.code !== 0) {
+      const files = unmergedFiles(dir)
+      if (revertInProgress(dir)) git(['revert', '--abort'], { cwd: dir, allowFail: true })
+      git(['reset', '--hard', '--quiet', pre], { cwd: dir, allowFail: true })
+      throw new ChainError(`git revert of the polish merge conflicted${files.length ? ` (${files.join(', ')})` : `: ${rv.stderr.split('\n')[0]}`} — ${branch} unchanged`)
+    }
+    return { revert_commit: revParse(dir, 'HEAD') }
+  })
+  const fresh = readCampaignMeta(root, campaign) || camp
+  fresh.stage = { ...(fresh.stage || {}), polish_revert_commit: r.revert_commit, polish_reverted_reason: reason.trim(), polish_merge_commit: null, polish_reverted_merge_commit: sha }
+  writeCampaignMeta(root, campaign, fresh)
+  return { status: 'reverted', revert_commit: r.revert_commit, campaign_sha: r.revert_commit }
 }
 
 export function cmdDeploy(root, { campaign, deployCmd, migrateCmd, noMigrate }) {
@@ -534,8 +637,10 @@ export function cmdStampReleased(root, { campaign, version, at }) {
   }
 }
 
+// The stage's parked.md text flags take the next argument verbatim (like --reason).
+const RELEASE_TEXT_FLAGS = Object.freeze([...TEXT_FLAGS, 'summary', 'evidence', 'issues', 'question'])
 function chainMain(cmd, rest) {
-  const f = parseFlags(rest)
+  const f = parseFlags(rest, { text: RELEASE_TEXT_FLAGS })
   const emit = (obj, code = 0) => { console.log(JSON.stringify(obj, null, 2)); return code }
   const SLUG = /^[a-z0-9][a-z0-9-]*$/
   try {
@@ -544,7 +649,8 @@ function chainMain(cmd, rest) {
     const root = repoRoot()
     const checkpoint = f.checkpoint === true
     const version = f.version === true ? '' : f.version
-    if (cmd === 'revert') return emit(cmdRevert(root, { campaign: f.campaign, hunt: f.hunt, reason: f.reason, at: f.at }))
+    if (cmd === 'revert') return emit(cmdRevert(root, { campaign: f.campaign, hunt: f.hunt, reason: f.reason, at: f.at, summary: f.summary, evidence: f.evidence, issues: f.issues, question: f.question }))
+    if (cmd === 'revert-merge') return emit(cmdRevertMerge(root, { campaign: f.campaign, commit: f.commit, reason: f.reason }))
     if (cmd === 'sign-off') return emit(cmdSignOff(root, { campaign: f.campaign, hunt: f.hunt, by: f.by, at: f.at }))
     if (cmd === 'check') { const r = releaseCheck(root, { campaign: f.campaign, checkpoint }); return emit(r, r.ok ? 0 : 2) }
     if (cmd === 'summary') { console.log(releaseSummary(root, { campaign: f.campaign, checkpoint })); return 0 }
@@ -562,7 +668,21 @@ function chainMain(cmd, rest) {
   }
   return null
 }
-const CHAIN_COMMANDS = ['revert', 'sign-off', 'check', 'summary', 'deploy', 'changelog', 'merge-commands', 'stamp-released']
+const CHAIN_COMMANDS = ['revert', 'revert-merge', 'sign-off', 'check', 'summary', 'deploy', 'changelog', 'merge-commands', 'stamp-released']
+
+// The configured smoke tenant names (wolfpack-config.md → Deployment Notes → Smoke tenants of
+// the invoking repo's main checkout), or null when there is no config / no tenants.
+function configuredTenants() {
+  try {
+    const root = repoRoot()
+    const p = join(root, 'wolfpack-config.md')
+    if (!existsSync(p)) return null
+    const names = Object.keys(readConfig(readFileSync(p, 'utf8')).smokeTenants || {})
+    return names.length ? names : null
+  } catch {
+    return null
+  }
+}
 
 // ─── CLI ──────────────────────────────────────────────────────────
 function main(argv) {
@@ -588,11 +708,15 @@ function main(argv) {
     return 0
   }
   if (cmd === 'criteria') {
-    const [path, slug] = rest
+    const f = parseFlags(rest)
+    const [path, slug] = f._
     if (!path || !slug) {
-      console.error('usage: wolfpack-release.mjs criteria <acceptance.md path> <slug>')
+      console.error('usage: wolfpack-release.mjs criteria <acceptance.md path> <slug> [--tenants a,b]')
       return 1
     }
+    let tenants = null
+    if (typeof f.tenants === 'string') tenants = f.tenants.split(',').map(t => t.trim()).filter(Boolean)
+    else tenants = configuredTenants()
     let md
     try {
       md = readFileSync(path, 'utf8')
@@ -600,7 +724,13 @@ function main(argv) {
       console.error(`wolfpack-release: could not read ${path}: ${e.message}`)
       return 1
     }
-    console.log(JSON.stringify(parseAcceptanceCriteria(md, slug), null, 2))
+    try {
+      console.log(JSON.stringify(parseAcceptanceCriteria(md, slug, { tenants }), null, 2))
+    } catch (e) {
+      if (!(e instanceof CriteriaError)) throw e
+      console.error(`wolfpack-release: ${e.message}`)
+      return 2
+    }
     return 0
   }
   console.error(`usage: wolfpack-release.mjs <version|criteria|${CHAIN_COMMANDS.join('|')}> ...`)
