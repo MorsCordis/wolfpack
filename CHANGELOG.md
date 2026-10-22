@@ -4,9 +4,14 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+## [v1.2.0] - 2026-10-22
+
 ### Added
 - Chain-mode post-merge stage: after each wave auto-merges into `campaign/<slug>`, the runner deploys the tip to dev from a temp worktree, runs the touched apps' suites on an isolated test DB, smokes every merged `[auto]` criterion on each configured smoke tenant, and triages findings (fix ≤2 reviewed rounds / log / block-and-revert), then polishes logged items once at campaign end and builds the campaign report (`scripts/wolfpack-smoke-stage.mjs`, `/smoke-chain`, `docs/post-merge-stage.md`). Opt-in via `Post-merge smoke stage: on`. <!-- hunt:wave-auto-smoke -->
 - `wolfpack-release.mjs`: `[tenant:<name>]` criterion scope; `revert` takes fix-round merges with it; `revert-merge` for a polish merge. `wolfpack-chain.mjs merge-hunt --fix-of/--polish`. `wolfpack-test-record.mjs --stage integration`, `WOLFPACK_RECORD_DEADLINE_EPOCH` and `tempfail` (exit 75, re-taken by hunt-pipeline). Notifier field `report_url` (meshnet http URL, no query). <!-- hunt:wave-auto-smoke -->
+
+### Fixed
+- Cross-family review of the post-merge stage (2 rounds): a crash between a fix merge and its bookkeeping no longer re-runs or reverts an already-landed fix; a mobile-manifest failure with several merged hunts blocks the stage as one unattributed finding instead of a fix round per hunt; test-DB isolation fails loud (the resume probe requires `testIsolation`, `Integration test args` must hold `{campaign}`); a merged hunt with no readable `acceptance.md` fails loud; JSON-form session values are redacted; `check-config` requires `.wolfpack/smoke-shots/` gitignored and keeps the isolation / Prod URL problems; app labels are checked as plain names and never trip the prod guard; `report_url` refuses prod, query and fragment URLs; `merge-hunt --polish` requires `polish_of`; prespec lint reads the configured smoke tenants. <!-- hunt:wave-auto-smoke -->
 
 ## [v1.1.0] - 2026-10-22
 
