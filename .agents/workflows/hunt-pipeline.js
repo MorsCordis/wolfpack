@@ -798,8 +798,10 @@ const cfg = () => {
 // configured Integration test args with {campaign} = the hunt's test isolation (shell-quoted)
 // when one is set — the SAME string scripts/wolfpack-test-record.mjs composeTestCommand writes
 // into the record's `command` (keep in step). No isolation → exactly cfg().testCommand.
-const huntTestCommand = (meta = null) => {
-  const iso = (meta && typeof meta.test_isolation === 'string' && meta.test_isolation) || huntIsolation
+// No parameter: the runtime body must never name the stripped `export const meta` block (AC5), and
+// huntIsolation already carries metadata.test_isolation via the resume probe.
+const huntTestCommand = () => {
+  const iso = huntIsolation
   if (!iso) return cfg().testCommand
   if (!cfg().integrationTestArgs) throw new Error(`hunt-pipeline: ${slug} has test isolation ${iso} but wolfpack-config.md has no Project Identity → Integration test args`)
   return `${cfg().testCommand} ${String(cfg().integrationTestArgs).replace(/\{campaign\}/g, () => shq(iso))}`

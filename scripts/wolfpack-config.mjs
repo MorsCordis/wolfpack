@@ -415,6 +415,9 @@ export const STAGE_KEYS = [
 
 const TENANT_NAME = /^[a-z][a-z0-9-]*$/
 const HOSTNAME = /^[a-z0-9.-]+$/
+// A smoke tenant host: dot-separated labels, no leading/trailing/double dot (a trailing-dot FQDN
+// is the same site and would slip past an exact never-smoke / prod-suffix comparison).
+const SMOKE_HOST = /^[a-z0-9-]+(\.[a-z0-9-]+)*$/
 
 // `name=value` spans → {name: value}. Pushes a problem (and returns {}) on a malformed pair.
 export function pairList(v, written, problems, { valueRe = null } = {}) {
@@ -523,7 +526,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     else if (v !== 'off') problems.push(`Deployment Notes → Post-merge smoke stage must be \`on\` or \`off\` (got '${v}')`)
   }
   const smokeTenants = pairList(field(sec('Deployment Notes'), 'Smoke tenants'),
-    'Deployment Notes → Smoke tenants', problems, { valueRe: HOSTNAME })
+    'Deployment Notes → Smoke tenants', problems, { valueRe: SMOKE_HOST })
   const smokeManifests = pairList(field(sec('Deployment Notes'), 'Smoke tenant manifests'),
     'Deployment Notes → Smoke tenant manifests', problems)
 

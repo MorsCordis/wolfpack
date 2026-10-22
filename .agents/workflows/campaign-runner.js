@@ -1363,7 +1363,10 @@ Write the raw results file the command describes to ${ps.raw_path} and return {r
         log(`post-merge stage: re-verify ${branch} @ ${String(tip).slice(0, 12)} (iteration ${iteration})`)
         continue
       }
-      const result = (tri.classified || []).length ? 'resolved' : 'green'
+      // `green` = nothing ever failed in this wave's stage run; `resolved` = something failed and was
+      // fixed, logged or blocked-and-reverted. A fix round / revert bumps the persisted iteration
+      // past 1 (resume-safe), and the re-verify triage is then empty — so look at both.
+      const result = ((tri.classified || []).length || iteration > 1) ? 'resolved' : 'green'
       const fin = await S('finish', `--result ${result}`, 'stage-finish')
       if (fin.status !== 'ok') return stageErr(fin, 'stage-finish', 'done')
       stageInfo.result = result

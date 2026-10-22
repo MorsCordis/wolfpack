@@ -117,8 +117,12 @@ const nowIso = () => new Date().toISOString()
 //   contain "prod", e.g. /inventory/medication_products/). An unparseable URL is refused.
 // Returns null (allowed) or the refusal reason.
 export function refuseProdTarget(text, cfg = {}, { kind = 'command', mask = null } = {}) {
-  const suffix = (cfg && typeof cfg.prodHostSuffix === 'string' && cfg.prodHostSuffix) ? cfg.prodHostSuffix.toLowerCase() : null
-  const never = ((cfg && Array.isArray(cfg.neverSmokeHosts)) ? cfg.neverSmokeHosts : []).map(h => String(h).toLowerCase())
+  // A trailing-dot FQDN (`x.example.vet.`) is the same host: trailing dots are stripped from the
+  // config values and from a url/host target before comparing (commands are matched as text).
+  const noDot = h => h.replace(/\.+$/, '')
+  const rawSuffix = (cfg && typeof cfg.prodHostSuffix === 'string') ? noDot(cfg.prodHostSuffix.trim().toLowerCase()) : ''
+  const suffix = rawSuffix || null
+  const never = ((cfg && Array.isArray(cfg.neverSmokeHosts)) ? cfg.neverSmokeHosts : []).map(h => noDot(String(h).trim().toLowerCase())).filter(Boolean)
   if (kind === 'command') {
     let t = String(text ?? '')
     if (mask) t = t.split(String(mask)).join('{campaign}')
@@ -133,6 +137,7 @@ export function refuseProdTarget(text, cfg = {}, { kind = 'command', mask = null
   if (kind === 'url') {
     try { host = new URL(String(text)).hostname.toLowerCase() } catch { return 'unparseable url' }
   } else host = String(text ?? '').trim().toLowerCase()
+  host = noDot(host)
   if (!host) return 'empty host'
   if (/prod/i.test(host)) return 'prod name'
   if (suffix && (host === suffix || host.endsWith(`.${suffix}`))) return 'prod suffix'
