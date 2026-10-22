@@ -14,7 +14,7 @@ import {
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { buildNotification, composeUsage, huntSlugs, validToken, NOTIFY_KEYS } from './wolfpack-cron-resume.mjs'
+import { buildNotification, composeUsage, huntSlugs, newestHeartbeat, validToken, NOTIFY_KEYS } from './wolfpack-cron-resume.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PACK = dirname(HERE)
@@ -993,5 +993,29 @@ describe('pure helpers', () => {
 
   test('huntSlugs reads ### N. <slug> headings only', () => {
     assert.deepEqual(huntSlugs('### 1. h1\n### 2. `h-2`\n## 3. no\n### x. no\n### 4. h1\n'), ['h1', 'h-2'])
+  })
+
+  test('newestHeartbeat: whole-ms newest across all three layouts, null when none (Tracker R1 / D6)', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'wp-hb-'))
+    try {
+      assert.equal(newestHeartbeat(repo, ['a', 'b']), null)
+      const paths = [
+        join(repo, '.wolfpack', 'heartbeats', 'a.json'),
+        join(repo, '.claude', 'worktrees', 'b', '.wolfpack', 'heartbeats', 'b.json'),
+        join(repo, '.agents', 'worktrees', 'a', '.wolfpack', 'heartbeats', 'a.json'),
+      ]
+      const base = Date.now() - 10 * MIN
+      // sub-millisecond fractions, as a real agent write carries (seconds for utimesSync)
+      const secs = [base / 1000 + 0.0004321, base / 1000 + 60.1234567, base / 1000 + 30.9999]
+      paths.forEach((p, i) => { mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, '{}'); utimesSync(p, secs[i], secs[i]) })
+      const got = newestHeartbeat(repo, ['a', 'b'])
+      assert.ok(Number.isInteger(got), `whole ms, got ${got}`)
+      assert.equal(got, Math.floor(statSync(paths[1]).mtimeMs))
+      // the stored form round-trips: the same heartbeat is never newer than what a tick saw
+      assert.ok(!(got > Date.parse(new Date(got).toISOString())))
+      // only the hunts asked for are scanned
+      assert.equal(newestHeartbeat(repo, ['a']), Math.floor(statSync(paths[2]).mtimeMs))
+      assert.equal(newestHeartbeat(repo, ['zz']), null)
+    } finally { rmSync(repo, { recursive: true, force: true }) }
   })
 })
