@@ -4,10 +4,15 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+## [v1.1.0] - 2026-10-22
+
 ### Added
 - `scripts/wolfpack-cron-resume.sh` (+ `.mjs`): cron-driven resume for an ARMED local chain campaign — `flock`-guarded 15-minute tick (heartbeat liveness across main and worktree layouts, usage-gate defer, tmux relaunch of an interactive `claude --permission-mode auto` running `/run-campaign-local <slug> --chain --unattended`), crash-loop guard (3 failed relaunches → disarm + notify), `arm`/`disarm`/`status`/`note-pause`/`note-exit`/`event`/`notify-test`/`--print-crontab`; never edits the crontab. <!-- hunt:campaign-cron-resume -->
 - Phone notifications through a private ntfy.sh topic (topic in a 600 file, allowlisted token-only payload with 5h/weekly usage, failures logged and shown by `status`, never blocking). <!-- hunt:campaign-cron-resume -->
 - `/run-campaign-local --unattended` (chain mode only): no RESUME PLAN confirmation, no pre-spec sweep, no questions; anything needing a human parks. `campaign-runner` takes `unattended`, sends park / ready-for-release / waiting-on-you events and disarms the armed campaign at the end of a chain run. <!-- hunt:campaign-cron-resume -->
+
+### Fixed
+- Cross-family review of the cron-resume half (3 rounds): a failed park page is not marked sent; a dropped event (state lock busy) prints `dropped:` and the runner logs a ⚠; a campaign whose only remaining work is a compliance sign-off pages `waiting-on-you`; `--print-crontab` quotes paths and refuses `%` or non-printable ones; the tick requires tmux 3.2+ (or `master`) and an existing gate file, naming the gate path in its error. <!-- hunt:campaign-cron-resume -->
 
 ## [v1.0.1] - 2026-10-21
 
