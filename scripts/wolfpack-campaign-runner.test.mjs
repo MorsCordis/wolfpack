@@ -1867,6 +1867,51 @@ test('stage AC24: block → revert → redeploy → the next wave runs the non-c
   assert.ok(r.idx(e => e.label === 'stage-revert:a') < r.idx(e => e.type === 'workflow-start' && e.slug === 'y'))
 })
 
+// smoke-stage.json result contract: `green` = nothing failed in that wave's stage run; `resolved` =
+// something failed and was fixed, logged or blocked-and-reverted (Tracker r1 finding 3).
+const finishResults = (r) => r.agentCalls.filter(c => c.label === 'stage-finish')
+  .map(c => (/--result (\S+)/.exec(c.prompt) || [])[1])
+
+test('stage result: a clean wave finishes green; a logged-only finding finishes resolved', async () => {
+  let r = await runStage([[ch('a')]], { cron: CRON_OK })
+  noErr(r)
+  assert.deepEqual(finishResults(r), ['green'])
+  assert.equal(r.result.stage.result, 'green')
+  r = await runStage([[ch('a')]], { cron: CRON_OK,
+    stage: (l) => (l === 'stage-triage'
+      ? { status: 'ok', pending: { fix: {}, block: {} }, classified: [{ id: 'ISS-l', hunt: 'a', outcome: 'log', rule: 'polish', reasoning: 'r' }], campaign_blocks: [], block_text: {} }
+      : undefined) })
+  noErr(r)
+  assert.deepEqual(finishResults(r), ['resolved'])
+})
+
+test('stage result: block → revert → clean re-verify finishes that wave resolved; the next clean wave stays green', async () => {
+  let reverted = false
+  const r = await runStage([[ch('a'), ch('x')], [ch('y')]], { cron: CRON_OK,
+    stage: (l, p) => {
+      if (l === 'stage-triage' && !reverted) return { status: 'ok', pending: { fix: {}, block: { a: ['ISS-b'] } }, classified: [{ id: 'ISS-b', hunt: 'a', outcome: 'block', rule: 'default_block', reasoning: 'r' }], campaign_blocks: [], block_text: {} }
+      if (l === 'stage-revert:a') { reverted = true; return { status: 'reverted', campaign_sha: 'e'.repeat(40), reverted: [{ slug: 'a' }] } }
+      return undefined
+    } })
+  noErr(r)
+  assert.ok(r.labels.includes('stage-iterate'), 'the revert re-verifies the reverted tip')
+  assert.deepEqual(finishResults(r), ['resolved', 'green'])
+})
+
+test('stage result: a RESUMED re-verify (persisted iteration 2, empty triage) still finishes resolved', async () => {
+  // The resume-safe half of the fix: the iteration counter lives in stage state, so a runner that
+  // crashed after the fix round and resumes at the re-verify cannot forget the wave had findings.
+  const r = await runStage([[ch('a', { status: 'merged_to_campaign' })]], {
+    stage: (l, p) => {
+      if (l === 'stage-begin' && p.includes('--resume-only')) return { status: 'ok', action: 'resume-only', created: false, staged_from_wave: 1, rearmed: null, unstaged: [], current: { wave: 1, step: 'smoke', result: null, campaign_sha: 'd'.repeat(40), iteration: 2 } }
+      if (l === 'stage-begin') return { status: 'ok', action: 'resume', wave: 1, step: 'smoke', campaign_sha: 'd'.repeat(40), iteration: 2, merged: ['a'], polish: null, polish_issues: [] }
+      return undefined
+    } })
+  noErr(r)
+  assert.deepEqual(finishResults(r), ['resolved'])
+  assert.equal(r.result.stage.result, 'resolved')
+})
+
 test('stage AC26: "revert stub exit 2 → parked:campaign_revert_failed", one page, no next-wave scaffold', async () => {
   const r = await runStage([[ch('a')], [ch('b')]], { cron: CRON_OK,
     stage: (l) => {

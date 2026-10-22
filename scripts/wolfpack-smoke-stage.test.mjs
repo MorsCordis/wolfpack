@@ -82,6 +82,21 @@ test('refuseProdTarget: a trailing-dot FQDN is the same host and is refused too'
   assert.equal(refuseProdTarget('https://demo.example.dev./login', GUARD_CFG, { kind: 'url' }), 'never-smoke')
   assert.equal(refuseProdTarget('surgical.example.vet.', GUARD_CFG, { kind: 'host' }), 'prod suffix')
   assert.equal(refuseProdTarget('demo.example.dev.', GUARD_CFG, { kind: 'host' }), 'never-smoke')
+  // Several trailing dots, and upper case, normalise the same way; a plain dev host stays allowed.
+  assert.equal(refuseProdTarget('https://X.Example.VET../', GUARD_CFG, { kind: 'url' }), 'prod suffix')
+  assert.equal(refuseProdTarget('dev.example.dev.', GUARD_CFG, { kind: 'host' }), null)
+  assert.equal(refuseProdTarget('https://dev.example.dev./login', GUARD_CFG, { kind: 'url' }), null)
+})
+
+test('refuseProdTarget: trailing dots / whitespace in the CONFIG values are normalised too', () => {
+  const cfg = { prodHostSuffix: ' example.vet. ', neverSmokeHosts: ['demo.example.dev.', ' Clone.Example.dev '] }
+  assert.equal(refuseProdTarget('https://x.example.vet/', cfg, { kind: 'url' }), 'prod suffix')
+  assert.equal(refuseProdTarget('example.vet', cfg, { kind: 'host' }), 'prod suffix')
+  assert.equal(refuseProdTarget('demo.example.dev', cfg, { kind: 'host' }), 'never-smoke')
+  assert.equal(refuseProdTarget('https://clone.example.dev/x', cfg, { kind: 'url' }), 'never-smoke')
+  assert.equal(refuseProdTarget('dev.example.dev', cfg, { kind: 'host' }), null)
+  // A suffix that is only dots is no suffix (not a match-everything '').
+  assert.equal(refuseProdTarget('dev.example.dev', { prodHostSuffix: '.', neverSmokeHosts: ['.'] }, { kind: 'host' }), null)
 })
 
 test('suiteSet (A-5): touched apps; Red hunt → full; docs-only → none; full-suite path → full; main-sync noise excluded', () => {

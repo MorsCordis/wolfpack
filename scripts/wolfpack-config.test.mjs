@@ -1056,6 +1056,11 @@ test('stage keys: problems — bad stage value, malformed / duplicate / bad-host
     [STAGE_DEP.replace('`surgical=surgical.example.dev`', '`surgical=Surgical.Example.dev`'), /Smoke tenants: 'Surgical\.Example\.dev' \(for surgical\) must match/],
     [STAGE_DEP.replace('`surgical=surgical.example.dev`', '`surgical=x.example.dev/path`'), /Smoke tenants: .* must match/],
     [STAGE_DEP.replace('`mobile=dev.example.dev`', '`surgical=dev.example.dev`'), /Smoke tenants: duplicate name 'surgical'/],
+    // Tracker r1 finding 2: a trailing-dot FQDN is the same site, so the tenant host shape refuses it
+    // (and a leading or doubled dot) instead of letting it past an exact never-smoke / suffix compare.
+    [STAGE_DEP.replace('`surgical=surgical.example.dev`', '`surgical=surgical.example.dev.`'), /Smoke tenants: 'surgical\.example\.dev\.' \(for surgical\) must match/],
+    [STAGE_DEP.replace('`surgical=surgical.example.dev`', '`surgical=.surgical.example.dev`'), /Smoke tenants: .* must match/],
+    [STAGE_DEP.replace('`surgical=surgical.example.dev`', '`surgical=surgical..example.dev`'), /Smoke tenants: .* must match/],
     [STAGE_DEP.replace('`mobile=scripts/smoke/mobile-manifest.md`', '`scripts/smoke/mobile-manifest.md`'), /Smoke tenant manifests: malformed pair/],
   ]
   for (const [dep, re] of cases) {
