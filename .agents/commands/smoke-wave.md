@@ -175,6 +175,7 @@ user **per owning hunt** (attribution from `ref`):
 - **Chain campaign:** never revert on `main`; revert from the campaign branch
   with `node "$PACK/scripts/wolfpack-release.mjs" revert --campaign <c> --hunt <slug> --reason "<smoke failure>"`
   (it also reverts dependents and re-arms the hunt for a fix).
+  In chain mode the runner's post-merge stage already ran this; use `/smoke-chain` to re-run one wave.
 - **Clean revert** — the hunt is wrong end-to-end / not salvageable in-cycle. **main is
   merge-only** (`git-workflow` SKILL — never commit directly to main, hook-enforced), so the
   revert + CHANGELOG fixup happen on a branch and merge back `--no-ff`:

@@ -1111,6 +1111,7 @@ test('the resume probe REQUIRES baseBranch, checks commits against the base, and
   const { find } = await runHunt({ args: CHAIN_ARGS })
   const p = find('resume-probe')[0]
   assert.ok(p.opts.schema.required.includes('baseBranch'))
+  assert.ok(p.opts.schema.required.includes('testIsolation'), 'a dropped testIsolation would run a fix hunt on the shared test DB')
   assert.equal(p.opts.schema.properties.baseBranch.type, 'string')
   assert.match(p.prompt, /git log campaign\/c1\.\.feat\/h/)
   assert.match(p.prompt, /"merged_to_campaign" \/ "merged_to_campaign_pending_compliance" \/ "certified_held_overlap" → "DONE"/)
@@ -3864,4 +3865,64 @@ test('AC16: the parked skill registers cert_shim_probe_failed (clarify → re-ru
   const row = skill.split('\n').find(l => /^\|.*`cert_shim_probe_failed`/.test(l))
   assert.ok(row)
   assert.match(row, /clarify → re-run Certify/)
+})
+
+// ── wave-auto-smoke (A-7/A-8): test isolation for stage fix/polish hunts; busy re-takes ──────
+const ISO_CONFIG = { ...FIXTURE_CONFIG, integrationTestArgs: '--isolated-db {campaign}' }
+const ISO_CMD = "bash scripts/test-all.sh --isolated-db 'c1'"
+const isoRecord = (over = {}) => (p) => recordAnswer(stageOf(p), { command: ISO_CMD, ...over })
+
+test('wave-auto-smoke: testIsolation → every test-command mention is the composed isolated command; the record must carry it', async () => {
+  const { result, find, logs } = await runHunt({ args: { testIsolation: 'c1' },
+    answers: { 'project-config': configAnswer(ISO_CONFIG), 'test-record': isoRecord() } })
+  assert.notEqual(result.status, 'parked:test_record_error', JSON.stringify(result))
+  const tr = find('tracker:')[0].prompt
+  assert.ok(tr.includes(`- Run tests using: ${ISO_CMD}`), tr)
+  assert.ok(tr.includes(`the pipeline itself runs ${ISO_CMD} at the committed HEAD`))
+  assert.ok(tr.includes(`Tests run ONLY via \`${ISO_CMD}\``), 'the TOOLING POLICY line')
+  const sh = find('shepherd:')[0].prompt
+  assert.ok(sh.includes(`NEVER invoke the project's test command (\`${ISO_CMD}\`)`))
+  assert.ok(logs.some(l => l === `🧪 h: tests run on the isolated test DB of c1 (${ISO_CMD})`), logs.join('\n'))
+  // a record taken with the PLAIN command is not this hunt's record → fail closed
+  const plain = await runHunt({ args: { testIsolation: 'c1' }, answers: { 'project-config': configAnswer(ISO_CONFIG) } })
+  assert.equal(plain.result.status, 'parked:test_record_error')
+})
+
+test('wave-auto-smoke: no isolation → exactly the configured test command (every non-fix hunt is unchanged)', async () => {
+  const { find } = await runHunt({ answers: { 'project-config': configAnswer(ISO_CONFIG) } })
+  const tr = find('tracker:')[0].prompt
+  assert.ok(tr.includes('- Run tests using: bash scripts/test-all.sh\n'), tr)
+  assert.doesNotMatch(tr, /--isolated-db/)
+})
+
+test('wave-auto-smoke: the stored metadata.test_isolation sticks on resume; a conflicting arg / bad value / missing Integration test args fail loud', async () => {
+  const resumed = await runHunt({ answers: { 'project-config': configAnswer(ISO_CONFIG), 'test-record': isoRecord(),
+    'resume-probe': (p) => ({ fresh: true, testIsolation: 'c1' }) } })
+  assert.ok(resumed.find('tracker:')[0].prompt.includes(`- Run tests using: ${ISO_CMD}`))
+  assert.match(resumed.find('resume-probe:')[0].prompt, /testIsolation: metadata\.test_isolation if a non-empty string, else ""/)
+  await assert.rejects(runHunt({ args: { testIsolation: 'c2' }, answers: { 'project-config': configAnswer(ISO_CONFIG), 'resume-probe': { fresh: true, testIsolation: 'c1' } } }),
+    /test_isolation c1 ≠ args\.testIsolation c2/)
+  for (const bad of ['Bad', 'c1;rm', 'a'.repeat(42)]) {
+    await assert.rejects(runHunt({ args: { testIsolation: bad } }), /invalid testIsolation/, bad)
+  }
+  await assert.rejects(runHunt({ answers: { 'resume-probe': { fresh: true, testIsolation: 'Bad Name' } } }), /metadata\.test_isolation .* is invalid/)
+  await assert.rejects(runHunt({ args: { testIsolation: 'c1' } }), /has test isolation c1 but wolfpack-config\.md has no Project Identity → Integration test args/)
+})
+
+test('wave-auto-smoke A-8: a tempfail (exit 75) record is re-taken at once and never scored as a Test bounce', async () => {
+  const { result, find, logs } = await runHunt({ answers: { 'test-record': (p, o, n) => recordAnswer(stageOf(p),
+    stageOf(p) === 'tracker' && n <= 2 ? { pass: false, tempfail: true, exit: 75, summary: 'test DB busy' } : {}) } })
+  assert.notEqual(result.status, 'parked:test_record_error', JSON.stringify(result))
+  assert.equal(find('test-record:h:tracker').length, 3)
+  assert.ok(logs.some(l => l === '↻ test-record:h:tracker test DB busy — retry 1/8'), logs.join('\n'))
+  assert.ok(logs.some(l => l === '↻ test-record:h:tracker test DB busy — retry 2/8'))
+  assert.equal(find('shepherd:').length, 1, 'no Implement bounce for a busy record')
+})
+
+test('wave-auto-smoke A-8: MAX_BUSY_RETRIES exhausted → fail closed test_record_error (9 records, no bounce)', async () => {
+  const { result, find, logs } = await runHunt({ answers: { 'test-record': (p) => recordAnswer(stageOf(p), { pass: false, tempfail: true, exit: 75 }) } })
+  assert.equal(result.status, 'parked:test_record_error')
+  assert.equal(find('test-record:h:tracker').length, 9)
+  assert.ok(logs.some(l => /test DB busy 9 times — giving up/.test(l)), logs.join('\n'))
+  assert.equal(find('shepherd:').length, 1)
 })

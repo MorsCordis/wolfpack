@@ -809,3 +809,57 @@ test('merge-hunt: the worktree plan dir is copied back to the main repo on succe
   assert.equal(cmdMergeHunt(root, { campaign: 'c', hunt: 'h', at: AT }).status, 'merged')
   assert.equal(readFileSync(join(mainPlan(root, 'h'), 'certification.md'), 'utf8'), '# cert\n')
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+// wave-auto-smoke: merge-hunt --fix-of / --polish (post-merge stage)
+// ════════════════════════════════════════════════════════════════════════════
+test('merge-hunt --fix-of records smoke_fixes on the parent and removes the fix worktree (plan copied back first)', () => {
+  const root = mkRepo({ graph: { h: { dependsOn: [] } } })
+  addHunt(root, 'h', { edits: { 'h.txt': 'h\n' } })
+  assert.equal(runCli(root, 'merge-hunt', '--campaign', 'c', '--hunt', 'h', '--at', AT).json.status, 'merged')
+  const fwt = addHunt(root, 'fix-h-smoke-1', { edits: { 'h.txt': 'h fixed\n' }, meta: { parent_hunt: 'h' } })
+  writeFileSync(join(wtPlan(root, 'fix-h-smoke-1'), 'shepherd-log.md'), '# log\n')
+  const r = runCli(root, 'merge-hunt', '--campaign', 'c', '--hunt', 'fix-h-smoke-1', '--at', AT, '--fix-of', 'h')
+  assert.equal(r.code, 0, r.stdout + r.stderr)
+  assert.deepEqual([r.json.status, r.json.fix_of, r.json.warning], ['merged', 'h', undefined])
+  assert.equal(showFile(root, 'campaign/c', 'h.txt'), 'h fixed\n')
+  const ph = readJ(join(mainPlan(root, 'h'), 'metadata.json'))
+  assert.deepEqual(ph.smoke_fixes, [{ slug: 'fix-h-smoke-1', merge_commit: r.json.commit, merged_at: AT }])
+  assert.equal(existsSync(fwt), false, 'the fix worktree is removed')
+  assert.ok(existsSync(join(mainPlan(root, 'fix-h-smoke-1'), 'shepherd-log.md')), 'the plan dir was copied back before the removal')
+  assert.equal(readJ(join(mainPlan(root, 'fix-h-smoke-1'), 'metadata.json')).status, 'merged_to_campaign')
+  assert.ok(noTempWorktrees(root))
+})
+
+test('merge-hunt --polish records the polish merge in the campaign metadata stage block', () => {
+  const root = mkRepo({ graph: { h: { dependsOn: [] } } })
+  addHunt(root, 'polish-c', { edits: { 'p.txt': 'p\n' }, meta: { polish_of: 'c', tier: 'Blue' } })
+  const r = runCli(root, 'merge-hunt', '--campaign', 'c', '--hunt', 'polish-c', '--at', AT, '--polish')
+  assert.equal(r.code, 0, r.stdout + r.stderr)
+  assert.equal(r.json.polish, true)
+  const cm = readJ(join(root, '.wolfpack', 'campaigns', 'c', 'metadata.json'))
+  assert.deepEqual(cm.stage, { polish_merge_commit: r.json.commit, polish_slug: 'polish-c', polish_merged_at: AT })
+  assert.ok(cm.chain, 'the chain block is kept')
+  assert.equal(existsSync(join(root, '.wt', 'polish-c')), false)
+})
+
+test('merge-hunt with neither flag: unchanged result shape, worktree kept, no smoke_fixes; --fix-of without a value is refused', () => {
+  const root = mkRepo({ graph: { h: { dependsOn: [] } } })
+  const wt = addHunt(root, 'h', { edits: { 'h.txt': 'h\n' } })
+  const r = runCli(root, 'merge-hunt', '--campaign', 'c', '--hunt', 'h', '--at', AT)
+  assert.deepEqual(Object.keys(r.json).sort(), ['commit', 'stamped', 'status'])
+  assert.equal(existsSync(wt), true)
+  assert.equal('smoke_fixes' in readJ(join(mainPlan(root, 'h'), 'metadata.json')), false)
+  const x = runCli(root, 'merge-hunt', '--campaign', 'c', '--hunt', 'h', '--fix-of')
+  assert.equal(x.code, 2)
+  assert.match(x.json.reason, /--fix-of needs a hunt slug/)
+})
+
+test('merge-hunt --polish refuses a hunt that is not this campaign\'s polish hunt', () => {
+  const root = mkRepo({ graph: { h: { dependsOn: [] } } })
+  addHunt(root, 'h', { edits: { 'h.txt': 'h\n' } })
+  const r = runCli(root, 'merge-hunt', '--campaign', 'c', '--hunt', 'h', '--at', AT, '--polish')
+  assert.notEqual(r.code, 0)
+  assert.match(r.stdout + r.stderr, /polish_of is null, not c/)
+  assert.ok(existsSync(join(root, '.wt', 'h')), 'nothing merged, worktree kept')
+})

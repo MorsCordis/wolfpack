@@ -328,3 +328,41 @@ test('answered-but-parked hunts are not re-drafted', () => {
   assert.equal(by['h-new'].redraft, true)
   assert.equal(by['h-ready'].redraft, true)
 })
+
+// ─── wave-auto-smoke AC34: [tenant:<name>] scope in the lint ──────────────────
+test('AC34 scoped line parses (not reported as unparsed)', () => {
+  const md = '## Acceptance criteria\n- AC1 [auto] [tenant:mobile] a\n- AC2 [auto] [tenant:both] b\n- AC3 [manual] [tenant:surgical] c\n- AC4 [auto] d\n'
+  const r = lintAcceptance(md)
+  assert.equal(r.ok, true, JSON.stringify(r.errors))
+  assert.deepEqual(r.counts, { auto: 3, manual: 1, compliance: 0 })
+})
+
+test('AC34 lint rejects unknown scope (reported once, the rest still lints)', () => {
+  const md = '## Acceptance criteria\n- AC1 [auto] [tenant:desktop] a\n- AC2 [auto] b\n- AC2 [auto] dup\n'
+  const r = lintAcceptance(md)
+  assert.equal(r.ok, false)
+  const scope = r.errors.filter((e) => /tenant scope/.test(e.message))
+  assert.deepEqual(scope.map((e) => e.id), ['AC1'])
+  assert.equal(scope[0].message, 'AC1: unknown tenant scope "desktop" (allowed: both, surgical, mobile)')
+  assert.ok(!r.errors.some((e) => e.id === 'AC1' && /not parsed/.test(e.message)), 'a scope error is not also "not parsed"')
+  assert.ok(r.errors.some((e) => /AC2: duplicate id/.test(e.message)), 'later lines still lint')
+})
+
+test('AC34 lint rejects a malformed scope', () => {
+  for (const line of ['- AC1 [auto] [tenant:] a', '- AC1 [auto] [tenant:mobile a']) {
+    const r = lintAcceptance(`## Acceptance criteria\n${line}\n- AC2 [auto] b\n`)
+    assert.equal(r.ok, false, line)
+    assert.ok(r.errors.some((e) => e.id === 'AC1' && /malformed tenant scope/.test(e.message)), `${line}: ${JSON.stringify(r.errors)}`)
+  }
+})
+
+test('AC34 CLI lint --tenants: project tenant names; bad flag value exits 2', () => {
+  const dir = tmp()
+  const f = join(dir, 'a.md')
+  writeFileSync(f, '## Acceptance criteria\n- AC1 [auto] [tenant:kiosk] a\n')
+  assert.equal(run(['lint', f]).status, 1)
+  const ok = run(['lint', f, '--tenants', 'kiosk,web'])
+  assert.equal(ok.status, 0, ok.stderr + ok.stdout)
+  assert.equal(lintAcceptance('## Acceptance criteria\n- AC1 [auto] [tenant:kiosk] a\n', { tenants: ['kiosk'] }).ok, true)
+  for (const bad of ['', 'Kiosk', 'a b', ',']) assert.equal(run(['lint', f, '--tenants', bad]).status, 2, bad)
+})

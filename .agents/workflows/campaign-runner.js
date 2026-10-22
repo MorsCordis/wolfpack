@@ -761,18 +761,82 @@ Return exitCode (its real exit code) and output (its last stdout line). Modify n
 const cronFinish = async (res) => {
   const v = String((res && res.verdict) || 'unknown')
   const c = shq(campaignSlug)
+  // wave-auto-smoke (AC30/AC35): the release report link rides along as report_url when the
+  // post-merge stage built one (the notifier drops anything that is not a meshnet http URL).
+  const reportUrl = res && res.stage && typeof res.stage.reportUrl === 'string' && res.stage.reportUrl ? res.stage.reportUrl : null
+  const ru = reportUrl ? ` --report-url ${shq(reportUrl)}` : ''
   // Everything merged but a compliance sign-off is still owed: that waits on a human (AC11).
   if (v === 'CAMPAIGN_READY_FOR_RELEASE' && res.pendingComplianceHunts && res.pendingComplianceHunts.length) {
-    return cronEvent(`event waiting-on-you --campaign ${c} --status merged_awaiting_compliance`, 'cron-finish')
+    return cronEvent(`event waiting-on-you --campaign ${c} --status merged_awaiting_compliance${ru}`, 'cron-finish')
   }
-  if (v === 'CAMPAIGN_READY_FOR_RELEASE') return cronEvent(`event ready-for-release --campaign ${c}`, 'cron-finish')
+  if (v === 'CAMPAIGN_READY_FOR_RELEASE') return cronEvent(`event ready-for-release --campaign ${c}${ru}`, 'cron-finish')
+  // A parked post-merge stage waits on a human: one page, with the park code and the report.
+  if (v === 'CAMPAIGN_PARKED_STAGE') {
+    return cronEvent(`event waiting-on-you --campaign ${c} --status ${shq(`parked:${res.parkReason || 'stage'}`)}${ru}`, 'cron-finish')
+  }
   if (v === 'CAMPAIGN_AWAITING_HUMAN' || v === 'CAMPAIGN_PARKED_MAIN_CONFLICT') {
-    return cronEvent(`event waiting-on-you --campaign ${c} --status ${shq(v.toLowerCase())}`, 'cron-finish')
+    return cronEvent(`event waiting-on-you --campaign ${c} --status ${shq(v.toLowerCase())}${ru}`, 'cron-finish')
   }
   if (v === 'WAVE_PAUSED_QUOTA' && res.resetAt) return cronEvent(`note-pause --campaign ${c} --reset-at ${shq(res.resetAt)}`, 'cron-finish')
   // The per-run runaway breaker tripped: a relaunch would reset the run budget and defeat it.
   if (v === 'WAVE_PAUSED_BUDGET') return cronEvent(`event waiting-on-you --campaign ${c} --status wave_paused_budget`, 'cron-finish')
   return cronEvent(`note-exit --campaign ${c} --verdict ${shq(v)}`, 'cron-finish')
+}
+
+// ─── Post-merge stage relays (wave-auto-smoke; docs/post-merge-stage.md) ───────
+// Every stage step runs ONE pack CLI from the main repo root through a sonnet relay that
+// returns its stdout VERBATIM; the JSON is parsed HERE (never by the agent), so park/retry
+// decisions stay in tested code. Unlike chainCli, a relay never throws: a missing or garbled
+// result comes back as {status:'error'} and the stage parks it (stage_cli_error), loudly.
+// Long steps (deploy, migrate, ensure, the integration record) use the background rc-file
+// relay — twin of hunt-pipeline.js shimRun / SHIM_WAIT_RULE (keep the two in step).
+const STAGE_RELAY_SCHEMA = { type: 'object', properties: { exitCode: { type: 'integer' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
+const stageShimRun = (cmd, base) => `( ${cmd} > ${base}.out 2> ${base}.err; echo $? > ${base}.rc ) </dev/null >/dev/null 2>&1 &
+       then, in the FOREGROUND, repeat
+         timeout 540 bash -c 'until [ -f "$1" ]; do sleep 20; done' _ ${base}.rc
+       until ${base}.rc exists (give up after ~90 minutes → this attempt FAILED, evidence "step did not finish").
+       The exit code is the content of ${base}.rc; the script's JSON is ${base}.out (stderr: ${base}.err).`
+const STAGE_WAIT_RULE = `   WAITING ON A LONG STEP (hard rule): the step stays alive only while YOU keep working. Wait ONLY with
+   the foreground \`timeout 540 … until [ -f <rc> ]\` poll above, issued again and again until the rc file
+   exists. Do NOT use Monitor, ScheduleWakeup, or the Bash tool's run_in_background, do NOT stop the
+   step's task, and NEVER end your turn or reply with a "waiting…" message while it runs.`
+async function stageCli(script, cliArgs, label, { long = false } = {}) {
+  const cmd = `node ${shq(packScript(script))} ${cliArgs}`
+  const safe = String(label).replace(/[^A-Za-z0-9_.-]/g, '_')
+  const relayDir = `.wolfpack/campaigns/${campaignSlug}/stage/.relay`
+  const base = `${relayDir}/${safe}`
+  let r = null
+  try {
+    r = await agent(long ? `
+You RELAY one deterministic post-merge-stage step for campaign ${campaignSlug}. The script does ALL the work —
+do NOT run anything else, do NOT edit any file, do NOT retry, do NOT interpret the result.
+From the MAIN repo root (the current directory — not a hunt worktree) first run:
+  mkdir -p ${shq(relayDir)} && rm -f ${shq(`${base}.out`)} ${shq(`${base}.err`)} ${shq(`${base}.rc`)}
+Then run exactly (ONE command line — the step can outlast one shell call, so it runs in the background):
+       ${stageShimRun(cmd, shq(base))}
+${STAGE_WAIT_RULE}
+Return exitCode = the integer content of ${base}.rc and output = the content of ${base}.out VERBATIM.
+If the command could not run at all, return exitCode -1 and the error text as output. Never invent a result.
+` : `
+You RELAY one deterministic post-merge-stage step for campaign ${campaignSlug}. The script does ALL the work —
+do NOT run anything else, do NOT edit any file, do NOT retry, do NOT interpret the result.
+From the MAIN repo root (the current directory — not a hunt worktree) run exactly ONE command line:
+  ${cmd}
+Return exitCode = its real exit code and output = its stdout VERBATIM (the JSON it printed).
+If the command could not run at all, return exitCode -1 and the error text as output. Never invent a result.
+`, { label, phase: 'Execute', model: 'sonnet', schema: STAGE_RELAY_SCHEMA })
+  } catch (e) {
+    return { status: 'error', reason: `relay ${label} failed: ${(e && e.message) || e}`, exitCode: -1 }
+  }
+  if (!r) return { status: 'error', reason: `relay ${label} returned no result`, exitCode: -1 }
+  let obj = null
+  try { const block = firstJsonObject(r.output); obj = block ? JSON.parse(block) : null } catch { obj = null }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    return { status: 'error', reason: `${label}: no parseable JSON (exit ${r.exitCode}): ${String(r.output || '').split('\n')[0].slice(0, 300)}`, exitCode: r.exitCode }
+  }
+  if (typeof obj.status !== 'string') obj.status = r.exitCode === 0 ? 'ok' : 'error'
+  obj.exitCode = r.exitCode
+  return obj
 }
 
 async function runChain(campaign) {
@@ -868,11 +932,13 @@ async function runChain(campaign) {
 
   // campaign-cron-resume (AC11): one `park` page per newly parked hunt. parked:model_quota is
   // transient (it auto-resumes; the cron's own gate defer covers the wait), so it never pages.
-  const notifyPark = async (hunt) => {
+  // wave-auto-smoke (AC25): a stage revert's page carries the report link (report_url) and
+  // nothing else beyond the allowlisted fields.
+  const notifyPark = async (hunt, reportUrl = null) => {
     const st = String(status.get(hunt.slug) || '')
     if (!(st === 'needs_spec' || (st.startsWith('parked:') && st !== 'parked:model_quota'))) return
     const reasonCode = st === 'needs_spec' ? 'needs_spec' : st.slice('parked:'.length)
-    await cronEvent(`event park --campaign ${shq(campaignSlug)} --hunt ${shq(hunt.slug)} --status ${shq(st)} --reason ${shq(reasonCode)}`, `cron-park:${hunt.slug}`)
+    await cronEvent(`event park --campaign ${shq(campaignSlug)} --hunt ${shq(hunt.slug)} --status ${shq(st)} --reason ${shq(reasonCode)}${reportUrl ? ` --report-url ${shq(reportUrl)}` : ''}`, `cron-park:${hunt.slug}`)
   }
 
   // Merge every awaiting-merge hunt (and every reapply-ready reverted dependent) of waves ≤ N,
@@ -933,7 +999,447 @@ async function runChain(campaign) {
     }
   }
 
+  // ─── Post-merge stage (wave-auto-smoke, plan §7.4–§7.5; operator doc docs/post-merge-stage.md) ───
+  // After each wave's merges: deploy the campaign tip to dev from a temp worktree, migrate,
+  // ensure the smoke tenants, probe the sessions, run the touched apps' suites on the isolated
+  // test DB, smoke every merged [auto] criterion on each smoke tenant, triage (fix ≤2 reviewed
+  // rounds / log / block-and-revert), re-verify; one polish wave at campaign end; the release
+  // report. Opt-in: wolfpack-config.md → Deployment Notes → Post-merge smoke stage: on. Every
+  // decision is made by <pack>/scripts/wolfpack-smoke-stage.mjs; this block only sequences it.
+  const stageOn = projectConfig.postMergeStage === true
+  const STAGE_STEPS = ['begin', 'deploy', 'migrate', 'ensure', 'session', 'integration', 'smoke', 'triage', 'act', 'done']
+  let stageInfo = { lastWave: null, result: null, reportUrl: null, park: null }
+  const S = (sub, args, label, opts) => stageCli('wolfpack-smoke-stage.mjs', `${sub} --campaign ${shq(campaignSlug)}${args ? ` ${args}` : ''}`, label, opts)
+  const TIER_ORDER = ['Green', 'Blue', 'Yellow', 'Orange', 'Red']
+  const stageTier = (slugs) => (slugs || []).map(s => normTier((bySlug.get(s) || {}).tier || 'Blue'))
+    .reduce((a, t) => (TIER_ORDER.indexOf(t) > TIER_ORDER.indexOf(a) ? t : a), 'Blue')
+  const stageReport = async () => {
+    const r = await S('report', '', 'stage-report')
+    if (r.status !== 'ok') log(`⚠ report: ${r.reason || 'failed'}`)
+    else {
+      if (r.warning) log(r.warning)
+      if (r.report_url) stageInfo.reportUrl = r.report_url
+    }
+    return stageInfo.reportUrl
+  }
+  // Park the CAMPAIGN on a stage failure: report first (so the page carries the link), then the
+  // CLI records parked:<code> (the relaunch re-arms it), then one CAMPAIGN_PARKED_STAGE return
+  // (cronFinish sends the one notification). Every code is in docs/post-merge-stage.md.
+  const stagePark = async (code, detail, atStep) => {
+    await stageReport()
+    const p = await S('park', `--code ${shq(code)} --detail ${shq(String(detail || '').slice(0, 900))}${atStep ? ` --step ${shq(atStep)}` : ''}`, `stage-park:${code}`)
+    if (p.status !== 'ok') log(`⚠ post-merge stage: park ${code} not recorded in smoke-stage.json: ${p.reason}`)
+    stageInfo = { ...stageInfo, result: `parked:${code}`, park: { code, detail: String(detail || '') } }
+    log(``)
+    log(`⛔ post-merge stage PARKED: ${code} — ${detail}`)
+    log(`   Clear it (docs/post-merge-stage.md → park codes), then re-run the campaign: the relaunch re-arms the stage.`)
+    if (stageInfo.reportUrl) log(`Report: ${stageInfo.reportUrl}`)
+    return { ...chainBase, completed: false, verdict: 'CAMPAIGN_PARKED_STAGE', parkReason: code, parkDetail: String(detail || ''), stage: { ...stageInfo } }
+  }
+  // A stage CLI error: a named config problem parks smoke_config_missing; anything else unmapped
+  // parks stage_cli_error naming the step — never a silent skip or retry.
+  const stageErr = (r, stepLabel, atStep) => (r && r.code === 'smoke_config_missing'
+    ? stagePark('smoke_config_missing', `${stepLabel}: ${r.key ? `${r.key} — ` : ''}${r.reason || 'config problem'}${r.detail ? ` (${r.detail})` : ''}`, atStep)
+    : stagePark('stage_cli_error', `${stepLabel}: ${(r && r.reason) || 'no result'}`, atStep))
+  // AC3: a defer before a Claude-heavy step (smoke, fix round, polish) is the re-runnable pause.
+  const stageGate = async (what, waveNumber, slugs) => {
+    const tier = stageTier(slugs)
+    const g = await usageGate({ slug: `stage:${campaignSlug}:${what}`, tier })
+    if (g.decision !== 'defer') return null
+    log(`⏸ post-merge stage: usage gate deferred ${what} — state saved; re-run after ${g.reset_at || 'the window resets'}`)
+    return {
+      ...usagePausedReturn({ slug: `stage:${what}`, tier, reason: g.reason, reset_at: g.reset_at, source: g.source }, [], [], waveNumber),
+      mode: 'chain', branch, stage: { ...stageInfo },
+    }
+  }
+  // S4/S-pre: a REFUSED host or hook is a config problem; anything else unreadable is the browser.
+  const sessionProblem = (r, atStep) => {
+    const probs = Array.isArray(r.problems) ? r.problems : []
+    const refused = probs.find(p => p.kind === 'refused')
+    if (refused) return stagePark('smoke_config_missing', `Smoke login hook / Deployment Notes → Smoke tenants (${refused.tenant}): ${refused.host} — ${refused.detail}`, atStep)
+    const dead = probs.find(p => p.kind !== 'refused')
+    if (dead) return stagePark('smoke_browser_unreachable', `${dead.host}: ${dead.detail} — start the Spark smoke Chrome (docs: smoke-on-spark), then re-run the campaign`, atStep)
+    return null
+  }
+  // AC24/AC26: revert a blocked hunt (+ its fix merges, + dependents) out of the campaign branch.
+  const stageRevert = async (h, ids, text) => {
+    const t = text || {}
+    const args = [
+      `revert --campaign ${shq(campaignSlug)} --hunt ${shq(h)}`,
+      `--reason ${shq(`post-merge stage: ${(ids || []).join(', ') || 'blocked'}`)}`,
+      t.summary ? `--summary ${shq(t.summary)}` : '', t.evidence ? `--evidence ${shq(t.evidence)}` : '',
+      ids && ids.length ? `--issues ${shq(ids.join(','))}` : '', t.question ? `--question ${shq(t.question)}` : '',
+    ].filter(Boolean).join(' ')
+    const rv = await stageCli('wolfpack-release.mjs', args, `stage-revert:${h}`)
+    if (rv.status !== 'reverted') return stagePark('campaign_revert_failed', `${h}: ${rv.reason || 'revert failed'} — ${branch} unchanged`, 'act')
+    status.set(h, CHAIN_STATUS.REVERTED)
+    for (const x of (Array.isArray(rv.reverted) ? rv.reverted : [])) {
+      if (!x || x.slug === h) continue
+      status.set(x.slug, CHAIN_STATUS.REVERTED_WITH_DEP)
+      revertedBecause.set(x.slug, h)
+    }
+    log(`  ↩ ${h} reverted from ${branch}${rv.campaign_sha ? ` (tip ${String(rv.campaign_sha).slice(0, 12)})` : ''}: ${(ids || []).join(', ')}`)
+    if (ids && ids.length) {
+      const rs = await S('resolve', `--ids ${shq(ids.join(','))} --resolution reverted`, `stage-resolve:${h}`)
+      if (rs.status !== 'ok') log(`⚠ post-merge stage: could not mark ${ids.join(', ')} reverted: ${rs.reason}`)
+    }
+    const url = await stageReport()
+    await notifyPark(bySlug.get(h) || { slug: h }, url)
+    return null
+  }
+  const BROWSER_PROBE_SCHEMA = { type: 'object', properties: { available: { type: 'boolean' }, tools_seen: { type: 'array', items: { type: 'string' } }, error: { type: ['string', 'null'] } }, required: ['available'] }
+  const SMOKE_AGENT_SCHEMA = { type: 'object', properties: { raw_path: { type: 'string' }, status: { type: 'string' }, note: { type: 'string' } }, required: ['raw_path'] }
+  const PLANNER_SCHEMA = { type: 'object', properties: { status: { type: 'string', enum: ['ok', 'error'] }, plan: { type: 'string' }, acceptance: { type: 'string' }, reason: { type: 'string' } }, required: ['status'] }
+  const certifiedVerdict = (r) => !!r && ['CERTIFIED_AWAITING_DEPLOY', 'CERTIFIED_PENDING_COMPLIANCE'].includes(r.verdict)
+  // The Claude planner that turns a fix round's findings (or the polish items) into a plan that
+  // hunt-pipeline starts at Implement. It plans only; Shepherd writes the code.
+  const plannerPrompt = (sc, kind) => `
+You are the Alpha planner for a post-merge-stage ${kind === 'polish' ? 'POLISH WAVE' : 'FIX ROUND'} of chain campaign ${campaignSlug}
+(operator doc: ${wolfpackHome.home}/docs/post-merge-stage.md). Plan only — do NOT edit, stage or commit any source file,
+do NOT run tests, do NOT use the browser.
+Worktree: ${sc.worktree} (branch ${sc.branch}, forked from the campaign tip ${String(sc.base_sha || '').slice(0, 12)}).
+Plan dir: ${sc.plan_dir}
+1. Read ${sc.plan_dir}/findings.md (the issue-log entries to fix: ids ${(sc.issues || []).join(', ')}) and ${sc.plan_dir}/metadata.json.
+${kind === 'polish'
+    ? '2. These are cosmetic/polish items logged across the campaign. Plan ONE change that fixes all of them; never touch the code of a hunt that is reverted or parked.'
+    : `2. Read the parent hunt's plan and acceptance: .wolfpack/plans/${sc.parent_hunt}/plan-final.md and acceptance.md (main repo, or the parent's worktree copy). Fix exactly the findings; nothing else.`}
+3. Write ${sc.plan_dir}/acceptance.md: a "## Acceptance criteria" section with one "- AC<n> [auto] <text>" line per finding, stating the
+   EXPECTED behaviour (from the finding / the parent's acceptance) as a checkable criterion.
+4. Write ${sc.plan_dir}/plan-final.md: the files to modify, the exact change per finding, and the test that FAILS before the fix
+   (the Tracker writes it). Follow the project's wolfpack-config.md rules. Tests for this hunt run ONLY through the configured
+   test command with the campaign's isolated test DB (metadata test_isolation).
+Return {status:'ok', plan:<plan-final.md path>, acceptance:<acceptance.md path>}, or {status:'error', reason} if you cannot plan it.`
+  const runStagePipeline = async (sc, kind) => {
+    const pl = await agent(plannerPrompt(sc, kind), { label: `stage-${kind}-plan:${sc.slug}`, phase: 'Execute', model: 'opus', schema: PLANNER_SCHEMA })
+    if (!pl || pl.status !== 'ok') return { ok: false, why: `planner: ${(pl && pl.reason) || 'no result'}` }
+    let res = null
+    try {
+      res = await workflow('hunt-pipeline', {
+        slug: sc.slug, description: sc.description, campaign: campaignSlug, tier: sc.tier, mode: 'update',
+        crossExaminer: nextCrossExaminer(), baseBranch: branch, testIsolation: campaignSlug,
+      })
+    } catch (e) { return { ok: false, why: `hunt-pipeline threw: ${(e && e.message) || e}` } }
+    if (!certifiedVerdict(res)) return { ok: false, why: res ? `${res.verdict}${res.status ? ` (${res.status})` : ''}` : 'hunt-pipeline returned no result' }
+    return { ok: true, res }
+  }
+
+  // S0–S9 for one wave (or one polish iteration). Returns null when the stage resolved (green /
+  // resolved), else the run's return object (WAVE_PAUSED_QUOTA or CAMPAIGN_PARKED_STAGE).
+  const postMergeStage = async (waveNumber, mergedSlugs, opts = {}) => {
+    const W = waveNumber
+    const beginArgs = opts.polish
+      ? `--wave ${W} --polish ${shq(opts.polish)}`
+      : `--wave ${W}${mergedSlugs && mergedSlugs.length ? ` --merged ${shq(mergedSlugs.join(','))}` : ''}`
+    const b = await S('begin', beginArgs, 'stage-begin')
+    if (b.status !== 'ok') return stageErr(b, 'stage-begin', 'begin')
+    if (b.action === 'nothing') { log(`post-merge stage: nothing new on ${branch}${b.reason ? ` (${b.reason})` : ''}`); return null }
+    stageInfo.lastWave = W
+    let step = b.action === 'resume' ? b.step : 'begin'
+    let tip = b.campaign_sha
+    let iteration = b.iteration
+    let polishSlug = b.polish || null
+    let polishMerge = b.polish_merge || null
+    const polishIssues = Array.isArray(b.polish_issues) ? b.polish_issues : []
+    const merged = Array.isArray(b.merged) ? b.merged : (mergedSlugs || [])
+    log(`post-merge stage: wave ${W} ${b.action}${b.action === 'resume' ? ` after ${step}` : ''} @ ${String(tip).slice(0, 12)} (iteration ${iteration}${polishSlug ? `, polish ${polishSlug}` : ''})`)
+    const past = (s) => STAGE_STEPS.indexOf(step) >= STAGE_STEPS.indexOf(s)
+    for (;;) {
+      // S-pre: the sessions BEFORE the deploy (first iteration only).
+      if (!past('deploy') && iteration === 1) {
+        const sb = await S('session', '--when before', 'stage-session:before')
+        if (sb.status !== 'ok') return stageErr(sb, 'stage-session:before', 'deploy')
+        const sp = sessionProblem(sb, 'deploy'); if (sp) return sp
+      }
+      // S1 deploy (one retry), S2 migrate (A-18).
+      if (!past('deploy')) {
+        for (;;) {
+          const d = await S('deploy', '', 'stage-deploy', { long: true })
+          if (d.status !== 'ok') return stageErr(d, 'stage-deploy', 'deploy')
+          if (d.exit === 0) break
+          if ((d.attempts || 0) >= 2) return stagePark('dev_deploy_failed', `deploy exited ${d.exit} twice: ${d.last_line || '(no output)'} (log ${d.log})`, 'deploy')
+          log(`↻ post-merge stage: deploy failed (exit ${d.exit}: ${d.last_line || '?'}) — retrying once`)
+        }
+        step = 'deploy'
+      }
+      let migrateBlocked = false
+      if (!past('migrate')) {
+        for (;;) {
+          const m = await S('migrate', '', 'stage-migrate', { long: true })
+          if (m.status !== 'ok') return stageErr(m, 'stage-migrate', 'migrate')
+          if (m.exit === 0) break
+          if (Array.isArray(m.migrating_hunts) && m.migrating_hunts.length) {
+            migrateBlocked = true
+            log(`⛔ post-merge stage: migrate failed (exit ${m.exit}) — blocking the migrating hunt(s) ${m.migrating_hunts.join(', ')}; never smoked over`)
+            break
+          }
+          if ((m.attempts || 0) >= 2) return stagePark('dev_deploy_failed', `migrate exited ${m.exit} twice with no migrating hunt in the wave: ${m.last_line || '(no output)'} (log ${m.log})`, 'migrate')
+          log(`↻ post-merge stage: migrate failed (exit ${m.exit}: ${m.last_line || '?'}) — retrying once`)
+        }
+        if (!migrateBlocked) step = 'migrate'
+      }
+      if (!migrateBlocked) {
+        // S3 ensure the smoke tenants (A-11/A-12).
+        if (!past('ensure')) {
+          const e = await S('ensure-tenants', '', 'stage-ensure-tenants', { long: true })
+          if (e.status !== 'ok') return stageErr(e, 'stage-ensure-tenants', 'ensure')
+          if (e.exit !== 0) return stagePark('smoke_tenant_ensure_failed', `exit ${e.exit}: ${e.last_line || '(no output)'} (log ${e.log})`, 'ensure')
+          for (const n of (e.notices || [])) log(`ℹ post-merge stage notice: ${n.text} (report only)`)
+          step = 'ensure'
+        }
+        // S4 sessions after the deploy (A-15).
+        if (!past('session')) {
+          const sa = await S('session', '--when after', 'stage-session')
+          if (sa.status !== 'ok') return stageErr(sa, 'stage-session', 'session')
+          const sp = sessionProblem(sa, 'session'); if (sp) return sp
+          if (Array.isArray(sa.session_drops) && sa.session_drops.length) {
+            log(`⚠ post-merge stage: signed out after the deploy on ${sa.session_drops.join(', ')} — logged for Cecil (session_drop, prod-relevant); signing in again through the hook`)
+          }
+          step = 'session'
+        }
+        // S5 integration suites on the isolated test DB (A-5..A-8, A-17).
+        if (!past('integration')) {
+          const su = await S('suites', polishSlug ? `--polish ${shq(polishSlug)}` : `--wave ${W}`, 'stage-suites')
+          if (su.status !== 'ok') return stageErr(su, 'stage-suites', 'integration')
+          if (su.empty) log(`post-merge stage: integration — ${su.reason}; nothing to run`)
+          else {
+            log(`post-merge stage: integration — ${su.reason}`)
+            const recordDir = `${hostRepoRoot}/.wolfpack/campaigns/${campaignSlug}/stage/wave-${W}`
+            let infra = 0
+            for (;;) {
+              const rec = await stageCli('wolfpack-test-record.mjs',
+                `run --json --stage integration --record-dir ${shq(recordDir)} --repo ${shq(hostRepoRoot)} --rev ${shq(tip)} --labels ${shq(su.record_labels)} --campaign ${shq(campaignSlug)} --timeout-min 55`,
+                'stage-integration', { long: true })
+              if (rec.exitCode !== 0 && rec.exitCode !== 2) {
+                infra++
+                if (infra >= 2) return stagePark('integration_infra', `the integration record failed twice: ${rec.error || rec.reason || `exit ${rec.exitCode}`}`, 'integration')
+                log(`↻ post-merge stage: integration record failed (${rec.error || rec.reason || `exit ${rec.exitCode}`}) — retrying once`)
+                continue
+              }
+              const ig = await S('ingest-integration', `--wave ${W}`, 'stage-ingest-integration')
+              if (ig.status !== 'ok') return stageErr(ig, 'stage-ingest-integration', 'integration')
+              for (const w of (ig.warnings || [])) log(w)
+              if (ig.action === 'retake') { log(`↻ post-merge stage: integration ${ig.busy ? `test DB busy — re-taking (${ig.busy_retries})` : `incomplete (${ig.reason || 'infra'}) — retrying once`}`); continue }
+              if (ig.action === 'park') {
+                if (ig.code === 'integration_unattributed') return stagePark('integration_unattributed', ig.reason, 'integration')
+                return stagePark('integration_infra', ig.reason, 'integration')
+              }
+              log(`post-merge stage: integration ${ig.action === 'pass' ? 'green' : `${ig.findings} finding(s): ${(ig.ids || []).join(', ')}`}`)
+              break
+            }
+          }
+          step = 'integration'
+        }
+        // S6 smoke (A-0, A-16, AC12–AC17).
+        if (!past('smoke')) {
+          const ps = await S('plan-smoke', `--wave ${W} --sha ${shq(tip)}`, 'stage-plan-smoke')
+          if (ps.status !== 'ok') return stageErr(ps, 'stage-plan-smoke', 'smoke')
+          const wa = await S('worktree', `add --wave ${W}`, 'stage-worktree-add')
+          if (wa.status !== 'ok') return stageErr(wa, 'stage-worktree-add', 'smoke')
+          try {
+            let raw = ps.raw_exists ? ps.raw_path : null
+            if (raw) log(`post-merge stage: a raw results file for ${String(tip).slice(0, 12)} is already there (the /smoke-chain fallback) — ingesting it`)
+            for (;;) {
+              if (!raw) {
+                const gp = await stageGate(`w${W}:smoke`, W, polishSlug ? [] : merged); if (gp) return gp
+                const probe = await agent(`
+READ-ONLY browser probe for the post-merge stage of campaign ${campaignSlug}. Call the tool mcp__chrome-devtools__list_pages
+EXACTLY ONCE (no navigation, no sign-in, no other tool). Return available = true only if that call succeeded,
+tools_seen = the mcp__chrome-devtools__* tool names you have, error = the error text or null.
+If the tool is not available to you, return {available:false, tools_seen:[…], error:"mcp__chrome-devtools__list_pages not available"}.`,
+                  { label: 'stage-browser-probe', phase: 'Execute', model: 'sonnet', schema: BROWSER_PROBE_SCHEMA })
+                if (!probe || probe.available !== true) {
+                  return stagePark('smoke_browser_unavailable', `${(probe && probe.error) || 'the browser probe returned no result'} — fallback: run /smoke-chain ${campaignSlug} ${W} in the interactive session, then re-run the campaign`, 'smoke')
+                }
+                const sm = await agent(`
+You are the post-merge-stage SMOKE agent for campaign ${campaignSlug}, wave ${W} (iteration ${iteration}).
+Read and follow ${wolfpackHome.home}/.agents/commands/smoke-chain.md EXACTLY, with the plan file
+  ${ps.plan}
+Sign in ONLY through the project's Smoke login hook (the plan's login_hook); never type a password, never read ~/.secrets,
+never open file:// or any host not in the plan. You do NOT triage, fix, revert or build the report.
+Write the raw results file the command describes to ${ps.raw_path} and return {raw_path: "${ps.raw_path}"}.`,
+                  { label: `stage-smoke:w${W}`, phase: 'Execute', model: 'opus', schema: SMOKE_AGENT_SCHEMA })
+                raw = sm && typeof sm.raw_path === 'string' && sm.raw_path ? sm.raw_path : null
+                if (!raw) {
+                  const sf = await S('smoke-failed', `--wave ${W} --reason ${shq('the smoke agent returned no raw results path')}`, 'stage-smoke-failed')
+                  if (sf.status !== 'ok') return stageErr(sf, 'stage-smoke-failed', 'smoke')
+                  if ((sf.attempts || 0) >= 2) return stagePark('smoke_agent_failed', 'the smoke agent returned no raw results twice', 'smoke')
+                  log('↻ post-merge stage: the smoke agent returned no results — running it once more')
+                  continue
+                }
+              }
+              const is = await S('ingest-smoke', `--wave ${W} --raw ${shq(raw)}`, 'stage-ingest-smoke')
+              if (is.status === 'ok') {
+                if (is.warning) log(is.warning)
+                log(`post-merge stage: smoke — ${Object.entries(is.verdicts || {}).map(([h, v]) => `${h} ${v}`).join(', ') || 'no criteria'}; ${is.findings} finding(s)`)
+                break
+              }
+              if (is.code === 'smoke_raw_invalid') {
+                if ((is.attempts || 0) >= 2) return stagePark('smoke_agent_failed', `the raw results failed validation twice: ${is.reason}`, 'smoke')
+                log(`↻ post-merge stage: raw results rejected (${is.reason}) — renamed aside, running the smoke agent once more`)
+                raw = null
+                continue
+              }
+              return stageErr(is, 'stage-ingest-smoke', 'smoke')
+            }
+          } finally {
+            const wr = await S('worktree', `remove --wave ${W}`, 'stage-worktree-remove')
+            if (wr.status !== 'ok') log(`⚠ post-merge stage: smoke worktree not removed: ${wr.reason}`)
+          }
+          step = 'smoke'
+        }
+      }
+      // S7 triage (AC18/AC19).
+      const tri = await S('triage', `--wave ${W}`, 'stage-triage')
+      if (tri.status !== 'ok') return stageErr(tri, 'stage-triage', 'triage')
+      step = 'triage'
+      for (const x of (tri.classified || [])) log(`  triage ${x.id} ${x.hunt || '(campaign)'}: ${x.outcome} (${x.rule}) — ${x.reasoning}`)
+      // Polish iteration (AC27/AC28): a regression reverts the polish merge only.
+      if (tri.polish) {
+        const pol = tri.polish
+        if (Array.isArray(pol.regressions) && pol.regressions.length) {
+          const what = pol.regressions.map(r => r.what || r.id).join(', ')
+          const rv = await stageCli('wolfpack-release.mjs', `revert-merge --campaign ${shq(campaignSlug)} --commit ${shq(polishMerge)} --reason ${shq(`polish change broke ${what}`)}`, 'stage-revert-polish')
+          if (rv.status !== 'reverted') return stagePark('campaign_revert_failed', `polish merge ${String(polishMerge).slice(0, 12)}: ${rv.reason || 'revert failed'} — ${branch} unchanged`, 'act')
+          log(`  ↩ polish merge ${String(polishMerge).slice(0, 12)} reverted: it broke ${what}`)
+          if (polishIssues.length) await S('resolve', `--ids ${shq(polishIssues.join(','))} --resolution ${shq('needs Cecil')} --reason ${shq(`polish change broke ${what}`)} --polish-slug ${shq(polishSlug)} --polish-result reverted`, 'stage-resolve-polish')
+          const it = await S('iterate', '--clear-polish', 'stage-iterate')
+          if (it.status !== 'ok') return stageErr(it, 'stage-iterate', 'act')
+          iteration = it.iteration; tip = it.campaign_sha; step = 'begin'; polishSlug = null; polishMerge = null
+          log(`post-merge stage: re-verify the reverted tip ${String(tip).slice(0, 12)} with the same suite set (iteration ${iteration})`)
+          continue
+        }
+        if (pol.fixed && pol.fixed.length) await S('resolve', `--ids ${shq(pol.fixed.join(','))} --resolution polished --polish-slug ${shq(polishSlug)} --polish-result merged`, 'stage-resolve-polished')
+        if (pol.still_failing && pol.still_failing.length) await S('resolve', `--ids ${shq(pol.still_failing.join(','))} --resolution ${shq('needs Cecil')} --reason ${shq('still fails after the polish change')} --polish-slug ${shq(polishSlug)} --polish-result merged`, 'stage-resolve-unpolished')
+        const fin = await S('finish', '--result resolved', 'stage-finish')
+        if (fin.status !== 'ok') return stageErr(fin, 'stage-finish', 'done')
+        stageInfo.result = 'resolved'
+        await stageReport()
+        log(`post-merge stage: polish ${polishSlug} — ${(pol.fixed || []).length} polished, ${(pol.still_failing || []).length} need Cecil`)
+        return null
+      }
+      if (Array.isArray(tri.campaign_blocks) && tri.campaign_blocks.length) {
+        const why = (tri.campaign_block_text || []).join(' · ')
+        return stagePark('stage_cli_error', `stage-triage: finding(s) ${tri.campaign_blocks.join(', ')} block with no hunt to revert${why ? ` — ${why}` : ''}`, 'triage')
+      }
+      // S8 act: blocks first (newest merge first), then fix rounds (AC21–AC26).
+      const pend = tri.pending || { fix: {}, block: {} }
+      let changed = false
+      const order = (hs) => [...hs].sort((a, b) => merged.indexOf(b) - merged.indexOf(a))
+      for (const h of order(Object.keys(pend.block || {}))) {
+        if (cls(h) !== 'campaign_merged') { log(`  ${h}: already out of ${branch} (${status.get(h)}) — nothing to revert`); continue }
+        const r = await stageRevert(h, pend.block[h], (tri.block_text || {})[h])
+        if (r) return r
+        changed = true
+      }
+      for (const h of Object.keys(pend.fix || {})) {
+        if (cls(h) !== 'campaign_merged') continue
+        const gp = await stageGate(`w${W}:fix:${h}`, W, [h]); if (gp) return gp
+        const sc = await S('fix-scaffold', `--hunt ${shq(h)}`, `stage-fix-scaffold:${h}`)
+        if (sc.status !== 'ok') return stageErr(sc, `stage-fix-scaffold:${h}`, 'act')
+        if (sc.landed && sc.landed.commit) {
+          // Resume after merge-hunt landed this round but before record-fix ran: record it, no re-run.
+          const rf = await S('record-fix', `--hunt ${shq(h)} --fix ${shq(sc.slug)} --commit ${shq(sc.landed.commit)} --issues ${shq((sc.issues || []).join(','))}`, `stage-record-fix:${sc.slug}`)
+          if (rf.status !== 'ok') return stageErr(rf, `stage-record-fix:${sc.slug}`, 'act')
+          log(`  ⛓ ${sc.slug} had already landed (${String(sc.landed.commit).slice(0, 12)}) — recorded; ${h} fix rounds: ${rf.fix_rounds}`)
+          changed = true
+          continue
+        }
+        log(`  🔧 fix round for ${h}: ${sc.slug} (${sc.tier}) from ${branch} @ ${String(sc.base_sha || '').slice(0, 12)} — ${(sc.issues || []).join(', ')}`)
+        const run = await runStagePipeline(sc, 'fix')
+        if (run.ok) {
+          const m = await stageCli('wolfpack-chain.mjs', `merge-hunt --campaign ${shq(campaignSlug)} --hunt ${shq(sc.slug)} --fix-of ${shq(h)}`, `chain-merge:${sc.slug}`)
+          if (m.status === 'merged' && m.commit) {
+            if (m.warning) log(`⚠ ${m.warning}`)
+            const rf = await S('record-fix', `--hunt ${shq(h)} --fix ${shq(sc.slug)} --commit ${shq(m.commit)} --issues ${shq((sc.issues || []).join(','))}`, `stage-record-fix:${sc.slug}`)
+            if (rf.status !== 'ok') return stageErr(rf, `stage-record-fix:${sc.slug}`, 'act')
+            log(`  ⛓ ${sc.slug} → ${branch} (${String(m.commit).slice(0, 12)}); ${h} fix rounds: ${rf.fix_rounds}`)
+            changed = true
+            continue
+          }
+          run.why = `merge-hunt ${m.status}${m.reason ? `: ${m.reason}` : ''}${m.files ? ` (${m.files.join(', ')})` : ''}`
+        }
+        log(`  ✗ fix round ${sc.slug} did not land: ${run.why} — ${h} blocks (fix_review_failed)`)
+        const rc = await S('reclassify', `--hunt ${shq(h)} --rule fix_review_failed --reason ${shq(`${sc.slug}: ${run.why}`)}`, `stage-reclassify:${h}`)
+        if (rc.status !== 'ok') return stageErr(rc, `stage-reclassify:${h}`, 'act')
+        const r = await stageRevert(h, rc.ids || [], rc.block_text)
+        if (r) return r
+        changed = true
+      }
+      if (changed) {
+        const it = await S('iterate', '', 'stage-iterate')
+        if (it.status !== 'ok') return stageErr(it, 'stage-iterate', 'act')
+        iteration = it.iteration; tip = it.campaign_sha; step = 'begin'
+        log(`post-merge stage: re-verify ${branch} @ ${String(tip).slice(0, 12)} (iteration ${iteration})`)
+        continue
+      }
+      // `green` = nothing ever failed in this wave's stage run; `resolved` = something failed and was
+      // fixed, logged or blocked-and-reverted. A fix round / revert bumps the persisted iteration
+      // past 1 (resume-safe), and the re-verify triage is then empty — so look at both.
+      const result = ((tri.classified || []).length || iteration > 1 || tri.skipped_landed) ? 'resolved' : 'green'
+      const fin = await S('finish', `--result ${result}`, 'stage-finish')
+      if (fin.status !== 'ok') return stageErr(fin, 'stage-finish', 'done')
+      stageInfo.result = result
+      await stageReport()
+      log(`post-merge stage: wave ${W} ${result}${stageInfo.reportUrl ? ` — Report: ${stageInfo.reportUrl}` : ''}`)
+      return null
+    }
+  }
+
+  // Polish wave (AC27/AC28): once, at campaign end, for the open `log` items.
+  const runPolish = async (lastWave) => {
+    const pp = await S('polish-plan', '', 'stage-polish-plan')
+    if (pp.status !== 'ok') return stageErr(pp, 'stage-polish-plan', 'done')
+    if (!pp.items || !pp.items.length) { log(`post-merge stage: no polish wave (${pp.reason || 'no open log items'})`); return null }
+    const gp = await stageGate('polish', lastWave, []); if (gp) return gp
+    const sc = await S('fix-scaffold', '--polish', 'stage-polish-scaffold')
+    if (sc.status !== 'ok') return stageErr(sc, 'stage-polish-scaffold', 'done')
+    log(`  ✨ polish wave ${sc.slug} (${sc.tier}): ${(sc.issues || []).join(', ')}`)
+    const run = await runStagePipeline(sc, 'polish')
+    if (run.ok) {
+      const m = await stageCli('wolfpack-chain.mjs', `merge-hunt --campaign ${shq(campaignSlug)} --hunt ${shq(sc.slug)} --polish`, `chain-merge:${sc.slug}`)
+      if (m.status === 'merged') {
+        if (m.warning) log(`⚠ ${m.warning}`)
+        log(`  ⛓ ${sc.slug} → ${branch} (${String(m.commit || '').slice(0, 12)}) — redeploy + full re-verify`)
+        return postMergeStage(lastWave, [], { polish: sc.slug })
+      }
+      run.why = `merge-hunt ${m.status}${m.reason ? `: ${m.reason}` : ''}`
+    }
+    log(`  ✗ polish wave ${sc.slug} did not land: ${run.why} — its items need Cecil`)
+    await S('resolve', `--ids ${shq((sc.issues || []).join(','))} --resolution ${shq('needs Cecil')} --reason ${shq(`polish ${sc.slug}: ${run.why}`)} --polish-slug ${shq(sc.slug)} --open-set ${shq(pp.open_set || '')} --polish-result failed`, 'stage-resolve-polish')
+    return null
+  }
+
   phase('Execute')
+
+  if (stageOn) {
+    // AC13: every stage key present and every target allowed, BEFORE any deploy or browser call.
+    const cc = await S('check-config', '', 'stage-check-config')
+    if (cc.status !== 'ok') {
+      log(`⛔ post-merge stage config: ${cc.reason || 'check-config failed'}`)
+      return { ...chainBase, completed: false, verdict: 'CAMPAIGN_PARKED_STAGE', parkReason: 'smoke_config_missing', parkDetail: cc.reason || '', problems: cc.problems || [], stage: { ...stageInfo, result: 'parked:smoke_config_missing' } }
+    }
+    // Resume / re-arm / reconcile before any wave (AC2).
+    const mergedByWave = {}
+    for (const h of hunts) if (cls(h.slug) === 'campaign_merged') (mergedByWave[h.__wave] = mergedByWave[h.__wave] || []).push(h.slug)
+    const waveNums = campaign.waves.map(w => w.number)
+    const nextWave = waveNums.find(n => !(mergedByWave[n] || []).length) ?? (Math.max(0, ...waveNums) + 1)
+    const openWaves = campaign.waves.filter(w => w.hunts.some(h => !['campaign_merged', 'released'].includes(cls(h.slug)))).map(w => w.number)
+    const rr = await S('begin', `--resume-only --next-wave ${nextWave}${openWaves.length ? ` --open-waves ${shq(openWaves.join(','))}` : ''} --merged-by-wave ${shq(JSON.stringify(mergedByWave))}`, 'stage-begin')
+    if (rr.status !== 'ok') return stageErr(rr, 'stage-begin', 'begin')
+    if (rr.not_staged_below) log(`post-merge stage: waves < ${rr.not_staged_below} merged before the stage was on; not staged`)
+    if (rr.rearmed) log(`post-merge stage: re-armed parked:${rr.rearmed} at ${rr.current ? rr.current.step : '?'}`)
+    if (rr.current && rr.current.result == null) {
+      const r = await postMergeStage(rr.current.wave, [])
+      if (r) return r
+    }
+    for (const u of (rr.unstaged || [])) {
+      log(`post-merge stage: wave ${u.wave} merged without a stage (crash recovery)`)
+      const r = await postMergeStage(u.wave, u.merged)
+      if (r) return r
+    }
+  } else {
+    log('post-merge stage: off (wolfpack-config.md → Deployment Notes → Post-merge smoke stage)')
+  }
 
   for (const wave of campaign.waves) {
     const pending = wave.hunts.filter(h => ['pending', 'quota'].includes(cls(h.slug)) && !failed.has(h.slug))
@@ -1118,36 +1624,57 @@ async function runChain(campaign) {
 
     const waitingNow = [...waiting.values()].filter(w => bySlug.has(w.slug) && bySlug.get(w.slug).__wave <= wave.number).map(w => w.slug)
     log(`Wave ${wave.number} → ${branch}: merged [${mergedThisWave.join(', ')}], held [${heldThisWave.join(', ')}], waiting [${waitingNow.join(', ')}]`)
+
+    // Post-merge stage (AC1/AC4): the next wave starts only after this wave's stage resolved.
+    if (stageOn) {
+      if (mergedThisWave.length) {
+        const r = await postMergeStage(wave.number, mergedThisWave)
+        if (r) return r
+      } else log(`post-merge stage: nothing new on ${branch}`)
+    }
   }
 
   // ─── End state (AC13) ───
-  const campaignMergedHunts = hunts.filter(h => cls(h.slug) === 'campaign_merged').map(h => h.slug)
-  const pendingComplianceHunts = hunts.filter(h => status.get(h.slug) === CHAIN_STATUS.MERGED_PENDING_COMPLIANCE).map(h => h.slug)
-  const heldHunts = hunts
-    .filter(h => cls(h.slug) === 'awaiting_merge' && (status.get(h.slug) === CHAIN_STATUS.HELD_OVERLAP || (heldOn.get(h.slug) || []).length))
-    .map(h => ({ slug: h.slug, status: status.get(h.slug), heldOn: heldOn.get(h.slug) || [] }))
-  const waitingHunts = [...waiting.values()]
-  const waitersOf = (b) => waitingHunts.filter(w => w.on === b).map(w => w.slug)
-  const resolveFor = (h) => {
-    const st = status.get(h.slug)
-    if (st === 'needs_spec') return `/spec ${h.slug}`
-    if (st === CHAIN_STATUS.REVERTED_WITH_DEP) return `auto: re-merges after ${revertedBecause.get(h.slug)}`
-    return `/resolve ${h.slug}`
-  }
-  const blockedHunts = hunts.filter(h => isBlockedStatus(status.get(h.slug)))
-    .map(h => ({ slug: h.slug, status: status.get(h.slug), resolve: resolveFor(h), waiting: waitersOf(h.slug) }))
-  const failedHunts = [...failed]
-  const unaccounted = hunts.filter(h => !['released', 'campaign_merged'].includes(cls(h.slug)) &&
-    !blockedHunts.some(b => b.slug === h.slug) && !heldHunts.some(x => x.slug === h.slug) &&
-    !waiting.has(h.slug) && !failed.has(h.slug) && !quotaDeferred.includes(h.slug)).map(h => ({ slug: h.slug, status: status.get(h.slug) }))
+  // A function: the polish wave (wave-auto-smoke) can revert hunts, so it is computed again after it.
+  const computeEnd = () => {
+    const campaignMergedHunts = hunts.filter(h => cls(h.slug) === 'campaign_merged').map(h => h.slug)
+    const pendingComplianceHunts = hunts.filter(h => status.get(h.slug) === CHAIN_STATUS.MERGED_PENDING_COMPLIANCE).map(h => h.slug)
+    const heldHunts = hunts
+      .filter(h => cls(h.slug) === 'awaiting_merge' && (status.get(h.slug) === CHAIN_STATUS.HELD_OVERLAP || (heldOn.get(h.slug) || []).length))
+      .map(h => ({ slug: h.slug, status: status.get(h.slug), heldOn: heldOn.get(h.slug) || [] }))
+    const waitingHunts = [...waiting.values()]
+    const waitersOf = (b) => waitingHunts.filter(w => w.on === b).map(w => w.slug)
+    const resolveFor = (h) => {
+      const st = status.get(h.slug)
+      if (st === 'needs_spec') return `/spec ${h.slug}`
+      if (st === CHAIN_STATUS.REVERTED_WITH_DEP) return `auto: re-merges after ${revertedBecause.get(h.slug)}`
+      return `/resolve ${h.slug}`
+    }
+    const blockedHunts = hunts.filter(h => isBlockedStatus(status.get(h.slug)))
+      .map(h => ({ slug: h.slug, status: status.get(h.slug), resolve: resolveFor(h), waiting: waitersOf(h.slug) }))
+    const failedHunts = [...failed]
+    const unaccounted = hunts.filter(h => !['released', 'campaign_merged'].includes(cls(h.slug)) &&
+      !blockedHunts.some(b => b.slug === h.slug) && !heldHunts.some(x => x.slug === h.slug) &&
+      !waiting.has(h.slug) && !failed.has(h.slug) && !quotaDeferred.includes(h.slug)).map(h => ({ slug: h.slug, status: status.get(h.slug) }))
 
-  // Precedence: any quota result → WAVE_PAUSED_QUOTA (auto-resumes; the human lists still return);
-  // else anything blocked/waiting/held/failed/unexplained → CAMPAIGN_AWAITING_HUMAN; else every
-  // hunt is released or campaign-merged → CAMPAIGN_READY_FOR_RELEASE.
-  let verdict
-  if (quotaDeferred.length) verdict = 'WAVE_PAUSED_QUOTA'
-  else if (blockedHunts.length || waitingHunts.length || heldHunts.length || failedHunts.length || unaccounted.length) verdict = 'CAMPAIGN_AWAITING_HUMAN'
-  else verdict = 'CAMPAIGN_READY_FOR_RELEASE'
+    // Precedence: any quota result → WAVE_PAUSED_QUOTA (auto-resumes; the human lists still return);
+    // else anything blocked/waiting/held/failed/unexplained → CAMPAIGN_AWAITING_HUMAN; else every
+    // hunt is released or campaign-merged → CAMPAIGN_READY_FOR_RELEASE.
+    let verdict
+    if (quotaDeferred.length) verdict = 'WAVE_PAUSED_QUOTA'
+    else if (blockedHunts.length || waitingHunts.length || heldHunts.length || failedHunts.length || unaccounted.length) verdict = 'CAMPAIGN_AWAITING_HUMAN'
+    else verdict = 'CAMPAIGN_READY_FOR_RELEASE'
+    return { campaignMergedHunts, pendingComplianceHunts, heldHunts, waitingHunts, waitersOf, resolveFor, blockedHunts, failedHunts, unaccounted, verdict }
+  }
+  let { campaignMergedHunts, pendingComplianceHunts, heldHunts, waitingHunts, blockedHunts, failedHunts, unaccounted, verdict } = computeEnd()
+  // Polish wave + release report (wave-auto-smoke AC27–AC30): once, when the campaign is done or
+  // only waits on a human — never on a quota pause (it would resume and run it then).
+  if (stageOn && ['CAMPAIGN_READY_FOR_RELEASE', 'CAMPAIGN_AWAITING_HUMAN'].includes(verdict)) {
+    const lastWave = stageInfo.lastWave || (campaign.waves.length ? campaign.waves[campaign.waves.length - 1].number : 1)
+    const pr = await runPolish(lastWave)
+    if (pr) return pr
+    ;({ campaignMergedHunts, pendingComplianceHunts, heldHunts, waitingHunts, blockedHunts, failedHunts, unaccounted, verdict } = computeEnd())
+  }
 
   if (verdict === 'CAMPAIGN_READY_FOR_RELEASE') {
     // Reconcile a main that advanced after the last wave start (always; the CLI no-ops when
@@ -1157,6 +1684,8 @@ async function runChain(campaign) {
     if (sync.status === 'conflict') return mainConflictReturn(sync, 'final sync before release')
     log(`main → ${branch}: ${sync.status}`)
   }
+  // S9: the campaign release report (fail soft: a broken report never blocks the verdict).
+  if (stageOn && verdict !== 'WAVE_PAUSED_QUOTA') await stageReport()
 
   log(``)
   log(`=== Chain campaign ${campaignSlug} → ${branch}: ${campaignMergedHunts.length} campaign-merged (${pendingComplianceHunts.length} awaiting compliance sign-off), ${heldHunts.length} held, ${blockedHunts.length} blocked, ${waitingHunts.length} waiting, ${failedHunts.length} failed, ${quotaDeferred.length} quota-deferred ===`)
@@ -1179,6 +1708,10 @@ async function runChain(campaign) {
   } else if (verdict === 'CAMPAIGN_AWAITING_HUMAN') {
     log(`Answer the blocked hunts above, then re-run the campaign. To ship what is already merged now: /release-campaign ${campaignSlug} --checkpoint`)
   }
+  if (stageOn) {
+    if (stageInfo.park) log(`  post-merge stage: ${stageInfo.result} — ${stageInfo.park.detail}`)
+    if (stageInfo.reportUrl) log(`Report: ${stageInfo.reportUrl}`)
+  }
 
   return {
     ...chainBase,
@@ -1192,6 +1725,7 @@ async function runChain(campaign) {
     failedHunts,
     quotaDeferredHunts: [...quotaDeferred],
     ...(unaccounted.length ? { unaccounted } : {}),
+    ...(stageOn ? { stage: { ...stageInfo } } : {}),
   }
 }
 

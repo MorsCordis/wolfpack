@@ -315,6 +315,14 @@ Set Project Identity → **Test verdict command** to a command that decides pass
 instead (placeholders `{log}`, `{exit}`, `{main}`; exit 0 = pass). The record keeps the raw exit
 either way. `none` (the default) means the suite's exit code is the verdict.
 
+## Post-merge stage (chain campaigns)
+
+A chain campaign can check each wave right after it merges into `campaign/<slug>`: deploy the tip to dev,
+run the touched apps' suites, smoke every merged `[auto]` criterion on each smoke tenant, then fix (at most 2
+reviewed rounds per hunt), log (polished once at the end) or block (revert) what broke, and build one release
+report. It is opt-in per project (`Post-merge smoke stage: on`). What runs, the triage table, every park code
+and what to do for it are in [post-merge-stage.md](post-merge-stage.md).
+
 ## Troubleshooting
 
 ### Pointer/Tracker skipped unexpectedly

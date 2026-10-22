@@ -19,7 +19,7 @@
 
 import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join, resolve, basename, dirname } from 'node:path'
-import { parseAcceptanceCriteria } from './wolfpack-release.mjs'
+import { parseAcceptanceCriteria, CriteriaError, DEFAULT_SMOKE_TENANTS, configuredTenants } from './wolfpack-release.mjs'
 
 export class PrespecError extends Error {
   constructor(message) {
@@ -278,10 +278,21 @@ export function recordDecision(md, { question, answer, hunt, date } = {}) {
 }
 
 // ─── Acceptance lint ──────────────────────────────────────────────
-export function lintAcceptance(md, { maxManual = 2 } = {}) {
+// `tenants`: the allowed `[tenant:<name>]` scope names (plus `both`); default surgical,mobile.
+export function lintAcceptance(md, { maxManual = 2, tenants = DEFAULT_SMOKE_TENANTS } = {}) {
   const text = String(md || '')
-  const crit = parseAcceptanceCriteria(text, 'lint')
   const errors = []
+  // Parse line by line so one bad tenant scope reports itself and the rest still lint.
+  const crit = []
+  for (const line of text.split('\n')) {
+    try {
+      crit.push(...parseAcceptanceCriteria(line, 'lint', { tenants }))
+    } catch (e) {
+      if (!(e instanceof CriteriaError)) throw e
+      const m = /^lint\/(\d+): (.*)$/.exec(e.message)
+      errors.push({ id: m ? `AC${m[1]}` : null, message: m ? `AC${m[1]}: ${m[2]}` : e.message })
+    }
+  }
   const counts = { auto: 0, manual: 0, compliance: 0 }
   for (const c of crit) counts[c.tag]++
   if (crit.length === 0) errors.push({ id: null, message: 'no acceptance criteria parse (- AC<n> [auto|manual|compliance] <text>)' })
@@ -303,13 +314,14 @@ export function lintAcceptance(md, { maxManual = 2 } = {}) {
   }
 
   const lines = text.split('\n')
-  const parsedRe = /^\s*-\s+(AC\d+)\s+\[(auto|manual|compliance)\]\s+(.*\S)\s*$/i
+  const parsedRe = /^\s*-\s+(AC\d+)\s+\[(auto|manual|compliance)\](?:\s+\[tenant:[^\]\s]*\])?\s+(.*\S)\s*$/i
+  const scopeErr = new Set(errors.map((e) => e.id).filter(Boolean))
   let inSection = false
   for (const line of lines) {
     if (/^##\s/.test(line)) inSection = /^##\s+Acceptance criteria/i.test(line)
     const idm = line.match(/^\s*-\s+(AC\d+)\b/)
     if (inSection) {
-      if (idm && !parsedRe.test(line)) {
+      if (idm && !parsedRe.test(line) && !scopeErr.has(idm[1].toUpperCase())) {
         errors.push({
           id: idm[1],
           message: `${idm[1]}: not parsed (tag must be [auto], [manual] or [compliance], followed by text) — release/smoke would drop it`,
@@ -332,7 +344,7 @@ export function lintAcceptance(md, { maxManual = 2 } = {}) {
 const USAGE = `usage:
   wolfpack-prespec.mjs list <campaign.md> [--wave] [--root <dir>]
   wolfpack-prespec.mjs record-decision <plan.md> --hunt <slug> --question <text> --answer <text> [--date YYYY-MM-DD]
-  wolfpack-prespec.mjs lint <acceptance.md> [--max-manual=N]`
+  wolfpack-prespec.mjs lint <acceptance.md> [--max-manual=N] [--tenants a,b]`
 
 function parseFlags(args) {
   const pos = []
@@ -404,7 +416,16 @@ export function main(argv) {
         maxManual = parseInt(raw, 10)
       }
       const file = pos[0]
-      const res = lintAcceptance(readFileSync(file, 'utf8'), { maxManual })
+      // Same source as `wolfpack-release.mjs criteria`: the project's Smoke tenants, else the default.
+      let tenants = configuredTenants() || DEFAULT_SMOKE_TENANTS
+      if (flags.tenants !== undefined) {
+        tenants = String(flags.tenants).split(',').map((t) => t.trim()).filter(Boolean)
+        if (!tenants.length || tenants.some((t) => !/^[a-z][a-z0-9-]*$/.test(t))) {
+          console.error(`wolfpack-prespec: invalid --tenants '${flags.tenants}'`)
+          return 2
+        }
+      }
+      const res = lintAcceptance(readFileSync(file, 'utf8'), { maxManual, tenants })
       if (res.ok) {
         const n = res.counts.auto + res.counts.manual + res.counts.compliance
         console.log(`OK ${file}: ${n} criteria (${res.counts.auto} auto, ${res.counts.manual} manual, ${res.counts.compliance} compliance)`)

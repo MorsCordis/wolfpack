@@ -9,7 +9,22 @@
 //       command, config, verdict_command, exit, timed_out, summary, verdict_exit,
 //       verdict_summary, pass, reason, log, log_sha256, started_at, finished_at, duration_ms }
 //   <record dir>/test-record-<stage>.log    the raw, interleaved stdout+stderr of the run
-// Stages: tracker (after Tracker), final (after the certify commit), release (campaign tip).
+// Stages: tracker (after Tracker), final (after the certify commit), release (campaign tip),
+// integration (the chain-mode post-merge stage's touched-app suites at the campaign tip).
+//
+// COMMAND COMPOSITION (post-merge stage, docs/post-merge-stage.md):
+//   integration stage: <Test command> <Integration test args, {campaign} = --campaign, shell-quoted>
+//                      <labels…> (--labels CSV of ^[a-z0-9_]+$ app labels, or ALL = none).
+//   any stage:         when <record-dir>/metadata.json has `test_isolation` (a fix/polish hunt of a
+//                      chain campaign), <Test command> <Integration test args, {campaign} = that value>.
+//   The record's `command` is the full composed command (hunt-pipeline's huntTestCommand composes
+//   the same string to cross-check it). The isolation value must match ^[a-z0-9][a-z0-9-]{0,40}$.
+// DEADLINE: the test command's env carries WOLFPACK_RECORD_DEADLINE_EPOCH (epoch seconds at which
+//   the record kills the run), so a lock-waiting runner can give up before the kill lands.
+// BUSY: a test-command exit of 75 (EX_TEMPFAIL: e.g. a shared test DB lock not acquired) writes
+//   `tempfail: true` (pass false, verdict command skipped); `ensure` never reuses such a record.
+// VERDICT LOG: the verdict command's stdout is saved as test-record-<stage>.verdict.log
+//   (`verdict_log` in the record) so a consumer can read its NEW FAILURES ids.
 // Watchdog, /merge, /merge-wave, /release-campaign and hunt-pipeline.js reuse a record whose
 // commit equals the target and re-run only when it moved.
 //
@@ -30,6 +45,7 @@
 //
 // CLI (JSON on stdout with --json; human lines on stderr):
 //   run    --stage S --record-dir D [--repo R] [--rev REV] [--config PATH] [--timeout-min N] [--json]
+//          [--labels CSV|ALL --campaign C]   (--stage integration only, both required there)
 //   ensure (same flags) [--fresh]  reuse a pass/fail record at the target commit + command; else run.
 //                        --fresh always re-takes (the gate's fix line adds it after a failure).
 //                        A FAILING record is re-taken instead when the hunt was re-armed after it
@@ -54,7 +70,11 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadConfig, mainWorktree } from './wolfpack-config.mjs'
 
-export const STAGES = Object.freeze(['tracker', 'final', 'release'])
+export const STAGES = Object.freeze(['tracker', 'final', 'release', 'integration'])
+export const ISOLATION_RE = /^[a-z0-9][a-z0-9-]{0,40}$/
+export const LABEL_RE = /^[a-z0-9_]+$/
+export const CAMPAIGN_RE = /^[a-z0-9][a-z0-9-]*$/
+export const TEMPFAIL_EXIT = 75
 const SHA_RE = /^[0-9a-f]{40}$/
 const SUMMARY_RE = /\b(pass(ed|es)?|fail(ed|ures?|s)?|ok|errors?|tests?|skipped)\b/i
 const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
@@ -73,7 +93,29 @@ export function summaryLine(output) {
 export function recordPaths(dir, stage) {
   if (!STAGES.includes(stage)) throw new Error(`unknown stage ${JSON.stringify(stage)} — expected one of ${STAGES.join(', ')}`)
   const d = resolve(dir)
-  return { json: join(d, `test-record-${stage}.json`), log: join(d, `test-record-${stage}.log`) }
+  return { json: join(d, `test-record-${stage}.json`), log: join(d, `test-record-${stage}.log`), verdictLog: join(d, `test-record-${stage}.verdict.log`) }
+}
+
+// The configured Integration test args with {campaign} = value (shell-quoted).
+export function isolationArgs(integrationTestArgs, value) {
+  return String(integrationTestArgs).replace(/\{campaign\}/g, () => shq(value))
+}
+
+// The full test command for a record (see COMMAND COMPOSITION above).
+export function composeTestCommand(testCommand, { integrationTestArgs = null, isolation = null, labels = null } = {}) {
+  let cmd = String(testCommand)
+  if (isolation != null) {
+    if (!ISOLATION_RE.test(String(isolation))) throw new InfraError(`test isolation ${JSON.stringify(isolation)} must match ${ISOLATION_RE.source}`)
+    if (!integrationTestArgs) throw new InfraError('a test isolation is set but wolfpack-config.md has no Project Identity → Integration test args')
+    if (!String(integrationTestArgs).includes('{campaign}')) throw new InfraError('a test isolation is set but Project Identity → Integration test args has no {campaign} placeholder — the suite would run on the shared test DB')
+    cmd += ` ${isolationArgs(integrationTestArgs, isolation)}`
+  }
+  if (labels && labels.length) {
+    const bad = labels.filter(l => !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(String(l)))
+    if (bad.length) throw new InfraError(`test label(s) ${bad.map(l => JSON.stringify(l)).join(', ')} are not plain app/module names`)
+    cmd += ` ${labels.join(' ')}`
+  }
+  return cmd
 }
 
 // {log} / {main} → shell-quoted paths; {exit} → the integer.
@@ -123,7 +165,7 @@ const resolveSha = (repo, rev) => git(repo, ['rev-parse', '--verify', '--quiet',
 function parseArgs(argv) {
   const [cmd, ...rest] = argv
   const o = { cmd, json: false }
-  const takes = { '--stage': 'stage', '--record-dir': 'recordDir', '--repo': 'repo', '--rev': 'rev', '--config': 'config', '--timeout-min': 'timeoutMin' }
+  const takes = { '--stage': 'stage', '--record-dir': 'recordDir', '--repo': 'repo', '--rev': 'rev', '--config': 'config', '--timeout-min': 'timeoutMin', '--labels': 'labels', '--campaign': 'campaign' }
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i]
     if (a === '--json') { o.json = true; continue }
@@ -135,9 +177,21 @@ function parseArgs(argv) {
     }
     throw new InfraError(`unknown argument ${a}`)
   }
-  if (!['run', 'ensure', 'check', 'gate'].includes(cmd)) throw new InfraError('usage: wolfpack-test-record.mjs run|ensure|check|gate --stage S --record-dir D [--repo R] [--rev REV] [--config PATH] [--timeout-min N] [--json]')
+  if (!['run', 'ensure', 'check', 'gate'].includes(cmd)) throw new InfraError('usage: wolfpack-test-record.mjs run|ensure|check|gate --stage S --record-dir D [--repo R] [--rev REV] [--config PATH] [--timeout-min N] [--labels CSV|ALL --campaign C] [--json]')
   if (!STAGES.includes(o.stage)) throw new InfraError(`--stage must be one of ${STAGES.join(', ')}`)
   if (!o.recordDir) throw new InfraError('--record-dir is required')
+  if (o.stage === 'integration') {
+    if (!o.campaign || !CAMPAIGN_RE.test(o.campaign)) throw new InfraError('--stage integration needs --campaign <slug>')
+    if (o.labels == null) throw new InfraError('--stage integration needs --labels <csv|ALL>')
+    if (o.labels === 'ALL') o.labelList = []
+    else {
+      o.labelList = String(o.labels).split(',').map(x => x.trim()).filter(Boolean)
+      const bad = o.labelList.filter(l => !LABEL_RE.test(l))
+      if (!o.labelList.length || bad.length) throw new InfraError(`--labels must be ALL or a CSV of ${LABEL_RE.source} labels (bad: ${bad.join(', ') || '(empty)'})`)
+    }
+  } else if (o.labels != null || o.campaign != null) {
+    throw new InfraError('--labels / --campaign are only valid with --stage integration')
+  }
   return o
 }
 
@@ -162,7 +216,20 @@ function context(o) {
   const sha = resolveSha(repo, rev)
   if (!sha) throw new InfraError(`cannot resolve ${rev} to a commit in ${repo}`)
   const paths = recordPaths(o.recordDir, o.stage)
-  return { repo, main, configPath, cfg, rev, sha, paths, command: cfg.testCommand, verdictCommand: cfg.testVerdictCommand ?? null }
+  let isolation = null
+  if (o.stage === 'integration') isolation = o.campaign
+  else {
+    const metaPath = join(resolve(o.recordDir), 'metadata.json')
+    if (existsSync(metaPath)) {
+      let meta
+      try { meta = JSON.parse(readFileSync(metaPath, 'utf8')) } catch (e) { throw new InfraError(`${metaPath} is not valid JSON: ${e.message}`) }
+      if (meta && meta.test_isolation != null) isolation = meta.test_isolation
+    }
+  }
+  const command = composeTestCommand(cfg.testCommand, {
+    integrationTestArgs: cfg.integrationTestArgs ?? null, isolation, labels: o.labelList || null,
+  })
+  return { repo, main, configPath, cfg, rev, sha, paths, command, verdictCommand: cfg.testVerdictCommand ?? null, labels: o.stage === 'integration' ? (o.labelList.length ? o.labelList : 'ALL') : null }
 }
 
 function readRecord(path) {
@@ -176,8 +243,9 @@ function runSuite(script, cwd, logPath, ms) {
   return new Promise((done, fail) => {
     const fd = openSync(logPath, 'w')
     let child
+    const env = { ...process.env, WOLFPACK_RECORD_DEADLINE_EPOCH: String(Math.floor((Date.now() + ms) / 1000)) }
     try {
-      child = spawn('bash', ['-c', `exec 2>&1 </dev/null\n${script}`], { cwd, detached: true, stdio: ['ignore', fd, fd] })
+      child = spawn('bash', ['-c', `exec 2>&1 </dev/null\n${script}`], { cwd, detached: true, stdio: ['ignore', fd, fd], env })
     } catch (e) { closeSync(fd); fail(new InfraError(`cannot start bash: ${e.message}`)); return }
     let timedOut = false
     const kill = (sig) => { try { process.kill(-child.pid, sig) } catch { /* gone */ } }
@@ -233,13 +301,18 @@ async function takeRecord(o, c) {
     const summary = summaryLine(logText.toString('utf8'))
     let verdictExit = null
     let verdictSummary = null
+    let verdictLog = null
+    const tempfail = !run.timedOut && run.exit === TEMPFAIL_EXIT
     let pass = run.exit === 0 && !run.timedOut
     let reason = run.timedOut ? `timed out after ${Math.round(ms / 60000 * 100) / 100} min` : (run.exit === 0 ? null : `suite exit ${run.exit}`)
-    if (c.verdictCommand && !run.timedOut) {
+    if (tempfail) reason = `test command exit ${TEMPFAIL_EXIT} (busy / EX_TEMPFAIL) — re-take the record`
+    if (c.verdictCommand && !run.timedOut && !tempfail) {
       const v = spawnSync('bash', ['-c', `exec 2>&1 </dev/null\n${substituteVerdict(c.verdictCommand, { log: c.paths.log, exit: run.exit, main: c.main })}`],
         { cwd, encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 64 * 1024 * 1024 })
       verdictExit = v.status ?? 1
       verdictSummary = summaryLine(`${v.stdout || ''}${v.error ? `\n${v.error.message}` : ''}`)
+      writeFileSync(c.paths.verdictLog, v.stdout || '')
+      verdictLog = c.paths.verdictLog
       pass = verdictExit === 0
       reason = pass ? null : `verdict command exit ${verdictExit}`
     }
@@ -249,7 +322,8 @@ async function takeRecord(o, c) {
       ran_in: inRepo ? 'repo' : 'scratch', dirty,
       command: c.command, config: c.configPath, verdict_command: c.verdictCommand,
       exit: run.exit, timed_out: run.timedOut, summary,
-      verdict_exit: verdictExit, verdict_summary: verdictSummary,
+      verdict_exit: verdictExit, verdict_summary: verdictSummary, verdict_log: verdictLog,
+      labels: c.labels, tempfail,
       pass, reason, log: c.paths.log, log_sha256: createHash('sha256').update(logText).digest('hex'),
       started_at: new Date(startedMs).toISOString(), finished_at: new Date(finishedMs).toISOString(),
       duration_ms: finishedMs - startedMs,
@@ -300,7 +374,8 @@ export async function main(argv) {
     if (o.cmd === 'run' || o.cmd === 'ensure') {
       if (o.cmd === 'ensure') {
         const j = judge()
-        if (!o.fresh && (j.state === 'pass' || (j.state === 'fail' && !rearmedSince(o.recordDir, j.rec)))) {
+        // A tempfail (busy) record is never reused: the run never happened.
+        if (!o.fresh && !(j.rec && j.rec.tempfail === true) && (j.state === 'pass' || (j.state === 'fail' && !rearmedSince(o.recordDir, j.rec)))) {
           emit(o, { ...j.rec, reused: true }, recordLine(j.rec, true))
           return j.rec.pass ? 0 : 2
         }

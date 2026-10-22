@@ -4,6 +4,10 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+### Added
+- Chain-mode post-merge stage: after each wave auto-merges into `campaign/<slug>`, the runner deploys the tip to dev from a temp worktree, runs the touched apps' suites on an isolated test DB, smokes every merged `[auto]` criterion on each configured smoke tenant, and triages findings (fix ≤2 reviewed rounds / log / block-and-revert), then polishes logged items once at campaign end and builds the campaign report (`scripts/wolfpack-smoke-stage.mjs`, `/smoke-chain`, `docs/post-merge-stage.md`). Opt-in via `Post-merge smoke stage: on`. <!-- hunt:wave-auto-smoke -->
+- `wolfpack-release.mjs`: `[tenant:<name>]` criterion scope; `revert` takes fix-round merges with it; `revert-merge` for a polish merge. `wolfpack-chain.mjs merge-hunt --fix-of/--polish`. `wolfpack-test-record.mjs --stage integration`, `WOLFPACK_RECORD_DEADLINE_EPOCH` and `tempfail` (exit 75, re-taken by hunt-pipeline). Notifier field `report_url` (meshnet http URL, no query). <!-- hunt:wave-auto-smoke -->
+
 ## [v1.1.0] - 2026-10-22
 
 ### Added

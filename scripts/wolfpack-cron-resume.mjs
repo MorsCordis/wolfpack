@@ -26,7 +26,10 @@ export const VERDICT_RE = /^[A-Za-z0-9_:.-]{1,64}$/
 export const USAGE_RE = /^(5h ([0-9]{1,3})% · 7d (([0-9]{1,3})%|n\/a)( DEGRADED)?|unavailable)$/
 export const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/
 export const TOPIC_RE = /^[A-Za-z0-9_-]{24,64}$/
-export const NOTIFY_KEYS = ['event', 'campaign', 'hunt', 'status', 'reason', 'usage', 'at']
+export const NOTIFY_KEYS = ['event', 'campaign', 'hunt', 'status', 'reason', 'usage', 'at', 'report_url']
+// report_url (post-merge stage release report, AC35): a plain http URL on the meshnet
+// (100.64.0.0/10), explicit port, a path of [A-Za-z0-9._~/-] only, no query or fragment.
+export const REPORT_URL_RE = /^http:\/\/(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3}):(\d{1,5})(\/[A-Za-z0-9._~\/-]*)?$/
 const WARNING_EVENTS = new Set(['park', 'disarm', 'waiting-on-you', 'stalled'])
 
 export class ConfigError extends Error {}
@@ -251,8 +254,23 @@ const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 // ─── notifications (Part C) ──────────────────────────────────────────────────
 const validInt = (v) => Number.isInteger(v) && v >= 0 && v <= 100
 
-export function validToken(key, v) {
+export function validReportUrl(v, env = {}) {
+  const m = REPORT_URL_RE.exec(v)
+  if (!m) return false
+  const octets = m.slice(1, 5).map(Number)
+  if (octets.some(o => o > 255)) return false
+  // 100.64.0.0/10: first octet 100, second 64–127.
+  if (octets[0] !== 100 || octets[1] < 64 || octets[1] > 127) return false
+  const port = Number(m[5])
+  if (port < 1 || port > 65535) return false
+  const pin = env && env.WOLFPACK_REPORT_HOST
+  if (pin && octets.join('.') !== pin) return false
+  return true
+}
+
+export function validToken(key, v, ctx = {}) {
   if (typeof v !== 'string') return false
+  if (key === 'report_url') return validReportUrl(v, ctx.env || {})
   if (key === 'campaign' || key === 'hunt') return SLUG_RE.test(v)
   if (key === 'event' || key === 'status' || key === 'reason') return CODE_RE.test(v)
   if (key === 'at') return ISO_UTC_RE.test(v)
@@ -282,13 +300,13 @@ export function composeUsage(d) {
 
 // Pure: allowlisted fields → {title, body, tags, priority, fields, dropped}. Any value that is
 // not a token is DROPPED (warn names the key only, never the value).
-export function buildNotification(fields, { warn = () => {} } = {}) {
+export function buildNotification(fields, { warn = () => {}, env = {} } = {}) {
   const kept = {}
   const dropped = []
   for (const k of NOTIFY_KEYS) {
     const v = fields[k]
     if (v == null) continue
-    if (validToken(k, v)) kept[k] = v
+    if (validToken(k, v, { env })) kept[k] = v
     else { dropped.push(k); warn(`WARNING notify: dropped ${k} (not a token)`) }
   }
   const event = kept.event || 'notification'
@@ -344,7 +362,7 @@ export async function sendNotification(ctx, fields, state = null) {
   }
   try {
     const usage = await readUsage(ctx, event)
-    const n = buildNotification({ ...fields, usage, at }, { warn: (m) => logLine(ctx, '-', 'WARNING', m.replace(/^WARNING /, '')) })
+    const n = buildNotification({ ...fields, usage, at }, { warn: (m) => logLine(ctx, '-', 'WARNING', m.replace(/^WARNING /, '')), env: ctx.env || {} })
     const t = topicFromFile(ctx.topicFile)
     if (t.code) return fail(t.code)
     const base = serverBase(ctx.ntfyServer)
@@ -630,7 +648,7 @@ export function noteExit(ctx, campaign, verdict) {
 
 const EVENTS = { park: null, 'ready-for-release': 'completed', 'waiting-on-you': 'waiting_on_human' }
 
-export async function event(ctx, type, { campaign, hunt, status: st0, reason } = {}) {
+export async function event(ctx, type, { campaign, hunt, status: st0, reason, 'report-url': reportUrl } = {}) {
   if (!(type in EVENTS)) throw new UsageError(`event must be one of ${Object.keys(EVENTS).join(', ')}`)
   if (type === 'park' && (!hunt || st0 == null)) throw new UsageError('event park needs --hunt <h> and --status <st>')
   if (hunt != null && !SLUG_RE.test(hunt)) throw new UsageError('--hunt must be a hunt slug')
@@ -642,7 +660,7 @@ export async function event(ctx, type, { campaign, hunt, status: st0, reason } =
       ctx.out('ok: already notified')
       return 0
     }
-    const r = await sendNotification(ctx, { event: 'park', campaign, hunt, status: st0, reason }, st)
+    const r = await sendNotification(ctx, { event: 'park', campaign, hunt, status: st0, reason, report_url: reportUrl }, st)
     // Dedupe only a page that went out: a failed send stays un-notified, so the next
     // `event park` for this hunt retries it instead of reporting "already notified".
     if (r.ok) st.notified_parks[hunt] = st0
@@ -651,7 +669,7 @@ export async function event(ctx, type, { campaign, hunt, status: st0, reason } =
     ctx.out(r.ok ? 'ok: park notified' : `ok: park notification FAILED: ${r.code}`)
     return 0
   }
-  const r = await sendNotification(ctx, { event: type, campaign, status: st0, reason }, st)
+  const r = await sendNotification(ctx, { event: type, campaign, status: st0, reason, report_url: reportUrl }, st)
   st.armed = false
   st.disarmed_reason = EVENTS[type]
   st.disarmed_at = iso(ctx.now())
@@ -708,8 +726,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       case 'note-pause': { const { pos, flags } = parseFlags(rest, ['campaign', 'reset-at']); if (pos.length) throw new UsageError('usage: note-pause --campaign <s> --reset-at <iso>'); return notePause(ctx, flags.campaign, flags['reset-at']) }
       case 'note-exit': { const { pos, flags } = parseFlags(rest, ['campaign', 'verdict']); if (pos.length) throw new UsageError('usage: note-exit --campaign <s> --verdict <token>'); return noteExit(ctx, flags.campaign, flags.verdict) }
       case 'event': {
-        const { pos, flags } = parseFlags(rest, ['campaign', 'hunt', 'status', 'reason'])
-        if (pos.length !== 1) throw new UsageError('usage: event <park|ready-for-release|waiting-on-you> --campaign <s> [--hunt <h>] [--status <st>] [--reason <code>]')
+        const { pos, flags } = parseFlags(rest, ['campaign', 'hunt', 'status', 'reason', 'report-url'])
+        if (pos.length !== 1) throw new UsageError('usage: event <park|ready-for-release|waiting-on-you> --campaign <s> [--hunt <h>] [--status <st>] [--reason <code>] [--report-url <url>]')
         return await event(ctx, pos[0], flags)
       }
       case 'notify-test': if (rest.length) throw new UsageError('notify-test takes no arguments'); return await notifyTest(ctx)

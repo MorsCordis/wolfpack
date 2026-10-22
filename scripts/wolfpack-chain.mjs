@@ -19,7 +19,14 @@
 //   node scripts/wolfpack-chain.mjs init      --campaign C [--graph JSON] [--at ISO]
 //   node scripts/wolfpack-chain.mjs sync-main --campaign C
 //   node scripts/wolfpack-chain.mjs overlap   --campaign C --hunt H --blockers b1,b2
-//   node scripts/wolfpack-chain.mjs merge-hunt --campaign C --hunt H [--at ISO]
+//   node scripts/wolfpack-chain.mjs merge-hunt --campaign C --hunt H [--at ISO] [--fix-of P | --polish]
+//     --fix-of P  (post-merge stage fix round) H is a smoke fix of the campaign-merged hunt P
+//                 (H's metadata.parent_hunt must equal P): after the merge, P's metadata gains
+//                 smoke_fixes += {slug: H, merge_commit, merged_at} and H's worktree is removed
+//                 (after the plan-dir copy-back; a removal failure is a `warning`, not an error).
+//     --polish    (post-merge stage polish wave) the same minus the parent: the campaign
+//                 metadata's `stage` block records polish_merge_commit / polish_slug.
+//     Neither flag: unchanged behaviour.
 //
 // The PURE CORE block below appears byte-identically (minus `export `) in the runner
 // (`campaign-runner.js`); a drift test fails if the two copies differ.
@@ -503,11 +510,13 @@ function stampMergeConflict(root, c, h, stage, files, at) {
   })
 }
 
-export function cmdMergeHunt(root, { campaign, hunt, at }) {
+export function cmdMergeHunt(root, { campaign, hunt, at, fixOf, polish }) {
   const c = need(campaign, 'campaign')
   const h = need(hunt, 'hunt')
   const branch = `campaign/${c}`
   const now = at || new Date().toISOString()
+  const parent = fixOf === undefined || fixOf === null ? null : need(fixOf, 'fix-of')
+  if (parent && polish === true) throw new ChainError('--fix-of and --polish are mutually exclusive')
   // 1. Preconditions.
   if (!branchExists(root, branch)) throw new ChainError(`${branch} does not exist`)
   const wt = findWorktree(root, h)
@@ -516,6 +525,17 @@ export function cmdMergeHunt(root, { campaign, hunt, at }) {
   if (dirty.length) throw new ChainError(`${h}'s worktree has uncommitted changes outside .wolfpack/: ${dirty.join(', ')}`)
   const { meta: before } = readHuntMeta(root, h)
   if (!before) throw new ChainError(`no metadata.json for hunt ${h}`)
+  if (parent) {
+    const { meta: pm } = readHuntMeta(root, parent)
+    if (!pm) throw new ChainError(`--fix-of ${parent}: no metadata.json for that hunt`)
+    if (chainClass(pm.status) !== 'campaign_merged' || pm.campaign_branch !== branch) {
+      throw new ChainError(`--fix-of ${parent}: ${parent} is ${pm.status || '(no status)'}${pm.campaign_branch ? ` on ${pm.campaign_branch}` : ''} — a fix merges only for a hunt campaign-merged on ${branch}`)
+    }
+    if (before.parent_hunt !== parent) throw new ChainError(`--fix-of ${parent}: ${h}'s metadata.parent_hunt is ${JSON.stringify(before.parent_hunt ?? null)}, not ${parent}`)
+  }
+  if (polish === true && before.polish_of !== c) {
+    throw new ChainError(`--polish: ${h}'s metadata.polish_of is ${JSON.stringify(before.polish_of ?? null)}, not ${c} — only the stage's polish hunt merges as the polish merge`)
+  }
   // Allow-list: only a certified (awaiting-merge) hunt or a reverted dependent. A mid-pipeline,
   // quota-parked, blocked, merged or released hunt is refused — never merged uncertified.
   const cls = chainClass(before.status)
@@ -538,15 +558,22 @@ export function cmdMergeHunt(root, { campaign, hunt, at }) {
     const r = withTempWorktree(root, branch, (dir) => {
       git(['checkout', '--quiet', '-b', tmpBranch, branch], { cwd: dir })
       try {
-        const rv = git(['revert', '--no-edit', revertCommit], { cwd: dir, allowFail: true })
-        if (rv.code !== 0) {
-          const res = revertInProgress(dir) ? resolveBookkeepingConflicts(dir) : { resolved: false, files: [] }
-          if (res.resolved) git(['-c', 'core.editor=true', 'revert', '--continue'], { cwd: dir })
-          else {
-            const files = res.files.length ? res.files : unmergedFiles(dir)
-            if (revertInProgress(dir)) git(['revert', '--abort'], { cwd: dir, allowFail: true })
-            git(['checkout', '--quiet', branch], { cwd: dir, allowFail: true })
-            return { conflict: true, stage: 'reapply', files }
+        // A dependent reverted together with its post-merge-stage fix merges carries every
+        // revert in campaign_revert_commits (creation order); reapply them newest-revert-last
+        // reversed, i.e. its own merge-revert first, so the fixes come back with it.
+        const list = Array.isArray(before.campaign_revert_commits) && before.campaign_revert_commits.length
+          ? [...before.campaign_revert_commits].reverse() : [revertCommit]
+        for (const rc of list) {
+          const rv = git(['revert', '--no-edit', rc], { cwd: dir, allowFail: true })
+          if (rv.code !== 0) {
+            const res = revertInProgress(dir) ? resolveBookkeepingConflicts(dir) : { resolved: false, files: [] }
+            if (res.resolved) git(['-c', 'core.editor=true', 'revert', '--continue'], { cwd: dir })
+            else {
+              const files = res.files.length ? res.files : unmergedFiles(dir)
+              if (revertInProgress(dir)) git(['revert', '--abort'], { cwd: dir, allowFail: true })
+              git(['checkout', '--quiet', branch], { cwd: dir, allowFail: true })
+              return { conflict: true, stage: 'reapply', files }
+            }
           }
         }
         git(['checkout', '--quiet', branch], { cwd: dir })
@@ -622,6 +649,7 @@ export function cmdMergeHunt(root, { campaign, hunt, at }) {
     }
     meta.campaign_merge_history = history
     delete meta.campaign_revert_commit
+    delete meta.campaign_revert_commits
     delete meta.held_on
     delete meta.reverted_because
     meta.status = stamped
@@ -630,7 +658,25 @@ export function cmdMergeHunt(root, { campaign, hunt, at }) {
     meta.campaign_merge_commit = commit
     meta.campaign_merged_at = now
   })
-  return { status: 'merged', commit, stamped }
+  if (!parent && polish !== true) return { status: 'merged', commit, stamped }
+
+  // 6. Post-merge stage fix / polish bookkeeping, then remove the (copied-back) worktree.
+  if (parent) {
+    writeHuntMeta(root, parent, (meta) => {
+      const fixes = Array.isArray(meta.smoke_fixes) ? meta.smoke_fixes : []
+      if (!fixes.some(f => f && f.merge_commit === commit)) fixes.push({ slug: h, merge_commit: commit, merged_at: now })
+      meta.smoke_fixes = fixes
+    })
+  } else {
+    const cm = readCampaignMeta(root, c) || { campaign: c }
+    cm.stage = { ...(cm.stage || {}), polish_merge_commit: commit, polish_slug: h, polish_merged_at: now }
+    writeCampaignMeta(root, c, cm)
+  }
+  let warning = null
+  const rm = git(['worktree', 'remove', wt], { cwd: root, allowFail: true })
+  if (rm.code !== 0) warning = `could not remove ${h}'s worktree ${wt}: ${rm.stderr.split('\n')[0] || `exit ${rm.code}`}`
+  else git(['worktree', 'prune'], { cwd: root, allowFail: true })
+  return { status: 'merged', commit, stamped, ...(parent ? { fix_of: parent } : { polish: true }), ...(warning ? { warning } : {}) }
 }
 
 // ─── CLI ──────────────────────────────────────────────────────────
@@ -670,7 +716,10 @@ function main(argv) {
     }
     if (cmd === 'sync-main') return emit(cmdSyncMain(root, { campaign: f.campaign }))
     if (cmd === 'overlap') return emit(cmdOverlap(root, { campaign: f.campaign, hunt: f.hunt, blockers: f.blockers }))
-    if (cmd === 'merge-hunt') return emit(cmdMergeHunt(root, { campaign: f.campaign, hunt: f.hunt, at: f.at }))
+    if (cmd === 'merge-hunt') {
+      if (f['fix-of'] === true) throw new ChainError('--fix-of needs a hunt slug')
+      return emit(cmdMergeHunt(root, { campaign: f.campaign, hunt: f.hunt, at: f.at, fixOf: f['fix-of'], polish: f.polish === true }))
+    }
     return emit({ status: 'error', reason: 'usage: wolfpack-chain.mjs <init|sync-main|overlap|merge-hunt> --campaign C [...]' }, 2)
   } catch (e) {
     return emit({ status: 'error', reason: e.message }, 2)

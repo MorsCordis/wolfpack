@@ -14,7 +14,7 @@ import {
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { buildNotification, composeUsage, huntSlugs, newestHeartbeat, validToken, NOTIFY_KEYS } from './wolfpack-cron-resume.mjs'
+import { buildNotification, composeUsage, huntSlugs, newestHeartbeat, validToken, validReportUrl, NOTIFY_KEYS } from './wolfpack-cron-resume.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PACK = dirname(HERE)
@@ -1043,13 +1043,112 @@ describe('notifications', () => {
   })
 })
 
+// ─── wave-auto-smoke AC35: report_url ─────────────────────────────────────────
+describe('report_url (wave-auto-smoke AC35)', () => {
+  const URL_OK = 'http://100.123.158.39:8766/c1/'
+
+  test('NOTIFY_KEYS = the T2 set + report_url (last), nothing else', () => {
+    assert.deepEqual(NOTIFY_KEYS, ['event', 'campaign', 'hunt', 'status', 'reason', 'usage', 'at', 'report_url'])
+  })
+
+  test('validReportUrl: meshnet http URL with a port and a plain path only', () => {
+    for (const u of [URL_OK, 'http://100.64.0.1:1', 'http://100.127.255.255:65535/a/b-c_d.e~f/', 'http://100.100.1.2:80']) {
+      assert.ok(validReportUrl(u), u)
+      assert.ok(validToken('report_url', u), u)
+    }
+    const bad = [
+      'https://100.123.158.39:8766/c1/',            // not http
+      'http://100.123.158.39/c1/',                  // no port
+      'http://100.123.158.39:8766/c1/?token=abc',   // query
+      'http://100.123.158.39:8766/c1/#x',           // fragment
+      'http://127.0.0.1:8766/c1/',                  // loopback
+      'http://0.0.0.0:8766/c1/',                    // unspecified
+      'http://10.0.0.5:8766/c1/',                   // private, not meshnet
+      'http://100.63.255.255:8766/',                // just below 100.64.0.0/10
+      'http://100.128.0.0:8766/',                   // just above
+      'http://100.123.158.300:8766/',               // octet > 255
+      'http://100.123.158.39:0/',                   // port 0
+      'http://100.123.158.39:65536/',               // port > 65535
+      'http://dev.example.dev:8766/',               // a hostname
+      'http://100.123.158.39:8766/c1/<b>',          // a character outside the path set
+      'http://100.123.158.39:8766/c 1/',
+      'http://100.123.158.39:8766\nextra',
+      '',
+    ]
+    for (const u of bad) {
+      assert.equal(validReportUrl(u), false, u)
+      assert.equal(validToken('report_url', u), false, u)
+    }
+    assert.equal(validToken('report_url', 42), false)
+  })
+
+  test('WOLFPACK_REPORT_HOST pins the host', () => {
+    assert.ok(validReportUrl(URL_OK, { WOLFPACK_REPORT_HOST: '100.123.158.39' }))
+    assert.equal(validReportUrl(URL_OK, { WOLFPACK_REPORT_HOST: '100.123.158.40' }), false)
+    assert.ok(validToken('report_url', URL_OK, { env: { WOLFPACK_REPORT_HOST: '100.123.158.39' } }))
+    assert.equal(validToken('report_url', URL_OK, { env: { WOLFPACK_REPORT_HOST: '100.64.0.9' } }), false)
+  })
+
+  test('buildNotification: a bad report_url is dropped with a WARNING naming only the key', () => {
+    const warns = []
+    const n = buildNotification({ event: 'park', campaign: 'c1', report_url: 'http://100.123.158.39:8766/c1/?token=s3cret' },
+      { warn: (m) => warns.push(m) })
+    assert.ok(!('report_url' in n.fields))
+    assert.deepEqual(n.dropped, ['report_url'])
+    assert.deepEqual(warns, ['WARNING notify: dropped report_url (not a token)'])
+    assert.ok(!n.body.includes('s3cret'))
+    const ok = buildNotification({ event: 'park', campaign: 'c1', report_url: URL_OK })
+    assert.match(ok.body, /^report_url: http:\/\/100\.123\.158\.39:8766\/c1\/$/m)
+    assert.equal(ok.body.split('\n').pop(), `report_url: ${URL_OK}`, 'report_url is the last line')
+    const pinned = buildNotification({ event: 'park', campaign: 'c1', report_url: URL_OK }, { env: { WOLFPACK_REPORT_HOST: '100.64.0.1' } })
+    assert.deepEqual(pinned.dropped, ['report_url'])
+  })
+
+  test('event park --report-url sends it; the parked.md summary never reaches the payload', async () => {
+    await fresh()
+    await arm()
+    const pd = join(H.repo, '.wolfpack', 'plans', 'h1')
+    mkdirSync(pd, { recursive: true })
+    writeFileSync(join(pd, 'parked.md'), '## Need\nThe post-merge stage blocked h1: Jane Smithers saw a 500 at /clients/42\n')
+    const r = await H.run(['event', 'park', '--campaign', 'c1', '--hunt', 'h1', '--status', 'parked:reverted_from_campaign',
+      '--report-url', URL_OK])
+    assert.equal(r.code, 0, r.err)
+    assert.equal(srv.posts.length, 1)
+    const keys = srv.posts[0].body.split('\n').map(l => l.split(':')[0])
+    assert.deepEqual(keys, ['event', 'campaign', 'hunt', 'status', 'usage', 'at', 'report_url'])
+    assert.match(srv.posts[0].body, new RegExp(`^report_url: ${URL_OK.replace(/[.]/g, '\\.')}$`, 'm'))
+    assert.doesNotMatch(srv.posts[0].body, /Smithers|blocked|clients\/42/)
+  })
+
+  test('event ready-for-release --report-url with a query string: dropped, WARNING, still sends', async () => {
+    await fresh()
+    await arm()
+    const r = await H.run(['event', 'ready-for-release', '--campaign', 'c1', '--report-url', 'http://100.123.158.39:8766/c1/?code=x'])
+    assert.equal(r.code, 0, r.err)
+    assert.equal(srv.posts.length, 1)
+    assert.doesNotMatch(srv.posts[0].body, /report_url|code=x/)
+    assert.match(H.logText(), /WARNING notify: dropped report_url \(not a token\)/)
+    assert.doesNotMatch(H.logText(), /code=x/)
+    assert.equal(H.state().disarmed_reason, 'completed')
+  })
+
+  test('event waiting-on-you --report-url (a stage park) sends it', async () => {
+    await fresh()
+    await arm()
+    const r = await H.run(['event', 'waiting-on-you', '--campaign', 'c1', '--status', 'parked:smoke_agent_failed', '--report-url', URL_OK])
+    assert.equal(r.code, 0, r.err)
+    assert.match(srv.posts[0].body, /^status: parked:smoke_agent_failed$/m)
+    assert.match(srv.posts[0].body, /^report_url: /m)
+  })
+})
+
 // ─── pure functions ──────────────────────────────────────────────────────────
 describe('pure helpers', () => {
   test('buildNotification keeps only allowlisted tokens', () => {
     const warns = []
     const n = buildNotification({
       event: 'park', campaign: 'c1', hunt: 'h1', status: 'parked:x', reason: 'x', usage: '5h 1% · 7d 2%',
-      at: '2026-10-22T00:00:00.000Z', extra: 'leak', note: 'Jane',
+      at: '2026-10-22T00:00:00.000Z', report_url: 'http://100.123.158.39:8766/c1/', extra: 'leak', note: 'Jane',
     }, { warn: (m) => warns.push(m) })
     assert.deepEqual(Object.keys(n.fields), NOTIFY_KEYS)
     assert.ok(!n.body.includes('leak') && !n.body.includes('Jane'))

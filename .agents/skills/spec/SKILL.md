@@ -62,6 +62,12 @@ Each criterion is a single, checkable, user-observable statement that **names it
   a spec defect.
 - `[compliance]` — touches a compliance-critical area (see `wolfpack-config.md` → Compliance Requirements); never auto-degrade
 
+**Tenant scope (`[tenant:<name>]`, optional, right after the tag).** In a project whose chain campaigns run the
+post-merge stage, each `[auto]` browser criterion runs on the smoke tenants its scope names: `[tenant:surgical]`,
+`[tenant:mobile]` or `[tenant:both]` (absent = `both` = every tenant). The names come from wolfpack-config.md →
+Deployment Notes → `Smoke tenants`; an unknown name fails the parse and the lint. Write `[tenant:mobile]` on a
+mobile-only check, e.g. `- AC4 [auto] [tenant:mobile] The day view fits a 390 px screen with no horizontal scroll.`
+
 - AC1 [auto] When <precondition>, <action> results in <observable outcome>. Check: <command | test | browser steps>.
 - AC2 [manual] The <screen> shows <state> with <copy/affordance>.
 - AC3 [compliance] The <record> retains <field> per the project's **Compliance Requirements** (`wolfpack-config.md`).
