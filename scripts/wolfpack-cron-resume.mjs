@@ -155,6 +155,9 @@ export function huntSlugs(campaignMd) {
 }
 
 // Newest heartbeat mtime (ms) across the three layouts wolfpack-watch.sh scans, or null.
+// Whole milliseconds: mtimeMs carries a sub-millisecond fraction, but the tick stores what it
+// saw as an ISO string (last_heartbeat_seen, whole ms). Comparing the raw float against that
+// stored value would make the same heartbeat "new" on every tick (A-12/D6: progress once).
 export function newestHeartbeat(repo, hunts) {
   let newest = null
   for (const h of hunts) {
@@ -164,7 +167,7 @@ export function newestHeartbeat(repo, hunts) {
       join(repo, '.agents', 'worktrees', h, '.wolfpack', 'heartbeats', `${h}.json`),
     ]) {
       try {
-        const t = statSync(p).mtimeMs
+        const t = Math.floor(statSync(p).mtimeMs)
         if (newest == null || t > newest) newest = t
       } catch { /* absent layout */ }
     }
