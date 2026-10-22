@@ -500,9 +500,22 @@ describe('gate and relaunch', () => {
     assert.equal(r.code, 4)
     assert.match(r.err, /is not tmux 3\.2 or later \(got 'tmux 3\.1c'\)/)
     assert.equal(relaunches(H).length, 0)
-    writeFileSync(join(H.stub, 'tmux-version'), 'tmux next-3.6\n')
-    r = await tick()
-    assert.doesNotMatch(r.err, /tmux 3\.2 or later/)
+    for (const v of ['tmux next-3.6', 'tmux master', 'tmux 3.2a', 'tmux 3.10']) {
+      writeFileSync(join(H.stub, 'tmux-version'), v + '\n')
+      r = await tick()
+      assert.doesNotMatch(r.err, /tmux 3\.2 or later/, v)
+    }
+  })
+
+  test('a bad gate path blocks only tick: event, disarm and status still work', async () => {
+    await fresh()
+    await arm()
+    H.writeConfig({ WOLFPACK_CRON_GATE: join(H.stub, 'no-such-gate.mjs') })
+    for (const args of [['status'], ['event', 'park', '--campaign', 'c1', '--hunt', 'h1', '--status', 'needs_spec'], ['disarm']]) {
+      const r = await H.run(args)
+      assert.equal(r.code, 0, `${args.join(' ')}: ${r.err}`)
+      assert.doesNotMatch(r.err, /WOLFPACK_CRON_GATE/)
+    }
   })
 
   test('AC5: dead runner window → kill-window then new-window with the exact argv (no -p)', async () => {
@@ -864,6 +877,17 @@ describe('entry and subcommands', () => {
     })
     assert.equal(r.code, 0, r.err)
     assert.ok(r.out.includes(`--repo ${spaced.replace(/ /g, '\\ ')} tick`), r.out)
+    const pct = join(H.root, '50%off')
+    mkdirSync(pct, { recursive: true })
+    const bad = await new Promise((resolve) => {
+      const p = spawn('bash', [SH, '--repo', pct, '--print-crontab'], { env: H.env() })
+      let out = '', err = ''
+      p.stdout.on('data', d => { out += d }); p.stderr.on('data', d => { err += d })
+      p.on('close', code => resolve({ code, out, err }))
+    })
+    assert.equal(bad.code, 2)
+    assert.equal(bad.out, '')
+    assert.match(bad.err, /cannot write a cron line for .*50%off/)
     assert.equal(H.calls('crontab').length, 0)
     assert.equal(existsSync(H.statePath()), false)
     assert.equal(existsSync(join(H.home, '.cache')), false)

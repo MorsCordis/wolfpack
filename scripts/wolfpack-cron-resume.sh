@@ -105,6 +105,12 @@ if [ "$CMD" = "--print-crontab" ]; then
   pack="$(cfg WOLFPACK_HOME "$SELF_PACK")"
   pack="${pack%/}"
   # %q-quote each path: a space in the pack, repo or home path must not split the cron line.
+  # Cron reads a bare % as a newline, and %q's $'...' form is not /bin/sh syntax: refuse both.
+  for p in "$pack" "$REPO" "$HOME"; do
+    case "$p" in
+      *%*|*[![:print:]]*) echo "ERROR: --print-crontab cannot write a cron line for '$p' (a % or a non-printable character); move it to a plain path" >&2; exit 2 ;;
+    esac
+  done
   printf '*/15 * * * * /bin/bash %q --repo %q tick >> %q 2>&1\n' \
     "$pack/scripts/wolfpack-cron-resume.sh" "$REPO" "$HOME/.cache/wolfpack/cron-resume.cron.log"
   exit 0
@@ -153,6 +159,8 @@ if [ "$CMD" = "tick" ]; then
   need_tool WOLFPACK_CRON_TMUX tmux
   # The relaunch uses `new-window -e` and multi-argv commands: tmux 3.2 or later.
   tmux_v="$("$WOLFPACK_CRON_TMUX" -V 2>/dev/null | sed -n 's/^tmux \(next-\)\{0,1\}\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\2 \3/p')"
+  # A source build reports "tmux master" (newer than any release): accept it.
+  if "$WOLFPACK_CRON_TMUX" -V 2>/dev/null | grep -qE '^tmux master'; then tmux_v="999 0"; fi
   read -r tmux_major tmux_minor <<< "$tmux_v"
   if [ -z "$tmux_major" ] || [ "$tmux_major" -lt 3 ] || { [ "$tmux_major" -eq 3 ] && [ "$tmux_minor" -lt 2 ]; }; then
     config_fail "WOLFPACK_CRON_TMUX=$WOLFPACK_CRON_TMUX is not tmux 3.2 or later (got '$("$WOLFPACK_CRON_TMUX" -V 2>/dev/null)') — the relaunch needs new-window -e"
@@ -168,7 +176,10 @@ export WOLFPACK_CRON_REPO="$REPO"
 export WOLFPACK_CRON_CONFIG="$CONFIG"
 export WOLFPACK_CRON_LOG="$LOG"
 export WOLFPACK_CRON_GATE="$(cfg WOLFPACK_CRON_GATE "$WOLFPACK_HOME/scripts/wolfpack-window-gate.mjs")"
-[ -f "$WOLFPACK_CRON_GATE" ] || config_fail "WOLFPACK_CRON_GATE=$WOLFPACK_CRON_GATE is not a file — cron cannot find the usage gate"
+# Only the tick runs the gate: a bad gate path must never block event, disarm or status.
+if [ "$CMD" = "tick" ] && [ ! -f "$WOLFPACK_CRON_GATE" ]; then
+  config_fail "WOLFPACK_CRON_GATE=$WOLFPACK_CRON_GATE is not a file — cron cannot find the usage gate"
+fi
 export WOLFPACK_CRON_TMUX_SESSION="$(cfg WOLFPACK_CRON_TMUX_SESSION paw)"
 export WOLFPACK_CRON_TMUX_WINDOW="$(cfg WOLFPACK_CRON_TMUX_WINDOW runner)"
 export WOLFPACK_CRON_STALE_MINUTES="$(cfg WOLFPACK_CRON_STALE_MINUTES 45)"

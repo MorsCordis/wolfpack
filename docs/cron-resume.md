@@ -155,7 +155,10 @@ log, acceptance or clinic text can enter it. `parked:model_quota` parks do not p
 
 A failed send (no or unsafe topic file, a non-`https` server, a non-2xx answer, a timeout, a network error) is a
 `WARNING notify <event> failed: <code>` log line plus `last notify failure` in `status`. It never blocks the
-runner or the tick. When the usage figures cannot be read the notification still goes out with
+runner or the tick. A failed park page is not marked as sent, so a later `event park` for the same hunt and
+status sends it; the runner does not re-send it by itself. What still reaches you is the end-of-run
+`waiting-on-you` page, which goes out whenever a hunt is left blocked. A dropped event (state lock busy) prints
+`dropped: state lock busy` and the runner logs a ⚠ for it. When the usage figures cannot be read the notification still goes out with
 `usage: unavailable` and a WARNING.
 
 ## Unattended mode
