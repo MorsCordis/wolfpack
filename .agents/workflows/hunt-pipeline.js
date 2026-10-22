@@ -185,6 +185,7 @@ const RESUME_SCHEMA = {
     driftWarning: { type: 'string' },      // [Fix 3] diagnostic: main/worktree divergence one-liner, else null
     latestRevisedPlan: { type: 'number' }, // highest K of plan-revised-K.md in the plan dir, else 0
     baseBranch: { type: 'string' },        // chain mode: metadata.base_branch, else "" (campaign-chain-mode)
+    testIsolation: { type: 'string' },     // wave-auto-smoke: metadata.test_isolation (a fix/polish hunt's campaign), else ""
   },
   // latestRevisedPlan is REQUIRED: as an optional field the probe silently dropped it and a
   // resumed review restarted at round 1 (wave 2, second relaunch). baseBranch is REQUIRED for
@@ -525,7 +526,8 @@ const _parseArgs = (a) => {
 }
 const _args = _parseArgs(args)
 const { slug, campaign, tier: campaignTier, mode: campaignMode,
-        ticketRefs, todoItemsCleared, migrationRisk, rationale, usageOffload, baseBranch: argBase } = _args
+        ticketRefs, todoItemsCleared, migrationRisk, rationale, usageOffload, baseBranch: argBase,
+        testIsolation: argIsolation } = _args
 const descriptionPassed = typeof _args.description === 'string' && _args.description.trim() !== ''
 const description = descriptionPassed
   ? _args.description
@@ -544,6 +546,14 @@ if (!/^[a-z0-9][a-z0-9-]*$/.test(String(slug || ''))) {
 if (!(argBase == null || /^campaign\/[a-z0-9][a-z0-9-]*$/.test(argBase))) {
   throw new Error(`hunt-pipeline: invalid baseBranch ${JSON.stringify(argBase)} — must be campaign/<slug> (^campaign\\/[a-z0-9][a-z0-9-]*$) or absent`)
 }
+
+// wave-auto-smoke (A-7): a post-merge-stage fix/polish hunt runs every test on its campaign's
+// isolated test DB. args.testIsolation (the stage passes the campaign slug) or, on a resume,
+// metadata.test_isolation; validated like the run_tests.sh --isolated-db name.
+if (!(argIsolation == null || /^[a-z0-9][a-z0-9-]{0,40}$/.test(argIsolation))) {
+  throw new Error(`hunt-pipeline: invalid testIsolation ${JSON.stringify(argIsolation)} — must match ^[a-z0-9][a-z0-9-]{0,40}$ or be absent`)
+}
+let huntIsolation = argIsolation || null
 
 // POSIX single-quote a value for a shell command string: 'it'\''s' form. Every path /
 // prompt-file / agent name interpolated into a command the shim agents run goes through
@@ -784,6 +794,16 @@ const cfg = () => {
   if (!projectConfig) throw new Error('hunt-pipeline: project config used before the project-config probe')
   return projectConfig
 }
+// wave-auto-smoke (A-7): the test command this hunt runs. The configured test command, plus the
+// configured Integration test args with {campaign} = the hunt's test isolation (shell-quoted)
+// when one is set — the SAME string scripts/wolfpack-test-record.mjs composeTestCommand writes
+// into the record's `command` (keep in step). No isolation → exactly cfg().testCommand.
+const huntTestCommand = (meta = null) => {
+  const iso = (meta && typeof meta.test_isolation === 'string' && meta.test_isolation) || huntIsolation
+  if (!iso) return cfg().testCommand
+  if (!cfg().integrationTestArgs) throw new Error(`hunt-pipeline: ${slug} has test isolation ${iso} but wolfpack-config.md has no Project Identity → Integration test args`)
+  return `${cfg().testCommand} ${String(cfg().integrationTestArgs).replace(/\{campaign\}/g, () => shq(iso))}`
+}
 const heartbeat = (phaseName, detail) => {
   const timed = phaseName !== 'Scaffold'
   const startMarker = timed ? `
@@ -821,7 +841,7 @@ TOOLING POLICY (every phase): Do NOT use the chrome-devtools MCP or any browser 
 (new_page / navigate_page / take_snapshot / etc.). This is a headless BUILD pipeline — there
 is no local server to drive, and the deployed dev environment runs the OLD code (this hunt is
 unmerged), so browsing it verifies nothing and just spawns a browser on the operator's screen.
-Tests run ONLY via \`${cfg().testCommand}\` (the project's test command — wolfpack-config.md → Project Identity → Test command). Browser/UI smoke is a SEPARATE,
+Tests run ONLY via \`${huntTestCommand()}\` (the project's test command — wolfpack-config.md → Project Identity → Test command). Browser/UI smoke is a SEPARATE,
 post-deploy, user-driven \`/smoke-wave\` step — never part of a build phase.`
 }
 
@@ -1145,6 +1165,7 @@ Steps:
    - latestRevisedPlan: the highest K among plan-revised-K.md files in the authoritative
      plan dir (ls it; K is an integer), or 0 if there are none.
    - baseBranch: ALWAYS return it — metadata.base_branch if a non-empty string, else ""
+   - testIsolation: metadata.test_isolation if a non-empty string, else ""
 Return ONLY these fields.
 `, { label: `resume-probe:${slug}`, phase: 'Scaffold', schema: RESUME_SCHEMA })
 
@@ -1163,6 +1184,12 @@ const storedBase = (resumeProbe && resumeProbe.baseBranch) || null   // "" → n
 if (storedBase && !/^campaign\/[a-z0-9][a-z0-9-]*$/.test(storedBase)) throw new Error(`hunt-pipeline: ${slug} metadata.base_branch ${storedBase} is not a campaign branch`)
 if (argBase && storedBase && argBase !== storedBase) throw new Error(`hunt-pipeline: ${slug} base_branch ${storedBase} ≠ args.baseBranch ${argBase} — refusing to rebase a hunt onto a different campaign`)
 const baseBranch = argBase || storedBase || null        // chain sticks per hunt
+// wave-auto-smoke: a fix/polish hunt's stored isolation sticks on resume; a conflicting arg fails loud.
+const storedIsolation = (resumeProbe && typeof resumeProbe.testIsolation === 'string' && resumeProbe.testIsolation) || null
+if (storedIsolation && !/^[a-z0-9][a-z0-9-]{0,40}$/.test(storedIsolation)) throw new Error(`hunt-pipeline: ${slug} metadata.test_isolation ${JSON.stringify(storedIsolation)} is invalid`)
+if (argIsolation && storedIsolation && argIsolation !== storedIsolation) throw new Error(`hunt-pipeline: ${slug} test_isolation ${storedIsolation} ≠ args.testIsolation ${argIsolation}`)
+huntIsolation = argIsolation || storedIsolation || null
+if (huntIsolation) log(`🧪 ${slug}: tests run on the isolated test DB of ${huntIsolation} (${huntTestCommand()})`)
 const BASE = baseBranch || 'main'                       // every diff site
 if (baseBranch) log(`⛓ ${slug}: chain mode — forks from, rebases onto and diffs against ${baseBranch} (local; never pushed)`)
 
@@ -2190,7 +2217,23 @@ Exit 10 is a NORMAL "defer", not an error. Return exitCode = the number after GA
 // certify commit). `ensure` reuses a record whose commit equals HEAD and re-runs when it moved.
 const TEST_RECORD_SCHEMA = { type: 'object', properties: { exitCode: { type: 'integer' }, output: { type: 'string' } }, required: ['exitCode', 'output'] }
 // → { ok:true, rec } | { ok:false, kind:'fail'|'error'|'dead', rec?, why }
+// wave-auto-smoke (A-8): a record whose test command exited 75 (the shared test DB lock was busy)
+// is `tempfail` — the suite never ran. It is re-taken at once, never scored as a Test bounce, up
+// to MAX_BUSY_RETRIES (keep equal to scripts/wolfpack-smoke-stage.mjs MAX_BUSY_RETRIES; a static
+// test checks it); exhaustion fails closed as test_record_error.
+const MAX_BUSY_RETRIES = 8
 async function takeTestRecord(stage, phaseLabel) {
+  for (let busy = 0; ; busy++) {
+    const tr = await takeTestRecordOnce(stage, phaseLabel)
+    if (!(tr.kind === 'fail' && tr.rec && tr.rec.tempfail === true)) return tr
+    if (busy >= MAX_BUSY_RETRIES) {
+      log(`⛔ test record (${stage}) test DB busy ${busy + 1} times — giving up`)
+      return { ok: false, kind: 'error', rec: tr.rec, why: `test DB busy: the test command exited 75 on ${busy + 1} consecutive records` }
+    }
+    log(`↻ test-record:${slug}:${stage} test DB busy — retry ${busy + 1}/${MAX_BUSY_RETRIES}`)
+  }
+}
+async function takeTestRecordOnce(stage, phaseLabel) {
   const base = `${planDir}/.test-record-${stage}`
   // --timeout-min 55: the shim relay gives up at ~60 min, so the script must time out first and write
   // an honest timed_out record (a Test bounce) instead of being killed and parking model_quota in a loop.
@@ -2228,7 +2271,7 @@ If the command could not run at all, return exitCode 1 and the error text as out
   if (typeof rec.pass !== 'boolean') return bad('record pass is not a boolean')
   if (typeof rec.summary !== 'string') return bad('record summary is not a string')
   if (typeof rec.log !== 'string' || !rec.log) return bad('record has no log path')
-  if (rec.command !== cfg().testCommand) return bad(`record command ${JSON.stringify(rec.command ?? null)} ≠ the configured test command ${JSON.stringify(cfg().testCommand)}`)
+  if (rec.command !== huntTestCommand()) return bad(`record command ${JSON.stringify(rec.command ?? null)} ≠ the configured test command ${JSON.stringify(huntTestCommand())}`)
   if ((rec.verdict_command ?? null) !== (cfg().testVerdictCommand ?? null)) return bad(`record verdict command ${JSON.stringify(rec.verdict_command ?? null)} ≠ the configured one ${JSON.stringify(cfg().testVerdictCommand ?? null)}`)
   if ((r.exitCode === 0) !== (rec.pass === true)) return bad(`exit ${r.exitCode} disagrees with pass ${rec.pass}`)
   log(`🧪 test record (${stage}) ${rec.commit.slice(0, 12)}: ${rec.pass ? 'PASS' : 'FAIL'} — ${rec.summary} [${rec.reused ? 'reused' : 'ran'} in ${rec.ran_in ?? 'unknown'}] log ${rec.log}`)
@@ -3521,7 +3564,7 @@ Only if rebase succeeds, execute ALL Shepherd instructions:${BASE_META_LINE ? `
 SAFETY RULES:
 - Do NOT git push
 - Do NOT deploy
-- Do NOT run the test suite. Running tests is the TRACKER phase's job, not yours (your SKILL.md says this too). To confirm your code loads, the MOST you may do is a fast syntax/import check (e.g. \`node --check <file>\`, a compile, or the project's quick check if wolfpack-config.md names one). NEVER invoke the project's test command (\`${cfg().testCommand}\`) — the full suite can hang for a long time and livelock the whole pipeline. Tracker runs the suite, scoped, in its own phase.
+- Do NOT run the test suite. Running tests is the TRACKER phase's job, not yours (your SKILL.md says this too). To confirm your code loads, the MOST you may do is a fast syntax/import check (e.g. \`node --check <file>\`, a compile, or the project's quick check if wolfpack-config.md names one). NEVER invoke the project's test command (\`${huntTestCommand()}\`) — the full suite can hang for a long time and livelock the whole pipeline. Tracker runs the suite, scoped, in its own phase.
 - Do NOT modify files outside the worktree
 - Do NOT run git add . or git add -A
 ${PROTECTED_PATCH_RULE}
@@ -4050,9 +4093,9 @@ cd to ${worktreePath} before doing any work.
 Execute ALL Tracker instructions:
 - Read plan-final.md, shepherd-log.md, pointer reviews, code diff
 - Write tests per the tier strategy
-- Run tests using: ${cfg().testCommand}
+- Run tests using: ${huntTestCommand()}
   (wolfpack-config.md → Project Identity → Test command — follow its notes on narrowing and on which test backend the sandbox uses)
-- PIPELINE TEST RECORD: after you return TESTS_PASS the pipeline itself runs ${cfg().testCommand} at the committed HEAD and writes ${planDir}/test-record-tracker.json + .log — that record, not your report, gates Certify. Run targeted tests while you write them; commit EVERY test file before returning (uncommitted tracked changes are not in the commit the record tests). Never write or edit test-record-*.json.
+- PIPELINE TEST RECORD: after you return TESTS_PASS the pipeline itself runs ${huntTestCommand()} at the committed HEAD and writes ${planDir}/test-record-tracker.json + .log — that record, not your report, gates Certify. Run targeted tests while you write them; commit EVERY test file before returning (uncommitted tracked changes are not in the commit the record tests). Never write or edit test-record-*.json.
 - Classify failures (baseline/transient/pre-existing/legitimate)
 - This is Tracker round ${windowRound} of at most ${trackerRounds + 1} in this budget window (absolute round ${trackerRound}). Write ${planDir}/tracker-log.md and ${planDir}/tracker-report-${trackerRound}.md if needed, and set metadata tracker_round = ${trackerRound} (the absolute round, not the window number)
 - Update ${planDir}/metadata.json ${META_PRESERVE_NOTE}
