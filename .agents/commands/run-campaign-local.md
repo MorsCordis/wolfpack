@@ -248,6 +248,23 @@ default.
 - A smoke-blocked or rejected hunt is reverted from the campaign branch (never from `main`):
   `node "$PACK/scripts/wolfpack-release.mjs" revert --campaign <slug> --hunt <hunt> --reason "<why>"`.
 
+## Post-merge stage (chain mode)
+When the project sets wolfpack-config.md → Deployment Notes → `Post-merge smoke stage: on`, the chain runner
+checks each wave right after it merges into `campaign/<slug>`, before the next wave starts:
+deploy the tip to dev from a temp worktree → migrate → ensure the smoke tenants → session probe → the touched
+apps' integration suites (isolated test DB) → smoke every merged `[auto]` criterion on each smoke tenant
+(`/smoke-chain`) → triage (fix / log / block) → fix rounds (max 2 per hunt, each a reviewed hunt) or revert
+the blocked hunt → re-verify. Findings go to `.wolfpack/campaigns/<slug>/issue-log.md`; logged (polish) items
+get ONE polish wave at campaign end; the release report URL is logged as `Report: <url>` and sent with the
+ready-for-release notification. Off (or absent) → the runner logs one line and behaves as before.
+- A stage park returns `CAMPAIGN_PARKED_STAGE` with its code (`smoke_config_missing`, `dev_deploy_failed`,
+  `smoke_tenant_ensure_failed`, `smoke_browser_unreachable`, `smoke_browser_unavailable`, `integration_infra`,
+  `integration_unattributed`, `smoke_agent_failed`, `campaign_revert_failed`, `stage_cli_error`). Clear the
+  blocker, then re-run the campaign: the relaunch re-arms the stage and resumes where it stopped.
+- **Fallback** for `smoke_browser_unavailable`: run `/smoke-chain <campaign> <wave>` here (the interactive
+  session can reach the smoke browser), then re-run the campaign; the stage ingests the results file.
+- Triage table, fix-round cap, issue-log format, polish wave and report: `docs/post-merge-stage.md`.
+
 ## Unattended mode (--unattended)
 For a run nobody is watching — normally the one `wolfpack-cron-resume.sh tick` starts in tmux `paw:runner`
 (see `"$PACK/docs/cron-resume.md"`). Chain mode only (`--chain` is required; see the refusals above). Every

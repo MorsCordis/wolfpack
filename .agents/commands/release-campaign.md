@@ -56,6 +56,10 @@ Your final response MUST end with the exact block in "## Finishing message" belo
    ```
    It shows ✅/⛔ per hunt with its status and bump, the first 40 lines of each pending-compliance hunt's
    `compliance-summary.md` with its sign-off prompt, and the held / reverted / blocked lists.
+   If the runner's post-merge stage ran (`Post-merge smoke stage: on`), also print the campaign report URL it
+   built (the runner's `Report: <url>` line, or `node "$PACK/scripts/wolfpack-smoke-stage.mjs" report --campaign
+   <slug>`) and every issue-log item with resolution `needs Cecil` (`.wolfpack/campaigns/<slug>/issue-log.md`):
+   they are part of this review (docs/post-merge-stage.md). This step's deploy (Step 3) is unchanged.
 2. For **each** hunt awaiting compliance sign-off, ask the operator in-session, one question per hunt; state the
    project's compliance areas from wolfpack-config.md → Compliance Requirements → Compliance areas:
    - **Sign off** →
