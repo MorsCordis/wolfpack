@@ -107,9 +107,14 @@ export function composeTestCommand(testCommand, { integrationTestArgs = null, is
   if (isolation != null) {
     if (!ISOLATION_RE.test(String(isolation))) throw new InfraError(`test isolation ${JSON.stringify(isolation)} must match ${ISOLATION_RE.source}`)
     if (!integrationTestArgs) throw new InfraError('a test isolation is set but wolfpack-config.md has no Project Identity → Integration test args')
+    if (!String(integrationTestArgs).includes('{campaign}')) throw new InfraError('a test isolation is set but Project Identity → Integration test args has no {campaign} placeholder — the suite would run on the shared test DB')
     cmd += ` ${isolationArgs(integrationTestArgs, isolation)}`
   }
-  if (labels && labels.length) cmd += ` ${labels.join(' ')}`
+  if (labels && labels.length) {
+    const bad = labels.filter(l => !/^[A-Za-z0-9_][A-Za-z0-9_.-]*$/.test(String(l)))
+    if (bad.length) throw new InfraError(`test label(s) ${bad.map(l => JSON.stringify(l)).join(', ')} are not plain app/module names`)
+    cmd += ` ${labels.join(' ')}`
+  }
   return cmd
 }
 

@@ -1111,6 +1111,7 @@ test('the resume probe REQUIRES baseBranch, checks commits against the base, and
   const { find } = await runHunt({ args: CHAIN_ARGS })
   const p = find('resume-probe')[0]
   assert.ok(p.opts.schema.required.includes('baseBranch'))
+  assert.ok(p.opts.schema.required.includes('testIsolation'), 'a dropped testIsolation would run a fix hunt on the shared test DB')
   assert.equal(p.opts.schema.properties.baseBranch.type, 'string')
   assert.match(p.prompt, /git log campaign\/c1\.\.feat\/h/)
   assert.match(p.prompt, /"merged_to_campaign" \/ "merged_to_campaign_pending_compliance" \/ "certified_held_overlap" → "DONE"/)

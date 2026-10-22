@@ -672,7 +672,7 @@ const CHAIN_COMMANDS = ['revert', 'revert-merge', 'sign-off', 'check', 'summary'
 
 // The configured smoke tenant names (wolfpack-config.md → Deployment Notes → Smoke tenants of
 // the invoking repo's main checkout), or null when there is no config / no tenants.
-function configuredTenants() {
+export function configuredTenants() {
   try {
     const root = repoRoot()
     const p = join(root, 'wolfpack-config.md')

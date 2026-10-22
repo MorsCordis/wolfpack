@@ -533,6 +533,9 @@ export function cmdMergeHunt(root, { campaign, hunt, at, fixOf, polish }) {
     }
     if (before.parent_hunt !== parent) throw new ChainError(`--fix-of ${parent}: ${h}'s metadata.parent_hunt is ${JSON.stringify(before.parent_hunt ?? null)}, not ${parent}`)
   }
+  if (polish === true && before.polish_of !== c) {
+    throw new ChainError(`--polish: ${h}'s metadata.polish_of is ${JSON.stringify(before.polish_of ?? null)}, not ${c} — only the stage's polish hunt merges as the polish merge`)
+  }
   // Allow-list: only a certified (awaiting-merge) hunt or a reverted dependent. A mid-pipeline,
   // quota-parked, blocked, merged or released hunt is refused — never merged uncertified.
   const cls = chainClass(before.status)

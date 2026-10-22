@@ -190,7 +190,8 @@ const RESUME_SCHEMA = {
   // latestRevisedPlan is REQUIRED: as an optional field the probe silently dropped it and a
   // resumed review restarted at round 1 (wave 2, second relaunch). baseBranch is REQUIRED for
   // the same reason: a dropped field would silently diff a chain-mode hunt against main.
-  required: ['fresh', 'latestRevisedPlan', 'baseBranch'],
+  // testIsolation likewise: a dropped field would run a fix/polish hunt's suite on main's test DB.
+  required: ['fresh', 'latestRevisedPlan', 'baseBranch', 'testIsolation'],
 }
 
 // [02] Park / resolve / resume. A hunt that can't safely proceed halts CLEANLY:
@@ -804,6 +805,7 @@ const huntTestCommand = () => {
   const iso = huntIsolation
   if (!iso) return cfg().testCommand
   if (!cfg().integrationTestArgs) throw new Error(`hunt-pipeline: ${slug} has test isolation ${iso} but wolfpack-config.md has no Project Identity → Integration test args`)
+  if (!String(cfg().integrationTestArgs).includes('{campaign}')) throw new Error(`hunt-pipeline: ${slug} has test isolation ${iso} but Project Identity → Integration test args has no {campaign} placeholder — the suite would run on the shared test DB`)
   return `${cfg().testCommand} ${String(cfg().integrationTestArgs).replace(/\{campaign\}/g, () => shq(iso))}`
 }
 const heartbeat = (phaseName, detail) => {

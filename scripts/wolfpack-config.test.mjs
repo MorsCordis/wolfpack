@@ -1114,3 +1114,14 @@ test('stage keys: the summary shows postMergeStage; --json carries the fields', 
     assert.equal(j.prodHostSuffix, 'example.vet')
   })
 })
+
+test('stage keys: Integration test args without {campaign} is a problem; a malformed Prod URL host is a problem', () => {
+  const noPh = readConfig(withStage(STAGE_DEP, STAGE_ID.replace('--isolated-db {campaign}', '--isolated-db campaign')))
+  assert.ok(noPh.problems.some(p => /Integration test args must contain the \{campaign\} placeholder/.test(p)), noPh.problems.join('; '))
+  const bad = readConfig(withStage(STAGE_DEP.replace('https://*.example.vet', 'https://*.paw..example.vet')))
+  assert.equal(bad.prodHostSuffix, null)
+  assert.ok(bad.problems.some(p => /Prod URL has a malformed host/.test(p)), bad.problems.join('; '))
+  // prose (the example template's "(e.g., …)") is not checked
+  const prose = readConfig(withStage(STAGE_DEP.replace('`https://*.example.vet`', '(e.g., https://*.example.vet)')))
+  assert.ok(!prose.problems.some(p => /Prod URL/.test(p)))
+})

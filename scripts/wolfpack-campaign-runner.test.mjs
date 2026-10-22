@@ -2003,3 +2003,19 @@ test('stage: a WAVE_PAUSED_QUOTA verdict from the waves never runs the polish wa
   assert.equal(r.result.verdict, 'WAVE_PAUSED_QUOTA')
   assert.equal(r.labels.includes('stage-polish-plan'), false)
 })
+
+test('stage resume: fix-scaffold reports an already-landed fix → record-fix with its commit, no fix pipeline, no second merge', async () => {
+  let fixed = false
+  const r = await runStage([[ch('a')]], { cron: CRON_OK,
+    stage: (l) => {
+      if (l === 'stage-triage' && !fixed) return { status: 'ok', pending: { fix: { a: ['ISS-1'] }, block: {} }, classified: [{ id: 'ISS-1', hunt: 'a', outcome: 'fix', rule: 'clear_defect', reasoning: 'a/2: clear defect' }], campaign_blocks: [] }
+      if (l === 'stage-fix-scaffold:a') return { status: 'ok', slug: 'fix-a-smoke-1', parent_hunt: 'a', tier: 'Yellow', branch: 'feat/fix-a-smoke-1', worktree: null, plan_dir: null, base_sha: TIP, issues: ['ISS-1'], description: null, reused: true, landed: { commit: '2'.repeat(40) } }
+      if (l === 'stage-record-fix:fix-a-smoke-1') { fixed = true; return { status: 'ok', fix_rounds: 1 } }
+      return undefined
+    } })
+  noErr(r)
+  assert.equal(r.workflowCalls.some(w => w.args.slug === 'fix-a-smoke-1'), false, 'the fix hunt is not re-run')
+  assert.equal(r.labels.includes('chain-merge:fix-a-smoke-1'), false, 'and not merged twice')
+  assert.match(promptOf(r, 'stage-record-fix:fix-a-smoke-1'), new RegExp(`--commit '${'2'.repeat(40)}' --issues 'ISS-1'`))
+  assert.ok(r.labels.indexOf('stage-record-fix:fix-a-smoke-1') < r.labels.indexOf('stage-iterate'))
+})

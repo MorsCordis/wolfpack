@@ -102,6 +102,8 @@ export class StageError extends Error {
 }
 
 const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
+// A test label as it may appear unquoted in a shell command: a plain app/module path.
+const TEST_LABEL_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/
 const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const normTier = (t) => { const s = String(t || '').trim(); return s ? s[0].toUpperCase() + s.slice(1).toLowerCase() : 'Red' }
 const TIER_RANK = { Green: 0, Blue: 1, Yellow: 2, Orange: 3, Red: 4 }
@@ -324,6 +326,8 @@ export function redact(text) {
     .replace(/\bauthorization\s*:\s*[^\n]*/gi, 'Authorization: [REDACTED]')
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/g, 'Bearer [REDACTED]')
     .replace(/\b(sessionid|csrftoken|csrfmiddlewaretoken|session|token|access_token|refresh_token|id_token|code|key|api_key|password|secret|sig|signature)=([^;&\s"'<>]+)/gi, '$1=[REDACTED]')
+    // JSON / header-dump forms: "sessionid": "abc", 'token': 'x', Session: abc
+    .replace(/(["']?)\b(sessionid|csrftoken|csrfmiddlewaretoken|session|token|access_token|refresh_token|id_token|api_key|password|secret|signature)\1(\s*:\s*)(["']?)[^"',;}\s<>]+\4/gi, '$1$2$1$3$4[REDACTED]$4')
 }
 
 // ─── AC23: review fingerprint lookup ─────────────────────────────────────────
@@ -677,6 +681,11 @@ export function checkConfig(cfg) {
 function cmdCheckConfig(c) {
   const r = checkConfig(c.cfg)
   if (c.cfg.problems && c.cfg.problems.length) r.problems.push(...c.cfg.problems.filter(p => /Smoke tenants|Post-merge smoke stage|Smoke tenant manifests/.test(p)))
+  // AC16: tenant screenshots land in .wolfpack/smoke-shots/ — it must be gitignored first.
+  if (r.postMergeStage) {
+    const ig = git(['check-ignore', '-q', '.wolfpack/smoke-shots/x.png'], { cwd: c.root, allowFail: true })
+    if (ig.code !== 0) r.problems.push('.wolfpack/smoke-shots/ is not gitignored — add `.wolfpack/smoke-shots/` to .gitignore (tenant screenshots must never be committed)')
+  }
   if (r.problems.length) throw new StageError(`post-merge stage config: ${r.problems.join('; ')}`, 'smoke_config_missing', { problems: r.problems })
   return { status: 'ok', post_merge_stage: r.postMergeStage, tenants: c.cfg.smokeTenants || {} }
 }
@@ -884,8 +893,14 @@ function cmdSuites(c, f) {
   saveState(c.root, c.campaign, s)
   const record = r.full ? 'ALL' : r.labels.join(',')
   const integration = c.cfg.integrationTestArgs
-  const command = (r.full || r.labels.length) ? `${c.cfg.testCommand} ${subst(integration, { campaign: c.campaign })}${r.full ? '' : ` ${r.labels.join(' ')}`}` : null
-  if (command) guardCommand(c, 'Project Identity → Test command', command)
+  // The guard reads the CONFIG text only: app labels are repo directory names (an app called
+  // `products` is not a prod target). They join the command unquoted (byte-identical to
+  // wolfpack-test-record.mjs composeTestCommand), so anything but a plain name is refused.
+  const bad = r.labels.filter(l => !TEST_LABEL_RE.test(l))
+  if (bad.length) throw new StageError(`app label(s) ${bad.map(l => JSON.stringify(l)).join(', ')} are not plain directory names — refusing to put them in a shell command`, 'smoke_config_missing')
+  const base = `${c.cfg.testCommand} ${subst(integration, { campaign: c.campaign })}`
+  if (r.full || r.labels.length) guardCommand(c, 'Project Identity → Test command', base)
+  const command = (r.full || r.labels.length) ? `${base}${r.full ? '' : ` ${r.labels.join(' ')}`}` : null
   return { status: 'ok', ...r, record_labels: (r.full || r.labels.length) ? record : null, command, empty: !r.full && !r.labels.length }
 }
 
@@ -976,6 +991,9 @@ function cmdPlanSmoke(c, f) {
     for (const m of String(p.text).matchAll(TEST_ID_IN_TEXT)) {
       if (sx.full || (sx.labels || []).includes(m[1])) { covered[p.key] = m[0]; break }
     }
+  }
+  if (cs.missing && cs.missing.length) {
+    throw new StageError(`no readable acceptance.md for campaign-merged hunt(s) ${cs.missing.join(', ')} — their criteria would silently not run`, 'smoke_config_missing', { hunts: cs.missing })
   }
   const sha12 = sha.slice(0, 12)
   const plan = {
@@ -1116,8 +1134,17 @@ function cmdIngestSmoke(c, f) {
     const rel = relative(plan.wave_dir, resolve(abs))
     return rel.startsWith('..') || isAbsolute(rel) ? null : rel
   }
-  // A manifest flow failure is attributed to the hunts merged in this stage run (or the polish).
-  const blameFor = (pair) => (pair.manifest ? (cur.polish ? [cur.polish.slug] : [...(cur.merged || [])]) : [pair.hunt])
+  // A manifest flow failure is attributed to the hunt merged in this stage run (or the polish).
+  // With several merged hunts the flow cannot say which one broke it: ONE unattributed finding
+  // (hunt null, blocked_with = the candidates) — triage blocks it as `unattributed` and the stage
+  // parks for Cecil, instead of one fix round / revert per innocent hunt.
+  const blameFor = (pair) => {
+    if (!pair.manifest) return [pair.hunt]
+    if (cur.polish) return [cur.polish.slug]
+    const merged = [...(cur.merged || [])]
+    return merged.length === 1 ? merged : [null]
+  }
+  const blockedWith = (pair, h) => (pair.manifest && h === null && !cur.polish ? { blocked_with: [...(cur.merged || [])] } : {})
   for (const pair of plan.pairs) {
     const hb = huntOf(pair.hunt)
     const r = byKey.get(pair.key) || {}
@@ -1133,7 +1160,7 @@ function cmdIngestSmoke(c, f) {
         crit.disposition = 'auto_fail'
         crit.detail = 'refused host'
         for (const h of blameFor(pair)) {
-          const fd = { kind: 'smoke', hunt: h, ref: pair.ref, tenant: pair.tenant, key: pair.key, summary: `visited a refused host (${refused.map(x => x.why).join(', ')})`, evidence: null, model: {}, prod_host: true }
+          const fd = { kind: 'smoke', hunt: h, ref: pair.ref, tenant: pair.tenant, key: pair.key, summary: `visited a refused host (${refused.map(x => x.why).join(', ')})`, evidence: null, model: {}, prod_host: true, ...blockedWith(pair, h) }
           fd.id = findingId(fd); findings.push(fd)
         }
       }
@@ -1152,7 +1179,7 @@ function cmdIngestSmoke(c, f) {
         const fd = {
           kind: 'smoke', hunt: h, ref: pair.ref, tenant: pair.tenant, key: pair.key,
           summary: redact(crit.detail || r.reason || 'criterion failed'), evidence: evidence ? join(plan.wave_dir, evidence) : null,
-          model: r.model || {}, ...(status5xx ? { http_status: status5xx.status } : {}),
+          model: r.model || {}, ...(status5xx ? { http_status: status5xx.status } : {}), ...blockedWith(pair, h),
         }
         fd.id = findingId(fd); findings.push(fd)
       }
@@ -1164,7 +1191,7 @@ function cmdIngestSmoke(c, f) {
           const fd = {
             kind: 'anomaly', hunt: h, ref: pair.ref, tenant: pair.tenant, key: pair.key, summary: a.text || `${a.kind} anomaly`, evidence: null,
             model: status5xx ? {} : (r.model && MODEL_CLASSES.includes(r.model.class) ? r.model : { class: 'log', expected_from: 'none' }),
-            ...(Number.isInteger(a.status) ? { http_status: a.status } : {}),
+            ...(Number.isInteger(a.status) ? { http_status: a.status } : {}), ...blockedWith(pair, h),
           }
           fd.id = findingId(fd); findings.push(fd)
         }
@@ -1238,7 +1265,11 @@ function cmdTriage(c) {
   const cache = new Map()
   const classified = []
   const entries = []
+  // Resume between record-fix and iterate: a finding whose fix already merged in THIS iteration
+  // is not re-triaged (it would start a second fix round on a tip that already has the fix).
+  const landed = new Set((cur.fix_merges || []).filter(x => x.iteration === cur.iteration).flatMap(x => x.issues || []))
   for (const fd of cur.findings) {
+    if (landed.has(fd.id)) continue
     const context = fd.hunt ? triageContext(c, s, cur, fd.hunt, cache) : {}
     const r = classifyFinding(fd, context)
     classified.push({ id: fd.id, hunt: fd.hunt, outcome: r.outcome, rule: r.rule, reasoning: r.reasoning, finding: fd })
@@ -1331,8 +1362,11 @@ function cmdFixScaffold(c, f) {
     const statuses = Object.fromEntries(campaignState(c).hunts.map(h => [h.slug, h.status]))
     const open = openPolishSet(store, statuses)
     if (!open.items.length) throw new StageError('no open log items to polish')
+    // A crash mid-polish leaves {open_set, result: null}: reuse its slug (and worktree) rather
+    // than minting polish-<c>-2 for the same open set.
+    const unfinished = (s.polish || []).find(p => p.open_set === open.open_set && p.result == null && p.slug)
     const k = (s.polish || []).length + 1
-    slug = k === 1 ? `polish-${c.campaign}` : `polish-${c.campaign}-${k}`
+    slug = unfinished ? unfinished.slug : (k === 1 ? `polish-${c.campaign}` : `polish-${c.campaign}-${k}`)
     tier = 'Blue'
     issues = open.items.map(e => e.id)
     description = `Polish wave for campaign ${c.campaign}: fix the ${issues.length} open logged smoke item(s) in one change (${issues.join(', ')}).`
@@ -1350,6 +1384,11 @@ function cmdFixScaffold(c, f) {
     tier = (TIER_RANK[pt] ?? 4) < TIER_RANK.Blue ? 'Blue' : pt
     issues = (cur.pending.fix[parent] || [])
     if (!issues.length) throw new StageError(`${parent} has no pending fix findings`)
+    const done = (Array.isArray(pm.smoke_fixes) ? pm.smoke_fixes : []).find(x => x && x.slug === slug && SHA_RE.test(String(x.merge_commit || '')))
+    if (done) {
+      // merge-hunt already landed this round (and removed its worktree); only record-fix is left.
+      return { status: 'ok', slug, parent_hunt: parent, tier: normTier(pm.tier), branch: `feat/${slug}`, worktree: null, plan_dir: null, base_sha: tip, issues, description: null, reused: true, landed: { commit: done.merge_commit } }
+    }
     description = `Smoke fix round ${n} for ${parent} (campaign ${c.campaign}): ${issues.join(', ')}.`
   }
   const branch = `feat/${slug}`
@@ -1430,7 +1469,7 @@ function cmdRecordFix(c, f) {
   const already = (cur.fix_merges || []).some(x => x.slug === fix)
   if (!already) {
     cur.fix_rounds[h] = ((cur.fix_rounds || {})[h] || 0) + 1
-    cur.fix_merges = [...(cur.fix_merges || []), { hunt: h, slug: fix, commit }]
+    cur.fix_merges = [...(cur.fix_merges || []), { hunt: h, slug: fix, commit, iteration: cur.iteration, issues: ids }]
     writeHuntMeta(c.root, h, (m) => { m.smoke_fix_rounds = cur.fix_rounds[h] })
   }
   delete cur.pending.fix[h]
@@ -1518,6 +1557,8 @@ function cmdReport(c) {
   const u = runLogged(url, c.root, join(logDir, 'report-url.log'))
   const reportUrl = (u.stdout.split('\n').map(l => l.trim()).filter(Boolean).pop() || '')
   if (u.exit !== 0 || !/^https?:\/\//.test(reportUrl) || /0\.0\.0\.0/.test(reportUrl)) return warn(`report url failed: ${redact(u.last)}`)
+  const ruw = /[?#\s]/.test(reportUrl) ? 'query, fragment or whitespace' : refuseProdTarget(reportUrl, c.cfg, { kind: 'url' })
+  if (ruw) return warn(`report url refused (${ruw}) — not stored`)
   if (s) {
     s.report_url = reportUrl
     if (s.current) s.current.report_url = reportUrl

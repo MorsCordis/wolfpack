@@ -1335,6 +1335,14 @@ Write the raw results file the command describes to ${ps.raw_path} and return {r
         const gp = await stageGate(`w${W}:fix:${h}`, W, [h]); if (gp) return gp
         const sc = await S('fix-scaffold', `--hunt ${shq(h)}`, `stage-fix-scaffold:${h}`)
         if (sc.status !== 'ok') return stageErr(sc, `stage-fix-scaffold:${h}`, 'act')
+        if (sc.landed && sc.landed.commit) {
+          // Resume after merge-hunt landed this round but before record-fix ran: record it, no re-run.
+          const rf = await S('record-fix', `--hunt ${shq(h)} --fix ${shq(sc.slug)} --commit ${shq(sc.landed.commit)} --issues ${shq((sc.issues || []).join(','))}`, `stage-record-fix:${sc.slug}`)
+          if (rf.status !== 'ok') return stageErr(rf, `stage-record-fix:${sc.slug}`, 'act')
+          log(`  ⛓ ${sc.slug} had already landed (${String(sc.landed.commit).slice(0, 12)}) — recorded; ${h} fix rounds: ${rf.fix_rounds}`)
+          changed = true
+          continue
+        }
         log(`  🔧 fix round for ${h}: ${sc.slug} (${sc.tier}) from ${branch} @ ${String(sc.base_sha || '').slice(0, 12)} — ${(sc.issues || []).join(', ')}`)
         const run = await runStagePipeline(sc, 'fix')
         if (run.ok) {

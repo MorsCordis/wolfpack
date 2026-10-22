@@ -745,3 +745,9 @@ test('a non-75 failure is not a tempfail and IS reused by ensure', () => {
   assert.equal(r.json.reused, true)
   assert.equal(runs(f), 1)
 })
+
+test('composeTestCommand: isolation without a {campaign} placeholder, and non-plain labels, fail loud', () => {
+  assert.throws(() => composeTestCommand('t', { integrationTestArgs: '--isolated-db campaign', isolation: 'c1' }), /no \{campaign\} placeholder/)
+  assert.throws(() => composeTestCommand('t', { labels: ['ok', 'x;rm -rf'] }), /not plain app\/module names/)
+  assert.equal(composeTestCommand('t', { labels: ['scheduler.tests', 'b_c'] }), 't scheduler.tests b_c')
+})

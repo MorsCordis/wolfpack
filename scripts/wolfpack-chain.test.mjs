@@ -854,3 +854,12 @@ test('merge-hunt with neither flag: unchanged result shape, worktree kept, no sm
   assert.equal(x.code, 2)
   assert.match(x.json.reason, /--fix-of needs a hunt slug/)
 })
+
+test('merge-hunt --polish refuses a hunt that is not this campaign\'s polish hunt', () => {
+  const root = mkRepo({ graph: { h: { dependsOn: [] } } })
+  addHunt(root, 'h', { edits: { 'h.txt': 'h\n' } })
+  const r = runCli(root, 'merge-hunt', '--campaign', 'c', '--hunt', 'h', '--at', AT, '--polish')
+  assert.notEqual(r.code, 0)
+  assert.match(r.stdout + r.stderr, /polish_of is null, not c/)
+  assert.ok(existsSync(join(root, '.wt', 'h')), 'nothing merged, worktree kept')
+})

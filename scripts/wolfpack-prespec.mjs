@@ -19,7 +19,7 @@
 
 import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join, resolve, basename, dirname } from 'node:path'
-import { parseAcceptanceCriteria, CriteriaError, DEFAULT_SMOKE_TENANTS } from './wolfpack-release.mjs'
+import { parseAcceptanceCriteria, CriteriaError, DEFAULT_SMOKE_TENANTS, configuredTenants } from './wolfpack-release.mjs'
 
 export class PrespecError extends Error {
   constructor(message) {
@@ -416,7 +416,8 @@ export function main(argv) {
         maxManual = parseInt(raw, 10)
       }
       const file = pos[0]
-      let tenants = DEFAULT_SMOKE_TENANTS
+      // Same source as `wolfpack-release.mjs criteria`: the project's Smoke tenants, else the default.
+      let tenants = configuredTenants() || DEFAULT_SMOKE_TENANTS
       if (flags.tenants !== undefined) {
         tenants = String(flags.tenants).split(',').map((t) => t.trim()).filter(Boolean)
         if (!tenants.length || tenants.some((t) => !/^[a-z][a-z0-9-]*$/.test(t))) {

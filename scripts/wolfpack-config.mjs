@@ -447,7 +447,7 @@ export function prodHostSuffixOf(v) {
   const first = code(v).trim().split(/\s+/)[0] || ''
   const host = first.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').split('/')[0].replace(/:\d+$/, '').toLowerCase()
   const bare = host.replace(/^\*\./, '')
-  return bare && HOSTNAME.test(bare) ? bare : null
+  return bare && SMOKE_HOST.test(bare) ? bare : null
 }
 
 export function readConfig(text, { configDir = process.cwd() } = {}) {
@@ -529,6 +529,18 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     'Deployment Notes → Smoke tenants', problems, { valueRe: SMOKE_HOST })
   const smokeManifests = pairList(field(sec('Deployment Notes'), 'Smoke tenant manifests'),
     'Deployment Notes → Smoke tenant manifests', problems)
+  const integrationTestArgs = optionalCode('Project Identity', 'Integration test args')
+  if (integrationTestArgs && !integrationTestArgs.includes('{campaign}')) {
+    problems.push('Project Identity → Integration test args must contain the {campaign} placeholder (without it every campaign-tip run shares one test DB)')
+  }
+  const prodUrlRaw = field(sec('Deployment Notes'), 'Prod URL')
+  const prodHostSuffix = prodHostSuffixOf(prodUrlRaw)
+  // Only a value that IS a URL (first word has a scheme or a `*.` wildcard) is checked; prose
+  // placeholders like the example's `(e.g., https://…)` stay as before (no suffix).
+  const prodUrlFirst = (prodUrlRaw !== undefined && !isNone(prodUrlRaw)) ? (code(prodUrlRaw).trim().split(/\s+/)[0] || '') : ''
+  if (prodHostSuffix === null && /^([a-z][a-z0-9+.-]*:\/\/|\*\.)/i.test(prodUrlFirst)) {
+    problems.push(`Deployment Notes → Prod URL has a malformed host (got '${prodUrlFirst}') — the prod-suffix guard would never match`)
+  }
 
   return {
     name,
@@ -551,7 +563,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     migrateCommand: optionalCode('Deployment Notes', 'Migration command'),
     migrationFilePattern: optionalCode('Deployment Notes', 'Migration file pattern'),
     neverSmokeHosts: list(field(sec('Deployment Notes'), 'Never-smoke hosts')).map((h) => h.toLowerCase()),
-    prodHostSuffix: prodHostSuffixOf(field(sec('Deployment Notes'), 'Prod URL')),
+    prodHostSuffix,
     smokeTenants,
     smokeManifests,
     smokeTenantEnsureCommand: optionalCode('Deployment Notes', 'Smoke tenant ensure command'),
@@ -560,7 +572,7 @@ export function readConfig(text, { configDir = process.cwd() } = {}) {
     campaignReportCommand: optionalCode('Deployment Notes', 'Campaign report command'),
     reportUrlCommand: optionalCode('Deployment Notes', 'Report URL command'),
     appMarkerFile: optionalCode('Project Identity', 'App marker file'),
-    integrationTestArgs: optionalCode('Project Identity', 'Integration test args'),
+    integrationTestArgs,
     integrationFullSuitePaths: list(field(sec('Project Identity'), 'Integration full-suite paths')),
     triageBlockPaths: list(field(sec('Compliance Requirements'), 'Triage block paths')),
     exec,

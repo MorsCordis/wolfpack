@@ -1251,7 +1251,7 @@ test('CLI record-fix (AC23): "fix round writes smoke-findings.md" — issue, loo
   assert.match(text, /^ {2}- Review fingerprint lookup: miss \(no review ran\)$/m)
   assert.equal(r.issues().entries[0].resolution, 'fixed in round 1')
   assert.equal(getMeta(r.root, 'a').smoke_fix_rounds, 1)
-  assert.deepEqual(r.state().current.fix_merges, [{ hunt: 'a', slug: sc.slug, commit: mm.commit }])
+  assert.deepEqual(r.state().current.fix_merges, [{ hunt: 'a', slug: sc.slug, commit: mm.commit, iteration: 1, issues: [id] }])
   assert.deepEqual(r.state().current.pending.fix, {})
   const again = r.ok(['record-fix', '--hunt', 'a', '--fix', sc.slug, '--commit', mm.commit, '--issues', id])
   assert.deepEqual([again.appended, again.fix_rounds], [0, 1])
@@ -1465,4 +1465,89 @@ test('CLI worktree add|remove: a detached worktree at the tip with the configure
   r.ok(['worktree', 'remove', '--wave', '1'])
   assert.ok(!fs.existsSync(a.worktree))
   assert.deepEqual(r.stageWorktrees(), [])
+})
+
+// ── Pointer (hand GLM pass) fixes ───────────────────────────────────────────
+test('resume between record-fix and iterate: a re-run triage does not re-open the landed fix', () => {
+  const r = stageRepo()
+  const t = fixReady(r)
+  const id = t.pending.fix.a[0]
+  const sc = r.ok(['fix-scaffold', '--hunt', 'a'])
+  commit(sc.worktree, { 'scheduler/views.py': 'v2 fixed\n' }, 'fix(a): save button')
+  fs.writeFileSync(join(sc.plan_dir, 'metadata.json'), JSON.stringify({ ...readJ(join(sc.plan_dir, 'metadata.json')), status: 'certified' }))
+  const mm = chainMerge(r.root, { campaign: 'c1', hunt: sc.slug, at: AT, fixOf: 'a' })
+  r.ok(['record-fix', '--hunt', 'a', '--fix', sc.slug, '--commit', mm.commit, '--issues', id])
+  // crash here; the relaunch re-runs triage on the same iteration
+  const again = r.ok(['triage', '--wave', '1'])
+  assert.deepEqual(again.pending.fix, {}, 'no second fix round')
+  assert.ok(!again.classified.some(x => x.id === id))
+})
+
+test('resume between merge-hunt and record-fix: fix-scaffold reports the landed merge instead of throwing', () => {
+  const r = stageRepo()
+  fixReady(r)
+  const sc = r.ok(['fix-scaffold', '--hunt', 'a'])
+  commit(sc.worktree, { 'scheduler/views.py': 'v2 fixed\n' }, 'fix(a): save button')
+  fs.writeFileSync(join(sc.plan_dir, 'metadata.json'), JSON.stringify({ ...readJ(join(sc.plan_dir, 'metadata.json')), status: 'certified' }))
+  const mm = chainMerge(r.root, { campaign: 'c1', hunt: sc.slug, at: AT, fixOf: 'a' })
+  // crash here: the worktree is gone, the branch remains, record-fix never ran
+  const again = r.ok(['fix-scaffold', '--hunt', 'a'])
+  assert.deepEqual([again.slug, again.landed && again.landed.commit], [sc.slug, mm.commit])
+  const rf = r.ok(['record-fix', '--hunt', 'a', '--fix', again.slug, '--commit', again.landed.commit, '--issues', again.issues.join(',')])
+  assert.equal(rf.fix_rounds, 1)
+})
+
+test('a manifest failure with several merged hunts is ONE unattributed finding → the stage blocks (no per-hunt fix rounds)', () => {
+  const r = stageRepo()
+  mergeHunt(r, 'a', { edits: { 'scheduler/views.py': 'v2\n' } })
+  mergeHunt(r, 'b', { edits: { 'billing/views.py': 'v2\n' } })
+  const ps = smokeReady(r, ['a', 'b'])
+  fs.writeFileSync(ps.raw_path, JSON.stringify(rawFor(ps, { 'mobile-manifest/2@mobile': { disposition: 'auto_fail', detail: 'sign-in broken', model: { class: 'fix', expected_from: 'ac' } } })))
+  r.ok(['ingest-smoke', '--wave', '1', '--raw', ps.raw_path])
+  const f = r.state().current.findings.filter(x => x.ref === 'mobile-manifest/2')
+  assert.equal(f.length, 1)
+  assert.equal(f[0].hunt, null)
+  assert.deepEqual(f[0].blocked_with, ['a', 'b'])
+  const t = r.ok(['triage', '--wave', '1'])
+  assert.deepEqual([t.pending.fix, t.pending.block], [{}, {}])
+  assert.deepEqual(t.campaign_blocks, [f[0].id])
+})
+
+test('plan-smoke: a campaign-merged hunt without a readable acceptance.md fails loud', () => {
+  const r = stageRepo()
+  mergeHunt(r, 'a', { edits: { 'scheduler/views.py': 'v2\n' }, acceptance: null })
+  r.ok(['begin', '--wave', '1', '--merged', 'a'])
+  r.ok(['suites', '--wave', '1'])
+  const x = r.run(['plan-smoke', '--wave', '1', '--sha', r.tip()])
+  assert.deepEqual([x.code, x.json && x.json.code], [2, 'smoke_config_missing'])
+  assert.match(x.json.reason, /acceptance\.md.*\ba\b/)
+})
+
+test('redact: JSON and colon forms of session values are removed', () => {
+  const s = redact('{"sessionid": "abc123", "csrftoken":"zz9", \'token\': \'t0k\'} Session: s3cr3t')
+  for (const leak of ['abc123', 'zz9', 't0k', 's3cr3t']) assert.ok(!s.includes(leak), `${leak} survived: ${s}`)
+  assert.match(s, /"sessionid": "\[REDACTED\]"/)
+})
+
+test('check-config: the stage refuses when .wolfpack/smoke-shots/ is not gitignored', () => {
+  const r = stageRepo()
+  commit(r.root, { '.gitignore': '.wolfpack/plans/\n.wolfpack/campaigns/\n.wt/\n' }, 'drop the shots ignore')
+  const x = r.run(['check-config'])
+  assert.deepEqual([x.code, x.json && x.json.code], [2, 'smoke_config_missing'])
+  assert.match(x.json.reason, /smoke-shots/)
+})
+
+test('suites: an app named like "products" is not a prod target; a non-plain app dir is refused', () => {
+  const r = stageRepo()
+  mergeHunt(r, 'a', { edits: { 'products/apps.py': '', 'products/views.py': 'v\n' } })
+  r.ok(['begin', '--wave', '1', '--merged', 'a'])
+  const s = r.ok(['suites', '--wave', '1'])
+  assert.ok(s.labels.includes('products'))
+  assert.match(s.command, / products$/)
+  const r2 = stageRepo()
+  mergeHunt(r2, 'a', { edits: { 'x;y/apps.py': '', 'x;y/views.py': 'v\n' } })
+  r2.ok(['begin', '--wave', '1', '--merged', 'a'])
+  const x = r2.run(['suites', '--wave', '1'])
+  assert.equal(x.code, 2, x.stdout)
+  assert.match(x.json.reason, /not plain directory names/)
 })
