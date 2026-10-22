@@ -22,7 +22,7 @@ The script never edits your crontab and never arms a campaign on its own.
    ```
    WOLFPACK_HOME=/abs/path/to/wolfpack
    WOLFPACK_CRON_NODE=/abs/path/to/node
-   WOLFPACK_CRON_TMUX=/usr/bin/tmux
+   WOLFPACK_CRON_TMUX=/usr/bin/tmux        # tmux 3.2 or later (the relaunch uses new-window -e)
    WOLFPACK_CRON_CLAUDE=/abs/path/to/claude
    # optional, with their defaults:
    # WOLFPACK_CRON_PS=/bin/ps

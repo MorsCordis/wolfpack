@@ -753,7 +753,7 @@ From the repo root run exactly ONE command line:
 Return exitCode (its real exit code) and output (its last stdout line). Modify nothing else.
 `, { label, phase: 'Execute', model: 'sonnet', schema: CRON_EVENT_SCHEMA })
   } catch (e) { log(`⚠ cron event ${label} failed: ${e && e.message}`); return }
-  if (!r || r.exitCode !== 0) log(`⚠ cron event ${label}: exit ${r ? r.exitCode : 'none'} — ${r ? r.output : 'no result'} (runner continues)`)
+  if (!r || r.exitCode !== 0 || /^dropped:|FAILED/.test(String(r.output || ''))) log(`⚠ cron event ${label}: exit ${r ? r.exitCode : 'none'} — ${r ? r.output : 'no result'} (runner continues)`)
 }
 // End of a chain run → the cron state: completion and "everything waits on a human" disarm
 // (with a page); a quota pause tells the cron when to resume; anything else marks the session
@@ -761,6 +761,10 @@ Return exitCode (its real exit code) and output (its last stdout line). Modify n
 const cronFinish = async (res) => {
   const v = String((res && res.verdict) || 'unknown')
   const c = shq(campaignSlug)
+  // Everything merged but a compliance sign-off is still owed: that waits on a human (AC11).
+  if (v === 'CAMPAIGN_READY_FOR_RELEASE' && res.pendingComplianceHunts && res.pendingComplianceHunts.length) {
+    return cronEvent(`event waiting-on-you --campaign ${c} --status merged_awaiting_compliance`, 'cron-finish')
+  }
   if (v === 'CAMPAIGN_READY_FOR_RELEASE') return cronEvent(`event ready-for-release --campaign ${c}`, 'cron-finish')
   if (v === 'CAMPAIGN_AWAITING_HUMAN' || v === 'CAMPAIGN_PARKED_MAIN_CONFLICT') {
     return cronEvent(`event waiting-on-you --campaign ${c} --status ${shq(v.toLowerCase())}`, 'cron-finish')

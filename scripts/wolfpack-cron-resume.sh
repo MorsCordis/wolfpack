@@ -104,8 +104,9 @@ if [ "$CMD" = "--print-crontab" ]; then
   [ $# -eq 1 ] || { echo "ERROR: --print-crontab takes no arguments" >&2; exit 2; }
   pack="$(cfg WOLFPACK_HOME "$SELF_PACK")"
   pack="${pack%/}"
-  printf '*/15 * * * * /bin/bash %s/scripts/wolfpack-cron-resume.sh --repo %s tick >> %s/.cache/wolfpack/cron-resume.cron.log 2>&1\n' \
-    "$pack" "$REPO" "$HOME"
+  # %q-quote each path: a space in the pack, repo or home path must not split the cron line.
+  printf '*/15 * * * * /bin/bash %q --repo %q tick >> %q 2>&1\n' \
+    "$pack/scripts/wolfpack-cron-resume.sh" "$REPO" "$HOME/.cache/wolfpack/cron-resume.cron.log"
   exit 0
 fi
 
@@ -150,6 +151,12 @@ export WOLFPACK_HOME
 need_tool WOLFPACK_CRON_NODE node
 if [ "$CMD" = "tick" ]; then
   need_tool WOLFPACK_CRON_TMUX tmux
+  # The relaunch uses `new-window -e` and multi-argv commands: tmux 3.2 or later.
+  tmux_v="$("$WOLFPACK_CRON_TMUX" -V 2>/dev/null | sed -n 's/^tmux \(next-\)\{0,1\}\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\2 \3/p')"
+  read -r tmux_major tmux_minor <<< "$tmux_v"
+  if [ -z "$tmux_major" ] || [ "$tmux_major" -lt 3 ] || { [ "$tmux_major" -eq 3 ] && [ "$tmux_minor" -lt 2 ]; }; then
+    config_fail "WOLFPACK_CRON_TMUX=$WOLFPACK_CRON_TMUX is not tmux 3.2 or later (got '$("$WOLFPACK_CRON_TMUX" -V 2>/dev/null)') — the relaunch needs new-window -e"
+  fi
   need_tool WOLFPACK_CRON_CLAUDE claude
   WOLFPACK_CRON_PS="$(cfg WOLFPACK_CRON_PS /bin/ps)"
   export WOLFPACK_CRON_PS
@@ -161,6 +168,7 @@ export WOLFPACK_CRON_REPO="$REPO"
 export WOLFPACK_CRON_CONFIG="$CONFIG"
 export WOLFPACK_CRON_LOG="$LOG"
 export WOLFPACK_CRON_GATE="$(cfg WOLFPACK_CRON_GATE "$WOLFPACK_HOME/scripts/wolfpack-window-gate.mjs")"
+[ -f "$WOLFPACK_CRON_GATE" ] || config_fail "WOLFPACK_CRON_GATE=$WOLFPACK_CRON_GATE is not a file — cron cannot find the usage gate"
 export WOLFPACK_CRON_TMUX_SESSION="$(cfg WOLFPACK_CRON_TMUX_SESSION paw)"
 export WOLFPACK_CRON_TMUX_WINDOW="$(cfg WOLFPACK_CRON_TMUX_WINDOW runner)"
 export WOLFPACK_CRON_STALE_MINUTES="$(cfg WOLFPACK_CRON_STALE_MINUTES 45)"
@@ -215,7 +223,8 @@ if [ "$rc" -eq "$LOCK_BUSY" ]; then
   log_line - WARNING "state lock busy: $CMD dropped"
   echo "WARNING state lock busy: $CMD dropped" >&2
   case "$CMD" in
-    event|note-pause|note-exit|notify-test) exit 0 ;;
+    # Never blocks the caller (exit 0), but stdout names the drop so the runner logs a ⚠.
+    event|note-pause|note-exit|notify-test) echo "dropped: state lock busy"; exit 0 ;;
     *) exit 1 ;;
   esac
 fi

@@ -1370,6 +1370,23 @@ test('AC11 (a): all hunts certify + merge → CAMPAIGN_READY_FOR_RELEASE → one
   assert.equal(r.labels[r.labels.length - 1], 'cron-finish')
 })
 
+test('AC11: all merged but a compliance sign-off owed → event waiting-on-you merged_awaiting_compliance, not ready-for-release', async () => {
+  const r = await runChainRunner([[ch('a', { status: 'merged_to_campaign' }), ch('b', { status: 'merged_to_campaign_pending_compliance' })]], { cron: CRON_OK })
+  noErr(r)
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  const fin = cronCalls(r).filter(c => c.label === 'cron-finish')
+  assert.equal(fin.length, 1)
+  assert.equal(cronCmd(fin[0]), "event waiting-on-you --campaign 'c1' --status merged_awaiting_compliance")
+})
+
+test('AC13: a cron event the CLI dropped (lock busy) or failed to page is logged as a warning, run continues', async () => {
+  for (const output of ['dropped: state lock busy', 'ok: park notification FAILED: http_500']) {
+    const r = await runChainRunner([[ch('a'), ch('b')]], { cron: () => ({ exitCode: 0, output }) })
+    noErr(r)
+    assert.ok(r.logs.some(l => /⚠ cron event cron-finish: exit 0/.test(l)), output)
+  }
+})
+
 test('AC11 (b): a parked hunt with the rest waiting → cron-park:<slug> (event park …), then event waiting-on-you', async () => {
   const waves = [[ch('b')], [ch('e', { dependsOn: ['b'] })]]
   const r = await runChainRunner(waves, { cron: CRON_OK,

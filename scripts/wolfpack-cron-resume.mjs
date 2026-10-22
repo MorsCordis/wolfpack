@@ -497,7 +497,7 @@ export async function tick(ctx) {
     return finish('defer', `reset_at=${gj.reset_at || 'unknown'}${gj.degraded ? ' DEGRADED' : ''}`)
   }
   if (g.error || g.status !== 0 || !gj || gj.decision !== 'proceed') {
-    return finish('ERROR', `gate unavailable (exit ${g.status ?? 'none'})`, 1)
+    return finish('ERROR', `gate unavailable (${ctx.gate}, exit ${g.status ?? 'none'})`, 1)
   }
 
   // 6. judge the previous relaunch (once)
@@ -643,7 +643,9 @@ export async function event(ctx, type, { campaign, hunt, status: st0, reason } =
       return 0
     }
     const r = await sendNotification(ctx, { event: 'park', campaign, hunt, status: st0, reason }, st)
-    st.notified_parks[hunt] = st0
+    // Dedupe only a page that went out: a failed send stays un-notified, so the next
+    // `event park` for this hunt retries it instead of reporting "already notified".
+    if (r.ok) st.notified_parks[hunt] = st0
     writeState(ctx, campaign, st)
     logLine(ctx, campaign, 'event park', r.ok ? 'sent' : `FAILED: ${r.code}`)
     ctx.out(r.ok ? 'ok: park notified' : `ok: park notification FAILED: ${r.code}`)

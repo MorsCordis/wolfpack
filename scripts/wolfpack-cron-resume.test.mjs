@@ -29,6 +29,11 @@ const STUB_JS = String.raw`
 const fs = require('fs'), path = require('path')
 const tool = process.argv[2], argv = process.argv.slice(3)
 const dir = process.env.STUB_DIR
+// The tmux version probe answers before the call log, so call-count assertions are unaffected.
+if (tool === 'tmux' && argv[0] === '-V') {
+  let v = 'tmux 3.4'; try { v = fs.readFileSync(path.join(dir, 'tmux-version'), 'utf8').trim() } catch {}
+  process.stdout.write(v + '\n'); process.exit(0)
+}
 fs.appendFileSync(path.join(dir, 'calls.jsonl'), JSON.stringify({ tool, argv }) + '\n')
 const rd = (f, d) => { try { return JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')) } catch { return d } }
 const wr = (f, o) => fs.writeFileSync(path.join(dir, f), JSON.stringify(o, null, 2))
@@ -477,9 +482,27 @@ describe('gate and relaunch', () => {
     H.gate({ decision: 'oops', rc: 3 })
     const r = await tick()
     assert.equal(r.code, 1)
-    assert.match(H.logText(), /ERROR gate unavailable \(exit 3\)/)
+    assert.match(H.logText(), /ERROR gate unavailable \(\S+stub-gate\.cjs, exit 3\)/)
     assert.equal(relaunches(H).length, 0)
     assert.equal(H.state().consecutive_failed_relaunches, 0)
+  })
+
+  test('a missing gate file fails loud naming the path; tmux older than 3.2 fails loud naming the version', async () => {
+    await fresh()
+    await arm()
+    H.writeConfig({ WOLFPACK_CRON_GATE: join(H.stub, 'no-such-gate.mjs') })
+    let r = await tick()
+    assert.equal(r.code, 4)
+    assert.match(r.err, /WOLFPACK_CRON_GATE=\S+no-such-gate\.mjs is not a file/)
+    H.writeConfig()
+    writeFileSync(join(H.stub, 'tmux-version'), 'tmux 3.1c\n')
+    r = await tick()
+    assert.equal(r.code, 4)
+    assert.match(r.err, /is not tmux 3\.2 or later \(got 'tmux 3\.1c'\)/)
+    assert.equal(relaunches(H).length, 0)
+    writeFileSync(join(H.stub, 'tmux-version'), 'tmux next-3.6\n')
+    r = await tick()
+    assert.doesNotMatch(r.err, /tmux 3\.2 or later/)
   })
 
   test('AC5: dead runner window → kill-window then new-window with the exact argv (no -p)', async () => {
@@ -727,6 +750,7 @@ describe('state lock', () => {
     const er = await H.run(['event', 'park', '--campaign', 'c1', '--hunt', 'h1', '--status', 'parked:x'], { env: { WOLFPACK_CRON_LOCK_WAIT: 1 } })
     assert.equal(er.code, 0)
     assert.match(er.err, /WARNING state lock busy: event dropped/)
+    assert.match(er.out, /^dropped: state lock busy$/m, 'stdout names the drop so the runner logs a warning')
     assert.match(H.logText(), /WARNING state lock busy: event dropped/)
     await t
     const ar = await (async () => { const tt = tick({ WOLFPACK_CRON_STALE_MINUTES: 0 }); await new Promise(r => setTimeout(r, 400)); const a = await H.run(['disarm'], { env: { WOLFPACK_CRON_LOCK_WAIT: 1 } }); await tt; return a })()
@@ -826,6 +850,20 @@ describe('entry and subcommands', () => {
     assert.equal(lines.length, 1)
     assert.match(lines[0], /^\*\/15 \* \* \* \* \/bin\/bash \/\S+\/scripts\/wolfpack-cron-resume\.sh --repo \/\S+ tick >> \/\S+\/\.cache\/wolfpack\/\S+ 2>&1$/)
     assert.ok(lines[0].includes(`--repo ${H.repo} `))
+  })
+
+  test('--print-crontab quotes a path with a space so cron does not split it', async () => {
+    await fresh()
+    const spaced = join(H.root, 'my repo')
+    mkdirSync(spaced, { recursive: true })
+    const r = await new Promise((resolve) => {
+      const p = spawn('bash', [SH, '--repo', spaced, '--print-crontab'], { env: H.env() })
+      let out = '', err = ''
+      p.stdout.on('data', d => { out += d }); p.stderr.on('data', d => { err += d })
+      p.on('close', code => resolve({ code, out, err }))
+    })
+    assert.equal(r.code, 0, r.err)
+    assert.ok(r.out.includes(`--repo ${spaced.replace(/ /g, '\\ ')} tick`), r.out)
     assert.equal(H.calls('crontab').length, 0)
     assert.equal(existsSync(H.statePath()), false)
     assert.equal(existsSync(join(H.home, '.cache')), false)
@@ -906,6 +944,23 @@ describe('notifications', () => {
     assert.doesNotMatch(srv.posts[0].body, /Smithers/)
     assert.match(H.logText(), /WARNING notify: dropped status \(not a token\)/)
     assert.doesNotMatch(H.logText(), /Smithers/)
+  })
+
+  test('a failed park page is not deduped: the next event park for that hunt retries it', async () => {
+    await fresh()
+    await arm()
+    srv.setStatus(500)
+    const park = () => H.run(['event', 'park', '--campaign', 'c1', '--hunt', 'h1', '--status', 'needs_spec'])
+    let r = await park()
+    assert.equal(r.code, 0)
+    assert.match(r.out, /park notification FAILED: http_500/)
+    assert.equal(H.state().notified_parks.h1, undefined)
+    srv.setStatus(200)
+    r = await park()
+    assert.match(r.out, /ok: park notified/)
+    assert.equal(H.state().notified_parks.h1, 'needs_spec')
+    r = await park()
+    assert.match(r.out, /already notified/)
   })
 
   test('AC13: failed sends (500, no topic file, 644 topic file, bad server) exit 0 and surface in status', async () => {
