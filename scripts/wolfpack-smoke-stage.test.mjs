@@ -1480,6 +1480,7 @@ test('resume between record-fix and iterate: a re-run triage does not re-open th
   // crash here; the relaunch re-runs triage on the same iteration
   const again = r.ok(['triage', '--wave', '1'])
   assert.deepEqual(again.pending.fix, {}, 'no second fix round')
+  assert.equal(again.skipped_landed, 1, 'the runner finishes the wave resolved, not green')
   assert.ok(!again.classified.some(x => x.id === id))
 })
 
@@ -1511,6 +1512,7 @@ test('a manifest failure with several merged hunts is ONE unattributed finding â
   const t = r.ok(['triage', '--wave', '1'])
   assert.deepEqual([t.pending.fix, t.pending.block], [{}, {}])
   assert.deepEqual(t.campaign_blocks, [f[0].id])
+  assert.match(t.campaign_block_text[0], /could be any of a, b/)
 })
 
 test('plan-smoke: a campaign-merged hunt without a readable acceptance.md fails loud', () => {
@@ -1527,6 +1529,9 @@ test('redact: JSON and colon forms of session values are removed', () => {
   const s = redact('{"sessionid": "abc123", "csrftoken":"zz9", \'token\': \'t0k\'} Session: s3cr3t')
   for (const leak of ['abc123', 'zz9', 't0k', 's3cr3t']) assert.ok(!s.includes(leak), `${leak} survived: ${s}`)
   assert.match(s, /"sessionid": "\[REDACTED\]"/)
+  const spaced = redact('{"password": "my secret", "token": "a,b", "note": "kept"}')
+  for (const leak of ['my secret', 'a,b']) assert.ok(!spaced.includes(leak), `${leak} survived: ${spaced}`)
+  assert.ok(spaced.includes('"note": "kept"'))
 })
 
 test('check-config: the stage refuses when .wolfpack/smoke-shots/ is not gitignored', () => {

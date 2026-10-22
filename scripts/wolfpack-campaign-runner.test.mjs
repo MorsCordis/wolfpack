@@ -2019,3 +2019,10 @@ test('stage resume: fix-scaffold reports an already-landed fix → record-fix wi
   assert.match(promptOf(r, 'stage-record-fix:fix-a-smoke-1'), new RegExp(`--commit '${'2'.repeat(40)}' --issues 'ISS-1'`))
   assert.ok(r.labels.indexOf('stage-record-fix:fix-a-smoke-1') < r.labels.indexOf('stage-iterate'))
 })
+
+test('stage resume: a re-run triage that only skipped landed findings finishes the wave resolved, not green', async () => {
+  const r = await runStage([[ch('a')]], { cron: CRON_OK,
+    stage: (l) => (l === 'stage-triage' ? { status: 'ok', pending: { fix: {}, block: {} }, classified: [], campaign_blocks: [], skipped_landed: 1 } : undefined) })
+  noErr(r)
+  assert.match(r.agentCalls.filter(c => c.label === 'stage-finish').pop().prompt, /--result resolved/)
+})

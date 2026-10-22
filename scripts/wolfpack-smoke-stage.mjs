@@ -103,7 +103,7 @@ export class StageError extends Error {
 
 const shq = (v) => `'${String(v).replace(/'/g, `'\\''`)}'`
 // A test label as it may appear unquoted in a shell command: a plain app/module path.
-const TEST_LABEL_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/
+const TEST_LABEL_RE = /^[a-z0-9_]+$/   // = wolfpack-test-record.mjs LABEL_RE (the --labels the runner passes)
 const escapeRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const normTier = (t) => { const s = String(t || '').trim(); return s ? s[0].toUpperCase() + s.slice(1).toLowerCase() : 'Red' }
 const TIER_RANK = { Green: 0, Blue: 1, Yellow: 2, Orange: 3, Red: 4 }
@@ -327,7 +327,8 @@ export function redact(text) {
     .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/g, 'Bearer [REDACTED]')
     .replace(/\b(sessionid|csrftoken|csrfmiddlewaretoken|session|token|access_token|refresh_token|id_token|code|key|api_key|password|secret|sig|signature)=([^;&\s"'<>]+)/gi, '$1=[REDACTED]')
     // JSON / header-dump forms: "sessionid": "abc", 'token': 'x', Session: abc
-    .replace(/(["']?)\b(sessionid|csrftoken|csrfmiddlewaretoken|session|token|access_token|refresh_token|id_token|api_key|password|secret|signature)\1(\s*:\s*)(["']?)[^"',;}\s<>]+\4/gi, '$1$2$1$3$4[REDACTED]$4')
+    .replace(/(["'])\b(sessionid|csrftoken|csrfmiddlewaretoken|session|token|access_token|refresh_token|id_token|api_key|password|secret|signature)\1(\s*:\s*)(["'])(?:\\.|(?!\4).)*\4/gi, '$1$2$1$3$4[REDACTED]$4')
+    .replace(/(["']?)\b(sessionid|csrftoken|csrfmiddlewaretoken|session|token|access_token|refresh_token|id_token|api_key|password|secret|signature)\1(\s*:\s*)(?!["']?\[REDACTED\])(["']?)[^"',;}\s<>]+\4/gi, '$1$2$1$3$4[REDACTED]$4')
 }
 
 // ─── AC23: review fingerprint lookup ─────────────────────────────────────────
@@ -680,7 +681,7 @@ export function checkConfig(cfg) {
 }
 function cmdCheckConfig(c) {
   const r = checkConfig(c.cfg)
-  if (c.cfg.problems && c.cfg.problems.length) r.problems.push(...c.cfg.problems.filter(p => /Smoke tenants|Post-merge smoke stage|Smoke tenant manifests/.test(p)))
+  if (c.cfg.problems && c.cfg.problems.length) r.problems.push(...c.cfg.problems.filter(p => /Smoke tenants|Post-merge smoke stage|Smoke tenant manifests|Integration test args|Prod URL/.test(p)))
   // AC16: tenant screenshots land in .wolfpack/smoke-shots/ — it must be gitignored first.
   if (r.postMergeStage) {
     const ig = git(['check-ignore', '-q', '.wolfpack/smoke-shots/x.png'], { cwd: c.root, allowFail: true })
@@ -1268,8 +1269,9 @@ function cmdTriage(c) {
   // Resume between record-fix and iterate: a finding whose fix already merged in THIS iteration
   // is not re-triaged (it would start a second fix round on a tip that already has the fix).
   const landed = new Set((cur.fix_merges || []).filter(x => x.iteration === cur.iteration).flatMap(x => x.issues || []))
+  let skippedLanded = 0
   for (const fd of cur.findings) {
-    if (landed.has(fd.id)) continue
+    if (landed.has(fd.id)) { skippedLanded += 1; continue }
     const context = fd.hunt ? triageContext(c, s, cur, fd.hunt, cache) : {}
     const r = classifyFinding(fd, context)
     classified.push({ id: fd.id, hunt: fd.hunt, outcome: r.outcome, rule: r.rule, reasoning: r.reasoning, finding: fd })
@@ -1299,9 +1301,17 @@ function cmdTriage(c) {
   const pending = { fix: {}, block: {} }
   const blockText = {}
   const campaignBlocks = []
+  const campaignBlockText = []
   for (const x of classified) {
     if (x.outcome === 'log') continue
-    if (!x.hunt) { if (x.outcome === 'block') campaignBlocks.push(x.id); continue }
+    if (!x.hunt) {
+      if (x.outcome === 'block') {
+        campaignBlocks.push(x.id)
+        const w = x.finding.blocked_with || []
+        campaignBlockText.push(redact(`${x.id} (${x.finding.ref || x.finding.test_id || x.finding.kind}): ${x.reasoning}${w.length ? ` — could be any of ${w.join(', ')}` : ''}`).slice(0, 400))
+      }
+      continue
+    }
     const bucket = x.outcome === 'block' ? pending.block : pending.fix
     ;(bucket[x.hunt] = bucket[x.hunt] || []).push(x.id)
   }
@@ -1321,7 +1331,7 @@ function cmdTriage(c) {
   saveStore(c.root, c.campaign, store)
   markStep(cur, 'triage')
   saveState(c.root, c.campaign, s)
-  return { status: 'ok', pending, block_text: blockText, campaign_blocks: campaignBlocks, classified: classified.map(({ finding, ...rest }) => rest) }
+  return { status: 'ok', pending, block_text: blockText, campaign_blocks: campaignBlocks, campaign_block_text: campaignBlockText, skipped_landed: skippedLanded, classified: classified.map(({ finding, ...rest }) => rest) }
 }
 
 function cmdReclassify(c, f) {

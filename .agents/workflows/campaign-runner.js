@@ -1318,7 +1318,8 @@ Write the raw results file the command describes to ${ps.raw_path} and return {r
         return null
       }
       if (Array.isArray(tri.campaign_blocks) && tri.campaign_blocks.length) {
-        return stagePark('stage_cli_error', `stage-triage: finding(s) ${tri.campaign_blocks.join(', ')} block with no hunt to revert`, 'triage')
+        const why = (tri.campaign_block_text || []).join(' · ')
+        return stagePark('stage_cli_error', `stage-triage: finding(s) ${tri.campaign_blocks.join(', ')} block with no hunt to revert${why ? ` — ${why}` : ''}`, 'triage')
       }
       // S8 act: blocks first (newest merge first), then fix rounds (AC21–AC26).
       const pend = tri.pending || { fix: {}, block: {} }
@@ -1374,7 +1375,7 @@ Write the raw results file the command describes to ${ps.raw_path} and return {r
       // `green` = nothing ever failed in this wave's stage run; `resolved` = something failed and was
       // fixed, logged or blocked-and-reverted. A fix round / revert bumps the persisted iteration
       // past 1 (resume-safe), and the re-verify triage is then empty — so look at both.
-      const result = ((tri.classified || []).length || iteration > 1) ? 'resolved' : 'green'
+      const result = ((tri.classified || []).length || iteration > 1 || tri.skipped_landed) ? 'resolved' : 'green'
       const fin = await S('finish', `--result ${result}`, 'stage-finish')
       if (fin.status !== 'ok') return stageErr(fin, 'stage-finish', 'done')
       stageInfo.result = result
