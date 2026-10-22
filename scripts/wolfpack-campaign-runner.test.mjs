@@ -406,7 +406,8 @@ const CERT = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', statu
 
 // Generic runner: any runner source, a parse result, and per-label stubs.
 async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => PROCEED, workflowResult = CERT,
-  init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] }, projectConfig = (p) => configAnswer(undefined, undefined, p), stamp = () => stampAnswer() } = {}) {
+  init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] }, projectConfig = (p) => configAnswer(undefined, undefined, p), stamp = () => stampAnswer(),
+  cron, budget = { total: 0, remaining: () => 1e12 } } = {}) {
   const events = []
   const logs = []
   const workflowCalls = []
@@ -425,6 +426,7 @@ async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => P
     }
     if (label.startsWith('dep-check:')) return depCheck
     if (label === 'crosswave-dep-check') return crosswave
+    if (cron && label.startsWith('cron-')) return cron(label, prompt)   // campaign-cron-resume (AC11)
     counts[label] = (counts[label] || 0) + 1
     if (label === 'chain-init') return init ? init(prompt) : { status: 'created', branch: 'campaign/c1', sha: 'a1b2c3d4e5f6a7b8', exitCode: 0 }
     if (label.startsWith('chain-sync-main:')) return sync ? sync(label, counts[label]) : { status: 'up_to_date', sha: 's', files: [], warning: null, exitCode: 0 }
@@ -446,7 +448,7 @@ async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => P
   let result, error
   try {
     result = await fn(args, agent, async (f) => Promise.all(f.map(x => x())), (m) => logs.push(String(m)), () => {},
-      { total: 0, remaining: () => 1e12 }, { env: {} }, workflow)
+      budget, { env: {} }, workflow)
   } catch (e) { error = e }
   events.push({ type: 'return' })
   const idx = (pred) => events.findIndex(pred)
@@ -1338,4 +1340,161 @@ test('AC7 runner config probe: env leg injects PACK=\'<env>\'; a mismatching pro
     assert.equal(grab(HP, start), grab(RN, start), start)
   }
   for (const line of ['let probedPackHome = \'\'']) { assert.ok(HP.includes(line) && RN.includes(line), line) }
+})
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// campaign-cron-resume AC11 — the chain runner's cron events (disarm + phone pages).
+// Each event is ONE sonnet agent step running `bash '<pack>/scripts/wolfpack-cron-resume.sh' …`;
+// the stub answers cron-* labels so a scenario can see (and break) them.
+// ════════════════════════════════════════════════════════════════════════════
+const CRON_OK = () => ({ exitCode: 0, output: 'ok' })
+const cronCalls = (r) => r.agentCalls.filter(c => c.label.startsWith('cron-'))
+const cronCmd = (c) => {
+  const m = /bash '\/pack\/scripts\/wolfpack-cron-resume\.sh' (.*)\n/.exec(c.prompt)
+  assert.ok(m, `the cron step runs the pack CLI: ${c.prompt}`)
+  return m[1]
+}
+
+test('AC11 (a): all hunts certify + merge → CAMPAIGN_READY_FOR_RELEASE → one cron-finish: event ready-for-release', async () => {
+  const r = await runChainRunner([[ch('a'), ch('b')], [ch('c')]], { cron: CRON_OK })
+  noErr(r)
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  const cc = cronCalls(r)
+  assert.deepEqual(cc.map(c => c.label), ['cron-finish'])
+  assert.equal(cronCmd(cc[0]), "event ready-for-release --campaign 'c1'")
+  assert.equal(cc[0].opts.model, 'sonnet')
+  assert.deepEqual(cc[0].opts.schema.required, ['exitCode', 'output'])
+  assert.match(cc[0].prompt, /Modify nothing else/)
+  // after every merge (the finish is the LAST agent step)
+  assert.equal(r.labels[r.labels.length - 1], 'cron-finish')
+})
+
+test('AC11 (b): a parked hunt with the rest waiting → cron-park:<slug> (event park …), then event waiting-on-you', async () => {
+  const waves = [[ch('b')], [ch('e', { dependsOn: ['b'] })]]
+  const r = await runChainRunner(waves, { cron: CRON_OK,
+    workflowResult: (a) => (a.slug === 'b' ? { slug: 'b', verdict: 'PARKED', status: 'parked:open_critical', reason: 'open_critical' } : CERT(a)) })
+  noErr(r)
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+  const cc = cronCalls(r)
+  assert.deepEqual(cc.map(c => c.label), ['cron-park:b', 'cron-finish'])
+  assert.equal(cronCmd(cc[0]), "event park --campaign 'c1' --hunt 'b' --status 'parked:open_critical' --reason 'open_critical'")
+  assert.equal(cronCmd(cc[1]), "event waiting-on-you --campaign 'c1' --status 'campaign_awaiting_human'")
+  // the park page follows that hunt's own result, before the next hunt's work
+  assert.ok(r.idx(e => e.type === 'workflow-end' && e.slug === 'b') < r.idx(e => e.label === 'cron-park:b'))
+})
+
+test('AC11 (c): one park among certifying hunts → exactly one cron-park call; needs_spec pages with reason needs_spec', async () => {
+  const r = await runChainRunner([[ch('a'), ch('p'), ch('c')]], { cron: CRON_OK,
+    workflowResult: (a) => (a.slug === 'p' ? { slug: 'p', verdict: 'NEEDS_SPEC', status: 'needs_spec' } : CERT(a)) })
+  noErr(r)
+  const parks = cronCalls(r).filter(c => c.label.startsWith('cron-park:'))
+  assert.deepEqual(parks.map(c => c.label), ['cron-park:p'])
+  assert.equal(cronCmd(parks[0]), "event park --campaign 'c1' --hunt 'p' --status 'needs_spec' --reason 'needs_spec'")
+})
+
+test('AC11 (c2): a parked DEPENDENT (the dependent path) pages too', async () => {
+  const r = await runChainRunner([[ch('a'), ch('d', { dependsOn: ['a'] })]], { cron: CRON_OK,
+    workflowResult: (a) => (a.slug === 'd' ? { slug: 'd', verdict: 'PARKED', status: 'parked:non_convergence', reason: 'non_convergence' } : CERT(a)) })
+  noErr(r)
+  const parks = cronCalls(r).filter(c => c.label.startsWith('cron-park:'))
+  assert.deepEqual(parks.map(c => c.label), ['cron-park:d'])
+})
+
+test('AC11 (d): parked:model_quota never pages (it auto-resumes)', async () => {
+  const r = await runChainRunner([[ch('a'), ch('q')]], { cron: CRON_OK,
+    workflowResult: (a) => (a.slug === 'q' ? { slug: 'q', verdict: 'PARKED', status: 'parked:model_quota', reason: 'model_quota' } : CERT(a)) })
+  noErr(r)
+  assert.equal(cronCalls(r).filter(c => c.label.startsWith('cron-park:')).length, 0)
+  assert.equal(r.result.verdict, 'WAVE_PAUSED_QUOTA')
+})
+
+test('AC11 (e): WAVE_PAUSED_QUOTA with resetAt → note-pause --reset-at; WAVE_PAUSED_BUDGET → event waiting-on-you', async () => {
+  const q = await runChainRunner([[ch('a'), ch('b')]], { cron: CRON_OK, gate: (slug) => (slug === 'b' ? DEFER5H : PROCEED) })
+  noErr(q)
+  assert.equal(q.result.verdict, 'WAVE_PAUSED_QUOTA')
+  const qf = cronCalls(q).filter(c => c.label === 'cron-finish')
+  assert.equal(qf.length, 1)
+  assert.equal(cronCmd(qf[0]), `note-pause --campaign 'c1' --reset-at '${DEFER5H.reset_at}'`)
+
+  let left = 1e6   // the run's budget is spent by hunt a (the per-run runaway breaker)
+  const b = await runChainRunner([[ch('a'), ch('b')]], { cron: CRON_OK, args: { maxParallel: 1 },
+    budget: { total: 1e6, remaining: () => left }, workflowResult: (a) => { left = 1000; return CERT(a) } })
+  noErr(b)
+  assert.equal(b.result.verdict, 'WAVE_PAUSED_BUDGET')
+  const bf = cronCalls(b).filter(c => c.label === 'cron-finish')
+  assert.equal(bf.length, 1)
+  assert.equal(cronCmd(bf[0]), "event waiting-on-you --campaign 'c1' --status wave_paused_budget")
+})
+
+test('AC11: CAMPAIGN_PARKED_MAIN_CONFLICT → waiting-on-you; a parked:model_quota pause without resetAt → note-exit', async () => {
+  const waves = [[ch('a', { status: 'merged_to_campaign' })]]
+  const c = await runChainRunner(waves, { cron: CRON_OK, sync: () => ({ status: 'conflict', files: ['README.md'], exitCode: 0 }) })
+  noErr(c)
+  assert.equal(c.result.verdict, 'CAMPAIGN_PARKED_MAIN_CONFLICT')
+  assert.equal(cronCmd(cronCalls(c).find(x => x.label === 'cron-finish')), "event waiting-on-you --campaign 'c1' --status 'campaign_parked_main_conflict'")
+  const q = await runChainRunner([[ch('q')]], { cron: CRON_OK,
+    workflowResult: (a) => ({ slug: a.slug, verdict: 'PARKED', status: 'parked:model_quota', reason: 'model_quota' }) })
+  noErr(q)
+  assert.equal(q.result.verdict, 'WAVE_PAUSED_QUOTA')
+  const fin = cronCmd(cronCalls(q).find(x => x.label === 'cron-finish'))
+  if (q.result.resetAt) assert.match(fin, /^note-pause --campaign 'c1' --reset-at /)
+  else assert.equal(fin, "note-exit --campaign 'c1' --verdict 'WAVE_PAUSED_QUOTA'")
+})
+
+test('AC11 (f): runChain throws → note-exit --verdict error (cron-exit:error), then the error propagates', async () => {
+  const r = await runChainRunner([[ch('a'), ch('b')]], { cron: CRON_OK, gate: (slug) => (slug === 'b' ? null : PROCEED) })
+  assert.ok(r.error, 'the runner still throws')
+  const cc = cronCalls(r)
+  assert.deepEqual(cc.map(c => c.label), ['cron-exit:error'])
+  assert.equal(cronCmd(cc[0]), "note-exit --campaign 'c1' --verdict error")
+})
+
+test('AC11 (g): a cron step that fails (exit 1 / throws / null) never changes the runner result — ⚠ log only', async () => {
+  const waves = [[ch('b')], [ch('e', { dependsOn: ['b'] })]]
+  const wr = (a) => (a.slug === 'b' ? { slug: 'b', verdict: 'PARKED', status: 'parked:open_critical', reason: 'open_critical' } : CERT(a))
+  const ok = await runChainRunner(waves, { cron: CRON_OK, workflowResult: wr })
+  noErr(ok)
+  for (const [name, cron] of [
+    ['exit 1', () => ({ exitCode: 1, output: 'ERROR: boom' })],
+    ['throws', () => { throw new Error('agent crashed') }],
+    ['null', () => null],
+  ]) {
+    const r = await runChainRunner(waves, { cron, workflowResult: wr })
+    noErr(r)
+    assert.deepEqual(r.result, ok.result, name)
+    assert.deepEqual(r.wf, ok.wf, name)
+    assert.ok(r.logs.some(l => /⚠ cron event cron-park:b/.test(l)), `${name}: ${r.logs.join('\n')}`)
+    assert.ok(r.logs.some(l => /⚠ cron event cron-finish/.test(l)), name)
+  }
+})
+
+test('AC11 (h): unattended: true is echoed in the chain result and logged once; absent → false', async () => {
+  const u = await runChainRunner([[ch('a')]], { cron: CRON_OK, args: { unattended: true } })
+  noErr(u)
+  assert.equal(u.result.unattended, true)
+  assert.equal(u.logs.filter(l => /UNATTENDED run/.test(l)).length, 1)
+  const a = await runChainRunner([[ch('a')]], { cron: CRON_OK })
+  noErr(a)
+  assert.equal(a.result.unattended, false)
+  assert.equal(a.logs.some(l => /UNATTENDED run/.test(l)), false)
+  const s = await runChainRunner([[ch('a')]], { cron: CRON_OK, args: { unattended: 'yes' } })
+  assert.equal(s.result.unattended, false, 'only a literal true')
+})
+
+test('AC11 (i): barrier mode makes no cron call at all', async () => {
+  const waves = [[hunt('a'), hunt('b')]]
+  const r = await runAny(RUNNER, { parse: parseOf(waves), args: { campaignSlug: 'c1', maxParallel: 1 },
+    capability: { ...CHAIN_CAP, chainProtocol: 0, chainScriptPresent: false }, cron: CRON_OK,
+    workflowResult: (a) => (a.slug === 'b' ? { slug: 'b', verdict: 'PARKED', status: 'parked:open_critical', reason: 'open_critical' } : { slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY' }) })
+  noErr(r)
+  assert.equal(cronCalls(r).length, 0)
+})
+
+test('AC11: the campaign and hunt slugs reach the cron CLI shell-quoted', async () => {
+  const r = await runChainRunner([[ch('h-1')]], { cron: CRON_OK,
+    workflowResult: (a) => ({ slug: a.slug, verdict: 'PARKED', status: 'parked:open_critical', reason: 'open_critical' }) })
+  noErr(r)
+  const park = cronCalls(r).find(c => c.label === 'cron-park:h-1')
+  assert.equal(cronCmd(park), "event park --campaign 'c1' --hunt 'h-1' --status 'parked:open_critical' --reason 'open_critical'")
 })
