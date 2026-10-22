@@ -272,3 +272,66 @@ test('AC10: the attended Step 1 confirmation text is unchanged', () => {
   has(t, 'runner will actually touch, render the one-glance plan, and **confirm before launching**. Do not', 'Step 1')
   has(t, '## Step 2 — Launch IN-SESSION via the Workflow tool (only after the user confirms)', 'Step 2 heading')
 })
+
+// ── wave-auto-smoke AC17 / AC32: /smoke-chain and the post-merge stage docs ─────────────
+const SMOKE_CHAIN_TOOLS = ['Bash', 'Read', 'Write', ...['list_pages', 'new_page', 'select_page', 'navigate_page', 'take_snapshot', 'click',
+  'fill', 'fill_form', 'press_key', 'wait_for', 'evaluate_script', 'list_network_requests', 'get_network_request',
+  'list_console_messages', 'take_screenshot', 'close_page'].map((t) => `mcp__chrome-devtools__${t}`)]
+const SECRETS_DIR = ['~', '.secrets'].join('/')   // assembled: the literal is a guarded path in consumer hooks
+
+test('AC17: smoke-chain allowed-tools is exactly Bash/Read/Write + the Spark chrome-devtools set (no laptop plugin names)', () => {
+  assert.ok(FILES.includes('smoke-chain.md'))
+  const t = ALL['smoke-chain.md']
+  assert.deepEqual([...frontTools(t)].sort(), [...SMOKE_CHAIN_TOOLS].sort())
+  lacks(t.split('---')[1], 'plugin_chrome-devtools', 'smoke-chain frontmatter')
+  assert.match(t, /^name: smoke-chain$/m)
+})
+
+test('AC17: smoke-chain routes sign-in only through the Smoke login hook and carries the safety rules', () => {
+  const t = ALL['smoke-chain.md']
+  for (const s of ['Smoke login hook', 'never type a password', SECRETS_DIR, 'file://', 'isolatedContext', 'console not reachable on dev']) {
+    has(t, s, 'smoke-chain')
+  }
+  // no project sign-in script, venv or account names (they come from the project's config)
+  for (const s of ['smoke_login.py', 'paw_env', 'smoke-admin', 'smoke-tech']) lacks(t, s, 'smoke-chain')
+})
+
+const STAGE_DOC = join(ROOT, 'docs', 'post-merge-stage.md')
+const RUNNER_SRC = join(ROOT, '.agents', 'workflows', 'campaign-runner.js')
+test('AC32: docs/post-merge-stage.md lists every park code the runner passes to stagePark', (t) => {
+  if (!existsSync(STAGE_DOC) || !existsSync(RUNNER_SRC)) return t.skip('not the pack checkout')
+  const doc = readFileSync(STAGE_DOC, 'utf8')
+  const codes = [...new Set([...readFileSync(RUNNER_SRC, 'utf8').matchAll(/stagePark\('([a-z_]+)'/g)].map((m) => m[1]))]
+  assert.ok(codes.length >= 10, `found ${codes.length} park codes`)
+  for (const c of codes) assert.match(doc, new RegExp(`\\|\\s*\`${c}\`\\s*\\|`), `park code ${c} missing from the doc's table`)
+})
+
+test('AC32: the triage / fix-cap / issue-log / polish / report terms agree across smoke-chain, the stage doc and run-campaign-local', (t) => {
+  if (!existsSync(STAGE_DOC)) return t.skip('not the pack checkout')
+  const doc = readFileSync(STAGE_DOC, 'utf8')
+  const sc = ALL['smoke-chain.md']
+  const rcl = ALL['run-campaign-local.md']
+  for (const [label, text] of [['stage doc', doc], ['smoke-chain', sc], ['run-campaign-local', rcl]]) {
+    for (const term of ['issue-log', 'polish', 'docs/post-merge-stage.md']) {
+      if (label === 'stage doc' && term === 'docs/post-merge-stage.md') continue
+      has(text, term, label)
+    }
+  }
+  has(sc, 'max 2', 'smoke-chain fix-round cap')
+  has(rcl, 'Post-merge stage', 'run-campaign-local section')
+  // the doc's triage table has all 13 rules, in order
+  const rules = ['deploy_or_migration', '5xx_or_cross_tenant', 'prod_host_touched', 'mobile_regression', 'money_medical_path',
+    'red_compliance', 'fix_cap', 'needs_decision', 'uncertain_log_vs_block', 'session_drop', 'clear_defect', 'polish', 'default_block']
+  let at = -1
+  for (const r of rules) {
+    const i = doc.indexOf(`\`${r}\``, at + 1)
+    assert.ok(i > at, `triage rule ${r} missing or out of order in the stage doc`)
+    at = i
+  }
+})
+
+test('AC32: smoke-wave and release-campaign point at the post-merge stage', () => {
+  has(ALL['smoke-wave.md'], '/smoke-chain', 'smoke-wave')
+  assert.match(ALL['release-campaign.md'], /campaign report|report URL|Report:/i)
+  assert.match(ALL['release-campaign.md'], /needs Cecil/)
+})

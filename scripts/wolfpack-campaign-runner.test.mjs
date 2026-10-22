@@ -407,7 +407,7 @@ const CERT = (a) => ({ slug: a.slug, verdict: 'CERTIFIED_AWAITING_DEPLOY', statu
 // Generic runner: any runner source, a parse result, and per-label stubs.
 async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => PROCEED, workflowResult = CERT,
   init, sync, overlap, merge, depCheck = { allMerged: true }, crosswave = { merged: [] }, projectConfig = (p) => configAnswer(undefined, undefined, p), stamp = () => stampAnswer(),
-  cron, budget = { total: 0, remaining: () => 1e12 } } = {}) {
+  cron, budget = { total: 0, remaining: () => 1e12 }, extra } = {}) {
   const events = []
   const logs = []
   const workflowCalls = []
@@ -417,6 +417,7 @@ async function runAny(src, { parse, args, capability = CHAIN_CAP, gate = () => P
     const label = opts.label || ''
     agentCalls.push({ label, prompt, opts })
     events.push({ type: 'agent', label })
+    if (extra) { const v = await extra(label, prompt, opts); if (v !== undefined) return v }   // wave-auto-smoke stage stubs
     if (label === 'project-config') return projectConfig(prompt)
     if (label === 'workflow-stamp') return stamp()
     if (label === 'parse-campaign') return JSON.parse(JSON.stringify(parse))
@@ -1514,4 +1515,446 @@ test('AC11: the campaign and hunt slugs reach the cron CLI shell-quoted', async 
   noErr(r)
   const park = cronCalls(r).find(c => c.label === 'cron-park:h-1')
   assert.equal(cronCmd(park), "event park --campaign 'c1' --hunt 'h-1' --status 'parked:open_critical' --reason 'open_critical'")
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// POST-MERGE STAGE (wave-auto-smoke) — postMergeStage() driven through the whole runner.
+// Every stage step is a relay of ONE wolfpack-smoke-stage.mjs / wolfpack-release.mjs /
+// wolfpack-test-record.mjs CLI call; here a stateful fake answers each relay label with the
+// CLI's JSON (as {exitCode, output}), so a scenario controls one step and asserts the sequence.
+// ════════════════════════════════════════════════════════════════════════════
+const STAGE_CONFIG = { ...FIXTURE_CONFIG, postMergeStage: true, integrationTestArgs: '--isolated-db {campaign}' }
+const TIP = 'c'.repeat(40)
+const REPORT = 'http://100.64.0.7:8766/c1/'
+const relayOut = (obj, exitCode) => ({ exitCode: exitCode ?? (obj && obj.status === 'error' ? 2 : 0), output: JSON.stringify(obj) })
+const waveOf = (prompt) => Number((/--wave (\d+)/.exec(prompt) || [])[1] || 0)
+const mergedOf = (prompt) => ((/--merged '([^']*)'/.exec(prompt) || [])[1] || '').split(',').filter(Boolean)
+// The default (green) CLI answers, by relay label.
+function stageDefaults(label, prompt) {
+  if (label === 'stage-check-config') return { status: 'ok', post_merge_stage: true, tenants: { surgical: 's.example.dev', mobile: 'm.example.dev' } }
+  if (label === 'stage-begin') {
+    if (prompt.includes('--resume-only')) return { status: 'ok', action: 'resume-only', created: true, staged_from_wave: 1, not_staged_below: null, rearmed: null, unstaged: [], current: null, pruned: [] }
+    const polish = (/--polish '([^']*)'/.exec(prompt) || [])[1]
+    return { status: 'ok', action: 'new', wave: waveOf(prompt), step: 'begin', campaign_sha: TIP, iteration: polish ? 2 : 1, merged: mergedOf(prompt), polish: polish || null,
+      polish_merge: polish ? 'f'.repeat(40) : null, polish_issues: polish ? ['ISS-p'] : [], pruned: [] }
+  }
+  if (label.startsWith('stage-session')) return { status: 'ok', sessions: {}, problems: [], session_drops: [] }
+  if (label === 'stage-deploy' || label === 'stage-migrate') return { status: 'ok', exit: 0, sha: TIP, log: '/l' }
+  if (label === 'stage-ensure-tenants') return { status: 'ok', exit: 0, notices: [] }
+  if (label === 'stage-suites') return { status: 'ok', labels: ['billing'], full: false, reason: 'touched apps: billing', record_labels: 'billing', empty: false, command: "t --isolated-db 'c1' billing" }
+  if (label === 'stage-integration') return { schema: 1, stage: 'integration', commit: TIP, pass: true }
+  if (label === 'stage-ingest-integration') return { status: 'ok', action: 'pass', findings: 0, warnings: [] }
+  if (label === 'stage-plan-smoke') return { status: 'ok', plan: '/r/stage/wave-1/smoke-plan.json', raw_path: '/r/stage/wave-1/smoke-raw-cccccccccccc.json', raw_exists: false, pairs: 3 }
+  if (label.startsWith('stage-worktree')) return { status: 'ok' }
+  if (label === 'stage-ingest-smoke') return { status: 'ok', verdicts: { a: 'PASS' }, findings: 0, results: '/w/results.json' }
+  if (label === 'stage-triage') return { status: 'ok', pending: { fix: {}, block: {} }, classified: [], campaign_blocks: [], block_text: {} }
+  if (label === 'stage-report') return { status: 'ok', report_url: REPORT, dir: '/reports/c1' }
+  if (label === 'stage-polish-plan') return { status: 'ok', items: [], open_set: null, reason: 'no open log items' }
+  if (label === 'stage-iterate') return { status: 'ok', iteration: 2, campaign_sha: 'd'.repeat(40) }
+  if (label.startsWith('stage-')) return { status: 'ok' }   // finish, park, resolve, record-fix, smoke-failed, reclassify, fix-scaffold…
+  return undefined
+}
+// A scenario's `stage(label, prompt, n)` returns a CLI object (or undefined → default); n counts that label.
+async function runStage(waves, { stage, probe, smoke, planner, cfg = STAGE_CONFIG, ...rest } = {}) {
+  const n = {}
+  const extra = (label, prompt) => {
+    if (label === 'project-config') return configAnswer(cfg, undefined, prompt)
+    if (label === 'stage-browser-probe') return probe ? probe() : { available: true, tools_seen: ['mcp__chrome-devtools__list_pages'], error: null }
+    if (label.startsWith('stage-smoke:')) return smoke ? smoke(label) : { raw_path: '/r/stage/wave-1/smoke-raw-cccccccccccc.json' }
+    if (/^stage-(fix|polish)-plan:/.test(label)) return planner ? planner(label) : { status: 'ok', plan: '/p/plan-final.md', acceptance: '/p/acceptance.md' }
+    if (!label.startsWith('stage-')) return undefined
+    n[label] = (n[label] || 0) + 1
+    const own = stage ? stage(label, prompt, n[label]) : undefined
+    const obj = own !== undefined ? own : stageDefaults(label, prompt)
+    if (obj && obj.__raw) return obj.__raw   // a scenario that hands back the relay's raw answer
+    return relayOut(obj)
+  }
+  return runChainRunner(waves, { extra, ...rest })
+}
+const stageLabels = (r) => r.labels.filter(l => l.startsWith('stage-'))
+const promptOf = (r, label) => (r.agentCalls.find(c => c.label === label) || {}).prompt || ''
+
+test('stage AC1: a chain wave runs the stage in order after its merges; green → finish, report; Report line logged', async () => {
+  const r = await runStage([[ch('a')]], { cron: CRON_OK })
+  noErr(r)
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  const want = ['stage-check-config', 'stage-begin', 'stage-begin', 'stage-session:before', 'stage-deploy', 'stage-migrate', 'stage-ensure-tenants',
+    'stage-session', 'stage-suites', 'stage-integration', 'stage-ingest-integration', 'stage-plan-smoke', 'stage-worktree-add', 'stage-browser-probe',
+    'stage-smoke:w1', 'stage-ingest-smoke', 'stage-worktree-remove', 'stage-triage', 'stage-finish', 'stage-report']
+  const got = stageLabels(r)
+  assert.deepEqual(got.slice(0, want.length), want, got.join('\n'))
+  // every stage step comes after the wave's merge
+  assert.ok(r.idx(e => e.label === 'chain-merge:a') < r.idx(e => e.label === 'stage-session:before'))
+  assert.match(promptOf(r, 'stage-deploy'), /wolfpack-smoke-stage\.mjs' deploy --campaign 'c1'/)
+  assert.ok(r.agentCalls.filter(c => c.label === 'stage-begin')[1].prompt.includes("--wave 1 --merged 'a'"))
+  const rec = promptOf(r, 'stage-integration')
+  assert.match(rec, /wolfpack-test-record\.mjs' run --json --stage integration .* --labels 'billing' --campaign 'c1' --timeout-min 55/)
+  assert.equal(r.agentCalls.find(c => c.label === 'stage-smoke:w1').opts.model, 'opus')
+  assert.equal(r.agentCalls.find(c => c.label === 'stage-deploy').opts.model, 'sonnet')
+  assert.match(r.agentCalls.find(c => c.label === 'stage-smoke:w1').prompt, /smoke-chain\.md EXACTLY/)
+  assert.deepEqual(r.result.stage.reportUrl, REPORT)
+  assert.ok(r.logs.some(l => l === `Report: ${REPORT}`), r.logs.join('\n'))
+  const fin = cronCalls(r).find(c => c.label === 'cron-finish')
+  assert.equal(cronCmd(fin), `event ready-for-release --campaign 'c1' --report-url '${REPORT}'`, 'AC30/AC35: the page carries report_url')
+})
+
+test('stage A-3: off → one log line and the chain labels are exactly as before (no stage-* agent)', async () => {
+  const off = await runStage([[ch('a'), ch('b')]], { cfg: FIXTURE_CONFIG })
+  noErr(off)
+  assert.deepEqual(stageLabels(off), [])
+  assert.ok(off.logs.some(l => /^post-merge stage: off/.test(l)))
+  assert.equal(off.result.stage, undefined)
+  const plain = await runChainRunner([[ch('a'), ch('b')]])
+  assert.deepEqual(off.labels, plain.labels)
+})
+
+test('stage: barrier mode never runs the stage, even with the stage on', async () => {
+  const r = await runAny(RUNNER, { parse: parseOf([[hunt('a')]]), args: { campaignSlug: 'c1', maxParallel: 1 },
+    capability: { ...CHAIN_CAP, chainProtocol: 0, chainScriptPresent: false }, projectConfig: (p) => configAnswer(STAGE_CONFIG, undefined, p) })
+  noErr(r)
+  assert.deepEqual(r.labels.filter(l => l.startsWith('stage-')), [])
+})
+
+test('stage AC13: a check-config problem → CAMPAIGN_PARKED_STAGE smoke_config_missing before any wave or stage step', async () => {
+  const r = await runStage([[ch('a')]], { cron: CRON_OK,
+    stage: (l) => (l === 'stage-check-config' ? { status: 'error', code: 'smoke_config_missing', reason: 'post-merge stage config: Deployment Notes → Smoke tenants (mobile): missing', problems: ['Deployment Notes → Smoke tenants (mobile): missing'] } : undefined) })
+  noErr(r)
+  assert.deepEqual([r.result.verdict, r.result.parkReason], ['CAMPAIGN_PARKED_STAGE', 'smoke_config_missing'])
+  assert.deepEqual(r.result.problems, ['Deployment Notes → Smoke tenants (mobile): missing'])
+  assert.deepEqual(stageLabels(r), ['stage-check-config'])
+  assert.equal(r.wf.length, 0, 'no hunt runs')
+  assert.equal(cronCmd(cronCalls(r).find(c => c.label === 'cron-finish')), "event waiting-on-you --campaign 'c1' --status 'parked:smoke_config_missing'")
+})
+
+test('stage: an empty wave skips ("nothing new"), and wave N+1 starts only after wave N\'s stage resolved (AC4)', async () => {
+  const r = await runStage([[ch('a')], [ch('b', { dependsOn: ['a'] })], [ch('c')]],
+    { workflowResult: (a) => (a.slug === 'b' ? { slug: 'b', verdict: 'PARKED', status: 'parked:open_critical' } : CERT(a)) })
+  noErr(r)
+  assert.ok(r.logs.some(l => l === 'post-merge stage: nothing new on campaign/c1'), r.logs.join('\n'))
+  const begins = r.agentCalls.filter(c => c.label === 'stage-begin' && !c.prompt.includes('--resume-only')).map(c => waveOf(c.prompt))
+  assert.deepEqual(begins, [1, 3])
+  // wave 3's hunt is scaffolded only after wave 1's stage finished
+  const fin1 = r.idx(e => e.label === 'stage-finish')
+  assert.ok(fin1 < r.idx(e => e.type === 'workflow-start' && e.slug === 'c'))
+})
+
+test('stage AC2: resume mid-stage — same tip, step smoke → no deploy; re-armed park is logged', async () => {
+  const r = await runStage([[ch('a', { status: 'merged_to_campaign' })]], {
+    stage: (l, p) => {
+      if (l === 'stage-begin' && p.includes('--resume-only')) return { status: 'ok', action: 'resume-only', created: false, staged_from_wave: 1, rearmed: 'smoke_browser_unavailable', unstaged: [], current: { wave: 1, step: 'smoke', result: null, campaign_sha: TIP, iteration: 1 } }
+      if (l === 'stage-begin') return { status: 'ok', action: 'resume', wave: 1, step: 'smoke', campaign_sha: TIP, iteration: 1, merged: ['a'], polish: null, polish_issues: [] }
+      return undefined
+    } })
+  noErr(r)
+  const got = stageLabels(r)
+  assert.ok(!got.includes('stage-deploy') && !got.includes('stage-migrate') && !got.includes('stage-plan-smoke'), got.join(','))
+  assert.ok(got.includes('stage-triage') && got.includes('stage-finish'))
+  assert.ok(r.logs.some(l => /post-merge stage: re-armed parked:smoke_browser_unavailable at smoke/.test(l)), r.logs.join('\n'))
+})
+
+test('stage AC2: "parked at smoke → hand-run raw file present → campaign re-run ingests it" (no probe, no smoke agent)', async () => {
+  const r = await runStage([[ch('a', { status: 'merged_to_campaign' })]], {
+    stage: (l, p) => {
+      if (l === 'stage-begin' && p.includes('--resume-only')) return { status: 'ok', action: 'resume-only', rearmed: 'smoke_browser_unavailable', unstaged: [], current: { wave: 1, step: 'integration', result: null } }
+      if (l === 'stage-begin') return { status: 'ok', action: 'resume', wave: 1, step: 'integration', campaign_sha: TIP, iteration: 1, merged: ['a'] }
+      if (l === 'stage-plan-smoke') return { status: 'ok', plan: '/p.json', raw_path: '/raw.json', raw_exists: true }
+      return undefined
+    } })
+  noErr(r)
+  const got = stageLabels(r)
+  assert.ok(got.includes('stage-ingest-smoke') && got.includes('stage-triage'))
+  assert.equal(got.includes('stage-browser-probe'), false)
+  assert.equal(got.some(l => l.startsWith('stage-smoke:')), false)
+  assert.match(promptOf(r, 'stage-ingest-smoke'), /--raw '\/raw\.json'/)
+})
+
+test('stage AC2: a crash between merge and stage — the relaunch stages the unstaged wave (suites included) before the waves', async () => {
+  const r = await runStage([[ch('a', { status: 'merged_to_campaign' })], [ch('b', { status: 'merged_to_campaign' })]], {
+    stage: (l, p) => {
+      if (l === 'stage-begin' && p.includes('--resume-only')) return { status: 'ok', action: 'resume-only', rearmed: null, unstaged: [{ wave: 2, merged: ['b'] }], current: null }
+      return undefined
+    } })
+  noErr(r)
+  assert.ok(r.logs.some(l => l === 'post-merge stage: wave 2 merged without a stage (crash recovery)'), r.logs.join('\n'))
+  const rr = r.agentCalls.find(c => c.label === 'stage-begin' && c.prompt.includes('--resume-only'))
+  assert.match(rr.prompt, /--merged-by-wave '\{"1":\["a"\],"2":\["b"\]\}'/)
+  const b2 = r.agentCalls.find(c => c.label === 'stage-begin' && !c.prompt.includes('--resume-only'))
+  assert.match(b2.prompt, /--wave 2 --merged 'b'/)
+  assert.ok(stageLabels(r).includes('stage-integration'))
+})
+
+test('stage AC3: a usage defer before the smoke agent → WAVE_PAUSED_QUOTA, no probe / smoke agent', async () => {
+  const r = await runStage([[ch('a')]], { cron: CRON_OK, gate: (slug) => (slug.startsWith('stage:') ? DEFER5H : PROCEED) })
+  noErr(r)
+  assert.equal(r.result.verdict, 'WAVE_PAUSED_QUOTA')
+  assert.equal(r.result.resetAt, DEFER5H.reset_at)
+  const got = stageLabels(r)
+  assert.ok(got.includes('stage-ingest-integration'))
+  assert.equal(got.includes('stage-browser-probe'), false)
+  assert.ok(got.includes('stage-worktree-remove'), 'the smoke worktree is removed even on the pause')
+  assert.ok(r.labels.includes('usage-gate:stage:c1:w1:smoke'))
+  assert.equal(cronCmd(cronCalls(r).find(c => c.label === 'cron-finish')), `note-pause --campaign 'c1' --reset-at '${DEFER5H.reset_at}'`)
+})
+
+test('stage AC7: deploy fails twice → parked dev_deploy_failed, one page, no smoke agent call', async () => {
+  const r = await runStage([[ch('a')]], { cron: CRON_OK,
+    stage: (l, p, k) => (l === 'stage-deploy' ? { status: 'ok', exit: 1, attempts: k, last_line: 'build failed', log: '/d.log' } : undefined) })
+  noErr(r)
+  assert.deepEqual([r.result.verdict, r.result.parkReason], ['CAMPAIGN_PARKED_STAGE', 'dev_deploy_failed'])
+  const got = stageLabels(r)
+  assert.equal(got.filter(l => l === 'stage-deploy').length, 2)
+  assert.ok(got.includes('stage-park:dev_deploy_failed'))
+  assert.match(promptOf(r, 'stage-park:dev_deploy_failed'), /--step 'deploy'/)
+  assert.equal(got.some(l => l.startsWith('stage-smoke:') || l === 'stage-migrate'), false)
+  assert.equal(cronCalls(r).filter(c => c.label === 'cron-finish').length, 1)
+  assert.match(cronCmd(cronCalls(r).find(c => c.label === 'cron-finish')), /--status 'parked:dev_deploy_failed' --report-url/)
+})
+
+test('stage AC7: migrate fails with a migrating hunt → it is blocked and reverted, then the tip is re-verified', async () => {
+  let reverted = false
+  const r = await runStage([[ch('a'), ch('b')]], { cron: CRON_OK,
+    stage: (l, p, k) => {
+      if (l === 'stage-migrate' && k === 1) return { status: 'ok', exit: 3, attempts: 1, migrating_hunts: ['a'], log: '/m.log' }
+      if (l === 'stage-triage' && !reverted) return { status: 'ok', pending: { fix: {}, block: { a: ['ISS-m'] } }, classified: [{ id: 'ISS-m', hunt: 'a', outcome: 'block', rule: 'deploy_or_migration', reasoning: 'migrate failed' }], campaign_blocks: [], block_text: { a: { summary: 'The post-merge stage blocked a', evidence: '/m.log', question: 'What should a do?' } } }
+      if (l === 'stage-revert:a') { reverted = true; return { status: 'reverted', campaign_sha: 'e'.repeat(40), reverted: [{ slug: 'a', revert_commit: 'r1' }] } }
+      return undefined
+    } })
+  noErr(r)
+  const got = stageLabels(r)
+  assert.equal(got.includes('stage-ensure-tenants') && got.indexOf('stage-ensure-tenants') < got.indexOf('stage-revert:a'), false, 'never smoked over a failed migration')
+  assert.ok(got.indexOf('stage-revert:a') < got.lastIndexOf('stage-deploy'), 'the reverted tip is redeployed')
+  const rv = promptOf(r, 'stage-revert:a')
+  assert.match(rv, /wolfpack-release\.mjs' revert --campaign 'c1' --hunt 'a' --reason 'post-merge stage: ISS-m' --summary 'The post-merge stage blocked a' --evidence '\/m\.log' --issues 'ISS-m' --question 'What should a do\?'/)
+  assert.ok(got.includes('stage-resolve:a'))
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN', 'the reverted hunt waits on a human')
+  assert.ok(r.result.blockedHunts.some(b => b.slug === 'a' && b.status === 'parked:reverted_from_campaign'))
+  const park = cronCalls(r).find(c => c.label === 'cron-park:a')
+  assert.equal(cronCmd(park), `event park --campaign 'c1' --hunt 'a' --status 'parked:reverted_from_campaign' --reason 'reverted_from_campaign' --report-url '${REPORT}'`, 'AC25: only the allowlisted fields + report_url')
+})
+
+test('stage AC14/AC13: session REFUSED → smoke_config_missing naming Smoke login hook; unreachable → smoke_browser_unreachable', async () => {
+  const refused = await runStage([[ch('a')]], {
+    stage: (l) => (l === 'stage-session:before' ? { status: 'ok', sessions: {}, problems: [{ tenant: 'mobile', host: 'm.example.dev', kind: 'refused', detail: 'REFUSED bad password file' }] } : undefined) })
+  noErr(refused)
+  assert.deepEqual([refused.result.verdict, refused.result.parkReason], ['CAMPAIGN_PARKED_STAGE', 'smoke_config_missing'])
+  assert.match(refused.result.parkDetail, /Smoke login hook/)
+  assert.equal(stageLabels(refused).includes('stage-deploy'), false)
+  const dead = await runStage([[ch('a')]], {
+    stage: (l) => (l === 'stage-session' ? { status: 'ok', sessions: {}, problems: [{ tenant: 'surgical', host: 's.example.dev', kind: 'unreachable', detail: 'exit 3' }] } : undefined) })
+  noErr(dead)
+  assert.equal(dead.result.parkReason, 'smoke_browser_unreachable')
+  const drop = await runStage([[ch('a')]], { stage: (l) => (l === 'stage-session' ? { status: 'ok', sessions: {}, problems: [], session_drops: ['m.example.dev'] } : undefined) })
+  noErr(drop)
+  assert.ok(drop.logs.some(l => /signed out after the deploy on m\.example\.dev — logged for Cecil/.test(l)))
+  assert.equal(drop.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+})
+
+test('stage A-0: the browser probe fails → parked smoke_browser_unavailable with the /smoke-chain fallback; no smoke agent', async () => {
+  const r = await runStage([[ch('a')]], { probe: () => ({ available: false, tools_seen: [], error: 'mcp__chrome-devtools__list_pages not available' }) })
+  noErr(r)
+  assert.equal(r.result.parkReason, 'smoke_browser_unavailable')
+  assert.match(r.result.parkDetail, /\/smoke-chain c1 1/)
+  assert.equal(stageLabels(r).some(l => l.startsWith('stage-smoke:')), false)
+  assert.ok(stageLabels(r).includes('stage-worktree-remove'))
+})
+
+test('stage S6: "smoke agent fails twice → parked:smoke_agent_failed"; "fails once then succeeds → no park"', async () => {
+  const twice = await runStage([[ch('a')]], {
+    smoke: () => ({ raw_path: '' }),
+    stage: (l, p, k) => (l === 'stage-smoke-failed' ? { status: 'ok', attempts: k, renamed: null } : undefined) })
+  noErr(twice)
+  assert.equal(twice.result.parkReason, 'smoke_agent_failed')
+  assert.equal(twice.labels.filter(l => l === 'stage-smoke:w1').length, 2)
+  assert.equal(stageLabels(twice).includes('stage-triage'), false)
+  // an invalid raw file the first time, a valid one the second
+  const once = await runStage([[ch('a')]], {
+    stage: (l, p, k) => (l === 'stage-ingest-smoke' && k === 1 ? { status: 'error', code: 'smoke_raw_invalid', reason: 'smoke raw results: missing result for a/1@mobile', attempts: 1, renamed: '/x.invalid-1.json' } : undefined) })
+  noErr(once)
+  assert.equal(once.labels.filter(l => l === 'stage-smoke:w1').length, 2)
+  assert.equal(once.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  // invalid twice → park
+  const bad = await runStage([[ch('a')]], {
+    stage: (l, p, k) => (l === 'stage-ingest-smoke' ? { status: 'error', code: 'smoke_raw_invalid', reason: 'bad', attempts: k } : undefined) })
+  noErr(bad)
+  assert.equal(bad.result.parkReason, 'smoke_agent_failed')
+})
+
+test('stage S5: a busy integration record is re-taken; an unattributed failure parks integration_unattributed', async () => {
+  const busy = await runStage([[ch('a')]], {
+    stage: (l, p, k) => (l === 'stage-ingest-integration' && k === 1 ? { status: 'ok', action: 'retake', busy: true, busy_retries: 1, warnings: [] } : undefined) })
+  noErr(busy)
+  assert.equal(busy.labels.filter(l => l === 'stage-integration').length, 2)
+  assert.ok(busy.logs.some(l => /test DB busy — re-taking \(1\)/.test(l)))
+  const un = await runStage([[ch('a')]], {
+    stage: (l) => (l === 'stage-ingest-integration' ? { status: 'ok', action: 'park', code: 'integration_unattributed', reason: 'failing test(s) no wave hunt touched: users.tests.U', warnings: [] } : undefined) })
+  noErr(un)
+  assert.deepEqual([un.result.parkReason, un.result.parkDetail], ['integration_unattributed', 'failing test(s) no wave hunt touched: users.tests.U'])
+  // a relay that cannot run the record twice → integration_infra
+  const infra = await runStage([[ch('a')]], { stage: (l) => (l === 'stage-integration' ? { __raw: { exitCode: 1, output: '{"status":"error","error":"no Test command"}' } } : undefined) })
+  noErr(infra)
+  assert.equal(infra.result.parkReason, 'integration_infra')
+  // an empty suite set skips the record
+  const empty = await runStage([[ch('a')]], { stage: (l) => (l === 'stage-suites' ? { status: 'ok', labels: [], full: false, reason: 'no app touched', empty: true } : undefined) })
+  noErr(empty)
+  assert.equal(empty.labels.includes('stage-integration'), false)
+})
+
+test('stage AC21: "fix round" — scaffold → planner → hunt-pipeline (campaign base, isolation) → merge --fix-of → record-fix → redeploy + re-smoke', async () => {
+  let fixed = false
+  const r = await runStage([[ch('a')]], { cron: CRON_OK,
+    stage: (l, p) => {
+      if (l === 'stage-triage' && !fixed) return { status: 'ok', pending: { fix: { a: ['ISS-1'] }, block: {} }, classified: [{ id: 'ISS-1', hunt: 'a', outcome: 'fix', rule: 'clear_defect', reasoning: 'a/2: clear defect' }], campaign_blocks: [] }
+      if (l === 'stage-fix-scaffold:a') return { status: 'ok', slug: 'fix-a-smoke-1', parent_hunt: 'a', tier: 'Yellow', branch: 'feat/fix-a-smoke-1', worktree: '/r/.wt/fix-a-smoke-1', plan_dir: '/r/.wt/fix-a-smoke-1/.wolfpack/plans/fix-a-smoke-1', base_sha: TIP, issues: ['ISS-1'], description: 'Smoke fix round 1 for a' }
+      if (l === 'stage-record-fix:fix-a-smoke-1') { fixed = true; return { status: 'ok', fix_rounds: 1 } }
+      return undefined
+    },
+    merge: (slug) => (slug === 'fix-a-smoke-1'
+      ? { exitCode: 0, output: JSON.stringify({ status: 'merged', commit: '1'.repeat(40), stamped: 'merged_to_campaign', fix_of: 'a' }) }
+      : { status: 'merged', commit: `merge-${slug}-0000000`, stamped: 'merged_to_campaign', exitCode: 0 }) })
+  noErr(r)
+  const got = r.labels
+  const i = (l) => got.indexOf(l)
+  assert.ok(i('stage-fix-scaffold:a') >= 0, got.join('\n'))
+  assert.ok(i('stage-fix-scaffold:a') < i('stage-fix-plan:fix-a-smoke-1'))
+  const wf = r.workflowCalls.find(w => w.args.slug === 'fix-a-smoke-1')
+  assert.ok(wf, 'hunt-pipeline ran the fix hunt')
+  assert.equal(wf.name, 'hunt-pipeline')
+  assert.deepEqual([wf.args.baseBranch, wf.args.testIsolation, wf.args.campaign, wf.args.mode], ['campaign/c1', 'c1', 'c1', 'update'])
+  assert.ok(wf.args.crossExaminer, 'a cross examiner is assigned')
+  assert.ok(r.idx(e => e.label === 'stage-fix-plan:fix-a-smoke-1') < r.idx(e => e.type === 'workflow-start' && e.slug === 'fix-a-smoke-1'))
+  assert.match(promptOf(r, 'chain-merge:fix-a-smoke-1'), /merge-hunt --campaign 'c1' --hunt 'fix-a-smoke-1' --fix-of 'a'/)
+  assert.match(promptOf(r, 'stage-record-fix:fix-a-smoke-1'), new RegExp(`--hunt 'a' --fix 'fix-a-smoke-1' --commit '${'1'.repeat(40)}' --issues 'ISS-1'`))
+  assert.ok(i('stage-record-fix:fix-a-smoke-1') < i('stage-iterate'))
+  assert.equal(got.filter(l => l === 'stage-deploy').length, 2, 'the fix tip is redeployed')
+  assert.equal(got.filter(l => l === 'stage-smoke:w1').length, 2, 'and re-smoked')
+  assert.ok(r.labels.includes('usage-gate:stage:c1:w1:fix:a'), 'AC3: the fix round is gated')
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+  // A wave that needed a fix round is `resolved`, not `green` (smoke-stage.json result contract:
+  // green = nothing failed; resolved = every failure fixed, logged or blocked-and-reverted).
+  assert.equal(r.result.stage.result, 'resolved')
+  assert.match(r.agentCalls.filter(c => c.label === 'stage-finish').pop().prompt, /--result resolved/)
+})
+
+test('stage AC22: a fix round that does not certify → the hunt blocks (fix_review_failed) and is reverted', async () => {
+  const r = await runStage([[ch('a')]], { cron: CRON_OK,
+    workflowResult: (a) => (a.slug === 'fix-a-smoke-1' ? { slug: a.slug, verdict: 'PARKED', status: 'parked:non_convergence' } : CERT(a)),
+    stage: (l, p, k) => {
+      if (l === 'stage-triage' && k === 1) return { status: 'ok', pending: { fix: { a: ['ISS-1'] }, block: {} }, classified: [{ id: 'ISS-1', hunt: 'a', outcome: 'fix', rule: 'clear_defect', reasoning: 'x' }], campaign_blocks: [] }
+      if (l === 'stage-fix-scaffold:a') return { status: 'ok', slug: 'fix-a-smoke-1', parent_hunt: 'a', tier: 'Yellow', branch: 'feat/fix-a-smoke-1', worktree: '/w', plan_dir: '/w/p', base_sha: TIP, issues: ['ISS-1'], description: 'd' }
+      if (l === 'stage-reclassify:a') return { status: 'ok', hunt: 'a', ids: ['ISS-1'], block_text: { summary: 'blocked a (fix_review_failed)', evidence: 'ISS-1', question: 'q' } }
+      if (l === 'stage-revert:a') return { status: 'reverted', campaign_sha: 'e'.repeat(40), reverted: [{ slug: 'a' }] }
+      return undefined
+    } })
+  noErr(r)
+  assert.match(promptOf(r, 'stage-reclassify:a'), /--rule fix_review_failed --reason 'fix-a-smoke-1: PARKED \(parked:non_convergence\)'/)
+  assert.ok(r.labels.indexOf('stage-reclassify:a') < r.labels.indexOf('stage-revert:a'))
+  assert.equal(r.labels.some(l => l.startsWith('stage-record-fix')), false)
+  assert.equal(r.labels.includes('chain-merge:fix-a-smoke-1'), false, 'an uncertified fix never merges')
+  assert.equal(r.result.verdict, 'CAMPAIGN_AWAITING_HUMAN')
+})
+
+test('stage AC24: block → revert → redeploy → the next wave runs the non-conflicting hunt and holds the dependent', async () => {
+  let reverted = false
+  const r = await runStage([[ch('a'), ch('x')], [ch('d', { dependsOn: ['a'] }), ch('y')]], { cron: CRON_OK,
+    stage: (l, p) => {
+      if (l === 'stage-triage' && waveOf(p) === 1 && !reverted) return { status: 'ok', pending: { fix: {}, block: { a: ['ISS-b'] } }, classified: [{ id: 'ISS-b', hunt: 'a', outcome: 'block', rule: 'default_block', reasoning: 'r' }], campaign_blocks: [], block_text: {} }
+      if (l === 'stage-revert:a') { reverted = true; return { status: 'reverted', campaign_sha: 'e'.repeat(40), reverted: [{ slug: 'a' }] } }
+      return undefined
+    } })
+  noErr(r)
+  assert.ok(r.wf.includes('y'), 'the non-conflicting next-wave hunt runs')
+  assert.equal(r.wf.includes('d'), false, 'the dependent of the reverted hunt is held')
+  assert.ok(r.idx(e => e.label === 'stage-revert:a') < r.idx(e => e.type === 'workflow-start' && e.slug === 'y'))
+})
+
+test('stage AC26: "revert stub exit 2 → parked:campaign_revert_failed", one page, no next-wave scaffold', async () => {
+  const r = await runStage([[ch('a')], [ch('b')]], { cron: CRON_OK,
+    stage: (l) => {
+      if (l === 'stage-triage') return { status: 'ok', pending: { fix: {}, block: { a: ['ISS-b'] } }, classified: [], campaign_blocks: [], block_text: {} }
+      if (l === 'stage-revert:a') return { status: 'error', reason: 'git revert of a\'s merge conflicted (x.py) — nothing reverted' }
+      return undefined
+    } })
+  noErr(r)
+  assert.deepEqual([r.result.verdict, r.result.parkReason], ['CAMPAIGN_PARKED_STAGE', 'campaign_revert_failed'])
+  assert.match(r.result.parkDetail, /conflicted.*campaign\/c1 unchanged/)
+  assert.equal(r.wf.includes('b'), false)
+  assert.equal(cronCalls(r).filter(c => c.label === 'cron-finish').length, 1)
+  assert.equal(cronCalls(r).some(c => c.label.startsWith('cron-park:')), false)
+})
+
+test('stage: an unmapped stage CLI error → stage_cli_error naming the step (never a silent skip)', async () => {
+  const r = await runStage([[ch('a')]], { stage: (l) => (l === 'stage-ensure-tenants' ? { __raw: { exitCode: 2, output: 'Traceback: boom' } } : undefined) })
+  noErr(r)
+  assert.equal(r.result.parkReason, 'stage_cli_error')
+  assert.match(r.result.parkDetail, /^stage-ensure-tenants: stage-ensure-tenants: no parseable JSON \(exit 2\): Traceback: boom/)
+  const cfgErr = await runStage([[ch('a')]], { stage: (l) => (l === 'stage-plan-smoke' ? { status: 'error', code: 'smoke_config_missing', key: 'Deployment Notes → Wave report dir command', reason: 'wave-dir failed', detail: 'cannot create' } : undefined) })
+  noErr(cfgErr)
+  assert.equal(cfgErr.result.parkReason, 'smoke_config_missing')
+  assert.match(cfgErr.result.parkDetail, /Deployment Notes → Wave report dir command — wave-dir failed \(cannot create\)/)
+  assert.equal(cfgErr.labels.some(l => l.startsWith('stage-smoke:') || l === 'stage-browser-probe'), false)
+  const hl = await runStage([[ch('a')]], { stage: (l) => (l === 'stage-triage' ? { status: 'ok', pending: { fix: {}, block: {} }, classified: [], campaign_blocks: ['ISS-c'] } : undefined) })
+  noErr(hl)
+  assert.equal(hl.result.parkReason, 'stage_cli_error')
+  assert.match(hl.result.parkDetail, /ISS-c block with no hunt to revert/)
+})
+
+test('stage AC27: "polish wave" — one polish hunt, merge --polish, a polish iteration, items polished', async () => {
+  let polished = false
+  let r0 = 0
+  const r = await runStage([[ch('a')]], { cron: CRON_OK,
+    stage: (l, p) => {
+      if (l === 'stage-polish-plan') return polished ? { status: 'ok', items: [] } : { status: 'ok', items: [{ id: 'ISS-p', hunt: 'a' }, { id: 'ISS-q', hunt: 'a' }], open_set: 'h'.repeat(40) }
+      if (l === 'stage-polish-scaffold') return { status: 'ok', slug: 'polish-c1', tier: 'Blue', branch: 'feat/polish-c1', worktree: '/w', plan_dir: '/w/p', base_sha: TIP, issues: ['ISS-p', 'ISS-q'], description: 'Polish wave' }
+      if (l === 'stage-begin' && p.includes('--polish')) return { status: 'ok', action: 'new', wave: 1, step: 'begin', campaign_sha: TIP, iteration: 2, merged: [], polish: 'polish-c1', polish_merge: 'f'.repeat(40), polish_issues: ['ISS-p', 'ISS-q'] }
+      if (l === 'stage-suites' && p.includes('--polish')) return { status: 'ok', labels: ['scheduler'], full: false, reason: 'touched apps: scheduler', record_labels: 'scheduler', empty: false }
+      if (l === 'stage-triage' && r0 > 0) return { status: 'ok', polish: { slug: 'polish-c1', regressions: [], fixed: ['ISS-p'], still_failing: ['ISS-q'] }, classified: [] }
+      if (l === 'stage-triage') { r0++; return undefined }
+      if (l === 'stage-resolve-polished') { polished = true; return { status: 'ok' } }
+      return undefined
+    },
+    merge: (slug) => (slug === 'polish-c1'
+      ? { exitCode: 0, output: JSON.stringify({ status: 'merged', commit: 'f'.repeat(40), polish: true }) }
+      : { status: 'merged', commit: `merge-${slug}-0000000`, stamped: 'merged_to_campaign', exitCode: 0 }) })
+  noErr(r)
+  assert.match(promptOf(r, 'chain-merge:polish-c1'), /--hunt 'polish-c1' --polish/)
+  assert.ok(r.workflowCalls.some(w => w.args.slug === 'polish-c1' && w.args.testIsolation === 'c1' && w.args.baseBranch === 'campaign/c1'))
+  assert.ok(r.agentCalls.some(c => c.label === 'stage-begin' && /--wave 1 --polish 'polish-c1'/.test(c.prompt)))
+  assert.match(r.agentCalls.filter(c => c.label === 'stage-integration').pop().prompt, /--labels 'scheduler'/, 'the polish iteration runs the polish merge\'s suite set')
+  assert.match(promptOf(r, 'stage-resolve-polished'), /--ids 'ISS-p' --resolution polished --polish-slug 'polish-c1' --polish-result merged/)
+  assert.match(promptOf(r, 'stage-resolve-unpolished'), /--ids 'ISS-q' --resolution 'needs Cecil'/)
+  assert.ok(r.labels.includes('usage-gate:stage:c1:polish'))
+  assert.equal(r.result.verdict, 'CAMPAIGN_READY_FOR_RELEASE')
+})
+
+test('stage AC28: "polish regression → polish merge reverted", items need Cecil, one re-verify on the reverted tip (no second polish)', async () => {
+  let triage = 0
+  const r = await runStage([[ch('a')]], { cron: CRON_OK,
+    stage: (l, p) => {
+      if (l === 'stage-polish-plan') return triage > 1 ? { status: 'ok', items: [], reason: 'this open set was already polished once' } : { status: 'ok', items: [{ id: 'ISS-p' }], open_set: 'h'.repeat(40) }
+      if (l === 'stage-polish-scaffold') return { status: 'ok', slug: 'polish-c1', tier: 'Blue', worktree: '/w', plan_dir: '/w/p', base_sha: TIP, issues: ['ISS-p'], description: 'd' }
+      if (l === 'stage-triage') {
+        triage++
+        if (triage === 2) return { status: 'ok', polish: { slug: 'polish-c1', regressions: [{ id: 'ISS-new', what: 'billing.tests.X' }], fixed: [], still_failing: [] }, classified: [] }
+      }
+      if (l === 'stage-revert-polish') return { status: 'reverted', revert_commit: 'r'.repeat(40), campaign_sha: 'r'.repeat(40) }
+      if (l === 'stage-iterate') return { status: 'ok', iteration: 3, campaign_sha: 'r'.repeat(40) }
+      return undefined
+    },
+    merge: (slug) => (slug === 'polish-c1'
+      ? { exitCode: 0, output: JSON.stringify({ status: 'merged', commit: 'f'.repeat(40), polish: true }) }
+      : { status: 'merged', commit: `merge-${slug}-0000000`, stamped: 'merged_to_campaign', exitCode: 0 }) })
+  noErr(r)
+  assert.match(promptOf(r, 'stage-revert-polish'), new RegExp(`revert-merge --campaign 'c1' --commit '${'f'.repeat(40)}' --reason 'polish change broke billing.tests.X'`))
+  assert.match(promptOf(r, 'stage-resolve-polish'), /--ids 'ISS-p' --resolution 'needs Cecil' --reason 'polish change broke billing\.tests\.X' --polish-slug 'polish-c1' --polish-result reverted/)
+  assert.match(promptOf(r, 'stage-iterate'), /iterate --campaign 'c1' --clear-polish/)
+  assert.equal(r.labels.filter(l => l === 'stage-triage').length, 3, 'wave 1, the polish iteration, one re-verify')
+  assert.equal(r.workflowCalls.filter(w => w.args.slug.startsWith('polish-')).length, 1, 'no second polish wave')
+  assert.equal(r.labels.filter(l => l === 'stage-polish-plan').length, 1)
+})
+
+test('stage: a WAVE_PAUSED_QUOTA verdict from the waves never runs the polish wave or the report', async () => {
+  const r = await runStage([[ch('a'), ch('b')]], { maxParallel: 1, args: { maxParallel: 1 }, gate: (slug) => (slug === 'b' ? DEFER5H : PROCEED) })
+  noErr(r)
+  assert.equal(r.result.verdict, 'WAVE_PAUSED_QUOTA')
+  assert.equal(r.labels.includes('stage-polish-plan'), false)
 })

@@ -16,6 +16,7 @@ import { spawnSync } from 'node:child_process'
 import {
   parseSections, field, code, list, isNone, modelPool, readConfig, loadConfig, problemLine,
   expandHome, execLayer, execLines, imageHasTag, EXEC_KEYS, validWorktreeRoot, smokeLoginHookValue,
+  STAGE_KEYS, pairList, prodHostSuffixOf,
 } from './wolfpack-config.mjs'
 import { homedir } from 'node:os'
 
@@ -754,7 +755,11 @@ test('D3/D4: the REAL wolfpack-config.md and the example → smokeLoginHook null
     assert.deepEqual(c.problems, [], p)
   }
   const e = runCli(['--exec', REAL])
-  assert.doesNotMatch(e.stdout, /smoke|projectCommands|Project commands/i, '--exec output carries only the execution-layer keys')
+  // The first line names the config path, which may itself contain "smoke" (e.g. a hunt worktree
+  // named wave-auto-smoke); only the key lines are judged.
+  const keyLines = e.stdout.split('\n').filter(l => !l.startsWith('config\t')).join('\n')
+  assert.match(e.stdout, /^config\t/, 'the path line is still first')
+  assert.doesNotMatch(keyLines, /smoke|projectCommands|Project commands/i, '--exec output carries only the execution-layer keys')
 })
 
 // ─── scripts-unfork: Model Pool `gate=<ENV>` → gates (the router's enabled set) ─────────────
@@ -969,4 +974,138 @@ test('AC20: releaseTags reaches --json and the summary', () => {
   })
   const src = readFileSync(CLI, 'utf8')
   assert.match(src.slice(0, src.indexOf('import ')), /\/\/\s+releaseTags\s+false when Deployment Notes → Tag pattern is PRESENT and `none`/, 'documented in the RESOLVED KEYS header')
+})
+
+
+// ─── wave-auto-smoke: the post-merge stage keys ───────────────────────────────────────────
+const STAGE_DEP = [
+  '- Post-merge smoke stage: `on` — chain mode post-merge stage.',
+  '- Migration command: `make migrate-dev`',
+  '- Migration file pattern: `/migrations/[0-9]`',
+  '- Never-smoke hosts: `example.com` `demo.example.dev` `Clone.Example.dev`',
+  '- Prod URL: `https://*.example.vet`',
+  '- Smoke tenants: `surgical=surgical.example.dev` `mobile=dev.example.dev`',
+  '- Smoke tenant manifests: `mobile=scripts/smoke/mobile-manifest.md`',
+  '- Smoke tenant ensure command: `scripts/ops/ensure_tenant.sh run` — idempotent.',
+  '- Wave report dir command: `venv/bin/python report.py wave-dir --campaign {campaign} --wave {wave}`',
+  '- Wave report build command: `venv/bin/python report.py build --dir {dir}`',
+  '- Campaign report command: `venv/bin/python report.py build-campaign --campaign {campaign} --issue-log {issue_log}`',
+  '- Report URL command: `venv/bin/python report.py url --dir {dir}`',
+].join('\n')
+const STAGE_ID = [
+  '- **App marker file:** `apps.py` — a Django app.',
+  '- **Integration test args:** `--isolated-db {campaign}`',
+  '- **Integration full-suite paths:** `settings/` `requirements.txt` `Dockerfile`',
+].join('\n')
+const withStage = (dep = STAGE_DEP, id = STAGE_ID, triage = '- **Triage block paths:** `billing/` `records/`') => FULL
+  .replace('- Backlog file:', `${dep}\n- Backlog file:`)
+  .replace('- **Worktree links:**', `${id}\n- **Worktree links:**`)
+  .replace('- **Risk-surface paths:**', `${triage}\n- **Risk-surface paths:**`)
+const stageProblems = (c) => c.problems.filter(p => /Post-merge|Smoke tenant/.test(p))
+
+test('stage keys: every field parsed from a full stage block, no problem', () => {
+  const c = readConfig(withStage())
+  assert.deepEqual(c.problems, [])
+  assert.equal(c.postMergeStage, true)
+  assert.equal(c.migrateCommand, 'make migrate-dev')
+  assert.equal(c.migrationFilePattern, '/migrations/[0-9]')
+  assert.deepEqual(c.neverSmokeHosts, ['example.com', 'demo.example.dev', 'clone.example.dev'], 'lower-cased')
+  assert.equal(c.prodHostSuffix, 'example.vet')
+  assert.deepEqual(c.smokeTenants, { surgical: 'surgical.example.dev', mobile: 'dev.example.dev' })
+  assert.deepEqual(c.smokeManifests, { mobile: 'scripts/smoke/mobile-manifest.md' })
+  assert.equal(c.smokeTenantEnsureCommand, 'scripts/ops/ensure_tenant.sh run')
+  assert.equal(c.waveReportDirCommand, 'venv/bin/python report.py wave-dir --campaign {campaign} --wave {wave}')
+  assert.equal(c.waveReportBuildCommand, 'venv/bin/python report.py build --dir {dir}')
+  assert.equal(c.campaignReportCommand, 'venv/bin/python report.py build-campaign --campaign {campaign} --issue-log {issue_log}')
+  assert.equal(c.reportUrlCommand, 'venv/bin/python report.py url --dir {dir}')
+  assert.equal(c.appMarkerFile, 'apps.py')
+  assert.equal(c.integrationTestArgs, '--isolated-db {campaign}')
+  assert.deepEqual(c.integrationFullSuitePaths, ['settings/', 'requirements.txt', 'Dockerfile'])
+  assert.deepEqual(c.triageBlockPaths, ['billing/', 'records/'])
+})
+
+test('stage keys: absent → off, empty maps/lists, nulls; never added to missing', () => {
+  const c = readConfig(FULL)
+  assert.equal(c.postMergeStage, false)
+  assert.deepEqual(c.smokeTenants, {})
+  assert.deepEqual(c.smokeManifests, {})
+  assert.deepEqual(c.neverSmokeHosts, [])
+  assert.deepEqual(c.integrationFullSuitePaths, [])
+  assert.deepEqual(c.triageBlockPaths, [])
+  for (const k of ['migrateCommand', 'migrationFilePattern', 'prodHostSuffix', 'smokeTenantEnsureCommand', 'waveReportDirCommand',
+    'waveReportBuildCommand', 'campaignReportCommand', 'reportUrlCommand', 'appMarkerFile', 'integrationTestArgs']) {
+    assert.equal(c[k], null, k)
+  }
+  assert.deepEqual(c.missing, [])
+  assert.deepEqual(c.problems, [])
+  assert.equal(readConfig(withStage(STAGE_DEP.replace('`on` — chain mode post-merge stage.', '`off`'))).postMergeStage, false)
+  assert.equal(readConfig(withStage(STAGE_DEP.replace('`on` — chain mode post-merge stage.', 'none'))).postMergeStage, false)
+})
+
+test('stage keys: the REAL pack config has the stage off and no problem', () => {
+  const c = loadConfig(REAL)
+  assert.equal(c.postMergeStage, false)
+  assert.deepEqual(c.smokeTenants, {})
+})
+
+test('stage keys: problems — bad stage value, malformed / duplicate / bad-host tenant pairs, malformed manifest pair', () => {
+  const cases = [
+    [STAGE_DEP.replace('`on` — chain mode post-merge stage.', '`yes`'), /Post-merge smoke stage must be `on` or `off` \(got 'yes'\)/],
+    [STAGE_DEP.replace('`surgical=surgical.example.dev`', '`surgical`'), /Smoke tenants: malformed pair 'surgical'/],
+    [STAGE_DEP.replace('`surgical=surgical.example.dev`', '`Surgical=surgical.example.dev`'), /Smoke tenants: malformed pair/],
+    [STAGE_DEP.replace('`surgical=surgical.example.dev`', '`surgical=Surgical.Example.dev`'), /Smoke tenants: 'Surgical\.Example\.dev' \(for surgical\) must match/],
+    [STAGE_DEP.replace('`surgical=surgical.example.dev`', '`surgical=x.example.dev/path`'), /Smoke tenants: .* must match/],
+    [STAGE_DEP.replace('`mobile=dev.example.dev`', '`surgical=dev.example.dev`'), /Smoke tenants: duplicate name 'surgical'/],
+    [STAGE_DEP.replace('`mobile=scripts/smoke/mobile-manifest.md`', '`scripts/smoke/mobile-manifest.md`'), /Smoke tenant manifests: malformed pair/],
+  ]
+  for (const [dep, re] of cases) {
+    const c = readConfig(withStage(dep))
+    assert.ok(stageProblems(c).some(p => re.test(p)), `${re}: ${JSON.stringify(c.problems)}`)
+  }
+  // A malformed tenant list yields {} (never a partial map).
+  assert.deepEqual(readConfig(withStage(cases[1][0])).smokeTenants, {})
+  // ...and makes the CLI exit 2.
+  withTemp((dir) => assert.equal(runCli(['--json', writeCfg(dir, withStage(cases[0][0]))]).status, 2))
+})
+
+test('pairList and prodHostSuffixOf', () => {
+  const problems = []
+  assert.deepEqual(pairList('`a=x.y` `b-2=z`', 'K', problems, { valueRe: /^[a-z0-9.-]+$/ }), { a: 'x.y', 'b-2': 'z' })
+  assert.deepEqual(problems, [])
+  assert.deepEqual(pairList(undefined, 'K', problems), {})
+  assert.deepEqual(pairList('`=x`', 'K', problems), {})
+  assert.equal(problems.length, 1)
+  assert.equal(prodHostSuffixOf('`https://*.example.vet`'), 'example.vet')
+  assert.equal(prodHostSuffixOf('`https://app.example.vet/login` — the prod app'), 'app.example.vet')
+  assert.equal(prodHostSuffixOf('`https://*.Example.VET:443/`'), 'example.vet')
+  assert.equal(prodHostSuffixOf('none'), null)
+  assert.equal(prodHostSuffixOf(undefined), null)
+  assert.equal(prodHostSuffixOf('`https://*.ex_ample.vet`'), null, 'not a hostname')
+})
+
+test('STAGE_KEYS: [field, written name, required]; only the full-suite paths are optional; names section-qualified', () => {
+  assert.ok(STAGE_KEYS.length >= 19)
+  const fields = new Set()
+  for (const [field, written, required] of STAGE_KEYS) {
+    assert.equal(typeof field, 'string')
+    assert.match(written, /^(Deployment Notes|Project Identity|Compliance Requirements) → \S/)
+    assert.equal(typeof required, 'boolean')
+    assert.ok(!fields.has(field), `duplicate ${field}`)
+    fields.add(field)
+    assert.ok(field in readConfig(withStage()), `${field} is a reader field`)
+  }
+  assert.deepEqual(STAGE_KEYS.filter(k => !k[2]).map(k => k[0]), ['integrationFullSuitePaths'])
+  for (const f of ['smokeLoginHook', 'testCommand', 'testVerdictCommand', 'smokeTenants', 'waveReportBuildCommand']) assert.ok(fields.has(f), f)
+})
+
+test('stage keys: the summary shows postMergeStage; --json carries the fields', () => {
+  withTemp((dir) => {
+    const p = writeCfg(dir, withStage())
+    const s = runCli([p])
+    assert.equal(s.status, 0, s.stderr)
+    assert.match(s.stdout, /^postMergeStage: on$/m)
+    const j = JSON.parse(runCli(['--json', p]).stdout)
+    assert.deepEqual(j.smokeTenants, { surgical: 'surgical.example.dev', mobile: 'dev.example.dev' })
+    assert.equal(j.prodHostSuffix, 'example.vet')
+  })
 })

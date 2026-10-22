@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { summaryLine, recordPaths, substituteVerdict, checkRecord, fixLine, STAGES } from './wolfpack-test-record.mjs'
+import { summaryLine, recordPaths, substituteVerdict, checkRecord, fixLine, STAGES, composeTestCommand, isolationArgs, TEMPFAIL_EXIT } from './wolfpack-test-record.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const CLI = join(here, 'wolfpack-test-record.mjs')
@@ -97,8 +97,11 @@ test('summaryLine: the LAST summary-like line; else the last non-empty line; emp
 })
 
 test('recordPaths: stage-keyed json + log in the dir; an unknown stage throws', () => {
-  assert.deepEqual([...STAGES], ['tracker', 'final', 'release'])
-  assert.deepEqual(recordPaths('/x/plan', 'final'), { json: '/x/plan/test-record-final.json', log: '/x/plan/test-record-final.log' })
+  assert.deepEqual([...STAGES], ['tracker', 'final', 'release', 'integration'])
+  assert.deepEqual(recordPaths('/x/plan', 'final'), {
+    json: '/x/plan/test-record-final.json', log: '/x/plan/test-record-final.log', verdictLog: '/x/plan/test-record-final.verdict.log',
+  })
+  assert.equal(recordPaths('/x/plan', 'integration').json, '/x/plan/test-record-integration.json')
   for (const s of ['', 'Tracker', 'deploy', undefined]) assert.throws(() => recordPaths('/x', s), /unknown stage/, String(s))
 })
 
@@ -580,4 +583,165 @@ test('AC9 Watchdog command + skill: SHA-equals-HEAD reuse rule; the Tracker skil
   assert.match(wd, /### Pipeline test record/)
   assert.match(wd, /test-record-\*\.log/)
   assert.match(doc('.agents/skills/tracker/SKILL.md'), /test-record/)
+})
+
+
+// ─── wave-auto-smoke: integration stage, test isolation, deadline env, tempfail (A-7, A-8) ──
+// a.sh records its argv and the deadline env, then exits with the code in exit.txt.
+const A_SH = `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$ARGS_OUT"
+echo "deadline=\${WOLFPACK_RECORD_DEADLINE_EPOCH:-unset}" >> "$ARGS_OUT"
+echo "run" >> "$COUNTER"
+code=$(cat exit.txt)
+echo "stub: 2 passed, $code failed"
+exit "$code"
+`
+const stageConfig = ({ integration = '--isolated-db {campaign}', verdict = null } = {}) => `# Config
+
+## Project Identity
+- **Name:** record-fixture
+- **Test command:** \`bash a.sh --local\` — the stub suite
+${verdict ? `- **Test verdict command:** \`${verdict}\`\n` : ''}${integration ? `- **Integration test args:** \`${integration}\`\n` : ''}
+## Compliance Requirements
+- **Compliance areas:** none
+- **Risk-surface paths:** none
+`
+function stageFixture({ exitCode = 0, integration, verdict, extra = {} } = {}) {
+  const f = fixture({ exitCode, extra: { 'a.sh': A_SH, 'wolfpack-config.md': stageConfig({ integration, verdict }), ...extra } })
+  f.argsOut = join(f.root, 'args.txt')
+  f.go = (args, env = {}) => f.run(args, { ARGS_OUT: f.argsOut, ...env })
+  f.args = () => (existsSync(f.argsOut) ? readFileSync(f.argsOut, 'utf8').trim().split('\n') : [])
+  return f
+}
+
+test('composeTestCommand / isolationArgs: isolation then labels; {campaign} shell-quoted; bad isolation throws', () => {
+  assert.equal(composeTestCommand('t'), 't')
+  assert.equal(composeTestCommand('t', { integrationTestArgs: '--isolated-db {campaign}', isolation: 'c1' }), "t --isolated-db 'c1'")
+  assert.equal(composeTestCommand('t', { integrationTestArgs: '--iso {campaign} --x={campaign}', isolation: 'c-2', labels: ['a', 'b_c'] }),
+    "t --iso 'c-2' --x='c-2' a b_c")
+  assert.equal(composeTestCommand('t', { labels: [] }), 't')
+  assert.equal(isolationArgs('--isolated-db {campaign}', "it's"), `--isolated-db 'it'\\''s'`)
+  for (const bad of ['Bad', '-x', 'a b', 'a'.repeat(42), '', 'c1;rm']) {
+    assert.throws(() => composeTestCommand('t', { integrationTestArgs: '--isolated-db {campaign}', isolation: bad }), /test isolation/, bad)
+  }
+  assert.throws(() => composeTestCommand('t', { isolation: 'c1' }), /no Project Identity → Integration test args/)
+  assert.equal(TEMPFAIL_EXIT, 75)
+})
+
+test('integration stage: Integration test args ({campaign} substituted) + the labels; record carries labels and the full command', () => {
+  const f = stageFixture()
+  const r = f.go(['run', '--json', '--stage', 'integration', '--record-dir', f.recordDir, '--labels', 'billing,scheduler', '--campaign', 'c1'])
+  assert.equal(r.code, 0, r.stderr)
+  assert.equal(r.json.stage, 'integration')
+  assert.equal(r.json.command, "bash a.sh --local --isolated-db 'c1' billing scheduler")
+  assert.deepEqual(r.json.labels, ['billing', 'scheduler'])
+  assert.equal(r.json.tempfail, false)
+  assert.equal(f.args()[0], '--local --isolated-db c1 billing scheduler')
+  assert.ok(existsSync(join(f.recordDir, 'test-record-integration.json')))
+})
+
+test('integration stage: --labels ALL appends no label (the full suite)', () => {
+  const f = stageFixture()
+  const r = f.go(['run', '--json', '--stage', 'integration', '--record-dir', f.recordDir, '--labels', 'ALL', '--campaign', 'c1'])
+  assert.equal(r.code, 0, r.stderr)
+  assert.equal(r.json.command, "bash a.sh --local --isolated-db 'c1'")
+  assert.equal(r.json.labels, 'ALL')
+})
+
+test('integration stage: bad labels / missing --campaign / labels on another stage → exit 1, no record, never runs', () => {
+  const f = stageFixture()
+  const cases = [
+    ['--stage', 'integration', '--labels', 'Billing', '--campaign', 'c1'],
+    ['--stage', 'integration', '--labels', 'billing,../x', '--campaign', 'c1'],
+    ['--stage', 'integration', '--labels', ',', '--campaign', 'c1'],
+    ['--stage', 'integration', '--labels', 'billing'],
+    ['--stage', 'integration', '--campaign', 'c1'],
+    ['--stage', 'integration', '--labels', 'billing', '--campaign', 'C 1'],
+    ['--stage', 'tracker', '--labels', 'billing'],
+    ['--stage', 'tracker', '--campaign', 'c1'],
+  ]
+  for (const args of cases) {
+    const r = f.go(['run', '--json', '--record-dir', f.recordDir, ...args])
+    assert.equal(r.code, 1, args.join(' '))
+  }
+  assert.equal(runs(f), 0)
+  assert.equal(existsSync(f.recordDir), false)
+})
+
+test('integration stage: the verdict command stdout is saved as the verdict log (NEW FAILURES ids readable)', () => {
+  const V = `#!/usr/bin/env bash
+printf 'NEW FAILURES\\nbilling.tests.InvoiceTests.test_total\\n\\nsummary: 1 new\\n'
+exit 1
+`
+  const f = stageFixture({ exitCode: 1, verdict: 'bash {main}/v.sh {log} {exit}', extra: { 'v.sh': V } })
+  const r = f.go(['run', '--json', '--stage', 'integration', '--record-dir', f.recordDir, '--labels', 'billing', '--campaign', 'c1'])
+  assert.equal(r.code, 2, r.stderr)
+  assert.equal(r.json.verdict_exit, 1)
+  assert.equal(r.json.verdict_log, join(f.recordDir, 'test-record-integration.verdict.log'))
+  assert.match(readFileSync(r.json.verdict_log, 'utf8'), /^NEW FAILURES\nbilling\.tests\.InvoiceTests\.test_total\n/)
+})
+
+test('any stage: metadata test_isolation appends the isolation args; none → the command is unchanged', () => {
+  const f = stageFixture()
+  let r = f.go(['run', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  assert.equal(r.code, 0, r.stderr)
+  assert.equal(r.json.command, 'bash a.sh --local')
+  assert.equal(r.json.labels, null)
+  put(f.recordDir, 'metadata.json', JSON.stringify({ feature: 'fix-h-smoke-1', test_isolation: 'c1' }))
+  r = f.go(['run', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  assert.equal(r.code, 0, r.stderr)
+  assert.equal(r.json.command, "bash a.sh --local --isolated-db 'c1'")
+  assert.equal(f.args().filter(l => !l.startsWith('deadline=')).pop(), '--local --isolated-db c1')
+  // ensure: the record is stale against a plain command, current against the composed one
+  r = f.go(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  assert.equal(r.json.reused, true)
+})
+
+test('any stage: a bad test_isolation, an isolation with no Integration test args, or corrupt metadata → exit 1, no record', () => {
+  for (const [meta, integration] of [[{ test_isolation: 'Bad Name' }, undefined], [{ test_isolation: 'c1' }, ''], ['{not json', undefined]]) {
+    const f = stageFixture({ integration })
+    put(f.recordDir, 'metadata.json', typeof meta === 'string' ? meta : JSON.stringify(meta))
+    const r = f.go(['run', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+    assert.equal(r.code, 1, JSON.stringify(meta))
+    assert.equal(runs(f), 0)
+    assert.equal(existsSync(join(f.recordDir, 'test-record-tracker.json')), false)
+  }
+})
+
+test('deadline env: the test command sees WOLFPACK_RECORD_DEADLINE_EPOCH ≈ start + timeout', () => {
+  const f = stageFixture()
+  const t0 = Math.floor(Date.now() / 1000)
+  const r = f.go(['run', '--json', '--stage', 'tracker', '--record-dir', f.recordDir, '--timeout-min', '7'])
+  assert.equal(r.code, 0, r.stderr)
+  const line = f.args().find(l => l.startsWith('deadline='))
+  const epoch = Number(line.slice('deadline='.length))
+  assert.ok(Number.isInteger(epoch), line)
+  assert.ok(Math.abs(epoch - (t0 + 7 * 60)) <= 5, `${epoch} vs ${t0 + 420}`)
+})
+
+test('exit 75 → tempfail true, pass false, verdict command skipped; ensure re-takes it instead of reusing', () => {
+  const V = '#!/usr/bin/env bash\necho verdict-ran >> "$ARGS_OUT"\nexit 0\n'
+  const f = stageFixture({ exitCode: 75, verdict: 'bash {main}/v.sh', extra: { 'v.sh': V } })
+  let r = f.go(['run', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  assert.equal(r.code, 2, r.stderr)
+  assert.equal(r.json.tempfail, true)
+  assert.equal(r.json.pass, false)
+  assert.equal(r.json.exit, 75)
+  assert.match(r.json.reason, /exit 75 \(busy \/ EX_TEMPFAIL\)/)
+  assert.equal(r.json.verdict_exit, null)
+  assert.equal(r.json.verdict_log, null)
+  assert.ok(!f.args().includes('verdict-ran'), 'the verdict command never ran on a busy run')
+  assert.equal(runs(f), 1)
+  r = f.go(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  assert.equal(runs(f), 2, 'a tempfail record is never reused')
+  assert.equal(r.json.reused, false)
+})
+
+test('a non-75 failure is not a tempfail and IS reused by ensure', () => {
+  const f = stageFixture({ exitCode: 1 })
+  f.go(['run', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  const r = f.go(['ensure', '--json', '--stage', 'tracker', '--record-dir', f.recordDir])
+  assert.equal(r.json.tempfail, false)
+  assert.equal(r.json.reused, true)
+  assert.equal(runs(f), 1)
 })

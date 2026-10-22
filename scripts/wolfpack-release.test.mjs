@@ -127,6 +127,7 @@ test('parseAcceptanceCriteria: extracts id, tag, text, ref', () => {
     slug: 'invoice-bundle',
     id: 'AC1',
     tag: 'auto',
+    tenant: 'both',
     text: 'When a bundle is selected, the default line items apply.',
     ref: 'invoice-bundle/1',
   })
@@ -851,4 +852,260 @@ test('AC11 chain: attribution alone (no version heading) still commits the tag',
   assert.ok(cl.committed && cl.committed !== tip, JSON.stringify(cl))
   assert.equal(rg(root, 'log', '-1', '--format=%s', 'campaign/c'), 'docs(changelog): attribute untagged items for campaign c')
   assert.match(rg(root, 'show', 'campaign/c:CHANGELOG.md'), /- a untagged <!-- hunt:a -->/)
+})
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// wave-auto-smoke: tenant scope (AC34), revert with smoke-fix merges (AC24),
+// parked.md text flags (AC25), revert-merge of the polish merge (AC28).
+// ════════════════════════════════════════════════════════════════════════════
+import { CriteriaError, DEFAULT_SMOKE_TENANTS, cmdRevertMerge } from './wolfpack-release.mjs'
+
+test('scope parsed: [tenant:<name>] right after the tag; case-insensitive; both', () => {
+  const md = [
+    '- AC1 [auto] [tenant:mobile] Mobile only.',
+    '- AC2 [auto] [tenant:surgical] Surgical only.',
+    '- AC3 [manual] [tenant:both] Everywhere.',
+    '- AC4 [AUTO] [TENANT:Surgical] Upper case.',
+    '  - AC5 [compliance] [tenant:mobile] Indented.',
+  ].join('\n')
+  const c = parseAcceptanceCriteria(md, 'h')
+  assert.deepEqual(c.map(x => [x.ref, x.tag, x.tenant, x.text]), [
+    ['h/1', 'auto', 'mobile', 'Mobile only.'],
+    ['h/2', 'auto', 'surgical', 'Surgical only.'],
+    ['h/3', 'manual', 'both', 'Everywhere.'],
+    ['h/4', 'auto', 'surgical', 'Upper case.'],
+    ['h/5', 'compliance', 'mobile', 'Indented.'],
+  ])
+  assert.deepEqual([...DEFAULT_SMOKE_TENANTS], ['surgical', 'mobile'])
+})
+
+test('scope default both: no scope tag → tenant both, text unchanged', () => {
+  const [c] = parseAcceptanceCriteria('- AC7 [auto] The [bracketed] text stays.', 'h')
+  assert.equal(c.tenant, 'both')
+  assert.equal(c.text, 'The [bracketed] text stays.')
+})
+
+test('unknown scope errors: CriteriaError names the ref and the allowed set', () => {
+  assert.throws(() => parseAcceptanceCriteria('- AC2 [auto] [tenant:desktop] x', 'h'),
+    (e) => e instanceof CriteriaError && /h\/2: unknown tenant scope "desktop" \(allowed: both, surgical, mobile\)/.test(e.message))
+  // A project's own tenant names replace the default set.
+  const c = parseAcceptanceCriteria('- AC1 [auto] [tenant:kiosk] x', 'h', { tenants: ['kiosk', 'web'] })
+  assert.equal(c[0].tenant, 'kiosk')
+  assert.throws(() => parseAcceptanceCriteria('- AC1 [auto] [tenant:mobile] x', 'h', { tenants: ['kiosk', 'web'] }),
+    (e) => e instanceof CriteriaError && /allowed: both, kiosk, web/.test(e.message))
+  // An empty tenants list falls back to the default.
+  assert.equal(parseAcceptanceCriteria('- AC1 [auto] [tenant:mobile] x', 'h', { tenants: [] })[0].tenant, 'mobile')
+})
+
+test('malformed scope errors: empty name, no closing bracket, a space inside', () => {
+  for (const line of ['- AC3 [auto] [tenant:] x', '- AC3 [auto] [tenant:mobile x', '- AC3 [auto] [tenant: mobile] x', '- AC3 [auto] [Tenant:mo bile] x']) {
+    assert.throws(() => parseAcceptanceCriteria(line, 'h'),
+      (e) => e instanceof CriteriaError && /h\/3: malformed tenant scope/.test(e.message), line)
+  }
+})
+
+test('CLI criteria: --tenants and exit 2 on an unknown scope', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wf-rel-scope-'))
+  try {
+    const p = join(dir, 'acceptance.md')
+    writeFileSync(p, '- AC1 [auto] [tenant:kiosk] x\n- AC2 [auto] y\n')
+    let r = pspawn(process.execPath, [SCRIPT, 'criteria', p, 'h', '--tenants', 'kiosk,web'], { cwd: dir, encoding: 'utf8' })
+    assert.equal(r.status, 0, r.stderr)
+    assert.deepEqual(JSON.parse(r.stdout).map(x => x.tenant), ['kiosk', 'both'])
+    r = pspawn(process.execPath, [SCRIPT, 'criteria', p, 'h'], { cwd: dir, encoding: 'utf8' })
+    assert.equal(r.status, 2)
+    assert.match(r.stderr, /h\/1: unknown tenant scope "kiosk"/)
+    assert.equal(r.stdout, '')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// A smoke fix hunt forked from the current campaign tip, certified, merged with --fix-of.
+function rFix(root, parent, n, edits) {
+  const slug = `fix-${parent}-smoke-${n}`
+  const wt = join(root, '.wt', slug)
+  rg(root, 'worktree', 'add', '-q', wt, '-b', `feat/${slug}`, 'campaign/c')
+  rcommit(wt, edits, `fix(${slug})`)
+  rMeta(root, slug, { feature: slug, status: 'certified', tier: 'Yellow', parent_hunt: parent, proposed_version: { bump: null } })
+  const r = chainMerge(root, { campaign: 'c', hunt: slug, at: RAT, fixOf: parent })
+  assert.equal(r.status, 'merged', JSON.stringify(r))
+  return { slug, commit: r.commit, wt }
+}
+
+test('AC24 revert after fix-round merge: the hunt AND its smoke fixes go out; feat/H gets both back', () => {
+  const root = rRepo({ graph: REV_GRAPH })
+  const preHunt = rsha(root, 'campaign/c')
+  const hwt = rHunt(root, 'h', { edits: { 'h.txt': 'h v1\n' } })
+  rHunt(root, 'x', { edits: { 'x.txt': 'x\n' } })            // an unrelated hunt merged in between
+  const f1 = rFix(root, 'h', 1, { 'h.txt': 'h v2 (fixed)\n', 'h-fix.txt': 'fix 1\n' })
+  assert.equal(nfs.existsSync(f1.wt), false, 'merge-hunt --fix-of removes the fix worktree')
+  const mh0 = rGetMeta(root, 'h')
+  assert.deepEqual(mh0.smoke_fixes.map(f => [f.slug, f.merge_commit]), [[f1.slug, f1.commit]])
+
+  const r = cmdRevert(root, { campaign: 'c', hunt: 'h', reason: 'ISS-0000000001', at: RAT })
+  assert.equal(r.status, 'reverted')
+  const post = rsha(root, 'campaign/c')
+  // Every path H and its fix touched is back to the pre-hunt state; x is untouched.
+  assert.equal(rg(root, 'diff', preHunt, post, '--', 'h.txt', 'h-fix.txt'), '')
+  assert.equal(rExists(root, 'campaign/c', 'x.txt'), true)
+  const [rh] = r.reverted
+  assert.equal(rh.slug, 'h')
+  assert.equal(rh.revert_commits.length, 2, 'own merge + one fix merge')
+  assert.equal(rh.revert_commit, rh.revert_commits[1], 'the fix (newest) is reverted first, then the hunt\'s own merge')
+  assert.equal(rsha(root, 'campaign/c'), rh.revert_commits[1])
+  const mh = rGetMeta(root, 'h')
+  assert.equal(mh.status, CS.REVERTED)
+  assert.equal(mh.campaign_revert_commit, rh.revert_commit)
+  assert.deepEqual(mh.campaign_revert_commits, rh.revert_commits)
+  assert.equal('smoke_fixes' in mh, false)
+  assert.deepEqual(mh.smoke_fixes_reverted.map(f => f.slug), [f1.slug])
+  const pmd = nfs.readFileSync(join(rMainPlan(root, 'h'), 'parked.md'), 'utf8')
+  assert.match(pmd, /\(\+1 smoke fix merge\)/)
+  // feat/h = new tip + the reapply commits: the hunt AND its fix.
+  assert.equal(nfs.readFileSync(join(hwt, 'h.txt'), 'utf8'), 'h v2 (fixed)\n')
+  assert.equal(nfs.readFileSync(join(hwt, 'h-fix.txt'), 'utf8'), 'fix 1\n')
+  assert.equal(rg(root, 'merge-base', '--is-ancestor', post, 'feat/h') === '', true)
+  assert.equal(rsha(root, 'feat/h~2'), post, 'two reapply commits on top of the new campaign tip')
+  // Re-merge after the fix cycle: both changes are back on the campaign tip.
+  rMeta(root, 'h', { ...rGetMeta(root, 'h'), status: 'certified' }, { main: true })
+  assert.equal(chainMerge(root, { campaign: 'c', hunt: 'h', at: RAT }).status, 'merged')
+  assert.equal(rg(root, 'show', 'campaign/c:h.txt'), 'h v2 (fixed)')
+  assert.equal(rg(root, 'show', 'campaign/c:h-fix.txt'), 'fix 1')
+  assert.equal('campaign_revert_commits' in rGetMeta(root, 'h'), false)
+})
+
+test('AC24: a reverted dependent\'s smoke fix goes out with it and comes back on reapply', () => {
+  const root = rRepo({ graph: REV_GRAPH })
+  const hwt = rHunt(root, 'h', { edits: { 'h.txt': 'h\n' } })
+  rHunt(root, 'd', { edits: { 'd.txt': 'd v1\n' } })
+  rFix(root, 'd', 1, { 'd.txt': 'd v2\n' })
+  const r = cmdRevert(root, { campaign: 'c', hunt: 'h', reason: 'ISS-1', at: RAT })
+  assert.deepEqual(r.reverted.map(t => [t.slug, t.revert_commits.length]), [['d', 2], ['h', 1]])
+  assert.equal(rExists(root, 'campaign/c', 'd.txt'), false)
+  const md = rGetMeta(root, 'd')
+  assert.equal(md.status, CS.REVERTED_WITH_DEP)
+  assert.equal(md.campaign_revert_commits.length, 2)
+  assert.equal(md.smoke_fixes_reverted.length, 1)
+  // h fixed and re-merged → d reapplies with its fix.
+  rcommit(hwt, { 'h2.txt': 'fix\n' }, 'fix(h)')
+  rMeta(root, 'h', { ...rGetMeta(root, 'h'), status: 'certified' }, { main: true })
+  assert.equal(chainMerge(root, { campaign: 'c', hunt: 'h', at: RAT }).status, 'merged')
+  assert.equal(chainMerge(root, { campaign: 'c', hunt: 'd', at: RAT }).status, 'merged')
+  assert.equal(rg(root, 'show', 'campaign/c:d.txt'), 'd v2', 'the dependent\'s smoke fix came back with it')
+})
+
+test('AC25: revert --summary/--evidence/--issues/--question fill parked.md; reverted_issues recorded', () => {
+  const root = rRepo({ graph: REV_GRAPH })
+  rHunt(root, 'h')
+  const r = rCli(root, {}, 'revert', '--campaign', 'c', '--hunt', 'h', '--reason', 'ISS-a,ISS-b', '--at', RAT,
+    '--summary', 'The post-merge stage blocked h (5xx_or_cross_tenant): h/2: server error 503',
+    '--evidence', '/reports/c/wave-1/shots/h-2.jpg, billing.tests.X',
+    '--issues', 'ISS-a, ISS-b', '--question', 'What should h do instead?')
+  assert.equal(r.code, 0, r.stderr + r.stdout)
+  const pmd = nfs.readFileSync(join(rMainPlan(root, 'h'), 'parked.md'), 'utf8')
+  assert.match(pmd, /The post-merge stage blocked h \(5xx_or_cross_tenant\): h\/2: server error 503/)
+  assert.match(pmd, /reverted out of campaign\/c by the post-merge stage/)
+  assert.match(pmd, /What should h do instead\?/)
+  assert.match(pmd, /Issue ids: ISS-a, ISS-b/)
+  assert.match(pmd, /Evidence: \/reports\/c\/wave-1\/shots\/h-2\.jpg, billing\.tests\.X/)
+  assert.match(pmd, /Revert commit\(s\) on campaign\/c: h=/)
+  assert.deepEqual(rGetMeta(root, 'h').reverted_issues, ['ISS-a', 'ISS-b'])
+})
+
+test('AC25: revert without the stage flags keeps the original parked.md wording', () => {
+  const root = rRepo({ graph: REV_GRAPH })
+  rHunt(root, 'h')
+  cmdRevert(root, { campaign: 'c', hunt: 'h', reason: 'manual', at: RAT })
+  const pmd = nfs.readFileSync(join(rMainPlan(root, 'h'), 'parked.md'), 'utf8')
+  assert.match(pmd, /h was reverted out of campaign\/c: manual\. feat\/h was rebuilt as the campaign tip \+ one reapply commit/)
+  assert.doesNotMatch(pmd, /post-merge stage|Issue ids/)
+  assert.equal('reverted_issues' in rGetMeta(root, 'h'), false)
+})
+
+test('AC24: a smoke fix not on the first-parent line refuses the revert before anything changes', () => {
+  const root = rRepo({ graph: REV_GRAPH })
+  rHunt(root, 'h')
+  const tip = rsha(root, 'campaign/c')
+  const m = rGetMeta(root, 'h')
+  // feat/h's own commit is the merge's SECOND parent: reachable from the tip, not on its first-parent line.
+  rMeta(root, 'h', { ...m, smoke_fixes: [{ slug: 'fix-h-smoke-1', merge_commit: rsha(root, 'feat/h') }] }, { main: true })
+  assert.throws(() => cmdRevert(root, { campaign: 'c', hunt: 'h', reason: 'x', at: RAT }), /not on campaign\/c's first-parent line/)
+  assert.equal(rsha(root, 'campaign/c'), tip)
+  assert.equal(rGetMeta(root, 'h').status, m.status)
+})
+
+// A polish hunt merged with --polish: the campaign metadata records the merge.
+function rPolish(root, edits) {
+  const slug = 'polish-c'
+  const wt = join(root, '.wt', slug)
+  rg(root, 'worktree', 'add', '-q', wt, '-b', `feat/${slug}`, 'campaign/c')
+  rcommit(wt, edits, 'polish')
+  rMeta(root, slug, { feature: slug, status: 'certified', tier: 'Blue', polish_of: 'c', proposed_version: { bump: null } })
+  const r = chainMerge(root, { campaign: 'c', hunt: slug, at: RAT, polish: true })
+  assert.equal(r.status, 'merged', JSON.stringify(r))
+  assert.equal(r.polish, true)
+  return r.commit
+}
+const rCampMeta = (root) => rreadJ(join(root, '.wolfpack', 'campaigns', 'c', 'metadata.json'))
+
+test('AC28 revert-merge polish: reverts exactly the recorded polish merge', () => {
+  const root = rRepo({ graph: REV_GRAPH })
+  rHunt(root, 'h', { edits: { 'h.txt': 'h\n' } })
+  const pre = rsha(root, 'campaign/c')
+  const pm = rPolish(root, { 'h.txt': 'h polished\n', 'p.txt': 'p\n' })
+  assert.equal(rCampMeta(root).stage.polish_merge_commit, pm)
+  assert.equal(rCampMeta(root).stage.polish_slug, 'polish-c')
+  const r = rCli(root, {}, 'revert-merge', '--campaign', 'c', '--commit', pm, '--reason', 'polish change broke h/1')
+  assert.equal(r.code, 0, r.stderr + r.stdout)
+  assert.equal(r.json.status, 'reverted')
+  assert.equal(r.json.campaign_sha, rsha(root, 'campaign/c'))
+  assert.equal(rg(root, 'diff', pre, 'campaign/c'), '', 'the tip is back to the pre-polish tree')
+  const st = rCampMeta(root).stage
+  assert.equal(st.polish_merge_commit, null)
+  assert.equal(st.polish_reverted_merge_commit, pm)
+  assert.equal(st.polish_revert_commit, r.json.revert_commit)
+  assert.equal(st.polish_reverted_reason, 'polish change broke h/1')
+  assert.equal(rGetMeta(root, 'h').status, CS.MERGED, 'no hunt status changes')
+  // A second revert-merge of the same commit is refused (no longer the recorded polish merge).
+  const again = rCli(root, {}, 'revert-merge', '--campaign', 'c', '--commit', pm, '--reason', 'x')
+  assert.equal(again.code, 2)
+  assert.match(again.json.reason, /not the recorded polish merge/)
+})
+
+test('AC28 revert-merge: refuses a commit that is not the recorded polish merge, and bad arguments', () => {
+  const root = rRepo({ graph: REV_GRAPH })
+  rHunt(root, 'h')
+  const hMerge = rGetMeta(root, 'h').campaign_merge_commit
+  const tip = rsha(root, 'campaign/c')
+  let r = rCli(root, {}, 'revert-merge', '--campaign', 'c', '--commit', hMerge, '--reason', 'x')
+  assert.equal(r.code, 2)
+  assert.match(r.json.reason, /refusing: .* is not the recorded polish merge of c \(stage\.polish_merge_commit = none\)/)
+  assert.equal(rsha(root, 'campaign/c'), tip)
+  const pm = rPolish(root, { 'p.txt': 'p\n' })
+  for (const args of [['--commit', pm], ['--commit', 'zzz', '--reason', 'x'], ['--reason', 'x'], ['--commit', pm, '--reason', '  ']]) {
+    r = rCli(root, {}, 'revert-merge', '--campaign', 'c', ...args)
+    assert.equal(r.code, 2, args.join(' '))
+  }
+  // Recorded but not on the first-parent line (a side commit forged into the metadata).
+  const side = rsha(root, 'feat/h')   // the merge's second parent: not on the first-parent line
+  const cm = rCampMeta(root)
+  nfs.writeFileSync(join(root, '.wolfpack', 'campaigns', 'c', 'metadata.json'), JSON.stringify({ ...cm, stage: { ...cm.stage, polish_merge_commit: side } }))
+  assert.throws(() => cmdRevertMerge(root, { campaign: 'c', commit: side, reason: 'x' }), /not on campaign\/c's first-parent line/)
+})
+
+test('merge-hunt --fix-of: refuses a wrong parent_hunt, an unmerged parent, and --polish together', () => {
+  const root = rRepo({ graph: REV_GRAPH })
+  rHunt(root, 'h')
+  rHunt(root, 'x', { merge: false })
+  const slug = 'fix-h-smoke-1'
+  const wt = join(root, '.wt', slug)
+  rg(root, 'worktree', 'add', '-q', wt, '-b', `feat/${slug}`, 'campaign/c')
+  rcommit(wt, { 'f.txt': 'f\n' }, 'fix')
+  rMeta(root, slug, { feature: slug, status: 'certified', tier: 'Yellow', parent_hunt: 'other', proposed_version: { bump: null } })
+  assert.throws(() => chainMerge(root, { campaign: 'c', hunt: slug, at: RAT, fixOf: 'h' }), /metadata\.parent_hunt is "other", not h/)
+  assert.throws(() => chainMerge(root, { campaign: 'c', hunt: slug, at: RAT, fixOf: 'x' }), /a fix merges only for a hunt campaign-merged on campaign\/c/)
+  assert.throws(() => chainMerge(root, { campaign: 'c', hunt: slug, at: RAT, fixOf: 'h', polish: true }), /mutually exclusive/)
+  assert.equal(rGetMeta(root, 'h').smoke_fixes, undefined, 'nothing recorded on the parent')
 })
