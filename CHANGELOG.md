@@ -4,6 +4,9 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ## [Unreleased]
 
+### Added
+- `wolfpack-cron-resume.sh ping --reason <code> [--campaign <s>] [--hunt <h>]`: a general-purpose phone page, armed or not, with the same token-only body as every other notification (the reason is a code, never free text).
+
 ## [v1.2.0] - 2026-10-22
 
 ### Added

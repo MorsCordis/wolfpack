@@ -690,6 +690,21 @@ export async function notifyTest(ctx) {
   return 0
 }
 
+// A general-purpose page (a human or an agent wants Cecil's attention outside the runner's own
+// events). Armed or not: it is an explicit request. The same token-only body as every other
+// notification, so the reason is a code (`step-d-ready`), never free text.
+export async function ping(ctx, flags) {
+  const reason = flags.reason
+  if (!reason || !CODE_RE.test(reason)) throw new UsageError('usage: ping --reason <code> [--campaign <s>] [--hunt <h>] (code: a-z 0-9 _ : . -, at most 64)')
+  for (const k of ['campaign', 'hunt']) {
+    if (flags[k] != null && !SLUG_RE.test(flags[k])) throw new UsageError(`ping: --${k} must be a slug`)
+  }
+  const r = await sendNotification(ctx, { event: 'ping', campaign: flags.campaign, hunt: flags.hunt, reason })
+  logLine(ctx, flags.campaign || '-', `ping ${reason}`, r.ok ? 'sent' : `FAILED: ${r.code}`)
+  ctx.out(r.ok ? 'sent' : `FAILED: ${r.code}`)
+  return 0
+}
+
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 function parseFlags(argv, allowed) {
   const pos = []
@@ -731,6 +746,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
         return await event(ctx, pos[0], flags)
       }
       case 'notify-test': if (rest.length) throw new UsageError('notify-test takes no arguments'); return await notifyTest(ctx)
+      case 'ping': {
+        const { pos, flags } = parseFlags(rest, ['reason', 'campaign', 'hunt'])
+        if (pos.length) throw new UsageError('usage: ping --reason <code> [--campaign <s>] [--hunt <h>]')
+        return await ping(ctx, flags)
+      }
       default: throw new UsageError(`unknown command ${JSON.stringify(cmd || '')}`)
     }
   } catch (e) {

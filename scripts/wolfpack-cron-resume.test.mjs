@@ -959,6 +959,28 @@ describe('notifications', () => {
     assert.match(r.out, /^sent$/m)
   })
 
+  test('ping: pages with a reason code, armed or not', async () => {
+    await fresh()
+    const r = await H.run(['ping', '--reason', 'step-d-ready', '--campaign', 'c1'])
+    assert.equal(r.code, 0, r.err)
+    assert.match(r.out, /^sent$/m)
+    assert.equal(srv.posts.length, 1)
+    assert.equal(srv.posts[0].headers.title, 'Wolfpack: ping - c1')
+    assert.match(srv.posts[0].body, /^event: ping$/m)
+    assert.match(srv.posts[0].body, /^reason: step-d-ready$/m)
+    assert.match(H.logText(), /ping step-d-ready sent/)
+  })
+
+  test('ping: free text is refused, never sent', async () => {
+    await fresh()
+    for (const args of [['ping'], ['ping', '--reason', 'Call Jane Smithers'], ['ping', '--reason', 'ok', '--hunt', 'Bad Hunt'], ['ping', 'extra', '--reason', 'ok']]) {
+      const r = await H.run(args)
+      assert.equal(r.code, 2, `${args.join(' ')}: ${r.err}`)
+    }
+    assert.equal(srv.posts.length, 0)
+    assert.doesNotMatch(H.logText(), /Smithers/)
+  })
+
   test('A-14: a non-token status is dropped with a WARNING naming only the key', async () => {
     await fresh()
     await arm()

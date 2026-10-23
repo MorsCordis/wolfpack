@@ -10,6 +10,7 @@
 #   wolfpack-cron-resume.sh [--repo <abs>] event <park|ready-for-release|waiting-on-you> --campaign <s>
 #                                         [--hunt <h>] [--status <st>] [--reason <code>]
 #   wolfpack-cron-resume.sh [--repo <abs>] notify-test
+#   wolfpack-cron-resume.sh [--repo <abs>] ping --reason <code> [--campaign <s>] [--hunt <h>]
 #   wolfpack-cron-resume.sh [--repo <abs>] --print-crontab      print the crontab line; changes nothing
 #
 # This entry only (1) reads the settings file, (2) resolves and checks the tools, (3) creates
@@ -80,7 +81,7 @@ if [ "${1:-}" = "--repo" ]; then
 fi
 CMD="${1:-}"
 case "$CMD" in
-  tick|arm|disarm|status|note-pause|note-exit|event|notify-test|--print-crontab) ;;
+  tick|arm|disarm|status|note-pause|note-exit|event|notify-test|ping|--print-crontab) ;;
   ''|-h|--help) usage; exit 2 ;;
   *) echo "ERROR: unknown command '$CMD'" >&2; usage; exit 2 ;;
 esac
@@ -235,7 +236,7 @@ if [ "$rc" -eq "$LOCK_BUSY" ]; then
   echo "WARNING state lock busy: $CMD dropped" >&2
   case "$CMD" in
     # Never blocks the caller (exit 0), but stdout names the drop so the runner logs a ⚠.
-    event|note-pause|note-exit|notify-test) echo "dropped: state lock busy"; exit 0 ;;
+    event|note-pause|note-exit|notify-test|ping) echo "dropped: state lock busy"; exit 0 ;;
     *) exit 1 ;;
   esac
 fi

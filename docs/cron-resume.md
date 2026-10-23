@@ -104,6 +104,7 @@ relaunch. Avoid it with the command-line form above.
 | `note-exit --campaign <s> --verdict <token>` | the runner session ended (not progress) |
 | `event <park\|ready-for-release\|waiting-on-you> --campaign <s> [--hunt <h>] [--status <st>] [--reason <code>]` | runner events: `park` pages once per park episode; the other two page, then disarm |
 | `notify-test` | send one test notification; prints `sent` or `FAILED: <code>` |
+| `ping --reason <code> [--campaign <s>] [--hunt <h>]` | page now, armed or not (a human or an agent wants attention, e.g. `--reason step-d-ready`); the reason is a code (`a-z 0-9 _ : . -`, at most 64), never free text; prints `sent` or `FAILED: <code>` |
 | `--print-crontab` | print the crontab line; changes nothing |
 
 `event` and `note-*` never block the runner: they exit 0 (a busy state lock logs `WARNING state lock busy` and
