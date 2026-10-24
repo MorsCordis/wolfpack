@@ -1828,6 +1828,20 @@ const TOOL_DENIAL_PATTERN =
 // (seat-handoff-writes): it is ALLOWED, confined by mount to the seat's own out dir, so a seat
 // that self-reports write_file denied IS audit-only evidence (profile drift).
 const ROLE_DENIED_TOOLS = ['edit', 'task', 'skill']
+// Tools a seat may lack without losing the ability to verify: recall/remember are optional
+// context, not git diff or the tests. A GLM certifier that reported only these (with shell
+// "ok") was parked audit_only_certification on a real, shell-backed PASS.
+const OPTIONAL_SEAT_TOOLS = ['memory_recall', 'memory_remember']
+// A self-report is free text ("memory_recall (not available in this sandbox)", "read_file
+// <path> (file not found)"): judge it by its leading tool name. A read_file that found no file
+// is the read tool WORKING on a path the pod does not mount, not a denied tool.
+const isVerificationDenial = (t) => {
+  const text = String(t).trim().toLowerCase()
+  const name = (text.match(/^[a-z_][\w.-]*/) || [text])[0]
+  if (ROLE_DENIED_TOOLS.includes(name) || OPTIONAL_SEAT_TOOLS.includes(name)) return false
+  if (name === 'read_file' && /file not found|no such file/.test(text)) return false
+  return true
+}
 const auditEvidence = (r) => {
   const ev = []
   for (const l of (Array.isArray(r && r.deniedTools) ? r.deniedTools : [])) if (String(l).trim()) ev.push(String(l).trim())
@@ -1835,7 +1849,7 @@ const auditEvidence = (r) => {
   if (ta && typeof ta === 'object') {
     if (String(ta.shell || '').toLowerCase() === 'denied') ev.push('seat reported tool_access.shell = denied')
     for (const t of (Array.isArray(ta.denied_tools) ? ta.denied_tools : [])) {
-      if (!ROLE_DENIED_TOOLS.includes(String(t).trim().toLowerCase())) ev.push(`seat reported denied tool: ${t}`)
+      if (isVerificationDenial(t)) ev.push(`seat reported denied tool: ${t}`)
     }
   }
   if (r && r.auditOnly === true && !ev.length) ev.push('shim agent reported auditOnly')
@@ -4367,7 +4381,8 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
 4.5 AUDIT-ONLY GATE (tier ${tier}): ${HEAVY(tier)
   ? `this tier cannot certify on audit alone. If the TOOL-DENIAL CHECK found ANY line, OR the verdict's
    tool_access shows shell as anything other than "ok" ("denied" or "unused") or lists any denied tool
-   other than the read-only-by-role ${ROLE_DENIED_TOOLS.join('/')},
+   other than the read-only-by-role ${ROLE_DENIED_TOOLS.join('/')} or the optional ${OPTIONAL_SEAT_TOOLS.join('/')}
+   (a read_file that only reported "file not found" is not a denied tool),
    OR the verdict has NO tool_access you can copy — do NOT perform the PASS-only actions: do not stamp status "certified" (step 7), do not run
    step 8/8b, do not append to .wolfpack/pedigree/index.md, do not commit. Still write
    certification.md if the claude link produced the verdict — a delivered Vibe link's
