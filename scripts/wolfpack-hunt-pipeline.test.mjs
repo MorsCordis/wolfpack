@@ -2219,6 +2219,23 @@ test('seat-handoff-writes AC12: ROLE_DENIED_TOOLS = edit/task/skill (no write_fi
   assert.equal(isAuditOnly({ toolAccess: { shell: 'ok', denied_tools: ['write_file'] } }), true)
 })
 
+test('audit evidence: missing memory tools and a read_file miss are not a denied shell; a Red PASS with shell ok is accepted', () => {
+  const body = SRC.match(/const SINGLE_LENS = .*\n/)[0] + SRC.match(/const TIER_CONFIG = \{[\s\S]*?\n\}\n/)[0]
+  const helpers = SRC.match(/const ROLE_DENIED_TOOLS = [\s\S]*?\nconst certAuditEvidence = [\s\S]*?\n\}\n/)[0]
+  const { auditEvidence, certAuditEvidence } = new Function(`${body}\n${helpers}\nreturn { auditEvidence, certAuditEvidence }`)()
+  // The two live parks (2026-10-24): GLM certifiers with a working shell, free-text self-reports.
+  const memOnly = { verdict: 'PASS', toolAccess: { shell: 'ok', denied_tools: ['memory_recall (not available in this sandbox)', 'memory_remember (not available in this sandbox)'] } }
+  assert.deepEqual(certAuditEvidence(memOnly, 'Red'), [])
+  const readMiss = { verdict: 'PASS', toolAccess: { shell: 'ok', denied_tools: ['read_file /pack/.agents/skills/watchdog/SKILL.md (file not found)', 'memory_recall (no memory tool in this seat)'] } }
+  assert.deepEqual(certAuditEvidence(readMiss, 'Red'), [])
+  // Still evidence: a denied read_file, a denied bash/grep, write_file, and shell other than ok.
+  assert.equal(auditEvidence({ toolAccess: { shell: 'ok', denied_tools: ['read_file (permanently disabled)'] } }).length, 1)
+  assert.equal(auditEvidence({ toolAccess: { shell: 'ok', denied_tools: ['bash', 'grep (denied)'] } }).length, 2)
+  assert.equal(auditEvidence({ toolAccess: { shell: 'ok', denied_tools: ['write_file (denied by hook)'] } }).length, 1)
+  assert.equal(certAuditEvidence({ verdict: 'PASS', toolAccess: { shell: 'unused', denied_tools: ['memory_recall'] } }, 'Red').length, 1)
+  assert.equal(auditEvidence({ toolAccess: { shell: 'ok', denied_tools: ['Edit', 'skill (role)'] } }).length, 0)
+})
+
 test('seat-handoff-writes AC12: the Orange Watchdog gate lists edit/task/skill as the read-only-by-role set', async () => {
   const { find } = await runHunt({ answers: { alpha: ORANGE, watchdog: GLM_PASS } })
   const wd = find('watchdog:')[0].prompt

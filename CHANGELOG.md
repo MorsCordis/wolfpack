@@ -7,6 +7,9 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 ### Added
 - `wolfpack-cron-resume.sh ping --reason <code> [--campaign <s>] [--hunt <h>]`: a general-purpose phone page, armed or not, with the same token-only body as every other notification (the reason is a code, never free text).
 
+### Fixed
+- The Orange/Red audit-only certification gate no longer parks a shell-backed PASS because the certifier lacked optional memory tools (`memory_recall`/`memory_remember`) or reported a `read_file` "file not found" on a pack path its pod does not mount; denied tools are judged by their leading tool name. A denied shell, read, grep or `write_file`, or a shell state other than `ok`, still parks. <!-- hunt:audit-evidence-optional-tools -->
+
 ## [v1.2.0] - 2026-10-22
 
 ### Added
