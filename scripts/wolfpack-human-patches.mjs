@@ -66,16 +66,29 @@ export function checkHumanPatches({ planDir, worktree }) {
     const cw = meta && meta.consumer_worktree
     consumer = cw && typeof cw === 'object' ? { path: cw.path, branch: cw.branch || null } : null
   }
-  const pending = []
+  const checked = []
   for (const { rel, target } of routed) {
     const repo = humanPatchRepo(target, { worktreePath: worktree, consumer })
     const inside = git(['-C', repo, 'rev-parse', '--is-inside-work-tree'], { allowFail: true })
     if (inside.code !== 0 || inside.stdout !== 'true') throw new Error(`${repo} (the ${target} repo for ${rel}) is not a git work tree`)
     const patch = resolve(dir, rel)
-    const applied = git(['-C', repo, 'apply', '--check', '-R', patch], { allowFail: true })
-    if (applied.code === 0) continue
-    const fwd = git(['-C', repo, 'apply', '--check', patch], { allowFail: true })
-    pending.push({ patch, rel, target, repo, paths: patchPaths(readFileSync(patch, 'utf8')), applies: fwd.code === 0 })
+    const applied = git(['-C', repo, 'apply', '--check', '-R', patch], { allowFail: true }).code === 0
+    const fwd = applied ? false : git(['-C', repo, 'apply', '--check', patch], { allowFail: true }).code === 0
+    checked.push({ patch, rel, target, repo, paths: patchPaths(readFileSync(patch, 'utf8')), applied, applies: fwd })
+  }
+  // Stacked patches: each Shepherd round writes the next patch on top of the last one for the same
+  // file, so once the stack is applied an EARLIER patch no longer reverses (the later one changed its
+  // lines). An earlier patch that neither reverses nor applies forward, every one of whose paths a
+  // LATER applied patch in the same repo covers, is superseded — not pending. A patch that still
+  // applies forward is always pending (it was skipped, not superseded).
+  const covered = new Map()
+  const pending = []
+  for (let i = checked.length - 1; i >= 0; i--) {
+    const x = checked[i]
+    const cov = covered.get(x.repo) || new Set()
+    if (x.applied) { for (const pth of x.paths) cov.add(pth); covered.set(x.repo, cov); continue }
+    if (!x.applies && x.paths.length > 0 && x.paths.every(pth => cov.has(pth))) continue
+    pending.unshift({ patch: x.patch, rel: x.rel, target: x.target, repo: x.repo, paths: x.paths, applies: x.applies })
   }
   return { pending, consumer }
 }

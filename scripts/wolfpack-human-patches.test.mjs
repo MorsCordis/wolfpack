@@ -297,6 +297,37 @@ test('AC2: a hunt-only plan dir never reads metadata.consumer_worktree (absent i
   assert.equal(r.json.pending[0].applies, false)
 })
 
+test('stacked patches: once the whole stack is applied, an earlier patch the later one rewrote is superseded, not pending', () => {
+  const { W, D } = scenario({ consumer: false })
+  const rel = '.claude/hooks/guard.sh'
+  const p1 = makePatch(W, rel, 'echo one\n')
+  put(D, 'human-patches/01-guard.patch', p1)
+  writeFileSync(join(W, rel), 'echo one\n'); g(W, 'commit', '-q', '-am', 'apply 01')
+  const p2 = makePatch(W, rel, 'echo two\n')
+  put(D, 'human-patches/02-guard.patch', p2)
+  // only 01 applied: 02 is pending (applies forward); 01 reverses, so it is not
+  let r = cli('check', '--plan-dir', D, '--worktree', W)
+  assert.equal(r.code, 0, r.stdout + r.stderr)
+  assert.deepEqual(r.json.pending.map(x => x.rel), ['02-guard.patch'])
+  // 02 applied on top: 01 no longer reverses, but 02 covers its file → nothing pending (live 2026-10-24)
+  writeFileSync(join(W, rel), 'echo two\n'); g(W, 'commit', '-q', '-am', 'apply 02')
+  r = cli('check', '--plan-dir', D, '--worktree', W)
+  assert.equal(r.code, 0, r.stdout + r.stderr)
+  assert.deepEqual(r.json.pending, [])
+})
+
+test('stacked patches: an earlier patch that still applies forward stays pending even when a later one is applied', () => {
+  const { W, D } = scenario({ consumer: false })
+  put(W, '.claude/hooks/other.sh', 'echo a\n'); g(W, 'add', '--', '.claude/hooks/other.sh'); g(W, 'commit', '-q', '-m', 'other')
+  put(D, 'human-patches/01-other.patch', makePatch(W, '.claude/hooks/other.sh', 'echo b\n'))
+  const p2 = makePatch(W, '.claude/hooks/guard.sh', 'echo two\n')
+  put(D, 'human-patches/02-guard.patch', p2)
+  writeFileSync(join(W, '.claude/hooks/guard.sh'), 'echo two\n'); g(W, 'commit', '-q', '-am', 'apply 02 only')
+  const r = cli('check', '--plan-dir', D, '--worktree', W)
+  assert.equal(r.code, 0, r.stdout + r.stderr)
+  assert.deepEqual(r.json.pending.map(x => [x.rel, x.applies]), [['01-other.patch', true]])
+})
+
 test('AC2 fail closed: a consumer patch with no consumer_worktree recorded → exit 2 {status:error}, never pending: []', () => {
   for (const consumerMeta of [null, { branch: 'feat/x' }, { path: 'relative/consumer' }]) {
     const { W, D } = scenario({ consumer: false, consumerMeta })
