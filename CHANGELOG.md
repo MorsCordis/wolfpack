@@ -9,6 +9,7 @@ All notable changes to the Wolfpack pack. Semver per campaign wave. Every entry 
 
 ### Fixed
 - A re-certified hunt no longer parks `pedigree_incomplete`: the pipeline writes its index row with the new `wolfpack-pedigree.mjs index-row --upsert` (replaces the hunt's one earlier row, e.g. from before a chain rebase; two rows still refuse), and the writer reads the round counters from a `rounds` block as well as `execution_scores` and the top level. <!-- hunt:pedigree-recert-counters -->
+- The chain post-merge stage no longer reverts a hunt as a mobile regression because a mobile check that still passes logged an anomaly (such as the 404 a "mobile sees no change" criterion expects); the rule now needs the criterion itself to fail. <!-- hunt:mobile-regression-anomaly -->
 - The Orange/Red audit-only certification gate no longer parks a shell-backed PASS because the certifier lacked optional memory tools (`memory_recall`/`memory_remember`) or reported a `read_file` "file not found" on a pack path its pod does not mount; denied tools are judged by their leading tool name. A denied shell, read, grep or `write_file`, or a shell state other than `ok`, still parks. <!-- hunt:audit-evidence-optional-tools -->
 
 ## [v1.2.0] - 2026-10-22
