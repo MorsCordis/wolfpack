@@ -4395,7 +4395,8 @@ ${certifyClaudeBranch}   A rate-limit signal (exit 75 / WOLFPACK_RATE_LIMITED) s
    4.5 allows it, perform these AFTER step 8 below has run (so the index row carries the
    DURATION value and the committed pedigree.json carries the timing block): write the
    .wolfpack/pedigree/index.md row with the validating writer (cwd = the worktree) — NEVER by hand:
-     \`node ${shq(packScript('wolfpack-pedigree.mjs'))} index-row --plan-dir ${shq(planDir)} --index .wolfpack/pedigree/index.md --date "$(date -u +%F)" --duration "<DURATION from step 8>"\`
+     \`node ${shq(packScript('wolfpack-pedigree.mjs'))} index-row --plan-dir ${shq(planDir)} --index .wolfpack/pedigree/index.md --date "$(date -u +%F)" --duration "<DURATION from step 8>" --upsert\`
+   (--upsert: a re-certification, e.g. after a chain rebase, replaces this hunt's earlier row.)
    If it exits non-zero it REFUSED a pedigree.json without scores: do NOT edit index.md by hand, do NOT run
    the lessons aggregator, do NOT commit, and return \`pedigreeRowError\` = its stderr. If it exits 0, run
    \`bash ${shq(packScript('wolfpack-lessons.sh'))}\` (cwd = the worktree), then commit the wolfpack

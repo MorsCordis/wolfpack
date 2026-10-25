@@ -196,6 +196,31 @@ test('index-row: counters at the TOP level of pedigree.json (the GLM Watchdog la
   assert.equal(indexRow({ pedigree: both, meta: META, date: '2026-10-21' }).row, a.row);
 });
 
+test('index-row: counters under a `rounds` block (the GLM Watchdog layout, 2026-10-24) are read too', () => {
+  const nested = deep(canonical());
+  Object.assign(nested.execution_scores, { rework_rounds: 1, pointer_rounds: 2, tracker_rounds: 1, human_interventions: 0 });
+  const viaRounds = deep(nested);
+  viaRounds.rounds = {};
+  for (const k of ['rework_rounds', 'pointer_rounds', 'tracker_rounds', 'human_interventions']) {
+    viaRounds.rounds[k] = viaRounds.execution_scores[k];
+    delete viaRounds.execution_scores[k];
+  }
+  const a = indexRow({ pedigree: nested, meta: META, date: '2026-10-24' });
+  const b = indexRow({ pedigree: viaRounds, meta: META, date: '2026-10-24' });
+  assert.equal(b.ok, true, `refused: ${b.missing}`);
+  assert.equal(b.row, a.row);
+});
+
+test('applyIndexRow upsert: replaces the one prior row (re-certification), appends when none, refuses two', () => {
+  const head = '| Date | Feature | Tier |\n|---|---|---|\n';
+  const a = '| 2026-01-01 | a | Yellow |';
+  const b = '| 2026-01-02 | b | Yellow |';
+  const repl = '| 2026-02-02 | a | Red |';
+  assert.equal(applyIndexRow(`${head}${a}\n${b}\n`, 'a', repl, { upsert: true }), `${head}${repl}\n${b}\n`);
+  assert.equal(applyIndexRow(`${head}${b}\n`, 'a', repl, { upsert: true }), `${head}${b}\n${repl}\n`);
+  assert.throws(() => applyIndexRow(`${head}${a}\n${a}\n`, 'a', repl, { upsert: true }), /--upsert found 2 rows/);
+});
+
 test('index-row: an invalid top-level counter (a string) with no nested value is refused, never written', () => {
   const ped = deep(canonical());
   delete ped.execution_scores.human_interventions;

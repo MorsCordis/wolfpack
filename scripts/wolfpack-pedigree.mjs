@@ -211,8 +211,13 @@ export function indexRow({ pedigree, meta, date, duration, notes } = {}) {
     return null;
   };
   // The counters belong under execution_scores; a certifier that wrote them at the top level of
-  // pedigree.json (seen from the GLM Watchdog) carries the same values, so read them there next.
-  const top = (k) => (ped[k] === undefined || ped[k] === null ? undefined : ped[k]);
+  // pedigree.json, or under a `rounds` block (both seen from the GLM Watchdog), carries the same
+  // values, so read them there next (top level first).
+  const roundsBlock = ped.rounds && typeof ped.rounds === 'object' ? ped.rounds : {};
+  const top = (k) => {
+    if (ped[k] !== undefined && ped[k] !== null) return ped[k];
+    return roundsBlock[k] === undefined || roundsBlock[k] === null ? undefined : roundsBlock[k];
+  };
   const rework = intField('Rework', 'execution_scores.rework_rounds', { fallback: top('rework_rounds') });
   const ptrRnd = intField('PtrRnd', 'execution_scores.pointer_rounds', { fallback: top('pointer_rounds') ?? m.pointer_round });
   const trkRnd = intField('TrkRnd', 'execution_scores.tracker_rounds', { fallback: top('tracker_rounds') ?? m.tracker_round });
@@ -231,7 +236,9 @@ export function indexRow({ pedigree, meta, date, duration, notes } = {}) {
 }
 
 // Index file edit (pure): append the row, or with replace swap exactly one existing row for the slug.
-export function applyIndexRow(indexText, slug, row, { replace = false } = {}) {
+// upsert: swap the one existing row if there is one, else append (a re-certification — e.g. after a
+// chain rebase — supersedes the hunt's earlier row); two or more rows still refuse.
+export function applyIndexRow(indexText, slug, row, { replace = false, upsert = false } = {}) {
   const lines = indexText.split('\n');
   const hits = [];
   lines.forEach((l, i) => {
@@ -239,6 +246,8 @@ export function applyIndexRow(indexText, slug, row, { replace = false } = {}) {
     const cells = l.split('|');
     if (cells.length > 3 && cells[2].trim() === slug) hits.push(i);
   });
+  if (upsert && hits.length > 1) throw new Error(`--upsert found ${hits.length} rows for ${slug}; fix index.md by hand`);
+  if (upsert && hits.length === 1) replace = true;
   if (replace) {
     if (hits.length !== 1) throw new Error(`--replace needs exactly one existing row for ${slug} (found ${hits.length})`);
     lines[hits[0]] = row;
@@ -256,7 +265,7 @@ export function applyIndexRow(indexText, slug, row, { replace = false } = {}) {
 //          block, and MERGES it into <dir>/pedigree.json (v1 fields preserved — model-stats reads
 //          overall/routing/dimensions from that one file). Validates; prints the scorecard.
 // index-row: node wolfpack-pedigree.mjs index-row --plan-dir <dir> --index <index.md> [--date YYYY-MM-DD]
-//            [--duration TEXT] [--notes TEXT] [--replace]
+//            [--duration TEXT] [--notes TEXT] [--replace | --upsert]
 //          Writes the pedigree index row from <dir>/pedigree.json + metadata.json. A pedigree.json
 //          without the Watchdog scores (or certifier_verdict) is REFUSED (exit 2, naming every
 //          missing field; index.md untouched). Without --replace a second row for the slug is refused.
@@ -271,6 +280,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const a = argv[i];
     if (a === '--reverted') opt.reverted = true;
     else if (a === '--replace') opt.replace = true;
+    else if (a === '--upsert') opt.upsert = true;
     else if (a.startsWith('--')) opt[a.slice(2)] = argv[++i];
   }
   const planDir = opt['plan-dir'];
@@ -328,10 +338,12 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     if (!r.ok) refuse(`missing or invalid pedigree scores: ${r.missing.join(', ')}`);
     let text;
     try { text = readFileSync(opt.index, 'utf8'); } catch (e) { refuse(`cannot read ${opt.index}: ${e.message}`); }
+    const slugKey = meta.feature || meta.slug || ped.hunt_id;
     let next;
-    try { next = applyIndexRow(text, meta.feature || meta.slug || ped.hunt_id, r.row, { replace: opt.replace === true }); } catch (e) { refuse(e.message); }
+    try { next = applyIndexRow(text, slugKey, r.row, { replace: opt.replace === true, upsert: opt.upsert === true }); } catch (e) { refuse(e.message); }
+    const replaced = next.split('\n').length === text.split('\n').length;
     writeFileSync(opt.index, next);
-    process.stdout.write(`index-row: ${opt.replace ? 'replaced' : 'appended'} the ${meta.feature || meta.slug || ped.hunt_id} row in ${opt.index}\n`);
+    process.stdout.write(`index-row: ${replaced ? 'replaced' : 'appended'} the ${slugKey} row in ${opt.index}\n`);
     process.exit(0);
   }
 
