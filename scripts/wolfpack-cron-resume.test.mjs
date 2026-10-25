@@ -1029,11 +1029,22 @@ describe('notifications', () => {
     }
   })
 
-  test('A-13/R5-F2: park dedupe per episode; not armed → no POST', async () => {
+  test('notify-unarmed: not armed → park and waiting-on-you still page, no state written, nothing disarmed', async () => {
     await fresh()
     let r = await H.run(['event', 'park', '--campaign', 'c1', '--hunt', 'h1', '--status', 'needs_spec'])
     assert.equal(r.code, 0)
-    assert.equal(srv.posts.length, 0, 'not armed: no page')
+    assert.equal(srv.posts.length, 1, 'not armed: the park still pages')
+    assert.match(srv.posts[0].body, /^hunt: h1$/m)
+    assert.match(r.out, /park notified \(not armed\)/)
+    r = await H.run(['event', 'waiting-on-you', '--campaign', 'c1', '--status', 'campaign_awaiting_human'])
+    assert.equal(r.code, 0)
+    assert.equal(srv.posts.length, 2)
+    assert.equal(existsSync(H.statePath()), false, 'no cron.json is created for an unarmed campaign')
+    assert.match(H.logText(), /event park \(not armed\) sent/)
+  })
+
+  test('A-13/R5-F2: park dedupe per episode (armed)', async () => {
+    await fresh()
     await arm()
     const park = () => H.run(['event', 'park', '--campaign', 'c1', '--hunt', 'h1', '--status', 'needs_spec'])
     await park(); await park()
