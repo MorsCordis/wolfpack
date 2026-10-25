@@ -69,9 +69,10 @@ bash "$WOLFPACK_HOME/scripts/wolfpack-cron-resume.sh" arm <slug>
 ```
 
 **Armed means "resume this campaign and page me about it", attended or not.** An armed campaign pages on park,
-waiting-on-you, ready-for-release and disarm even while you watch; to stay quiet, do not arm (or `disarm`). For a
-campaign that is not armed every runner event is a logged no-op, so an attended run of an unarmed campaign never
-pages you. One campaign per repo can be armed (one runner per repo); arming a second is refused with the name of
+waiting-on-you, ready-for-release and disarm even while you watch. A campaign that is **not** armed still pages on
+`event park` and `event waiting-on-you` (a hunt or the run waits on a human, and nobody may be watching a hand-launched
+session), with no dedupe state and no disarm; its other runner events (ready-for-release, note-exit, note-pause) are
+logged no-ops. One campaign per repo can be armed (one runner per repo); arming a second is refused with the name of
 the armed one.
 
 The runner disarms the campaign itself at the end of a chain run: `completed` on `CAMPAIGN_READY_FOR_RELEASE`,

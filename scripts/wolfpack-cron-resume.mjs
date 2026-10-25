@@ -652,8 +652,17 @@ export async function event(ctx, type, { campaign, hunt, status: st0, reason, 'r
   if (!(type in EVENTS)) throw new UsageError(`event must be one of ${Object.keys(EVENTS).join(', ')}`)
   if (type === 'park' && (!hunt || st0 == null)) throw new UsageError('event park needs --hunt <h> and --status <st>')
   if (hunt != null && !SLUG_RE.test(hunt)) throw new UsageError('--hunt must be a hunt slug')
-  const st = armedStateFor(ctx, campaign, `event ${type}`)
-  if (!st) return 0
+  if (!campaign || !CAMPAIGN_SLUG_RE.test(campaign)) throw new UsageError(`event ${type} needs --campaign <slug>`)
+  const st = readState(ctx, campaign)
+  if (!st || st.armed !== true) {
+    // Not armed (an interactive run nobody may be watching): a hunt or campaign that waits on a
+    // human still pages. No dedupe and no disarm: there is no armed state to change, and the
+    // runner sends `event park` once, right after the hunt that parked.
+    const r = await sendNotification(ctx, { event: type, campaign, hunt: type === 'park' ? hunt : undefined, status: st0, reason, report_url: reportUrl })
+    logLine(ctx, campaign, `event ${type} (not armed)`, r.ok ? 'sent' : `FAILED: ${r.code}`)
+    ctx.out(r.ok ? `ok: ${type} notified (not armed)` : `ok: ${type} notification FAILED: ${r.code} (not armed)`)
+    return 0
+  }
   if (type === 'park') {
     if (st.notified_parks[hunt] === st0) {
       logLine(ctx, campaign, 'INFO', `event park ${SLUG_RE.test(hunt) ? hunt : '(hunt)'}: already notified (${CODE_RE.test(st0) ? st0 : '(status)'})`)
