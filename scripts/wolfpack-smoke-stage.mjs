@@ -290,7 +290,9 @@ export function classifyFinding(finding, context = {}) {
     return out('block', '5xx_or_cross_tenant', m.cross_tenant === true ? `${what}: cross-tenant data seen` : `${what}: server error ${f.http_status}`)
   }
   if (f.prod_host === true) return out('block', 'prod_host_touched', `${what}: a refused (prod / never-smoke) host was visited`)
-  if (f.tenant === 'mobile' && key && ctx.mobilePassed && Object.prototype.hasOwnProperty.call(ctx.mobilePassed, key)) {
+  // A mobile regression is a criterion that FAILS now after passing before. An anomaly note on a
+  // check that still passes (e.g. the 404 a mobile-unchanged criterion expects) is not one.
+  if (f.tenant === 'mobile' && f.kind !== 'anomaly' && key && ctx.mobilePassed && Object.prototype.hasOwnProperty.call(ctx.mobilePassed, key)) {
     return out('block', 'mobile_regression', `${what}: passed on mobile in wave ${ctx.mobilePassed[key]}, fails now`)
   }
   if ((f.kind === 'smoke' || f.kind === 'integration') && files.some(p => blockPaths.some(b => p.startsWith(b)))) {

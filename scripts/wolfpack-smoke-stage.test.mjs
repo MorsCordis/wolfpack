@@ -285,6 +285,12 @@ test('classifyFinding: "uncertain log-vs-block → block"; "mobile regression �
   assert.match(r.reasoning, /passed on mobile in wave 2/)
   // not yet passed on mobile → the cosmetic class wins
   assert.equal(classifyFinding(F({ tenant: 'mobile', model: { class: 'log' } }), CTX()).outcome, 'log')
+  // an anomaly on a mobile check that still PASSES is not a regression (live 2026-10-24: the
+  // expected 404 of a "mobile sees no change" criterion reverted the hunt) — it falls to polish
+  const a = classifyFinding(F({ kind: 'anomaly', tenant: 'mobile', ref: 'h/11', http_status: 404, model: { class: 'log', expected_from: 'none' } }),
+    CTX({ mobilePassed: { 'h/11@mobile': 2 } }))
+  assert.equal(a.rule, 'polish')
+  assert.equal(a.outcome, 'log')
 })
 
 test('classifyFinding: ordering — earlier rules win; a hunt-less fix blocks the campaign; reasoning is rendered, never model prose', () => {
