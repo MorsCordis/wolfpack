@@ -143,6 +143,8 @@ On Red-tier hunts (or when `review_strategy == "ultra"`), Watchdog MAY spawn 2-3
 - [ ] If status is DEFERRED: the blocker is legitimate and a follow-up is noted
 - [ ] If the feature adds/changes user-visible workflows: doc frontmatter includes required tags: `docs/help/<area>`, `help/<workflow>`, `audience/<role>`
 
+- [ ] Every acceptance criterion that requires a project review (e.g. "passes `doc-reviewer`") has its verdict file in the plan dir (`doc-review.md` for `doc-reviewer`) reading `Verdict: PASS` for the file at HEAD. A missing or CHANGES_REQUIRED verdict is a REWORK, not a pass with a note.
+
 ### Cross-cutting infra observation
 - [ ] Did this hunt surface an infra/tooling issue outside its scope (test runner, CI step, local-dev setup, env-var drift)? If yes:
   - Check `.wolfpack/cross-cutting-debt.md` — if the issue already has a bullet, **append the current hunt slug** to its `surfaced in:` list

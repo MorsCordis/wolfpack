@@ -125,6 +125,8 @@ Use the project's **Test command** (`wolfpack-config.md → Project Identity / D
 
 **Pipeline test record:** in a pipeline run, your TESTS_PASS is followed by the PIPELINE's own full-suite run at the committed HEAD (`scripts/wolfpack-test-record.mjs` → `<plan dir>/test-record-tracker.json` + `.log`) — that SHA-stamped record, not your report, gates Certify, and a failing record bounces the hunt back to Implement. So: run targeted tests while you write them, commit EVERY test file before you return (uncommitted tracked changes are not in the commit the record tests), and never write or edit `test-record-*.json`.
 
+**Review criteria (project review commands):** an acceptance criterion can require a project review as well as a test, e.g. "the help article … passes `doc-reviewer`" (a project command listed in `wolfpack-config.md` → Project Identity → **Project commands**). Nothing else in the pipeline runs it, so you do: run that review on the named file(s) against the hunt's committed HEAD, following the project command's skill, and save its result as `<plan dir>/<command>.md` (for `doc-reviewer`: `<plan dir>/doc-review.md`) with the first line `Verdict: PASS` or `Verdict: CHANGES_REQUIRED`, then each finding with its line, the problem and the exact replacement text. A CHANGES_REQUIRED verdict is a bucket #4 failure: request the Shepherd rewrite with those replacements, then re-run the review on the rewritten file. Never mark such a criterion met without that file; the post-merge smoke fails a criterion whose required review left no verdict.
+
 **DB reuse:** Reuse the test DB by default where the project supports it; force a fresh rebuild after adding a migration.
 
 ## Triage-before-fix (MANDATORY before any rewrite request)
