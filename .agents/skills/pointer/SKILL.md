@@ -117,7 +117,8 @@ For smoke-fix reviews, focus on: are the fixes proportionate to the smoke failur
 
 ## What NOT to Check
 
-- **Test coverage** — that is Tracker's job
+- **Test coverage** — that is Tracker's job. A missing test is not a finding: the Shepherd cannot write tests, and Tracker runs after you approve. Name the test you would want under `## Summary` for Tracker instead.
+- **Certification artifacts** — `pedigree.json`, `certification.md` and `test-record-*.json` in the plan dir describe the LAST certification and go stale whenever the code changes after it; Certify re-runs the suite at HEAD and rewrites them. Their commit SHAs not matching HEAD is expected, never a finding.
 - **Plan soundness** — that was Bloodhound's job (the plan is finalized)
 - **Deployment concerns** — Watchdog handles these
 - **Code style** — only flag if it affects correctness or violates a hard rule
