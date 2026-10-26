@@ -171,6 +171,14 @@ function makeHarness() {
   h.tmuxState = () => JSON.parse(readFileSync(join(stub, 'tmux.json'), 'utf8'))
   h.procs = (rows) => writeFileSync(join(stub, 'procs.json'), JSON.stringify(rows))
   h.gate = (g) => writeFileSync(join(stub, 'gate.json'), JSON.stringify(g))
+  h.workflowActivity = (mtimeMs) => {
+    const dir = join(home, '.claude', 'projects', repo.replace(/[^A-Za-z0-9]/g, '-'), 'sess1', 'subagents', 'workflows', 'wf_x')
+    mkdirSync(dir, { recursive: true })
+    const p = join(dir, 'agent-1.jsonl')
+    writeFileSync(p, '{}\n')
+    utimesSync(p, mtimeMs / 1000, mtimeMs / 1000)
+    return p
+  }
   h.heartbeat = (layout, hunt, mtimeMs) => {
     const base = layout === 'main' ? repo : join(repo, layout, 'worktrees', hunt)
     const p = join(base, '.wolfpack', 'heartbeats', `${hunt}.json`)
@@ -299,6 +307,22 @@ describe('liveness', () => {
     await tick()
     assert.match(lastTick(H), / stalled \(1\/4\)$/)
     assert.equal(kills(H).length, 0); assert.equal(relaunches(H).length, 0); assert.equal(gateCalls(H).length, 0)
+  })
+
+  test('cron-workflow-liveness: a stale hunt heartbeat but a fresh Workflow transcript (post-merge stage) → alive', async () => {
+    await fresh()
+    await arm()
+    H.tmux({ sessions: { paw: { windows: [runnerWindow([{ pid: 100, dead: false }])] } } })
+    H.procs([{ pid: 100, ppid: 1, comm: 'bash' }, { pid: 101, ppid: 100, comm: 'claude', args: 'claude --permission-mode auto /run-campaign-local c1 --chain --unattended' }])
+    H.heartbeat('.claude', 'h1', OLD())
+    const wf = H.workflowActivity(Date.now())
+    H.clearCalls()
+    await tick()
+    assert.match(lastTick(H), / alive$/)
+    assert.equal(kills(H).length, 0)
+    utimesSync(wf, OLD() / 1000, OLD() / 1000)
+    await tick()
+    assert.match(lastTick(H), / stalled \(1\/4\)$/, 'a stale transcript is no liveness signal')
   })
 
   test('AC3: manually started runner (login shell → plain claude) + stale → stalled, no kill', async () => {

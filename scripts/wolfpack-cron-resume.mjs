@@ -73,6 +73,7 @@ export function loadContext(env = process.env) {
     limitRe: reSetting(env, 'WOLFPACK_CRON_LIMIT_RE', '(usage limit|limit reached|resets [0-9])', 'i'),
     limitLines: intSetting(env, 'WOLFPACK_CRON_LIMIT_LINES', 12, 1),
     procRe: reSetting(env, 'WOLFPACK_CRON_PROC_RE', '^(claude|node)$', ''),
+    claudeProjects: env.WOLFPACK_CRON_CLAUDE_PROJECTS || join(home, '.claude', 'projects'),
     sessionPath: env.WOLFPACK_CRON_SESSION_PATH || `${home}/.local/bin:/usr/local/bin:/usr/bin:/bin`,
     ntfyServer: env.WOLFPACK_NTFY_SERVER || 'https://ntfy.sh',
     topicFile: env.WOLFPACK_NTFY_TOPIC_FILE || join(home, '.secrets', 'wolfpack', 'ntfy-topic'),
@@ -173,6 +174,39 @@ export function newestHeartbeat(repo, hunts) {
         const t = Math.floor(statSync(p).mtimeMs)
         if (newest == null || t > newest) newest = t
       } catch { /* absent layout */ }
+    }
+  }
+  return newest
+}
+
+// Newest write (ms) by a Workflow-tool run of this repo: Claude Code keeps each run's agent
+// transcripts under <projects>/<repo path, non-alphanumerics as '-'>/<session>/subagents/workflows/<run>/,
+// and they grow on every agent step. A campaign's post-merge stage (deploy, suites, browser smoke)
+// writes no hunt heartbeat, so without this a working runner reads as stalled. Only run dirs
+// touched in the last day are scanned. Null when nothing is there.
+export function newestWorkflowActivity(projectsDir, repo, nowMs, windowMs = 24 * 3600 * 1000) {
+  if (!projectsDir) return null
+  const base = join(projectsDir, repo.replace(/[^A-Za-z0-9]/g, '-'))
+  let newest = null
+  let sessions
+  try { sessions = readdirSync(base) } catch { return null }
+  for (const s of sessions) {
+    const wf = join(base, s, 'subagents', 'workflows')
+    let runs
+    try { runs = readdirSync(wf) } catch { continue }
+    for (const r of runs) {
+      const dir = join(wf, r)
+      let files
+      try {
+        if (nowMs - statSync(dir).mtimeMs > windowMs) continue
+        files = readdirSync(dir)
+      } catch { continue }
+      for (const f of files) {
+        try {
+          const t = Math.floor(statSync(join(dir, f)).mtimeMs)
+          if (newest == null || t > newest) newest = t
+        } catch { /* gone */ }
+      }
     }
   }
   return newest
@@ -425,7 +459,7 @@ export async function tick(ctx) {
   const mdPath = join(ctx.campaignsDir, slug, 'campaign.md')
   if (!existsSync(mdPath)) return finish('ERROR', `campaign.md missing for the armed campaign — disarm it`, 1)
   const hunts = huntSlugs(readFileSync(mdPath, 'utf8'))
-  const newest = newestHeartbeat(ctx.repo, hunts)
+  const newest = maxMs(newestHeartbeat(ctx.repo, hunts), newestWorkflowActivity(ctx.claudeProjects, ctx.repo, now))
   const lr = ms(st.last_relaunch_at)
 
   // 2. progress bookkeeping (A-12). A heartbeat counts once: it must be newer than the last
