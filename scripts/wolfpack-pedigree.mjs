@@ -246,7 +246,13 @@ export function applyIndexRow(indexText, slug, row, { replace = false, upsert = 
     const cells = l.split('|');
     if (cells.length > 3 && cells[2].trim() === slug) hits.push(i);
   });
-  if (upsert && hits.length > 1) throw new Error(`--upsert found ${hits.length} rows for ${slug}; fix index.md by hand`);
+  // --upsert means "this hunt's one row": earlier re-certifications written before --upsert existed
+  // left several, so the first is replaced and the rest are dropped.
+  if (upsert && hits.length > 1) {
+    lines[hits[0]] = row;
+    const drop = new Set(hits.slice(1));
+    return lines.filter((_, i) => !drop.has(i)).join('\n');
+  }
   if (upsert && hits.length === 1) replace = true;
   if (replace) {
     if (hits.length !== 1) throw new Error(`--replace needs exactly one existing row for ${slug} (found ${hits.length})`);

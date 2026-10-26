@@ -218,7 +218,8 @@ test('applyIndexRow upsert: replaces the one prior row (re-certification), appen
   const repl = '| 2026-02-02 | a | Red |';
   assert.equal(applyIndexRow(`${head}${a}\n${b}\n`, 'a', repl, { upsert: true }), `${head}${repl}\n${b}\n`);
   assert.equal(applyIndexRow(`${head}${b}\n`, 'a', repl, { upsert: true }), `${head}${b}\n${repl}\n`);
-  assert.throws(() => applyIndexRow(`${head}${a}\n${a}\n`, 'a', repl, { upsert: true }), /--upsert found 2 rows/);
+  // two earlier rows (pre---upsert re-certifications) collapse to the one new row
+  assert.equal(applyIndexRow(`${head}${a}\n${a}\n`, 'a', repl, { upsert: true }), `${head}${repl}\n`);
 });
 
 test('index-row: an invalid top-level counter (a string) with no nested value is refused, never written', () => {
