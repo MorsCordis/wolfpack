@@ -1072,6 +1072,7 @@ describe('notifications', () => {
     r = await H.run(['event', 'waiting-on-you', '--campaign', 'c1', '--status', 'wave_paused_budget'])
     assert.equal(r.code, 0)
     assert.equal(H.state().disarmed_reason, 'waiting_on_human')
+    assert.equal(H.state().session_ended_at, H.state().disarmed_at, 'a finish event ends the session, so a re-arm relaunches at once')
     assert.match(srv.posts[1].body, /^status: wave_paused_budget$/m)
   })
 })

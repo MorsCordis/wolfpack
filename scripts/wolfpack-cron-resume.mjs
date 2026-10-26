@@ -682,6 +682,10 @@ export async function event(ctx, type, { campaign, hunt, status: st0, reason, 'r
   st.armed = false
   st.disarmed_reason = EVENTS[type]
   st.disarmed_at = iso(ctx.now())
+  // A finish event ends the session too: the runner's own note-exit that follows is skipped
+  // (now not armed), and without this a re-arm sees the finished, idle runner window as a
+  // live-then-stalled session and waits ~4 ticks before relaunching.
+  st.session_ended_at = st.disarmed_at
   writeState(ctx, campaign, st)
   logLine(ctx, campaign, `event ${type}`, `${r.ok ? 'sent' : `FAILED: ${r.code}`}; disarmed reason=${EVENTS[type]}`)
   ctx.out(`ok: ${type} ${r.ok ? 'notified' : `notification FAILED: ${r.code}`}; disarmed (${EVENTS[type]})`)
