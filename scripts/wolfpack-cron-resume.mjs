@@ -562,7 +562,12 @@ export function arm(ctx, slug) {
     ctx.out(`refused: ${others[0].slug} is already armed — one runner per repo; disarm it first`)
     return 3
   }
-  writeState(ctx, slug, freshArmedState(ctx.now()))
+  // Re-arming after a finished run keeps that run's end: without it the next tick takes the idle,
+  // finished runner window for a live session (then a stalled one) and waits ~4 ticks to relaunch.
+  const prev = readState(ctx, slug)
+  const st = freshArmedState(ctx.now())
+  if (prev && prev.session_ended_at) { st.session_ended_at = prev.session_ended_at; st.last_verdict = prev.last_verdict }
+  writeState(ctx, slug, st)
   logLine(ctx, slug, 'armed')
   ctx.out(`armed ${slug}: the cron resumes it in tmux ${ctx.session}:${ctx.window} and pages on park/finish. A runner you start yourself is safe while its heartbeats are fresh; start it as claude "/run-campaign-local ${slug} --chain" (or in ${ctx.session}:${ctx.window}) so a silent long phase is never duplicated.`)
   return 0

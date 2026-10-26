@@ -1073,6 +1073,10 @@ describe('notifications', () => {
     assert.equal(r.code, 0)
     assert.equal(H.state().disarmed_reason, 'waiting_on_human')
     assert.equal(H.state().session_ended_at, H.state().disarmed_at, 'a finish event ends the session, so a re-arm relaunches at once')
+    const ended = H.state().session_ended_at
+    await H.run(['arm', 'c1'])
+    assert.equal(H.state().session_ended_at, ended, 're-arming keeps the finished run\'s end')
+    assert.equal(H.state().armed, true)
     assert.match(srv.posts[1].body, /^status: wave_paused_budget$/m)
   })
 })
