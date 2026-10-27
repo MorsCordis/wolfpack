@@ -90,6 +90,7 @@ export function loadContext(env = process.env) {
 
 const iso = (ms) => new Date(ms).toISOString()
 const ms = (v) => { if (v == null) return null; const t = Date.parse(v); return Number.isFinite(t) ? t : null }
+const ENDED_GRACE_MS = 5 * 60 * 1000
 const maxMs = (...vals) => { const xs = vals.filter(v => v != null); return xs.length ? Math.max(...xs) : null }
 
 // One structured log line: `<iso> <campaign|-> <event> <detail>`. Never topic, never pane text.
@@ -459,7 +460,9 @@ export async function tick(ctx) {
   const mdPath = join(ctx.campaignsDir, slug, 'campaign.md')
   if (!existsSync(mdPath)) return finish('ERROR', `campaign.md missing for the armed campaign — disarm it`, 1)
   const hunts = huntSlugs(readFileSync(mdPath, 'utf8'))
-  const newest = maxMs(newestHeartbeat(ctx.repo, hunts), newestWorkflowActivity(ctx.claudeProjects, ctx.repo, now))
+  const hbNewest = newestHeartbeat(ctx.repo, hunts)
+  const wfNewest = newestWorkflowActivity(ctx.claudeProjects, ctx.repo, now)
+  const newest = maxMs(hbNewest, wfNewest)
   const lr = ms(st.last_relaunch_at)
 
   // 2. progress bookkeeping (A-12). A heartbeat counts once: it must be newer than the last
@@ -499,7 +502,11 @@ export async function tick(ctx) {
     break
   }
   const sea = ms(st.session_ended_at)
-  const ended = sea != null && (lr == null || sea >= lr) && (newest == null || newest <= sea)
+  // A finished run keeps writing its Workflow transcript for a few seconds after its end is recorded
+  // (the cron-finish relay's own result), so transcript writes within ENDED_GRACE_MS of the end don't
+  // revive it. A hunt heartbeat after the end still means a new run.
+  const ended = sea != null && (lr == null || sea >= lr) && (hbNewest == null || hbNewest <= sea) &&
+    (wfNewest == null || wfNewest <= sea + ENDED_GRACE_MS)
   const freshRef = maxMs(newest, lr)
   const fresh = freshRef != null && now - freshRef < ctx.staleMs
   const where = `${S}:${W}`

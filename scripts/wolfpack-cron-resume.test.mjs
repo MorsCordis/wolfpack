@@ -325,6 +325,19 @@ describe('liveness', () => {
     assert.match(lastTick(H), / stalled \(1\/4\)$/, 'a stale transcript is no liveness signal')
   })
 
+  test('ended-grace: a transcript write seconds after note-exit does not revive a finished run', async () => {
+    await fresh()
+    await arm()
+    H.tmux({ sessions: { paw: { windows: [runnerWindow([{ pid: 100, dead: false }])] } } })
+    H.procs([{ pid: 100, ppid: 1, comm: 'bash' }, { pid: 101, ppid: 100, comm: 'claude', args: 'claude --permission-mode auto /run-campaign-local c1 --chain --unattended' }])
+    await H.run(['note-exit', '--campaign', 'c1', '--verdict', 'CAMPAIGN_AWAITING_HUMAN'])
+    H.workflowActivity(Date.now() + 20000)
+    H.clearCalls()
+    await tick()
+    assert.match(H.logText(), /runner ended/)
+    assert.equal(relaunches(H).length, 1)
+  })
+
   test('AC3: manually started runner (login shell → plain claude) + stale → stalled, no kill', async () => {
     await fresh()
     await arm()
