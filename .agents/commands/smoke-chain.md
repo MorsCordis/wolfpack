@@ -30,6 +30,10 @@ It runs on the Spark only (the user-scope chrome-devtools MCP that drives the Sp
    navigation verify the host and the path before asserting anything.
 4. **Public (logged-out) pages** run in `new_page` with `isolatedContext: "public"`; never sign in inside
    that context.
+4a. **One page at a time** (the smoke host is memory-tight). Do every signed-in check in the one page that
+   is already open (`list_pages` → `select_page`); never `new_page` for a signed-in check. Open the public
+   page only for the public criteria, run them back to back, then `close_page` it before the next signed-in
+   criterion. Never hold more than that one extra page, and close any page you opened before you finish.
 5. **Re-login on a sign-in redirect** (a login form where the criterion expected another page): run the hook
    with ` --check`; on `SIGNED_OUT` sign in once through the hook, then re-navigate. A second redirect in the
    same criterion = `auto_fail` with detail `session lost after re-login`.
