@@ -27,7 +27,7 @@ import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 
 import { join } from 'node:path'
 import {
   readSnapshot, computeUsageDecision, thresholdsFromEnv, snapshotPathFromEnv,
-  estimateFromEnv, estimateConfigFromEnv,
+  estimateFromEnv, estimateConfigFromEnv, isValidWindow,
 } from './wolfpack-window-gate.mjs'
 
 // claude-hud's rounding (dist/stdin.js) — the one-liner must agree with the status line.
@@ -46,6 +46,32 @@ export function currentUsage({ env = process.env, nowMs = Date.now(), fsImpl, th
     nowMs, tier: 'Red', thresholds: th,
     estimate: () => estimateFromEnv(env, nowMs),
   })
+}
+
+// Informational last-known figures for a notification (never a gate decision): the
+// snapshot's own percentages and age, however stale, with a window whose reset time has
+// passed reported as reset rather than as its old figure. null when there is no usable
+// snapshot (missing, unparseable, no valid five_hour window, captured in the future or
+// more than LAST_KNOWN_NOTIFY_MAX_MS ago).
+export const LAST_KNOWN_NOTIFY_MAX_MS = 24 * 60 * 60 * 1000
+export function lastKnownUsage({ env = process.env, nowMs = Date.now(), fsImpl } = {}) {
+  const snap = readSnapshot(snapshotPathFromEnv(env), fsImpl)
+  if (!snap.ok) return null
+  const s = snap.snapshot
+  const capMs = typeof s.captured_at === 'string' ? Date.parse(s.captured_at) : NaN
+  if (!Number.isFinite(capMs) || capMs > nowMs + 60 * 1000 || nowMs - capMs > LAST_KNOWN_NOTIFY_MAX_MS) return null
+  const win = (w) => {
+    if (!isValidWindow(w)) return null
+    return w.resets_at * 1000 <= nowMs ? { reset: true, pct: null } : { reset: false, pct: w.used_percentage }
+  }
+  const five = win(s.rate_limits && s.rate_limits.five_hour)
+  if (!five) return null
+  const seven = win(s.rate_limits && s.rate_limits.seven_day)
+  return {
+    five_hour_pct: five.pct, five_hour_reset: five.reset,
+    seven_day_pct: seven ? seven.pct : null, seven_day_reset: seven ? seven.reset : false,
+    age_min: Math.max(0, Math.round((nowMs - capMs) / 60000)),
+  }
 }
 
 function fmtClock(epochSec, nowMs, tz) {

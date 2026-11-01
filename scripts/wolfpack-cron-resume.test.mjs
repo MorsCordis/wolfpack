@@ -14,7 +14,7 @@ import {
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
-import { buildNotification, composeUsage, huntSlugs, newestHeartbeat, validToken, validReportUrl, NOTIFY_KEYS } from './wolfpack-cron-resume.mjs'
+import { buildNotification, composeLastKnown, composeUsage, huntSlugs, newestHeartbeat, validToken, validReportUrl, NOTIFY_KEYS } from './wolfpack-cron-resume.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PACK = dirname(HERE)
@@ -978,6 +978,26 @@ describe('notifications', () => {
     assert.match(srv.posts[1].body, /^usage: 5h 42% · 7d n\/a$/m)
   })
 
+  test('a stale snapshot sends its last-known figures, aged and DEGRADED, without the unavailable WARNING', async () => {
+    await fresh()
+    await arm()
+    const now = Date.now() / 1000
+    const old = (ageMin, rl) => writeFileSync(H.snapshot, JSON.stringify({ captured_at: new Date(Date.now() - ageMin * 60000).toISOString(), rate_limits: rl }))
+    old(47, { five_hour: { used_percentage: 16, resets_at: now + 3600 }, seven_day: { used_percentage: 41, resets_at: now + 86400 } })
+    await H.run(['event', 'waiting-on-you', '--campaign', 'c1', '--status', 'campaign_awaiting_human'])
+    assert.match(srv.posts[0].body, /^usage: 5h 16% · 7d 41% DEGRADED \(as of 47 min\)$/m)
+    assert.doesNotMatch(H.logText(), /usage unavailable/)
+    // older than the gate's last-known limit, and the 5h window has reset since the capture
+    old(200, { five_hour: { used_percentage: 88, resets_at: now - 600 }, seven_day: { used_percentage: 41, resets_at: now + 86400 } })
+    await H.run(['event', 'waiting-on-you', '--campaign', 'c1', '--status', 'campaign_awaiting_human'])
+    assert.match(srv.posts[1].body, /^usage: 5h reset · 7d 41% DEGRADED \(as of 3 h\)$/m)
+    // more than a day old → unavailable, as before
+    old(25 * 60, { five_hour: { used_percentage: 16, resets_at: now + 3600 } })
+    await H.run(['event', 'waiting-on-you', '--campaign', 'c1', '--status', 'campaign_awaiting_human'])
+    assert.match(srv.posts[2].body, /^usage: unavailable$/m)
+    assert.match(H.logText(), /WARNING notify waiting-on-you: usage unavailable/)
+  })
+
   test('AC13/A-14: usage unavailable (missing snapshot / currentUsage throws) still sends, with a WARNING', async () => {
     await fresh()
     await arm()
@@ -1242,6 +1262,18 @@ describe('pure helpers', () => {
     assert.equal(composeUsage({ five_hour_pct: 4, seven_day_pct: 'x' }).usage, 'unavailable')
     assert.ok(validToken('usage', '5h 42% · 7d 17% DEGRADED'))
     assert.ok(!validToken('usage', '5h 42% · 7d 17% Jane'))
+  })
+
+  test('composeLastKnown: aged, DEGRADED, reset windows named, junk refused', () => {
+    assert.equal(composeLastKnown({ five_hour_pct: 16.4, seven_day_pct: 41, age_min: 47 }), '5h 16% · 7d 41% DEGRADED (as of 47 min)')
+    assert.equal(composeLastKnown({ five_hour_pct: null, five_hour_reset: true, seven_day_pct: null, age_min: 150 }), '5h reset · 7d n/a DEGRADED (as of 3 h)')
+    assert.equal(composeLastKnown({ five_hour_pct: 5, seven_day_pct: null, seven_day_reset: true, age_min: 12 }), '5h 5% · 7d reset DEGRADED (as of 12 min)')
+    assert.equal(composeLastKnown({ five_hour_pct: 400, age_min: 5 }), null)
+    assert.equal(composeLastKnown({ five_hour_pct: 5, age_min: -1 }), null)
+    assert.equal(composeLastKnown(null), null)
+    for (const v of ['5h 16% · 7d 41% DEGRADED (as of 47 min)', '5h reset · 7d n/a DEGRADED (as of 3 h)']) assert.ok(validToken('usage', v), v)
+    assert.ok(!validToken('usage', '5h 16% · 7d 41% DEGRADED (as of Jane)'))
+    assert.ok(!validToken('usage', '5h 101% · 7d 41% DEGRADED (as of 4 min)'))
   })
 
   test('huntSlugs reads ### N. <slug> headings only', () => {
