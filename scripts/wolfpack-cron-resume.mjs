@@ -23,7 +23,7 @@ export const SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,80}$/
 export const CODE_RE = /^[a-z0-9_:.-]{1,64}$/
 export const CAMPAIGN_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/   // reaches tmux argv: stricter
 export const VERDICT_RE = /^[A-Za-z0-9_:.-]{1,64}$/
-export const USAGE_RE = /^(5h ([0-9]{1,3})% · 7d (([0-9]{1,3})%|n\/a)( DEGRADED)?|unavailable)$/
+export const USAGE_RE = /^(5h (?:([0-9]{1,3})%|reset) · 7d (?:([0-9]{1,3})%|n\/a|reset)( DEGRADED)?( \(as of [0-9]{1,4} (?:min|h)\))?|unavailable)$/
 export const ISO_UTC_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/
 export const TOPIC_RE = /^[A-Za-z0-9_-]{24,64}$/
 export const NOTIFY_KEYS = ['event', 'campaign', 'hunt', 'status', 'reason', 'usage', 'at', 'report_url']
@@ -313,7 +313,7 @@ export function validToken(key, v, ctx = {}) {
     const m = v.match(USAGE_RE)
     if (!m) return false
     if (v === 'unavailable') return true
-    return validInt(Number(m[2])) && (m[3] === 'n/a' || validInt(Number(m[4])))
+    return (m[2] == null || validInt(Number(m[2]))) && (m[3] == null || validInt(Number(m[3])))
   }
   return false
 }
@@ -331,6 +331,24 @@ export function composeUsage(d) {
   else if (typeof s === 'number' && Number.isFinite(s) && validInt(Math.round(s))) week = `${Math.round(s)}%`
   else return { usage: 'unavailable', why: 'no_figures' }
   return { usage: `5h ${fi}% · 7d ${week}${d.degraded ? ' DEGRADED' : ''}`, why: null }
+}
+
+// Compose `usage` from lastKnownUsage() (a stale snapshot's own figures): always DEGRADED and
+// aged, a window past its reset says `reset`. null when there is nothing valid to show.
+export function composeLastKnown(lk) {
+  if (!lk || typeof lk !== 'object' || !Number.isInteger(lk.age_min) || lk.age_min < 0) return null
+  const part = (pct, reset) => {
+    if (reset === true) return 'reset'
+    if (typeof pct !== 'number' || !Number.isFinite(pct) || !validInt(Math.round(pct))) return null
+    return `${Math.round(pct)}%`
+  }
+  const five = part(lk.five_hour_pct, lk.five_hour_reset)
+  if (!five) return null
+  const week = lk.seven_day_pct == null && lk.seven_day_reset !== true ? 'n/a' : part(lk.seven_day_pct, lk.seven_day_reset)
+  if (!week) return null
+  const age = lk.age_min < 90 ? `${lk.age_min} min` : `${Math.round(lk.age_min / 60)} h`
+  if (!/^[0-9]{1,4} (min|h)$/.test(age)) return null
+  return `5h ${five} · 7d ${week} DEGRADED (as of ${age})`
 }
 
 // Pure: allowlisted fields → {title, body, tags, priority, fields, dropped}. Any value that is
@@ -358,6 +376,12 @@ async function readUsage(ctx, event) {
   try {
     const mod = await import(new URL('./wolfpack-usage.mjs', import.meta.url).href)
     out = composeUsage(mod.currentUsage({ env: ctx.env }))
+    // A long headless run never re-renders the status line, so by the time it pings the
+    // snapshot is usually past the gate's staleness limit: show its last-known figures, aged.
+    if (out.why) {
+      const lk = composeLastKnown(mod.lastKnownUsage({ env: ctx.env }))
+      if (lk) out = { usage: lk, why: null }
+    }
   } catch (e) {
     out = { usage: 'unavailable', why: (e && e.constructor && e.constructor.name) || 'error' }
   }
