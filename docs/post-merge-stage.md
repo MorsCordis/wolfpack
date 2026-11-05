@@ -95,7 +95,8 @@ header of `scripts/wolfpack-smoke-stage.mjs`). `current.step` is the last step *
   `stage/wave-<n>/smoke-raw-<sha12>.json`. An agent error or a raw file that fails validation (renamed
   `.invalid-<k>.json`) gets one more run; a second failure parks `smoke_agent_failed`.
 - **Ingest:** the stage validates the raw file, applies the hunt verdict (any `auto_fail` → FAIL; a 5xx on the
-  hunt's pages → FAIL even when every criterion passed; any `needs_human_run` → PENDING), redacts every
+  hunt's pages → FAIL even when every criterion passed, unless the agent flagged that anomaly `expected`
+  with an `expected_reason` on a passing criterion; any `needs_human_run` → PENDING), redacts every
   anomaly, writes `<wave dir>/results.json` and builds the wave page. A criterion that needs the platform
   console is `needs_human_run` with detail `console not reachable on dev`.
 - **Manual items the stage writes** into results.json `manual`: `{ref, hunt, steps, expected, reason}` — the
@@ -113,23 +114,39 @@ header of `scripts/wolfpack-smoke-stage.mjs`). `current.step` is the last step *
 | # | Rule id | Condition | Outcome |
 |---|---|---|---|
 | 1 | `deploy_or_migration` | kind deploy/migrate | block |
-| 2 | `5xx_or_cross_tenant` | any 5xx on the finding, or `model.cross_tenant` | block |
+| 2 | `5xx_or_cross_tenant` | any 5xx on the finding (except an anomaly flagged `expected: true` with a non-empty `expected_reason` on a passing criterion), or `model.cross_tenant` (always) | block |
 | 3 | `prod_host_touched` | a refused host was visited | block |
 | 4 | `mobile_regression` | tenant mobile and `<key>@mobile` in `mobile_passed` | block |
 | 5 | `money_medical_path` | kind smoke/integration and the hunt's merge diff touches a `triageBlockPaths` dir | block |
 | 6 | `red_compliance` | the hunt is Red and the ref is one of its `[compliance]` criteria | block |
-| 7 | `fix_cap` | `fix_rounds[hunt] >= 2` | block |
-| 8 | `needs_decision` | `model.class == needs_decision` | block |
-| 9 | `uncertain_log_vs_block` | `model.class == uncertain` | block |
-| 10 | `session_drop` | kind session | log (resolution `needs Cecil` at once) |
-| 11 | `clear_defect` | `model.class == fix` and `expected_from != none`; or kind integration (a failing test is its own expected behaviour) | fix |
-| 12 | `polish` | `model.class == log` | log |
-| 13 | `default_block` | anything else (incl. `fix` with no expected behaviour = a product decision; `block` from the model) | block |
+| 7 | `expected_anomaly` | kind anomaly on a passing criterion, expected by flag, text fallback or criterion-named status (§ Expected anomalies) | expected (resolution `expected behaviour` at once) |
+| 8 | `fix_cap` | `fix_rounds[hunt] >= 2` | block |
+| 9 | `needs_decision` | `model.class == needs_decision` | block |
+| 10 | `uncertain_log_vs_block` | `model.class == uncertain` | block |
+| 11 | `session_drop` | kind session | log (resolution `needs Cecil` at once) |
+| 12 | `clear_defect` | `model.class == fix` and `expected_from != none`; or kind integration (a failing test is its own expected behaviour) | fix |
+| 13 | `polish` | `model.class == log` | log |
+| 14 | `default_block` | anything else (incl. `fix` with no expected behaviour = a product decision; `block` from the model) | block |
 
 A finding with no hunt that would be `fix` becomes `block` on the campaign stage. A hunt with any `block`
 finding drops its `fix` findings (block wins). A manifest flow's failure is attributed to the hunts merged in
-that stage run. A console / non-2xx anomaly on a passing criterion is polish unless the agent judged it
-otherwise; a 5xx always blocks.
+that stage run.
+
+### Expected anomalies
+
+- An anomaly on an `auto_pass` criterion is expected when (first match): the raw anomaly has
+  `expected: true` and a non-empty `expected_reason`; its text contains `(expected NNN` with NNN = its status;
+  or its 4xx/5xx status appears as a standalone number in the criterion text.
+- It is recorded `outcome: expected`, rule `expected_anomaly`, resolution `expected behaviour`, the agent's
+  reason in `evidence`; never polish, fix or block, never in the polish set.
+- The 5xx exception and its limit: only the flag WITH a reason lifts rule 2 (and the hunt's FAIL verdict);
+  the text fallback or a criterion-named 5xx does not. `cross_tenant` always blocks. Anomalies on failing or
+  `needs_human_run` criteria are never treated as expected.
+- Any other console / non-2xx anomaly on a passing criterion is polish unless the agent judged it otherwise.
+- Known limit: two anomalies on one check with the same status share one id; the unflagged one is kept.
+- Known limit: upgrading the pack mid-iteration of an in-flight campaign is unsupported. An already-merged
+  fix's finding re-seen under its new id is not matched by the landed-fix guard and gets a second fix round
+  (then `fix_cap` parks).
 
 A migrate failure blocks every hunt of the wave whose merge diff adds a file matching the Migration file
 pattern (the failing app cannot be read from the job's exit code). Each one's `parked.md` names the others
@@ -169,11 +186,15 @@ dependents, lets non-conflicting later hunts keep running, rebuilds the report a
 ## The issue log
 
 `.wolfpack/campaigns/<c>/issue-log.json` is the machine store; `issue-log.md` is re-rendered from it on every
-write. Append-only: one entry per finding id `ISS-<sha1(kind|hunt|tenant|ref-or-test-id|normalised
-summary)[:10]>` — the same failure seen again keeps its id (`seen_waves` grows). Fields: id, wave,
+write. Append-only: one entry per finding id `ISS-<sha1(kind|hunt|tenant|ref-or-test-id|status)[:10]>`
+(status = the HTTP status, `-` when none; the wording never enters the id, so a reworded finding keeps its
+id) — the same failure seen again keeps its id (`seen_waves` grows). Ids written before this key stay as they
+are and remain resolvable; a re-seen finding starts one new entry under the new key. Fields: id, wave,
 seen_waves, hunt, ref, tenant, kind (smoke / integration / anomaly / session / deploy / migrate), outcome,
 rule, reasoning, evidence (screenshot path or failing test id), resolution (`fixed in round <n>` /
-`polished` / `reverted` / `needs Cecil`) and resolved_at. Cookies, `Authorization`, `csrftoken`,
+`polished` / `reverted` / `needs Cecil` / `expected behaviour`; resolve with `--resolution "expected
+behaviour"` when a finding turns out to be the designed behaviour) and resolved_at. Outcomes: fix, block,
+log, expected. Cookies, `Authorization`, `csrftoken`,
 `sessionid` and token query strings are redacted before anything is written.
 
 ## The polish wave
@@ -182,7 +203,9 @@ When the campaign is ready for release (or only waits on a human) and the issue 
 campaign-merged hunts, the runner runs ONE polish wave: `polish-<c>[-<k>]` (branch `feat/polish-<c>`), Blue,
 one change for all the items → cross-family review → `merge-hunt --polish` → a polish iteration (redeploy,
 the polish merge's own suites, the full smoke). Green → the items are `polished`; an item that still fails →
-`needs Cecil`. A previously passing check that now fails (smoke or integration) → `revert-merge` of the polish
+`needs Cecil`. A check or test that was not targeted and now fails (an `auto_fail` disposition, a failing test, or a
+deploy/migrate failure; the comparison is by disposition, and an anomaly note on a check that still passes
+is never a regression) → `revert-merge` of the polish
 merge only, its items `needs Cecil`, one plain re-verify on the reverted tip. It never touches reverted or
 parked hunts and never runs twice for the same open set.
 

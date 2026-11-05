@@ -242,7 +242,7 @@ test('huntVerdict (AC15): "5xx flips hunt verdict"; "console-not-reachable → n
 // ── classifyFinding (AC18): one case per rule, first match wins ───────────────
 const F = (over = {}) => ({ kind: 'smoke', hunt: 'h', ref: 'h/1', tenant: 'surgical', summary: 's', evidence: null, model: { class: 'fix', expected_from: 'ac' }, ...over })
 const CTX = (over = {}) => ({ tier: 'Yellow', files: ['scheduler/views.py'], complianceRefs: [], fixRounds: 0, mobilePassed: {}, triageBlockPaths: ['billing/', 'records'], ...over })
-test('classifyFinding: one case per rule 1–13 (first match wins)', () => {
+test('classifyFinding: one case per rule 1–14 (first match wins)', () => {
   const cases = [
     ['deploy_or_migration', 'block', F({ kind: 'deploy' }), CTX()],
     ['deploy_or_migration', 'block', F({ kind: 'migrate' }), CTX()],
@@ -253,6 +253,7 @@ test('classifyFinding: one case per rule 1–13 (first match wins)', () => {
     ['money_medical_path', 'block', F(), CTX({ files: ['records/models.py'] })],
     ['money_medical_path', 'block', F({ kind: 'integration', test_id: 'billing.tests.X', ref: null }), CTX({ files: ['billing/x.py'] })],
     ['red_compliance', 'block', F({ ref: 'h/4' }), CTX({ tier: 'Red', complianceRefs: ['h/4'] })],
+    ['expected_anomaly', 'expected', F({ kind: 'anomaly', http_status: 404, summary: 'x (expected 404)', model: { class: 'log' } }), CTX()],
     ['fix_cap', 'block', F(), CTX({ fixRounds: 2 })],
     ['needs_decision', 'block', F({ model: { class: 'needs_decision' } }), CTX()],
     ['uncertain_log_vs_block', 'block', F({ model: { class: 'uncertain' } }), CTX()],
@@ -273,7 +274,7 @@ test('classifyFinding: one case per rule 1–13 (first match wins)', () => {
   }
   // every rule id appears in the table (and only the documented ones)
   assert.deepEqual([...new Set(cases.map(c => c[0]))].sort(), [...TRIAGE_RULES].sort())
-  assert.equal(TRIAGE_RULES.length, 13)
+  assert.equal(TRIAGE_RULES.length, 14)
 })
 
 test('classifyFinding: "uncertain log-vs-block → block"; "mobile regression → block even if cosmetic"', () => {
@@ -310,10 +311,11 @@ test('classifyFinding: ordering — earlier rules win; a hunt-less fix blocks th
   assert.doesNotMatch(prose.reasoning, /IGNORE ME/)
 })
 
-test('findingId: stable, ISS-<10 hex>, normalised summary (digits/case/space), distinct per tenant/ref/kind', () => {
+test('findingId: stable, ISS-<10 hex>, wording-independent, distinct per tenant/ref/kind/status', () => {
   const a = findingId({ kind: 'smoke', hunt: 'h', tenant: 'mobile', ref: 'h/1', summary: 'Got 503 at  12:01' })
   assert.match(a, /^ISS-[0-9a-f]{10}$/)
-  assert.equal(findingId({ kind: 'smoke', hunt: 'h', tenant: 'mobile', ref: 'h/1', summary: 'got 500 at 9:59' }), a)
+  assert.equal(findingId({ kind: 'smoke', hunt: 'h', tenant: 'mobile', ref: 'h/1', summary: 'a completely different wording' }), a)
+  assert.notEqual(findingId({ kind: 'smoke', hunt: 'h', tenant: 'mobile', ref: 'h/1', http_status: 404, summary: 'got 500 at 9:59' }), a)
   assert.notEqual(findingId({ kind: 'smoke', hunt: 'h', tenant: 'surgical', ref: 'h/1', summary: 'got 500 at 9:59' }), a)
   assert.notEqual(findingId({ kind: 'anomaly', hunt: 'h', tenant: 'mobile', ref: 'h/1', summary: 'got 500 at 9:59' }), a)
   assert.notEqual(findingId({ kind: 'integration', hunt: 'h', test_id: 'x.tests.A', summary: 's' }), findingId({ kind: 'integration', hunt: 'h', test_id: 'x.tests.B', summary: 's' }))
