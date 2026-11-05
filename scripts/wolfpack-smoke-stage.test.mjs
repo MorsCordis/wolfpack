@@ -21,6 +21,7 @@ import {
   huntVerdict, classifyFinding, TRIAGE_RULES, findingId, redact, fingerprintLookup, lookupLine, appendIssues, resolveIssue,
   renderIssueLog, emptyStore, openPolishSet, checkConfig, validateRaw, newCurrent, resetIteration, rearm,
   MAX_TEST_RECORD_MIN, SUITE_RESERVE_MIN, MAX_BUSY_RETRIES, MAX_FIX_ROUNDS, STEPS, CONSOLE_DETAIL, StageError,
+  expectedBasis, RESOLUTIONS,
 } from './wolfpack-smoke-stage.mjs'
 import { STAGE_KEYS } from './wolfpack-config.mjs'
 import { cmdInit as chainInit, cmdMergeHunt as chainMerge, CHAIN_STATUS as CS } from './wolfpack-chain.mjs'
@@ -1563,4 +1564,364 @@ test('suites: an app named like "products" is not a prod target; a non-plain app
   const x = r2.run(['suites', '--wave', '1'])
   assert.equal(x.code, 2, x.stdout)
   assert.match(x.json.reason, /not plain directory names/)
+})
+
+// ── triage-expected-anomalies: expected anomalies are not defects (docs/post-merge-stage.md § Expected anomalies) ──
+const NET = (over = {}) => ({ kind: 'network', text: 'GET /settings/x', status: 404, ...over })
+// One hunt `a`, one stage run at wave 1, a raw file with `over` per pair key; returns ingest + triage output.
+function expectedRun(over, { acceptance } = {}) {
+  const r = stageRepo()
+  mergeHunt(r, 'a', { edits: { 'scheduler/views.py': 'v2\n' }, ...(acceptance ? { acceptance } : {}) })
+  const ps = smokeReady(r)
+  fs.writeFileSync(ps.raw_path, JSON.stringify(rawFor(ps, over)))
+  const is = r.ok(['ingest-smoke', '--wave', '1', '--raw', ps.raw_path])
+  const t = r.ok(['triage', '--wave', '1'])
+  return { r, ps, is, t, res: readJ(is.results) }
+}
+
+test('AC1 validateRaw: anomalies[].expected must be a boolean and expected_reason a string; null / absent allowed', () => {
+  const plan = { sha: 'a'.repeat(40), pairs: [{ key: 'h/1@mobile' }] }
+  const raw = (a) => ({ schema: 1, sha: plan.sha, results: [{ ref: 'h/1', tenant: 'mobile', disposition: 'auto_pass', anomalies: [a], urls: [] }] })
+  assert.equal(validateRaw(raw(NET({ expected: true, expected_reason: 'the criterion says 404' })), plan), true)
+  assert.equal(validateRaw(raw(NET({ expected: false })), plan), true)
+  assert.equal(validateRaw(raw(NET({ expected: null, expected_reason: null })), plan), true)
+  assert.equal(validateRaw(raw(NET()), plan), true)
+  assert.throws(() => validateRaw(raw(NET({ expected: 'yes' })), plan), (e) => e instanceof StageError && /anomalies\[0\]\.expected must be a boolean/.test(e.message))
+  assert.throws(() => validateRaw(raw(NET({ expected: 1 })), plan), /anomalies\[0\]\.expected must be a boolean/)
+  assert.throws(() => validateRaw(raw(NET({ expected: true, expected_reason: 42 })), plan), (e) => e instanceof StageError && /anomalies\[0\]\.expected_reason must be a string/.test(e.message))
+})
+
+test('expectedBasis: flag needs a non-empty reason; text fallback must match the status; criterion needs a standalone 4xx/5xx', () => {
+  assert.equal(expectedBasis(NET({ expected: true, expected_reason: 'per AC' })), 'flag')
+  assert.equal(expectedBasis({ kind: 'console', text: 'x', expected: true, expected_reason: 'per AC' }), 'flag', 'a status-less console anomaly can be flagged')
+  assert.equal(expectedBasis({ kind: 'console', text: 'x', expected: true, expected_reason: '   ' }), null, 'blank reason, no status → null')
+  assert.equal(expectedBasis({ kind: 'console', text: 'x', expected: true }), null, 'missing reason → null')
+  assert.equal(expectedBasis(NET({ expected: true, expected_reason: '', text: 'GET /x (expected 404)' })), 'text', 'blank reason falls through to the text basis')
+  assert.equal(expectedBasis(NET({ expected: 'true', expected_reason: 'r' })), null, 'only boolean true flags')
+  assert.equal(expectedBasis(NET({ text: 'GET /settings/booking-capacity/ (Expected 404 per AC)' })), 'text')
+  assert.equal(expectedBasis(NET({ text: 'GET /x ( EXPECTED 404)' })), 'text', 'case-insensitive, space after the paren tolerated')
+  assert.equal(expectedBasis(NET({ status: 403, text: 'GET /x (expected 404 per AC)' })), null, 'text names another status')
+  assert.equal(expectedBasis(NET({ text: 'GET /x expected 404' })), null, 'the fallback needs the "(expected" form')
+  assert.equal(expectedBasis(NET({ text: 'GET /x (expected 4040)' })), null)
+  assert.equal(expectedBasis(NET(), 'a mobile tenant gets 404'), 'criterion')
+  assert.equal(expectedBasis(NET(), 'a mobile tenant gets 404s (not found)'), 'criterion')
+  assert.equal(expectedBasis(NET(), 'answers (404) for a mobile tenant'), 'criterion')
+  assert.equal(expectedBasis(NET({ status: 503 }), 'answers 503 while unconfigured'), 'criterion')
+  assert.equal(expectedBasis(NET({ status: 403 }), 'a mobile tenant gets 404'), null)
+  assert.equal(expectedBasis(NET(), 'ticket 1404 and code 4040'), null, 'digit boundaries')
+  assert.equal(expectedBasis(NET({ status: 390 }), 'the layout fits 390 px'), null, 'only 4xx/5xx statuses use the criterion basis')
+  assert.equal(expectedBasis(NET({ status: 302 }), 'redirects with 302'), null)
+  assert.equal(expectedBasis(NET({ text: 'GET /x' })), null, 'nothing says it is expected')
+  assert.equal(expectedBasis({ kind: 'console', text: 'boom (expected 404)' }), null, 'no status → no text/criterion basis')
+  assert.equal(expectedBasis(null), null)
+})
+
+test('AC2 CLI ingest → triage → polish-plan: a flagged 404 with a reason on a passing pair is recorded expected, never polish', () => {
+  const reason = 'mobile tenant must get 404 per AC'
+  const { r, t, res } = expectedRun({ 'a/1@mobile': { anomalies: [NET({ expected: true, expected_reason: reason })] } })
+  assert.deepEqual(t.pending, { fix: {}, block: {} })
+  const x = t.classified.find(c => c.rule === 'expected_anomaly')
+  assert.ok(x, JSON.stringify(t.classified))
+  assert.equal(x.outcome, 'expected')
+  assert.doesNotMatch(x.reasoning, /mobile tenant must/, 'the agent prose goes to evidence, never reasoning')
+  const log = r.issues().entries
+  assert.equal(log.length, 1)
+  const e = log[0]
+  assert.deepEqual([e.hunt, e.ref, e.tenant, e.kind, e.outcome, e.rule, e.resolution], ['a', 'a/1', 'mobile', 'anomaly', 'expected', 'expected_anomaly', 'expected behaviour'])
+  assert.ok(e.resolved_at, 'born resolved')
+  assert.equal(e.evidence, `expected_reason: ${reason}`)
+  assert.deepEqual(r.ok(['polish-plan']).items, [])
+  // results.json shows why it was not a finding; the hunt still passes
+  const ha = res.hunts.find(h => h.slug === 'a')
+  assert.equal(ha.verdict, 'PASS')
+  const an = ha.anomalies.find(a => a.status === 404)
+  assert.deepEqual([an.expected, an.expected_reason, an.expected_basis], [true, reason, 'flag'])
+  const md = fs.readFileSync(join(r.root, '.wolfpack', 'campaigns', 'c1', 'issue-log.md'), 'utf8')
+  assert.match(md, /— expected \(expected_anomaly\)/)
+})
+
+test('AC2: the flag only counts on auto_pass — on a needs_human_run pair the fields are stripped and the 404 is polish', () => {
+  const { r, t, res } = expectedRun({ 'a/1@mobile': { disposition: 'needs_human_run', anomalies: [NET({ expected: true, expected_reason: 'r' })] } })
+  const ha = res.hunts.find(h => h.slug === 'a')
+  const an = ha.anomalies.find(a => a.status === 404)
+  assert.equal(an.expected, undefined)
+  assert.equal(an.expected_basis, undefined)
+  const f = r.state().current.findings.find(x => x.kind === 'anomaly')
+  assert.equal(f.criterion_passed, false)
+  assert.equal(f.expected, undefined)
+  assert.deepEqual(t.classified.map(c => [c.outcome, c.rule]), [['log', 'polish']])
+  assert.equal(r.ok(['polish-plan']).items.length, 1)
+})
+
+test('AC3 CLI: the "(expected NNN" text fallback on a passing pair → expected, polish-plan empty', () => {
+  const { r, t } = expectedRun({ 'a/1@mobile': { anomalies: [NET({ text: 'GET /settings/booking-capacity/ (expected 404 per AC)' })] } })
+  assert.deepEqual(t.classified.map(c => [c.outcome, c.rule]), [['expected', 'expected_anomaly']])
+  assert.match(t.classified[0].reasoning, /the anomaly text says \(expected 404\)/)
+  assert.deepEqual(t.pending, { fix: {}, block: {} })
+  assert.deepEqual(r.issues().entries.map(e => [e.outcome, e.resolution]), [['expected', 'expected behaviour']])
+  assert.deepEqual(r.ok(['polish-plan']).items, [])
+})
+
+test('AC4 CLI: a 4xx the criterion text names → expected without a flag; another 4xx on that criterion stays polish', () => {
+  const acceptance = '## Acceptance criteria\n- AC1 [auto] [tenant:mobile] a mobile tenant gets 404 on the booking settings page.\n'
+  let { r, t } = expectedRun({ 'a/1@mobile': { anomalies: [NET()] } }, { acceptance })
+  assert.deepEqual(t.classified.map(c => [c.outcome, c.rule]), [['expected', 'expected_anomaly']])
+  assert.match(t.classified[0].reasoning, /the criterion text names 404/)
+  assert.deepEqual(r.ok(['polish-plan']).items, [])
+  ;({ r, t } = expectedRun({ 'a/1@mobile': { anomalies: [NET({ status: 403 })] } }, { acceptance }))
+  assert.deepEqual(t.classified.map(c => [c.outcome, c.rule]), [['log', 'polish']])
+  const e = r.issues().entries[0]
+  assert.deepEqual([e.outcome, e.resolution], ['log', null])
+  assert.deepEqual(r.ok(['polish-plan']).items.map(i => i.id), [e.id])
+})
+
+test('AC5: a flagged 503 with a reason on a passing pair does not block, revert or FAIL the hunt', () => {
+  const reason = 'no messaging channel on the smoke tenant'
+  const { t, res, is } = expectedRun({ 'a/1@mobile': { anomalies: [NET({ status: 503, text: 'GET /api/sms', expected: true, expected_reason: reason })] } })
+  assert.deepEqual(t.pending.block, {})
+  assert.deepEqual(t.pending.fix, {})
+  assert.equal(res.hunts.find(h => h.slug === 'a').verdict, 'PASS')
+  assert.equal(is.verdicts.a, 'PASS')
+  assert.deepEqual(t.classified.map(c => [c.outcome, c.rule]), [['expected', 'expected_anomaly']])
+  const fd = F({ kind: 'anomaly', http_status: 503, summary: 'GET /api/sms', expected: true, expected_reason: reason, model: {} })
+  for (const ctx of [{}, CTX()]) {
+    const out = classifyFinding(fd, ctx)
+    assert.notEqual(out.rule, '5xx_or_cross_tenant')
+    assert.deepEqual([out.outcome, out.rule], ['expected', 'expected_anomaly'])
+  }
+  const pass = [{ disposition: 'auto_pass' }]
+  assert.equal(huntVerdict(pass, [{ status: 503, expected: true, expected_reason: 'x' }]), 'PASS')
+  assert.equal(huntVerdict([{ disposition: 'auto_fail' }], [{ status: 503, expected: true, expected_reason: 'x' }]), 'FAIL', 'a failing criterion is still FAIL')
+})
+
+test('AC6: an unexpected 5xx still blocks — unflagged, flag without a reason, text fallback only; cross_tenant always', () => {
+  const variants = [
+    { summary: 'GET /api/sms' },
+    { summary: 'GET /api/sms', expected: true, expected_reason: '' },
+    { summary: 'GET /api/sms', expected: true },
+    { summary: 'GET /api/sms (expected 503)' },
+  ]
+  for (const v of variants) {
+    const out = classifyFinding(F({ kind: 'anomaly', http_status: 503, model: {}, ...v }), CTX())
+    assert.deepEqual([out.outcome, out.rule], ['block', '5xx_or_cross_tenant'], JSON.stringify(v))
+    assert.equal(huntVerdict([{ disposition: 'auto_pass' }], [{ status: 503, text: v.summary, expected: v.expected, expected_reason: v.expected_reason }]), 'FAIL', JSON.stringify(v))
+  }
+  // a criterion-named 5xx does not lift the block either
+  assert.equal(classifyFinding(F({ kind: 'anomaly', http_status: 503, model: {}, criterion_text: 'answers 503 while unconfigured' }), CTX()).rule, '5xx_or_cross_tenant')
+  // flagged with a reason but cross-tenant → blocks
+  const ct = classifyFinding(F({ kind: 'anomaly', http_status: 404, expected: true, expected_reason: 'r', model: { class: 'log', cross_tenant: true } }), CTX())
+  assert.deepEqual([ct.outcome, ct.rule], ['block', '5xx_or_cross_tenant'])
+  assert.match(ct.reasoning, /cross-tenant/)
+  // a smoke (non-anomaly) 5xx is never lifted by an expected flag
+  assert.equal(classifyFinding(F({ http_status: 503, expected: true, expected_reason: 'r' }), CTX()).rule, '5xx_or_cross_tenant')
+  // CLI: flag without a reason, and text-only, both block the hunt and FAIL it
+  for (const a of [NET({ status: 503, expected: true, expected_reason: '  ' }), NET({ status: 503, text: 'GET /api/sms (expected 503)' })]) {
+    const { t, res } = expectedRun({ 'a/1@mobile': { anomalies: [a] } })
+    assert.deepEqual(Object.keys(t.pending.block), ['a'], JSON.stringify(a))
+    assert.ok(t.classified.some(c => c.rule === '5xx_or_cross_tenant'))
+    assert.equal(res.hunts.find(h => h.slug === 'a').verdict, 'FAIL')
+  }
+  // CLI: a flagged 503 on a needs_human_run pair is not lifted (fail-closed)
+  const { t, res } = expectedRun({ 'a/1@mobile': { disposition: 'needs_human_run', anomalies: [NET({ status: 503, expected: true, expected_reason: 'r' })] } })
+  assert.deepEqual(Object.keys(t.pending.block), ['a'])
+  assert.equal(res.hunts.find(h => h.slug === 'a').verdict, 'FAIL')
+})
+
+test('AC6: a flagged 503 next to an unflagged 503 on one passing check → the unflagged one blocks', () => {
+  const { t, r } = expectedRun({ 'a/1@mobile': { anomalies: [NET({ status: 503, text: 'GET /a', expected: true, expected_reason: 'r' }), NET({ status: 503, text: 'GET /b' })] } })
+  assert.deepEqual(Object.keys(t.pending.block), ['a'])
+  const f = r.state().current.findings.filter(x => x.kind === 'anomaly')
+  assert.equal(f.length, 1)
+  assert.equal(f[0].summary, 'GET /b')
+})
+
+test('expected anomalies: rule order — Red compliance still blocks; the fix cap does not swallow an expected anomaly', () => {
+  const ex = F({ kind: 'anomaly', ref: 'h/4', http_status: 404, summary: 'GET /x (expected 404)', model: { class: 'log' } })
+  assert.equal(classifyFinding(ex, CTX({ tier: 'Red', complianceRefs: ['h/4'] })).rule, 'red_compliance')
+  assert.deepEqual(Object.values(classifyFinding(ex, CTX({ fixRounds: 2 }))).slice(0, 2), ['expected', 'expected_anomaly'])
+  assert.equal(classifyFinding(F({ kind: 'anomaly', http_status: 404, summary: 'GET /x', model: { class: 'log' } }), CTX({ fixRounds: 2 })).rule, 'fix_cap', 'an unexpected one still hits the cap')
+  // a failing criterion's anomaly is never expected (criterion_passed: false)
+  assert.equal(classifyFinding({ ...ex, ref: 'h/1', criterion_passed: false }, CTX()).rule, 'polish')
+  // only anomaly findings: a smoke finding whose summary says (expected 404) is not lifted
+  assert.notEqual(classifyFinding(F({ http_status: 404, summary: 'x (expected 404)' }), CTX()).rule, 'expected_anomaly')
+  assert.ok(TRIAGE_RULES.indexOf('expected_anomaly') === TRIAGE_RULES.indexOf('red_compliance') + 1)
+  assert.ok(TRIAGE_RULES.indexOf('expected_anomaly') === TRIAGE_RULES.indexOf('fix_cap') - 1)
+})
+
+test('expected anomalies: one flagged and one unflagged 404 on the same check share an id → the unflagged (polish) one is kept', () => {
+  const { r, t, res } = expectedRun({ 'a/1@mobile': { anomalies: [NET({ text: 'GET /a', expected: true, expected_reason: 'r' }), NET({ text: 'GET /b' })] } })
+  const f = r.state().current.findings.filter(x => x.kind === 'anomaly')
+  assert.equal(f.length, 1)
+  assert.equal(f[0].summary, 'GET /b')
+  assert.deepEqual(t.classified.map(c => c.outcome), ['log'])
+  // results.json still shows both anomalies
+  assert.equal(res.hunts.find(h => h.slug === 'a').anomalies.filter(a => a.status === 404).length, 2)
+})
+
+test('expected anomalies: a flagged status-less console error is expected; the finding carries the criterion fields', () => {
+  const { r, t } = expectedRun({ 'a/1@mobile': { anomalies: [{ kind: 'console', text: 'Uncaught TypeError', expected: true, expected_reason: 'known third-party widget error' }] } })
+  assert.deepEqual(t.classified.map(c => [c.outcome, c.rule]), [['expected', 'expected_anomaly']])
+  assert.match(t.classified[0].reasoning, /expected anomaly — the smoke agent flagged it expected/)
+  const f = r.state().current.findings.find(x => x.kind === 'anomaly')
+  assert.deepEqual([f.criterion_passed, f.criterion_text, f.expected, f.expected_reason], [true, 'a one runs everywhere.', true, 'known third-party widget error'])
+})
+
+test('AC7 CLI polish triage: an anomaly on a still-passing check is never a regression; a non-targeted auto_fail is', () => {
+  const r = stageRepo()
+  mergeHunt(r, 'a', { edits: { 'scheduler/views.py': 'v2\n' } })
+  const ps = smokeReady(r)
+  fs.writeFileSync(ps.raw_path, JSON.stringify(rawFor(ps, { 'a/2@mobile': { disposition: 'auto_fail', detail: 'x', model: { class: 'log' } } })))
+  r.ok(['ingest-smoke', '--wave', '1', '--raw', ps.raw_path])
+  r.ok(['triage', '--wave', '1'])
+  r.ok(['finish', '--result', 'resolved'])
+  r.ok(['fix-scaffold', '--polish'])
+  const wt = join(r.root, '.wt', 'polish-c1')
+  commit(wt, { 'scheduler/views.py': 'v2 polished\n' }, 'polish')
+  const pmeta = readJ(join(wt, '.wolfpack', 'plans', 'polish-c1', 'metadata.json'))
+  fs.writeFileSync(join(wt, '.wolfpack', 'plans', 'polish-c1', 'metadata.json'), JSON.stringify({ ...pmeta, status: 'certified' }))
+  assert.equal(chainMerge(r.root, { campaign: 'c1', hunt: 'polish-c1', at: AT, polish: true }).status, 'merged')
+  const b = r.ok(['begin', '--wave', '1', '--polish', 'polish-c1'])
+  assert.equal(b.polish_issues.length, 1)
+  r.ok(['suites', '--polish', 'polish-c1'])
+  const ps2 = r.ok(['plan-smoke', '--wave', '1', '--sha', r.tip()])
+  fs.writeFileSync(ps2.raw_path, JSON.stringify(rawFor(ps2, {
+    'a/1@mobile': { anomalies: [NET({ text: 'GET /settings/x' }), { kind: 'console', text: 'favicon missing' }] },  // unexpected, still passing
+    'a/2@mobile': { anomalies: [NET({ text: 'GET /y', expected: true, expected_reason: 'per AC' })] },             // the targeted check now passes
+    'a/1@surgical': { disposition: 'auto_fail', detail: 'page blank', model: { class: 'fix', expected_from: 'ac' } }, // not targeted, now fails
+  })))
+  r.ok(['ingest-smoke', '--wave', '1', '--raw', ps2.raw_path])
+  const t = r.ok(['triage', '--wave', '1'])
+  assert.equal(t.polish.slug, 'polish-c1')
+  assert.deepEqual(t.polish.regressions.map(x => x.what), ['a/1'])
+  const reg = r.state().current.findings.find(f => f.id === t.polish.regressions[0].id)
+  assert.deepEqual([reg.kind, reg.tenant], ['smoke', 'surgical'])
+  assert.deepEqual(t.polish.fixed, b.polish_issues, 'the targeted item no longer fails')
+  assert.deepEqual(t.polish.still_failing, [])
+  assert.ok(t.classified.some(c => c.outcome === 'log' && c.rule === 'polish'), 'the anomaly notes are still logged')
+  assert.ok(t.classified.some(c => c.outcome === 'expected'), 'the flagged anomaly is recorded expected')
+})
+
+test('AC7 CLI polish triage: a pass with only anomalies (expected or not) → no regressions at all', () => {
+  const r = stageRepo()
+  mergeHunt(r, 'a', { edits: { 'scheduler/views.py': 'v2\n' } })
+  const ps = smokeReady(r)
+  fs.writeFileSync(ps.raw_path, JSON.stringify(rawFor(ps, { 'a/2@mobile': { disposition: 'auto_fail', detail: 'x', model: { class: 'log' } } })))
+  r.ok(['ingest-smoke', '--wave', '1', '--raw', ps.raw_path])
+  r.ok(['triage', '--wave', '1'])
+  r.ok(['finish', '--result', 'resolved'])
+  r.ok(['fix-scaffold', '--polish'])
+  const wt = join(r.root, '.wt', 'polish-c1')
+  commit(wt, { 'scheduler/views.py': 'v2 polished\n' }, 'polish')
+  const pmeta = readJ(join(wt, '.wolfpack', 'plans', 'polish-c1', 'metadata.json'))
+  fs.writeFileSync(join(wt, '.wolfpack', 'plans', 'polish-c1', 'metadata.json'), JSON.stringify({ ...pmeta, status: 'certified' }))
+  assert.equal(chainMerge(r.root, { campaign: 'c1', hunt: 'polish-c1', at: AT, polish: true }).status, 'merged')
+  r.ok(['begin', '--wave', '1', '--polish', 'polish-c1'])
+  r.ok(['suites', '--polish', 'polish-c1'])
+  const ps2 = r.ok(['plan-smoke', '--wave', '1', '--sha', r.tip()])
+  fs.writeFileSync(ps2.raw_path, JSON.stringify(rawFor(ps2, {
+    'a/1@surgical': { anomalies: [NET({ status: 403, text: 'GET /a' })] },
+    'a/1@mobile': { anomalies: [NET({ text: 'GET /b (expected 404)' })] },
+    'mobile-manifest/1@mobile': { anomalies: [{ kind: 'console', text: 'deprecated API warning' }] },
+  })))
+  r.ok(['ingest-smoke', '--wave', '1', '--raw', ps2.raw_path])
+  const t = r.ok(['triage', '--wave', '1'])
+  assert.ok(t.classified.length >= 3, JSON.stringify(t.classified))
+  assert.deepEqual(t.polish.regressions, [])
+})
+
+test('AC8 findingId: wording never changes the id; hunt / ref / tenant / http_status / kind / test_id do', () => {
+  const base = { kind: 'anomaly', hunt: 'a', tenant: 'mobile', ref: 'a/1', http_status: 404 }
+  const id = findingId({ ...base, summary: 'GET /settings/x' })
+  assert.equal(findingId({ ...base, summary: 'GET /settings/booking-capacity/ (expected 404 per AC)' }), id)
+  assert.equal(findingId({ ...base }), id, 'no summary at all')
+  for (const d of [{ hunt: 'b' }, { ref: 'a/2' }, { tenant: 'surgical' }, { http_status: 403 }, { http_status: undefined }, { kind: 'smoke' }]) {
+    assert.notEqual(findingId({ ...base, ...d, summary: 'GET /settings/x' }), id, JSON.stringify(d))
+  }
+  assert.equal(findingId({ kind: 'integration', hunt: 'a', test_id: 'x.tests.A', summary: 'one' }), findingId({ kind: 'integration', hunt: 'a', test_id: 'x.tests.A', summary: 'two' }))
+  assert.equal(findingId({ ...base, http_status: '404' }), findingId({ ...base, http_status: undefined }), 'only an integer status enters the key')
+})
+
+test('AC8 CLI: the same 404 anomaly reworded in wave 1 and wave 2 → ONE issue-log entry, seen_waves [1, 2]', () => {
+  const r = stageRepo()
+  mergeHunt(r, 'a', { edits: { 'scheduler/views.py': 'v2\n' } })
+  let ps = smokeReady(r, ['a'])
+  fs.writeFileSync(ps.raw_path, JSON.stringify(rawFor(ps, { 'a/1@mobile': { anomalies: [NET({ text: 'GET /settings/x returned 404 Not Found' })] } })))
+  r.ok(['ingest-smoke', '--wave', '1', '--raw', ps.raw_path])
+  r.ok(['triage', '--wave', '1'])
+  r.ok(['finish', '--result', 'green'])
+  mergeHunt(r, 'b', { edits: { 'docs/x.md': 'v3\n' }, acceptance: '## Acceptance criteria\n- AC1 [auto] [tenant:surgical] b.\n' })
+  r.ok(['begin', '--wave', '2', '--merged', 'b'])
+  r.ok(['suites', '--wave', '2'])
+  ps = r.ok(['plan-smoke', '--wave', '2', '--sha', r.tip()])
+  fs.writeFileSync(ps.raw_path, JSON.stringify(rawFor(ps, { 'a/1@mobile': { anomalies: [NET({ text: 'Network: 404 on GET /settings/x at 10:42' })] } })))
+  r.ok(['ingest-smoke', '--wave', '2', '--raw', ps.raw_path])
+  r.ok(['triage', '--wave', '2'])
+  const entries = r.issues().entries.filter(e => e.kind === 'anomaly')
+  assert.equal(entries.length, 1, JSON.stringify(r.issues().entries))
+  assert.deepEqual(entries[0].seen_waves, [1, 2])
+  assert.deepEqual([entries[0].hunt, entries[0].ref, entries[0].tenant], ['a', 'a/1', 'mobile'])
+})
+
+test('AC9 CLI: a pre-change issue id stays in the store byte-equal and is still resolvable', async () => {
+  const { createHash } = await import('node:crypto')
+  // the pre-change formula: sha1(kind|hunt|tenant|ref|normalised summary)
+  const oldId = `ISS-${createHash('sha1').update('anomaly|a|mobile|a/1|get /x #').digest('hex').slice(0, 10)}`
+  assert.notEqual(oldId, findingId({ kind: 'anomaly', hunt: 'a', tenant: 'mobile', ref: 'a/1', summary: 'GET /x 404', http_status: 404 }))
+  const r = stageRepo()
+  mergeHunt(r, 'a', { edits: { 'scheduler/views.py': 'v2\n' } })
+  const seeded = appendIssues(emptyStore(), [{ id: oldId, wave: 1, hunt: 'a', ref: 'a/1', tenant: 'mobile', kind: 'anomaly', outcome: 'log', rule: 'polish',
+    reasoning: 'a/1: polish', evidence: null }]).store
+  put(r.root, '.wolfpack/campaigns/c1/issue-log.json', JSON.stringify(seeded, null, 2))
+  const before = structuredClone(seeded.entries[0])
+  const ps = smokeReady(r)
+  fs.writeFileSync(ps.raw_path, JSON.stringify(rawFor(ps, {
+    'a/1@mobile': { anomalies: [NET({ text: 'GET /x 404' })] },
+    'a/2@mobile': { disposition: 'auto_fail', detail: 'Save missing', model: { class: 'fix', expected_from: 'ac' } },
+  })))
+  r.ok(['ingest-smoke', '--wave', '1', '--raw', ps.raw_path])
+  r.ok(['triage', '--wave', '1'])
+  let log = r.issues().entries
+  assert.equal(log.length, 3, 'the re-seen finding starts one new entry under the new key')
+  assert.deepEqual(log.find(e => e.id === oldId), before)
+  r.ok(['resolve', '--ids', oldId, '--resolution', 'polished'])
+  log = r.issues().entries
+  const e = log.find(x => x.id === oldId)
+  assert.equal(e.resolution, 'polished')
+  assert.ok(e.resolved_at)
+  assert.equal(log.length, 3)
+  // another triage still leaves it alone
+  r.ok(['triage', '--wave', '1'])
+  assert.deepEqual(r.issues().entries.find(x => x.id === oldId), e)
+})
+
+test('AC10 CLI resolve --resolution "expected behaviour": closes the issue, appends the reason, drops it from polish-plan', () => {
+  assert.deepEqual([...RESOLUTIONS], ['polished', 'reverted', 'needs Cecil', 'expected behaviour'])
+  assert.ok(Object.isFrozen(RESOLUTIONS))
+  const { r } = expectedRun({ 'a/1@mobile': { anomalies: [NET({ status: 403 })] } })
+  let pp = r.ok(['polish-plan'])
+  assert.equal(pp.items.length, 1)
+  const id = pp.items[0].id
+  const out = r.ok(['resolve', '--ids', id, '--resolution', 'expected behaviour', '--reason', 'the plan says staff get 403 here'])
+  assert.equal(out.status, 'ok')
+  const e = r.issues().entries.find(x => x.id === id)
+  assert.equal(e.resolution, 'expected behaviour')
+  assert.ok(e.resolved_at)
+  assert.match(e.reasoning, /the plan says staff get 403 here/)
+  pp = r.ok(['polish-plan'])
+  assert.deepEqual(pp.items, [])
+  for (const bad of ['done', 'expected', 'Expected Behaviour', 'fixed in round x']) {
+    const x = r.run(['resolve', '--ids', id, '--resolution', bad])
+    assert.equal(x.code, 2, bad)
+    assert.match(x.json.reason, /must be one of polished, reverted, needs Cecil, expected behaviour or "fixed in round <n>"/)
+  }
+})
+
+test('stage doc and smoke-chain prompt agree on the expected-anomaly fields', () => {
+  const doc = fs.readFileSync(join(PACK, 'docs', 'post-merge-stage.md'), 'utf8')
+  const sc = fs.readFileSync(join(PACK, '.agents', 'commands', 'smoke-chain.md'), 'utf8')
+  for (const t of ['expected_reason', 'expected behaviour', '`expected_anomaly`', '### Expected anomalies', 'kind|hunt|tenant|ref-or-test-id|status']) assert.ok(doc.includes(t), t)
+  assert.ok(!doc.includes('normalised summary'))
+  assert.ok(sc.includes('"expected": true') && sc.includes('expected_reason'))
+  const src = fs.readFileSync(CLI, 'utf8')
+  assert.ok(!src.includes('normalised summary') && !src.includes('normaliseSummary'))
 })
