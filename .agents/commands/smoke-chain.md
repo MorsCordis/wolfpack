@@ -75,7 +75,12 @@ For each tenant in `tenants`, sign in through the hook (rule 1), then run that t
   `.jpg` to `.jpeg`) into `<wave_dir>/shots/` and record its path relative to `wave_dir` (`shots/<file>`).
 - **Anomaly sweep (every page you touched):** every console error and every non-2xx response, with the
   status code kept and the URL's query string stripped. Never copy cookies, `Authorization` headers or
-  tokens into the text.
+  tokens into the text. If the criterion text (the pair's `text`) or the hunt's plan says this response
+  should happen (for example 'a mobile tenant gets 404', or a 503 'unavailable' answer while the tenant lacks
+  a dependency the criterion names), set `"expected": true` and a one-line `expected_reason` saying where
+  that comes from. Never flag an anomaly the criterion does not call for. The stage records a flagged anomaly
+  as expected instead of polish; a 5xx stops blocking only when it is flagged with a reason: an unflagged 5xx
+  (or `(expected 503)` in the text alone) still blocks the hunt.
 - **A failure** (`auto_fail`) gets a one-line `reason` (actual vs expected) and a `model` judgement:
   `class` (`fix` = a clear defect, `log` = cosmetic/polish, `block` = wrong end to end, `uncertain`,
   `needs_decision` = a product decision), `expected_from` (`ac` / `plan` / `pattern` / `none` — where the
@@ -93,10 +98,12 @@ Write `raw_path` (JSON, schema 1), one result per pair you ran:
       "detail": "one line (optional)", "reason": "actual vs expected (failures)",
       "urls": ["https://<tenant host>/<path>"],
       "screenshots": ["shots/<file>"],
-      "anomalies": [ { "kind": "console|network", "text": "…", "status": 503 } ],
+      "anomalies": [ { "kind": "console|network", "text": "…", "status": 503, "expected": true, "expected_reason": "the criterion says this tenant answers 503 without a messaging channel" } ],
       "model": { "class": "fix|log|block|uncertain|needs_decision", "expected_from": "ac|plan|pattern|none", "cross_tenant": false } }
   ] }
 ```
+
+`expected` / `expected_reason` are optional; omit them for an unexpected anomaly.
 
 Every non-covered pair appears exactly once (`ref` + `tenant`). `urls` lists every URL you visited for the
 pair. Then return the raw path. Do NOT build the report, do NOT write `results.json`, do NOT touch the issue

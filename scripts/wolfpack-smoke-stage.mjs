@@ -33,7 +33,8 @@
 // ISSUE LOG: .wolfpack/campaigns/<c>/issue-log.json is the machine store (append-only: entries are
 // never removed; only resolution, resolved_at and seen_waves change in place); issue-log.md is
 // re-rendered from it on every write. Finding id: ISS-<sha1(kind|hunt|tenant|ref-or-test-id|
-// normalised summary)[:10]>.
+// status)[:10]> (status = the finding's integer http_status, '-' when absent; never the free-text
+// summary). Ids written before this change are kept as they are and stay resolvable.
 //
 // CLI (JSON on stdout; exit 0 = decided, 2 = refused/error {status:'error', reason, code?}):
 //   check-config   --campaign C
@@ -89,6 +90,8 @@ export const MAX_BUSY_RETRIES = 8
 export const MAX_FIX_ROUNDS = 2
 export const STEPS = Object.freeze(['begin', 'deploy', 'migrate', 'ensure', 'session', 'integration', 'smoke', 'triage', 'act', 'done'])
 export const DISPOSITIONS = Object.freeze(['auto_pass', 'auto_fail', 'needs_human_run'])
+const REGRESSION_KINDS = new Set(['smoke', 'integration', 'deploy', 'migrate'])
+export const RESOLUTIONS = Object.freeze(['polished', 'reverted', 'needs Cecil', 'expected behaviour'])
 export const MODEL_CLASSES = Object.freeze(['fix', 'log', 'block', 'uncertain', 'needs_decision'])
 export const CONSOLE_DETAIL = 'console not reachable on dev'
 export const CAPABILITY_NOTICE_RE = /^WARNING capabilities: not available\b/m
@@ -249,7 +252,7 @@ export function tenantPlan(criteria, tenants = {}, manifests = {}) {
 }
 
 // AC15: a console-only criterion is needs_human_run; any auto_fail → FAIL; a 5xx anomaly → FAIL
-// even when every criterion passed; any needs_human_run → PENDING; else PASS.
+// even when every criterion passed (unless flagged expected with a reason); any needs_human_run → PENDING; else PASS.
 export function normaliseDisposition(c) {
   if (c && (c.needs_console === true || (typeof c.detail === 'string' && c.detail.toLowerCase().includes(CONSOLE_DETAIL)))) {
     return { ...c, disposition: 'needs_human_run', detail: CONSOLE_DETAIL }
@@ -259,19 +262,37 @@ export function normaliseDisposition(c) {
 export function huntVerdict(criteria, anomalies = []) {
   const cs = (criteria || []).map(normaliseDisposition)
   if (cs.some(c => c.disposition === 'auto_fail' || c.disposition === 'manual_fail')) return 'FAIL'
-  if ((anomalies || []).some(a => Number.isInteger(a.status) && a.status >= 500)) return 'FAIL'
+  if ((anomalies || []).some(a => Number.isInteger(a.status) && a.status >= 500 && expectedBasis(a) !== 'flag')) return 'FAIL'
   if (cs.some(c => c.disposition === 'needs_human_run')) return 'PENDING'
   return 'PASS'
 }
 
+// An anomaly the smoke agent or the criterion says should happen (docs/post-merge-stage.md § Expected
+// anomalies). Returns 'flag' | 'text' | 'criterion' | null, first match wins:
+//   flag      — expected === true AND a non-empty expected_reason (the only basis that lifts the 5xx block);
+//   text      — the text contains "(expected NNN" (case-insensitive) and NNN === status;
+//   criterion — status is 4xx/5xx and appears as a standalone number in the criterion text.
+const EXPECTED_TEXT_RE = /\(\s*expected\s+(\d{3})\b/i
+export function expectedBasis(a, criterionText = '') {
+  const x = a || {}
+  if (x.expected === true && typeof x.expected_reason === 'string' && x.expected_reason.trim()) return 'flag'
+  const status = Number.isInteger(x.status) ? x.status : null
+  if (status == null) return null
+  const m = EXPECTED_TEXT_RE.exec(String(x.text || ''))
+  if (m && Number(m[1]) === status) return 'text'
+  if (status >= 400 && status <= 599 && new RegExp(`(^|[^0-9])${status}($|[^0-9])`).test(String(criterionText || ''))) return 'criterion'
+  return null
+}
+
 // ─── Triage (AC18) ───────────────────────────────────────────────────────────
 // finding: {kind: smoke|integration|anomaly|session|deploy|migrate, hunt|null, ref|test_id, tenant|null,
-//   summary, evidence, model:{class, expected_from, cross_tenant}, http_status, prod_host, key}
+//   summary, evidence, model:{class, expected_from, cross_tenant}, http_status, prod_host, key,
+//   expected, expected_reason, criterion_text, criterion_passed (anomaly kind only)}
 // context: {tier, files, complianceRefs, fixRounds, mobilePassed, triageBlockPaths}
 // Pure, ordered, first match wins. The reasoning is rendered from the rule, never model prose.
 export const TRIAGE_RULES = Object.freeze([
   'deploy_or_migration', '5xx_or_cross_tenant', 'prod_host_touched', 'mobile_regression', 'money_medical_path',
-  'red_compliance', 'fix_cap', 'needs_decision', 'uncertain_log_vs_block', 'session_drop', 'clear_defect', 'polish', 'default_block',
+  'red_compliance', 'expected_anomaly', 'fix_cap', 'needs_decision', 'uncertain_log_vs_block', 'session_drop', 'clear_defect', 'polish', 'default_block',
 ])
 export function classifyFinding(finding, context = {}) {
   const f = finding || {}
@@ -279,6 +300,10 @@ export function classifyFinding(finding, context = {}) {
   const ctx = context || {}
   const what = f.ref || f.test_id || f.kind
   const key = f.key || (f.ref && f.tenant ? `${f.ref}@${f.tenant}` : null)
+  // criterion_passed absent reads as passing: anomaly findings are only emitted for non-failing criteria.
+  const basis = f.kind === 'anomaly' && f.criterion_passed !== false
+    ? expectedBasis({ status: f.http_status, text: f.summary, expected: f.expected, expected_reason: f.expected_reason }, f.criterion_text)
+    : null
   const files = Array.isArray(ctx.files) ? ctx.files : []
   const blockPaths = (Array.isArray(ctx.triageBlockPaths) ? ctx.triageBlockPaths : []).map(p => (p.endsWith('/') ? p : `${p}/`))
   const out = (outcome, rule, reasoning) => {
@@ -286,7 +311,7 @@ export function classifyFinding(finding, context = {}) {
     return { outcome, rule, reasoning }
   }
   if (f.kind === 'deploy' || f.kind === 'migrate') return out('block', 'deploy_or_migration', `${f.kind} failed: never smoked over`)
-  if ((Number.isInteger(f.http_status) && f.http_status >= 500) || m.cross_tenant === true) {
+  if (m.cross_tenant === true || (Number.isInteger(f.http_status) && f.http_status >= 500 && basis !== 'flag')) {
     return out('block', '5xx_or_cross_tenant', m.cross_tenant === true ? `${what}: cross-tenant data seen` : `${what}: server error ${f.http_status}`)
   }
   if (f.prod_host === true) return out('block', 'prod_host_touched', `${what}: a refused (prod / never-smoke) host was visited`)
@@ -301,6 +326,12 @@ export function classifyFinding(finding, context = {}) {
   if (isRed(ctx.tier) && f.ref && Array.isArray(ctx.complianceRefs) && ctx.complianceRefs.includes(f.ref)) {
     return out('block', 'red_compliance', `${what}: a Red hunt's compliance criterion failed`)
   }
+  if (basis) {
+    const why = basis === 'flag' ? 'the smoke agent flagged it expected (its reason is in the evidence)'
+      : basis === 'text' ? `the anomaly text says (expected ${f.http_status})`
+      : `the criterion text names ${f.http_status}`
+    return out('expected', 'expected_anomaly', `${what}: expected ${Number.isInteger(f.http_status) ? f.http_status : 'anomaly'} — ${why}`)
+  }
   if (Number.isInteger(ctx.fixRounds) && ctx.fixRounds >= MAX_FIX_ROUNDS) return out('block', 'fix_cap', `${what}: ${ctx.fixRounds} fix rounds already ran (cap ${MAX_FIX_ROUNDS})`)
   if (m.class === 'needs_decision') return out('block', 'needs_decision', `${what}: needs a product decision`)
   if (m.class === 'uncertain') return out('block', 'uncertain_log_vs_block', `${what}: log vs block unclear — blocking`)
@@ -312,9 +343,10 @@ export function classifyFinding(finding, context = {}) {
   return out('block', 'default_block', `${what}: no clear expected behaviour (a product decision) — blocking`)
 }
 
-const normaliseSummary = (s) => String(s || '').toLowerCase().replace(/\d+/g, '#').replace(/\s+/g, ' ').trim()
+// The wording never enters the id (one finding = one id across waves); ids written before this key
+// stay in the store untouched and resolvable.
 export function findingId(f) {
-  const key = [f.kind, f.hunt || '-', f.tenant || '-', f.ref || f.test_id || '-', normaliseSummary(f.summary)].join('|')
+  const key = [f.kind, f.hunt || '-', f.tenant || '-', f.ref || f.test_id || '-', Number.isInteger(f.http_status) ? String(f.http_status) : '-'].join('|')
   return `ISS-${createHash('sha1').update(key).digest('hex').slice(0, 10)}`
 }
 
@@ -1075,6 +1107,10 @@ export function validateRaw(raw, plan) {
     seen.add(key)
     if (!want.get(key).covered_by_integration && !DISPOSITIONS.includes(r.disposition)) bad(`${w}: disposition must be one of ${DISPOSITIONS.join(', ')}`)
     for (const k of ['anomalies', 'urls', 'screenshots']) if (r[k] != null && !Array.isArray(r[k])) bad(`${w}.${k} must be an array`)
+    for (const [j, a] of (r.anomalies || []).entries()) {
+      if (a && a.expected != null && typeof a.expected !== 'boolean') bad(`${w}.anomalies[${j}].expected must be a boolean`)
+      if (a && a.expected_reason != null && typeof a.expected_reason !== 'string') bad(`${w}.anomalies[${j}].expected_reason must be a string`)
+    }
     if (r.disposition === 'auto_fail' && r.model != null) {
       if (!MODEL_CLASSES.includes(r.model.class)) bad(`${w}.model.class must be one of ${MODEL_CLASSES.join(', ')}`)
     }
@@ -1170,10 +1206,20 @@ function cmdIngestSmoke(c, f) {
     }
     hb.criteria.push(crit)
     for (const sh of (r.screenshots || [])) { const rel = shotRel(sh); if (rel && !hb.screenshots.includes(rel)) hb.screenshots.push(rel) }
-    const anomalies = (r.anomalies || []).map(a => ({
-      kind: ['console', 'network'].includes(a && a.kind) ? a.kind : 'console', text: redact(String((a && a.text) || '')).slice(0, 500), tenant: pair.tenant,
-      ...(Number.isInteger(a && a.status) ? { status: a.status } : {}),
-    }))
+    const passing = crit.disposition === 'auto_pass'   // only auto_pass counts as a passing criterion (fail-closed)
+    const anomalies = (r.anomalies || []).map(a => {
+      const m = {
+        kind: ['console', 'network'].includes(a && a.kind) ? a.kind : 'console', text: redact(String((a && a.text) || '')).slice(0, 500), tenant: pair.tenant,
+        ...(Number.isInteger(a && a.status) ? { status: a.status } : {}),
+      }
+      if (passing && a && a.expected === true) {
+        m.expected = true
+        if (typeof a.expected_reason === 'string') m.expected_reason = redact(a.expected_reason.trim()).slice(0, 200)
+      }
+      const basis = passing ? expectedBasis(m, pair.text) : null
+      if (basis) m.expected_basis = basis
+      return m
+    })
     hb.anomalies.push(...anomalies)
     const status5xx = anomalies.find(a => Number.isInteger(a.status) && a.status >= 500)
     if (crit.disposition === 'auto_fail' && crit.detail !== 'refused host') {
@@ -1187,14 +1233,23 @@ function cmdIngestSmoke(c, f) {
         fd.id = findingId(fd); findings.push(fd)
       }
     } else if (status5xx || anomalies.length) {
-      // A non-failing criterion with page anomalies: a 5xx always becomes a finding (rule 2);
-      // a console / non-2xx anomaly on a passing check is polish unless the agent says otherwise.
-      for (const a of status5xx ? [status5xx] : anomalies) {
+      // A non-failing criterion with page anomalies: a 5xx becomes a finding (rule 2) unless the agent
+      // flagged it expected with a reason; an anomaly the agent, its text or the criterion marks expected
+      // is recorded `expected` (rule 7); any other console / non-2xx anomaly on a passing check is polish
+      // unless the agent says otherwise.
+      const block5xx = anomalies.find(a => Number.isInteger(a.status) && a.status >= 500 && a.expected_basis !== 'flag')
+      // Unexpected first, expected last: ids ignore the wording, so the first finding per id wins (fail-loud).
+      const ordered = block5xx ? [block5xx] : [...anomalies].sort((x, y) => (x.expected_basis ? 1 : 0) - (y.expected_basis ? 1 : 0))
+      for (const a of ordered) {
         for (const h of blameFor(pair)) {
           const fd = {
-            kind: 'anomaly', hunt: h, ref: pair.ref, tenant: pair.tenant, key: pair.key, summary: a.text || `${a.kind} anomaly`, evidence: null,
-            model: status5xx ? {} : (r.model && MODEL_CLASSES.includes(r.model.class) ? r.model : { class: 'log', expected_from: 'none' }),
-            ...(Number.isInteger(a.status) ? { http_status: a.status } : {}), ...blockedWith(pair, h),
+            kind: 'anomaly', hunt: h, ref: pair.ref, tenant: pair.tenant, key: pair.key, summary: a.text || `${a.kind} anomaly`,
+            evidence: a.expected_basis === 'flag' ? `expected_reason: ${a.expected_reason}` : null,
+            model: block5xx ? {} : (r.model && MODEL_CLASSES.includes(r.model.class) ? r.model : { class: 'log', expected_from: 'none' }),
+            ...(Number.isInteger(a.status) ? { http_status: a.status } : {}),
+            criterion_passed: passing, criterion_text: String(pair.text || '').slice(0, 500),
+            ...(a.expected ? { expected: true } : {}), ...(a.expected_reason ? { expected_reason: a.expected_reason } : {}),
+            ...blockedWith(pair, h),
           }
           fd.id = findingId(fd); findings.push(fd)
         }
@@ -1280,15 +1335,17 @@ function cmdTriage(c) {
     entries.push({
       id: fd.id, wave: cur.wave, hunt: fd.hunt, ref: fd.ref || fd.test_id, tenant: fd.tenant, kind: fd.kind,
       outcome: r.outcome, rule: r.rule, reasoning: r.reasoning, evidence: fd.evidence || fd.test_id || null,
-      resolution: r.rule === 'session_drop' ? 'needs Cecil' : null,
+      resolution: r.outcome === 'expected' ? 'expected behaviour' : (r.rule === 'session_drop' ? 'needs Cecil' : null),
     })
   }
   appendIssues(store, entries)
   // Polish iteration (AC27/AC28): a failure that is not one of the polished items is a regression.
   if (cur.polish) {
     const targeted = new Set(cur.polish.issues || [])
-    const failing = classified.filter(x => x.finding.kind !== 'session')
-    const regressions = failing.filter(x => !targeted.has(x.id))
+    // A regression is a disposition change (a check or test that now fails), never an anomaly note on a
+    // check that still passes.
+    const failing = classified.filter(x => x.finding.kind !== 'session' && x.outcome !== 'expected')
+    const regressions = failing.filter(x => !targeted.has(x.id) && REGRESSION_KINDS.has(x.finding.kind))
     const failingIds = new Set(failing.map(x => x.id))
     saveStore(c.root, c.campaign, store)
     markStep(cur, 'triage')
@@ -1305,7 +1362,7 @@ function cmdTriage(c) {
   const campaignBlocks = []
   const campaignBlockText = []
   for (const x of classified) {
-    if (x.outcome === 'log') continue
+    if (x.outcome === 'log' || x.outcome === 'expected') continue
     if (!x.hunt) {
       if (x.outcome === 'block') {
         campaignBlocks.push(x.id)
@@ -1503,7 +1560,7 @@ function cmdResolve(c, f) {
   const store = loadStore(c.root, c.campaign)
   const ids = String(f.ids || '').split(',').map(x => x.trim()).filter(Boolean)
   const res = String(f.resolution || '')
-  if (!(['polished', 'reverted', 'needs Cecil'].includes(res) || /^fixed in round \d+$/.test(res))) throw new StageError(`--resolution must be polished, reverted, needs Cecil or "fixed in round <n>" (got ${res})`)
+  if (!(RESOLUTIONS.includes(res) || /^fixed in round \d+$/.test(res))) throw new StageError(`--resolution must be one of ${RESOLUTIONS.join(', ')} or "fixed in round <n>" (got ${res})`)
   const reason = typeof f.reason === 'string' && f.reason.trim() ? redact(f.reason.trim()) : null
   for (const id of ids) {
     const e = resolveIssue(store, id, res)

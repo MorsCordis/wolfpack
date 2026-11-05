@@ -319,9 +319,9 @@ test('AC32: the triage / fix-cap / issue-log / polish / report terms agree acros
   }
   has(sc, 'max 2', 'smoke-chain fix-round cap')
   has(rcl, 'Post-merge stage', 'run-campaign-local section')
-  // the doc's triage table has all 13 rules, in order
+  // the doc's triage table has all 14 rules, in order
   const rules = ['deploy_or_migration', '5xx_or_cross_tenant', 'prod_host_touched', 'mobile_regression', 'money_medical_path',
-    'red_compliance', 'fix_cap', 'needs_decision', 'uncertain_log_vs_block', 'session_drop', 'clear_defect', 'polish', 'default_block']
+    'red_compliance', 'expected_anomaly', 'fix_cap', 'needs_decision', 'uncertain_log_vs_block', 'session_drop', 'clear_defect', 'polish', 'default_block']
   let at = -1
   for (const r of rules) {
     const i = doc.indexOf(`\`${r}\``, at + 1)
