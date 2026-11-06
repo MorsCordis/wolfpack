@@ -684,7 +684,7 @@ if [ "$VIBE_FAMILY" = "glm" ]; then
     if [ "$VIBE_MODE" = "implement" ]; then
         GLM_TIMEOUT="${WOLFPACK_VIBE_IMPLEMENT_TIMEOUT:-3600}"
     else
-        GLM_TIMEOUT="${WOLFPACK_VIBE_REVIEW_TIMEOUT:-1800}"
+        GLM_TIMEOUT="${WOLFPACK_VIBE_REVIEW_TIMEOUT:-3300}"  # stays under the pipeline's ~60 min seat poll
     fi
     # Must be > 0: `timeout 0` means NO limit, which would silently drop the runaway bound
     # on an auto-approved GLM run.
